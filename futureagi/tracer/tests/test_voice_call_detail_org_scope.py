@@ -23,6 +23,10 @@ from accounts.models.organization import Organization
 from accounts.models.workspace import Workspace
 from model_hub.models.ai_model import AIModel
 from tracer.models.project import Project
+from tracer.serializers.trace import (
+    TraceVoiceCallDetailQuerySerializer,
+    TraceVoiceCallDetailResponseSerializer,
+)
 from tracer.services.clickhouse.v2.trace_detail_reads import (
     TraceDetailNotFound,
     TraceDetailRead,
@@ -30,6 +34,7 @@ from tracer.services.clickhouse.v2.trace_detail_reads import (
 )
 
 VOICE_CALL_DETAIL_URL = "/tracer/trace/voice_call_detail/"
+VOICE_CALL_LIST_URL = "/tracer/trace/list_voice_calls/"
 
 
 def _make_org_project(user, label):
@@ -87,8 +92,9 @@ def _detail(project_id, trace_id):
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("trace_id_parameter", ("trace_id", "traceId"))
 def test_detail_allows_project_in_active_org_not_user_home_org(
-    auth_client, user, monkeypatch
+    auth_client, user, monkeypatch, trace_id_parameter
 ):
     # The user's home organization stays whatever the fixture made it; the
     # request acts in a different organization that owns the project.
@@ -113,11 +119,105 @@ def test_detail_allows_project_in_active_org_not_user_home_org(
 
     monkeypatch.setattr("tracer.views.trace.read_trace_detail", fake_read)
 
-    response = auth_client.get(VOICE_CALL_DETAIL_URL, {"trace_id": trace_id})
+    response = auth_client.get(
+        VOICE_CALL_DETAIL_URL,
+        {trace_id_parameter: trace_id},
+    )
 
     assert response.status_code == status.HTTP_200_OK
-    assert str(project.id) in str(response.data)
-    assert trace_id in str(response.data)
+    assert response.data["status"] is True
+    assert response.data["result"]["project_id"] == str(project.id)
+    assert response.data["result"]["trace_id"] == trace_id
+
+
+@pytest.mark.parametrize(
+    "aliases",
+    (
+        ("trace_id",),
+        ("traceId",),
+        ("trace_id", "traceId"),
+    ),
+)
+def test_detail_query_contract_normalizes_compatibility_aliases(aliases):
+    trace_id = uuid.uuid4()
+    serializer = TraceVoiceCallDetailQuerySerializer(
+        data={alias: str(trace_id) for alias in aliases}
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data == {"trace_id": trace_id}
+
+
+def test_detail_success_contract_requires_envelope_and_named_result_shape():
+    trace_id = str(uuid.uuid4())
+    serializer = TraceVoiceCallDetailResponseSerializer(
+        data={
+            "status": True,
+            "result": {
+                "id": trace_id,
+                "trace_id": trace_id,
+                "project_id": str(uuid.uuid4()),
+                "provider_call_id": None,
+                "phone_number": None,
+                "duration_seconds": None,
+                "cost_breakdown": None,
+                "transcript": [{"role": "user", "content": "hello"}],
+                "messages": None,
+                "analysis_data": None,
+                "scenario_id": None,
+                "turn_count": 3,
+                "recording": {},
+                "recording_available": False,
+                "call_metadata": {},
+                "observation_span": [],
+                "eval_outputs": {},
+                "talk_ratio": None,
+                "agent_talk_percentage": None,
+                "bot_talk_pct": None,
+                "user_talk_pct": None,
+                "avg_agent_latency_ms": None,
+                "user_wpm": None,
+                "bot_wpm": None,
+                "user_interruption_count": None,
+                "ai_interruption_count": None,
+            },
+        }
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["result"]["transcript"] == [
+        {"role": "user", "content": "hello"}
+    ]
+    missing_status = TraceVoiceCallDetailResponseSerializer(data={"result": {}})
+    assert not missing_status.is_valid()
+    assert "status" in missing_status.errors
+
+    missing_result_identity = TraceVoiceCallDetailResponseSerializer(
+        data={"status": True, "result": {}}
+    )
+    assert not missing_result_identity.is_valid()
+    assert "trace_id" in missing_result_identity.errors["result"]
+
+
+@pytest.mark.parametrize(
+    ("query", "error_field"),
+    (
+        ({}, "trace_id"),
+        ({"trace_id": "not-a-uuid"}, "trace_id"),
+        (
+            {"trace_id": str(uuid.uuid4()), "traceId": str(uuid.uuid4())},
+            "traceId",
+        ),
+        ({"trace_id": str(uuid.uuid4()), "allow_sampled": "true"}, "allow_sampled"),
+    ),
+)
+def test_detail_query_contract_rejects_invalid_or_ambiguous_identity(
+    query, error_field
+):
+    serializer = TraceVoiceCallDetailQuerySerializer(data=query)
+
+    assert not serializer.is_valid()
+    assert error_field in serializer.errors
 
 
 @pytest.mark.django_db
@@ -161,7 +261,9 @@ def test_detail_sanitizes_bounded_clickhouse_failure(auth_client, user, monkeypa
 
 
 @pytest.mark.django_db
-def test_detail_preserves_sanitized_generic_bad_request(auth_client, user, monkeypatch):
+def test_detail_returns_sanitized_server_error_for_unexpected_failure(
+    auth_client, user, monkeypatch
+):
     _, active_workspace, _ = _make_org_project(user, "Active")
     auth_client.set_workspace(active_workspace)
     monkeypatch.setattr("tracer.views.trace.V2AnalyticsQueryService", lambda: object())
@@ -175,6 +277,32 @@ def test_detail_preserves_sanitized_generic_bad_request(auth_client, user, monke
 
     response = auth_client.get(VOICE_CALL_DETAIL_URL, {"trace_id": str(uuid.uuid4())})
 
-    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
     assert response.data["result"] == "Voice call details could not be loaded"
+    assert "private compiler state" not in str(response.data)
+
+
+@pytest.mark.django_db
+def test_list_returns_sanitized_server_error_for_unexpected_failure(
+    auth_client, user, monkeypatch
+):
+    _, active_workspace, project = _make_org_project(user, "Active")
+    auth_client.set_workspace(active_workspace)
+    monkeypatch.setattr("tracer.views.trace.V2AnalyticsQueryService", lambda: object())
+
+    def fail_with_private_detail(*_args, **_kwargs):
+        raise RuntimeError("private compiler state and SQL")
+
+    monkeypatch.setattr(
+        "tracer.views.trace.TraceViewSet._list_voice_calls_clickhouse",
+        fail_with_private_detail,
+    )
+
+    response = auth_client.get(
+        VOICE_CALL_LIST_URL,
+        {"project_id": str(project.id)},
+    )
+
+    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    assert response.data["result"] == "Voice call data could not be loaded"
     assert "private compiler state" not in str(response.data)

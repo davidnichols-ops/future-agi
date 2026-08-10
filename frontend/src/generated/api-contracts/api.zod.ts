@@ -34698,6 +34698,12 @@ Each metric is validated against the canonical query contract before
 it reaches any query builder.
  * @summary Execute a widget query and return chart data.
  */
+export const tracerDashboardQueryQueryRefreshDefault = false;
+
+export const TracerDashboardQueryQueryParams = zod.object({
+  "refresh": zod.boolean().default(tracerDashboardQueryQueryRefreshDefault)
+})
+
 export const tracerDashboardQueryBodyWorkflowDefault = `observability`;
 export const tracerDashboardQueryBodyProjectIdsDefault = [];
 export const tracerDashboardQueryBodyGranularityDefault = `day`;
@@ -35029,6 +35035,12 @@ export const TracerDashboardWidgetsCreateBody = zod.object({
  */
 export const TracerDashboardWidgetsPreviewQueryParams = zod.object({
   "dashboard_pk": zod.string()
+})
+
+export const tracerDashboardWidgetsPreviewQueryQueryRefreshDefault = false;
+
+export const TracerDashboardWidgetsPreviewQueryQueryParams = zod.object({
+  "refresh": zod.boolean().default(tracerDashboardWidgetsPreviewQueryQueryRefreshDefault)
 })
 
 export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigWorkflowDefault = `observability`;
@@ -35425,6 +35437,12 @@ export const TracerDashboardWidgetsDuplicateWidgetBody = zod.object({
 export const TracerDashboardWidgetsExecuteQueryParams = zod.object({
   "dashboard_pk": zod.string(),
   "id": zod.string()
+})
+
+export const tracerDashboardWidgetsExecuteQueryQueryRefreshDefault = false;
+
+export const TracerDashboardWidgetsExecuteQueryQueryParams = zod.object({
+  "refresh": zod.boolean().default(tracerDashboardWidgetsExecuteQueryQueryRefreshDefault)
 })
 
 export const tracerDashboardWidgetsExecuteQueryBodyAllowSampledDefault = false;
@@ -42310,7 +42328,9 @@ export const TracerTraceCreateBody = zod.object({
 
 
 /**
- * Return one cached exact Agent Graph and chronological Agent Path.
+ * ``path_edges`` remains an empty compatibility field until telemetry
+records authoritative chronological execution transitions.
+ * @summary Return one cached exact Agent Graph.
  */
 export const tracerTraceAgentGraphQueryFiltersDefault = `[]`;
 
@@ -43097,47 +43117,96 @@ export const TracerTraceListVoiceCallsResponse = zod.object({
 
 /**
  * Query params:
-- trace_id (required) — UUID of the voice call trace.
+- trace_id or legacy traceId (required) — UUID of the voice call trace.
  * @summary Return the heavy / detail-only fields for a single voice call.
  */
 export const TracerTraceVoiceCallDetailQueryParams = zod.object({
-  "page": zod.number().optional().describe('A page number within the paginated result set.'),
-  "limit": zod.number().optional().describe('Number of results to return per page.')
+  "trace_id": zod.string().uuid().optional().describe('Voice-call trace UUID. Supply this or the legacy traceId alias.'),
+  "traceId": zod.string().uuid().optional().describe('Legacy alias for trace_id; when both are supplied they must match.')
 })
 
-export const tracerTraceVoiceCallDetailResponseResultsItemNameMax = 2000;
 
-export const tracerTraceVoiceCallDetailResponseResultsItemExternalIdMax = 255;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
 export const TracerTraceVoiceCallDetailResponse = zod.object({
-  "count": zod.number(),
-  "next": zod.string().url().optional(),
-  "previous": zod.string().url().optional(),
-  "results": zod.array(zod.object({
-  "id": zod.string().uuid().optional(),
-  "project": zod.string().uuid(),
-  "project_version": zod.string().uuid().optional(),
-  "name": zod.string().max(tracerTraceVoiceCallDetailResponseResultsItemNameMax).optional(),
-  "metadata": zod.object({
-
-}).passthrough().optional(),
-  "input": zod.object({
-
-}).passthrough().optional(),
-  "output": zod.object({
-
-}).passthrough().optional(),
-  "error": zod.object({
-
-}).passthrough().optional(),
-  "session": zod.string().uuid().optional(),
-  "external_id": zod.string().max(tracerTraceVoiceCallDetailResponseResultsItemExternalIdMax).optional(),
-  "tags": zod.object({
-
-}).passthrough().optional()
-}))
+  "status": zod.boolean(),
+  "result": zod.object({
+  "id": zod.string().min(1),
+  "trace_id": zod.string().min(1),
+  "project_id": zod.string().min(1),
+  "provider_call_id": zod.string().min(1).nullable(),
+  "phone_number": zod.string().min(1).nullish(),
+  "customer_name": zod.string().min(1).nullish(),
+  "call_id": zod.string().min(1).nullish(),
+  "status": zod.string().min(1).nullish(),
+  "started_at": zod.string().min(1).nullish(),
+  "ended_at": zod.string().min(1).nullish(),
+  "created_at": zod.string().min(1).nullish(),
+  "duration_seconds": zod.number().nullish(),
+  "recording_url": zod.string().min(1).nullish(),
+  "stereo_recording_url": zod.string().min(1).nullish(),
+  "cost_cents": zod.number().nullish(),
+  "cost_breakdown": zod.record(zod.string(), zod.unknown()).nullish(),
+  "error_message": zod.string().min(1).nullish(),
+  "call_summary": zod.string().min(1).nullish(),
+  "ended_reason": zod.string().min(1).nullish(),
+  "overall_score": zod.number().nullish(),
+  "response_time_ms": zod.number().nullish(),
+  "response_time_seconds": zod.number().nullish(),
+  "assistant_id": zod.string().min(1).nullish(),
+  "assistant_phone_number": zod.string().min(1).nullish(),
+  "call_type": zod.string().min(1).nullish(),
+  "message_count": zod.number().nullish(),
+  "transcript_available": zod.boolean().nullish(),
+  "transcript": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))).nullish(),
+  "messages": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))).nullish(),
+  "analysis_data": zod.record(zod.string(), zod.unknown()).nullish(),
+  "evaluation_data": zod.record(zod.string(), zod.unknown()).nullish(),
+  "recording": zod.record(zod.string(), zod.unknown()),
+  "recording_available": zod.boolean(),
+  "call_metadata": zod.record(zod.string(), zod.unknown()),
+  "observation_span": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))),
+  "eval_outputs": zod.record(zod.string(), zod.unknown()),
+  "call_execution_id": zod.string().min(1).nullish(),
+  "test_execution_id": zod.string().min(1).nullish(),
+  "scenario_id": zod.string().min(1).nullish(),
+  "scenario_name": zod.string().min(1).nullish(),
+  "scenario_graph_id": zod.string().min(1).nullish(),
+  "scenario_graph": zod.record(zod.string(), zod.unknown()).optional(),
+  "turn_count": zod.number().nullable(),
+  "talk_ratio": zod.number().nullable(),
+  "agent_talk_percentage": zod.number().nullable(),
+  "bot_talk_pct": zod.number().nullable(),
+  "user_talk_pct": zod.number().nullable(),
+  "avg_agent_latency_ms": zod.number().nullable(),
+  "user_wpm": zod.number().nullable(),
+  "bot_wpm": zod.number().nullable(),
+  "user_interruption_count": zod.number().nullable(),
+  "ai_interruption_count": zod.number().nullable()
+})
 })
 
 

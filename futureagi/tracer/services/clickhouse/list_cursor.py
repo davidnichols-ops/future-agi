@@ -95,18 +95,80 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+_FILTER_PRESENTATION_KEYS = frozenset(
+    {
+        "display_name",
+        "displayName",
+    }
+)
+
+
+def _deduplicated_sorted_json_values(values: list[Any]) -> list[Any]:
+    by_json = {_canonical_json(value): value for value in values}
+    return [by_json[key] for key in sorted(by_json)]
+
+
 def _normalized_filter(item: Any) -> Any:
     if not isinstance(item, dict):
         return _json_value(item)
     normalized = _json_value(item)
+    for key in _FILTER_PRESENTATION_KEYS:
+        normalized.pop(key, None)
+    column_id = normalized.get("column_id", normalized.get("columnId"))
     config = normalized.get("filter_config") or normalized.get("filterConfig") or {}
+    canonical_config: dict[str, Any] = {}
+    for snake_key, camel_key in (
+        ("filter_type", "filterType"),
+        ("filter_op", "filterOp"),
+        ("filter_value", "filterValue"),
+        ("col_type", "colType"),
+        ("attribute_value_types", "attributeValueTypes"),
+    ):
+        if snake_key in config:
+            canonical_config[snake_key] = config[snake_key]
+        elif camel_key in config:
+            canonical_config[snake_key] = config[camel_key]
+    config = canonical_config
     operator = config.get("filter_op") or config.get("filterOp")
-    value_key = "filter_value" if "filter_value" in config else "filterValue"
+    value_key = "filter_value"
     if operator in {"in", "not_in"} and isinstance(config.get(value_key), list):
-        config[value_key] = sorted(
-            config[value_key], key=lambda value: _canonical_json(value)
-        )
-    return normalized
+        values = config[value_key]
+        types_key = "attribute_value_types"
+        value_types = config.get(types_key)
+        if isinstance(value_types, list) and len(value_types) == len(values):
+            # Storage provenance is positional. Sort and deduplicate pairs, not
+            # values alone, or a mixed typed attribute filter changes meaning.
+            pairs = _deduplicated_sorted_json_values(
+                [
+                    [value, value_type]
+                    for value, value_type in zip(values, value_types, strict=True)
+                ]
+            )
+            config[value_key] = [pair[0] for pair in pairs]
+            config[types_key] = [pair[1] for pair in pairs]
+        else:
+            config[value_key] = _deduplicated_sorted_json_values(values)
+    canonical_item = {"column_id": column_id, "filter_config": config}
+    # These fields affect routing/type interpretation in dashboard and eval
+    # query builders, so they are semantic even though they are outside
+    # filter_config. Only the human-facing display label is discarded.
+    if "source" in normalized:
+        canonical_item["source"] = normalized["source"]
+    if "output_type" in normalized:
+        canonical_item["output_type"] = normalized["output_type"]
+    elif "outputType" in normalized:
+        canonical_item["output_type"] = normalized["outputType"]
+    return canonical_item
+
+
+def normalize_filter_conjunction(filters: list[Any] | tuple[Any, ...]) -> list[Any]:
+    """Canonicalize one AND-conjunction without presentation-only metadata."""
+
+    normalized = [_normalized_filter(item) for item in (filters or [])]
+    # Repeated identical leaves are idempotent under conjunction. Removing them
+    # keeps cursor/cache identities stable and bounds redundant query predicates.
+    by_json = {_canonical_json(item): item for item in normalized}
+    return [by_json[key] for key in sorted(by_json)]
 
 
 def normalize_cursor_query(query: dict[str, Any]) -> dict[str, Any]:
@@ -123,8 +185,7 @@ def normalize_cursor_query(query: dict[str, Any]) -> dict[str, Any]:
         }:
             continue
         if key == "filters":
-            filters = [_normalized_filter(item) for item in (value or [])]
-            normalized[key] = sorted(filters, key=_canonical_json)
+            normalized[key] = normalize_filter_conjunction(value or [])
         elif key in {"project_ids"} and isinstance(value, (list, tuple)):
             normalized[key] = sorted(str(item) for item in value)
         elif key == "search" and isinstance(value, str):
@@ -148,8 +209,8 @@ def exact_total_explicitly_required(
     that explicitly send ``allow_sampled=false`` retain the strict exact-total
     contract. Trace cursor reads may opt into a lower-bound total because every
     returned row is still exact and ordered and the signed continuation proves
-    where the unscanned suffix begins. Other resources remain strict until they
-    explicitly implement and expose the same continuation contract.
+    where the unscanned suffix begins. Other resources may opt in only after
+    implementing and exposing the same signed exact-continuation contract.
     """
 
     query_params = getattr(request, "query_params", None)
@@ -437,6 +498,7 @@ __all__ = [
     "decode_list_cursor",
     "encode_list_cursor",
     "frozen_window_filter",
+    "normalize_filter_conjunction",
     "normalize_cursor_query",
     "snapshot_cursor_supported",
 ]

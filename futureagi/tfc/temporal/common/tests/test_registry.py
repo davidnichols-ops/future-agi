@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
+import pytest
+
 from tfc.temporal.common import registry
 
 
@@ -60,3 +62,26 @@ def test_usage_temporal_registry_does_not_hide_internal_import_error(monkeypatch
         assert exc is import_error
     else:  # pragma: no cover - assertion guard
         raise AssertionError("internal import failure was silently ignored")
+
+
+@pytest.mark.parametrize(
+    ("register", "args"),
+    [
+        (registry._register_usage_temporal_workflows, ()),
+        (registry._register_usage_temporal_activities, (MagicMock(),)),
+    ],
+)
+def test_usage_temporal_registration_does_not_hide_packaging_failure(
+    monkeypatch, register, args
+):
+    import_error = ModuleNotFoundError("dependency unavailable", name="redis")
+    monkeypatch.setattr(
+        registry,
+        "_load_usage_temporal_registry",
+        MagicMock(side_effect=import_error),
+    )
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        register(*args)
+
+    assert exc_info.value is import_error

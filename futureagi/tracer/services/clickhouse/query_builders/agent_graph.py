@@ -1,10 +1,8 @@
-"""One-snapshot aggregate Agent Graph/Path query for direct-write ClickHouse.
+"""One-snapshot aggregate Agent Graph query for direct-write ClickHouse.
 
-The graph and path are two views of the same current span set:
-
-* ``edges`` are exact parent -> child topology transitions;
-* ``path_edges`` are the same exact recorded parent -> child transitions,
-  projected for the Agent Path (Sankey) presentation.
+``edges`` are exact parent -> child topology transitions. ``path_edges`` stays
+empty because span hierarchy does not prove chronological execution paths;
+publishing the hierarchy twice under different labels would be misleading.
 
 Both, together with node metrics, are produced by one ClickHouse statement and
 one physical ``spans`` reference.  This matters on ClickHouse 25.3: named CTEs
@@ -28,20 +26,20 @@ from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
 AGENT_GRAPH_MAX_VISIBLE_NODES = 64
 AGENT_GRAPH_OTHER_NODE_ID = "aggregate:__other_nodes__"
 AGENT_GRAPH_OTHER_NODE_NAME = "__other_nodes__"
-# The final SQL fold emits at most N nodes plus N^2 hierarchy and N^2 path
-# transitions. Keep one extra sentinel row in the transport limit so an
+# The final SQL fold emits at most N nodes plus N^2 hierarchy transitions.
+# Keep one extra sentinel row in the transport limit so an
 # accidental regression fails closed before Python allocates an unbounded
 # response.
 AGENT_GRAPH_MAX_RESULT_ROWS = (
     AGENT_GRAPH_MAX_VISIBLE_NODES
-    + 2 * AGENT_GRAPH_MAX_VISIBLE_NODES * AGENT_GRAPH_MAX_VISIBLE_NODES
+    + AGENT_GRAPH_MAX_VISIBLE_NODES * AGENT_GRAPH_MAX_VISIBLE_NODES
 )
 AGENT_GRAPH_RESULT_ROW_SENTINEL = AGENT_GRAPH_MAX_RESULT_ROWS + 1
 AGENT_GRAPH_MAX_RESULT_BYTES = 64 * 1024 * 1024
 
 
 class AgentGraphQueryBuilder(BaseQueryBuilder):
-    """Build one exact latest-state Agent Graph/Path statement."""
+    """Build one exact latest-state Agent Graph statement."""
 
     TABLE = "spans"
     VERSION_COLUMN = "_version"
@@ -241,23 +239,21 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                     graph_spans
                 )"""
 
-        def recorded_edge_events(row_kind: str) -> str:
+        def recorded_edge_events() -> str:
             """Return exact recorded parent -> child edge events.
 
             A span's timestamps do not prove causality between siblings.  In
-            particular, both Agent Graph and Agent Path must use only the
-            explicit ``parent_span_id`` topology. ``row_kind`` is an internal
-            literal selected by this builder, never request input.
+            particular, Agent Graph uses only explicit ``parent_span_id``
+            topology. Agent Path is unavailable until producers record an
+            authoritative execution-path relation.
             """
 
-            if row_kind not in {"hierarchy", "path"}:
-                raise ValueError(f"unsupported agent edge row kind: {row_kind!r}")
-            return f"""arrayFlatten(arrayMap(
+            return """arrayFlatten(arrayMap(
                     graph_sibling_set -> if(
                         tupleElement(graph_sibling_set, 2) > 0,
                         arrayMap(
                             graph_child -> tuple(
-                                '{row_kind}',
+                                'hierarchy',
                                 tupleElement(graph_id_sorted_spans[
                                     tupleElement(graph_sibling_set, 2)
                                 ], 3),
@@ -279,8 +275,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                     graph_sibling_sets
                 ))"""
 
-        hierarchy_events = recorded_edge_events("hierarchy")
-        path_events = recorded_edge_events("path")
+        hierarchy_events = recorded_edge_events()
 
         query = f"""
         WITH graph_latest_spans AS (
@@ -388,8 +383,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                 trace_id,
                 arrayJoin(arrayConcat(
                     {node_events},
-                    {hierarchy_events},
-                    {path_events}
+                    {hierarchy_events}
                 )) AS graph_event
             FROM graph_prepared_traces
         ),
@@ -578,7 +572,6 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
 
         nodes: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
-        path_edges: list[dict[str, Any]] = []
         original_node_count = 0
         for row in rows or []:
             kind = str(value(row, "row_kind", 0, ""))
@@ -634,7 +627,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                     }
                 )
                 continue
-            if kind not in {"hierarchy", "path"}:
+            if kind != "hierarchy":
                 continue
             target_id = (
                 self._make_node_id(target_name, target_type)
@@ -657,12 +650,12 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                     else {}
                 ),
             }
-            (edges if kind == "hierarchy" else path_edges).append(edge)
+            edges.append(edge)
 
         return self._bound_result(
             nodes,
             edges,
-            path_edges,
+            [],
             original_node_count=original_node_count or len(nodes),
         )
 

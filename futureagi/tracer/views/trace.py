@@ -82,6 +82,8 @@ from tracer.serializers.trace import (
     TraceObserveListResponseSerializer,
     TracePrototypeListResponseSerializer,
     TraceSerializer,
+    TraceVoiceCallDetailQuerySerializer,
+    TraceVoiceCallDetailResponseSerializer,
     TraceVoiceCallListQuerySerializer,
     TraceVoiceCallListResponseSerializer,
     UserCodeExampleResponseSerializer,
@@ -3513,7 +3515,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "voice_call_list_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Voice call data could not be loaded")
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Voice call data could not be loaded",
+                code="server_error",
+            )
 
     # ------------------------------------------------------------------
     # Voice call detail — returns heavy fields for a single call
@@ -3549,20 +3555,28 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             return {}
         return {"system_metrics": metrics}
 
-    @action(detail=False, methods=["get"])
+    @validated_request(
+        query_serializer=TraceVoiceCallDetailQuerySerializer,
+        responses={
+            200: TraceVoiceCallDetailResponseSerializer,
+            400: ApiErrorResponseSerializer,
+            404: ApiErrorResponseSerializer,
+            500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        },
+        strict_response_validation=True,
+    )
+    @action(detail=False, methods=["get"], pagination_class=None)
     def voice_call_detail(self, request, *args, **kwargs):
         """
         Return the heavy / detail-only fields for a single voice call.
 
         Query params:
-        - trace_id (required) — UUID of the voice call trace.
+        - trace_id or legacy traceId (required) — UUID of the voice call trace.
         """
+        trace_id = ""
         try:
-            trace_id = request.query_params.get("trace_id") or request.query_params.get(
-                "traceId"
-            )
-            if not trace_id:
-                return self._gm.bad_request("trace_id is required")
+            trace_id = str(request.validated_query_data["trace_id"])
 
             # Scope the ClickHouse identity read up front.  The exact reader
             # resolves latest span versions/tombstones inside only these
@@ -3607,7 +3621,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         except TraceDetailReadUnavailable as e:
             logger.warning(
                 "voice_call_detail_bounded_read_incomplete",
-                trace_id=str(request.query_params.get("trace_id") or ""),
+                trace_id=trace_id,
                 error_code=e.code,
             )
             return self._gm.custom_error_response(
@@ -3616,8 +3630,15 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 code="service_unavailable",
             )
         except Exception as e:
-            logger.exception("voice_call_detail_error", error=str(e))
-            return self._gm.bad_request("Voice call details could not be loaded")
+            logger.exception(
+                "voice_call_detail_error",
+                error_type=type(e).__name__,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Voice call details could not be loaded",
+                code="server_error",
+            )
 
     def _voice_call_detail_clickhouse(self, request, trace_id, detail, eval_configs):
         """Return heavy voice-call detail fields from ClickHouse."""
@@ -4060,7 +4081,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
 
             if has_voice_traces:
-                return self._export_voice_calls(request, project, project_id)
+                # Voice telemetry is direct-write-only. The legacy exporter reads
+                # PostgreSQL and can therefore return stale or empty data; fail
+                # closed until a complete ClickHouse export collector is available.
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "A complete voice call export is temporarily unavailable. Please retry later.",
+                    code="service_unavailable",
+                )
 
             # Regular observe export path
             response = self.list_traces_of_session(request, export=True)
@@ -4630,7 +4658,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     ),
                     None,
                 )
-                if failed_attempt is not None:
+                safe_cursor_checkpoint = bool(
+                    cursor_enabled and bounded_page.continuation_slice_end is not None
+                )
+                if failed_attempt is not None and not safe_cursor_checkpoint:
                     logger.warning(
                         "trace_list_bounded_statement_failed",
                         project_id=str(project_id) if project_id else None,
@@ -4641,6 +4672,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Filtered trace data is temporarily unavailable. Please retry.",
                         code="service_unavailable",
+                    )
+                if failed_attempt is not None:
+                    logger.warning(
+                        "trace_list_bounded_statement_checkpoint_published",
+                        project_id=str(project_id) if project_id else None,
+                        page_number=page_number,
+                        error_code=failed_attempt.error_code,
                     )
                 logger.warning(
                     "trace_list_bounded_read_incomplete",
@@ -4654,11 +4692,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         "Filtered trace data is temporarily unavailable. Please retry.",
                         code="service_unavailable",
                     )
-                if (
-                    cursor_enabled
-                    and not bounded_page.rows
-                    and bounded_page.continuation_slice_end is None
-                ):
+                if cursor_enabled and bounded_page.continuation_slice_end is None:
                     return self._gm.custom_error_response(
                         status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Filtered trace data is temporarily unavailable. Please retry.",
@@ -5675,7 +5709,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 ),
                 None,
             )
-            if failed_attempt is not None:
+            safe_cursor_checkpoint = bool(
+                cursor_enabled and bounded_page.continuation_slice_end is not None
+            )
+            if failed_attempt is not None and not safe_cursor_checkpoint:
                 logger.warning(
                     "voice_call_list_bounded_statement_failed",
                     project_id=str(project_id),
@@ -5687,6 +5724,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     "Voice call data is temporarily unavailable. Please retry.",
                     code="service_unavailable",
                 )
+            if failed_attempt is not None:
+                logger.warning(
+                    "voice_call_list_bounded_statement_checkpoint_published",
+                    project_id=str(project_id),
+                    page_number=page_number,
+                    error_code=failed_attempt.error_code,
+                )
             logger.warning(
                 "voice_call_list_bounded_read_incomplete",
                 project_id=str(project_id),
@@ -5694,9 +5738,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 error_code=bounded_page.error_code,
             )
             if not publish_bounded_partial or (
-                cursor_enabled
-                and not bounded_page.rows
-                and bounded_page.continuation_slice_end is None
+                cursor_enabled and bounded_page.continuation_slice_end is None
             ):
                 return self._gm.custom_error_response(
                     status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -6792,7 +6834,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     )
     @action(detail=False, methods=["get"])
     def agent_graph(self, request, *args, **kwargs):
-        """Return one cached exact Agent Graph and chronological Agent Path."""
+        """Return one cached exact Agent Graph.
+
+        ``path_edges`` remains an empty compatibility field until telemetry
+        records authoritative chronological execution transitions.
+        """
         project_id = None
         try:
             query = request.validated_query_data

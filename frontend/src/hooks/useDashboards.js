@@ -28,10 +28,9 @@ const DASHBOARD_KEYS = {
   ],
 };
 
-const FILTER_VALUE_TERMINAL_BROWSE_STATUSES = new Set([
-  "exhausted",
-  "limit_reached",
-]);
+// A bounded value walk may report `limit_reached` together with an advancing
+// signed cursor. That is a resumable checkpoint; only `exhausted` is terminal.
+const FILTER_VALUE_TERMINAL_BROWSE_STATUSES = new Set(["exhausted"]);
 const FILTER_VALUE_FOLLOWED_CURSORS_KEY = "__filterValueFollowedCursors";
 const FILTER_VALUE_CURSOR_STOPPED_KEY = "__filterValueCursorStopped";
 
@@ -538,7 +537,7 @@ export function useDashboardFilterValues({
     data: values,
     queryReadState,
     browseStatus,
-    browseLimitReached: browseStatus === "limit_reached",
+    browseLimitReached: browseStatus === "limit_reached" && !query.hasNextPage,
     attributeType: pages.find((page) => page?.attribute_type)?.attribute_type,
   };
 }

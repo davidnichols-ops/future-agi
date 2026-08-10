@@ -9,6 +9,7 @@ from tracer.services.clickhouse.filter_value_reads import (
     FILTER_VALUE_CURSOR_INITIAL_SEGMENT,
     FILTER_VALUE_CURSOR_MIN_SEGMENT,
     FilterValueRead,
+    _value_digest,
     read_end_user_filter_value_cursor_page,
     read_span_system_filter_value_cursor_page,
     read_span_system_filter_values,
@@ -193,6 +194,34 @@ def test_system_values_cursor_exhausts_dense_slice_without_duplicates():
     assert second.values == ("queued",)
     assert second.has_more is False
     assert second.browse_status == "exhausted"
+
+
+def test_system_values_cursor_uses_exact_count_only_state_past_4096():
+    class Analytics:
+        def execute_ch_query(self, _query, _params, **_kwargs):
+            return SimpleNamespace(
+                data=[{"val": "completed"}, {"val": "new-status"}]
+            )
+
+    completed_digest = _value_digest("completed")
+    read = read_span_system_filter_value_cursor_page(
+        Analytics(),
+        project_ids=[PROJECT_ID],
+        metric_name="status",
+        page_size=10,
+        window_start=NOW - FILTER_VALUE_CURSOR_INITIAL_SEGMENT,
+        window_end=NOW,
+        seen_value_digests=(),
+        seen_value_contains=lambda digest: digest == completed_digest,
+        seen_value_count=4_097,
+    )
+
+    assert read.values == ("new-status",)
+    assert read.appended_value_digests == (_value_digest("new-status"),)
+    assert read.seen_value_digests == read.appended_value_digests
+    assert read.seen_value_count == 4_098
+    assert read.has_more is False
+    assert read.browse_status == "exhausted"
 
 
 def test_system_value_budget_backoff_changes_cursor_then_fails_at_floor():

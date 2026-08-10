@@ -30577,7 +30577,15 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "requestBody": {
           "$ref": "#/definitions/DashboardQuery"
         },
-        "queryParameters": {},
+        "queryParameters": {
+          "refresh": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
         "responses": {
           "200": {
             "$ref": "#/definitions/DashboardQueryApiResponse"
@@ -30732,7 +30740,15 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "requestBody": {
           "$ref": "#/definitions/DashboardPreviewQuery"
         },
-        "queryParameters": {},
+        "queryParameters": {
+          "refresh": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
         "responses": {
           "200": {
             "$ref": "#/definitions/DashboardQueryApiResponse"
@@ -30861,7 +30877,15 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "requestBody": {
           "$ref": "#/definitions/DashboardSampleOptIn"
         },
-        "queryParameters": {},
+        "queryParameters": {
+          "refresh": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
         "responses": {
           "200": {
             "$ref": "#/definitions/DashboardQueryApiResponse"
@@ -36478,51 +36502,40 @@ export const OPENAPI_CONTRACT = Object.freeze({
     "/tracer/trace/voice_call_detail/": {
       "get": {
         "operationId": "tracer_trace_voice_call_detail",
-        "runtimeRequestValidation": false,
-        "runtimeResponseValidation": false,
+        "runtimeRequestValidation": true,
+        "runtimeResponseValidation": true,
         "requestBody": null,
         "queryParameters": {
-          "page": {
+          "trace_id": {
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string",
+              "format": "uuid"
             }
           },
-          "limit": {
+          "traceId": {
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string",
+              "format": "uuid"
             }
           }
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/Trace"
-                }
-              }
-            }
+            "$ref": "#/definitions/TraceVoiceCallDetailResponse"
+          },
+          "400": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "404": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "500": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "503": {
+            "$ref": "#/definitions/ApiErrorResponse"
           },
           "default": {
             "$ref": "#/definitions/ManagementAPIErrorResponse"
@@ -73303,6 +73316,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "TraceVoiceCallDetailResponse": {
+      "required": [
+        "status",
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean"
+        },
+        "result": {
+          "$ref": "#/definitions/TraceVoiceCallDetailResult"
+        }
+      }
+    },
     "TraceVoiceCallListResponse": {
       "required": [
         "count",
@@ -93065,6 +93094,338 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Version id",
           "type": "string",
           "format": "uuid"
+        }
+      }
+    },
+    "TraceVoiceCallDetailResult": {
+      "required": [
+        "id",
+        "trace_id",
+        "project_id",
+        "provider_call_id",
+        "recording",
+        "recording_available",
+        "call_metadata",
+        "observation_span",
+        "eval_outputs",
+        "turn_count",
+        "talk_ratio",
+        "agent_talk_percentage",
+        "bot_talk_pct",
+        "user_talk_pct",
+        "avg_agent_latency_ms",
+        "user_wpm",
+        "bot_wpm",
+        "user_interruption_count",
+        "ai_interruption_count"
+      ],
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string",
+          "minLength": 1
+        },
+        "trace_id": {
+          "title": "Trace id",
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "title": "Project id",
+          "type": "string",
+          "minLength": 1
+        },
+        "provider_call_id": {
+          "title": "Provider call id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "phone_number": {
+          "title": "Phone number",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "customer_name": {
+          "title": "Customer name",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "call_id": {
+          "title": "Call id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "status": {
+          "title": "Status",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "started_at": {
+          "title": "Started at",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "ended_at": {
+          "title": "Ended at",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "created_at": {
+          "title": "Created at",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "duration_seconds": {
+          "title": "Duration seconds",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "recording_url": {
+          "title": "Recording url",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "stereo_recording_url": {
+          "title": "Stereo recording url",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "cost_cents": {
+          "title": "Cost cents",
+          "type": "number",
+          "x-nullable": true
+        },
+        "cost_breakdown": {
+          "title": "Cost breakdown",
+          "type": "object",
+          "x-nullable": true,
+          "additionalProperties": true
+        },
+        "error_message": {
+          "title": "Error message",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "call_summary": {
+          "title": "Call summary",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "ended_reason": {
+          "title": "Ended reason",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "overall_score": {
+          "title": "Overall score",
+          "type": "number",
+          "x-nullable": true
+        },
+        "response_time_ms": {
+          "title": "Response time ms",
+          "type": "number",
+          "x-nullable": true
+        },
+        "response_time_seconds": {
+          "title": "Response time seconds",
+          "type": "number",
+          "x-nullable": true
+        },
+        "assistant_id": {
+          "title": "Assistant id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "assistant_phone_number": {
+          "title": "Assistant phone number",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "call_type": {
+          "title": "Call type",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "message_count": {
+          "title": "Message count",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "transcript_available": {
+          "title": "Transcript available",
+          "type": "boolean",
+          "x-nullable": true
+        },
+        "transcript": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          },
+          "x-nullable": true
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          },
+          "x-nullable": true
+        },
+        "analysis_data": {
+          "title": "Analysis data",
+          "type": "object",
+          "x-nullable": true,
+          "additionalProperties": true
+        },
+        "evaluation_data": {
+          "title": "Evaluation data",
+          "type": "object",
+          "x-nullable": true,
+          "additionalProperties": true
+        },
+        "recording": {
+          "title": "Recording",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "recording_available": {
+          "title": "Recording available",
+          "type": "boolean"
+        },
+        "call_metadata": {
+          "title": "Call metadata",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "observation_span": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          }
+        },
+        "eval_outputs": {
+          "title": "Eval outputs",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "call_execution_id": {
+          "title": "Call execution id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "test_execution_id": {
+          "title": "Test execution id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "scenario_id": {
+          "title": "Scenario id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "scenario_name": {
+          "title": "Scenario name",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "scenario_graph_id": {
+          "title": "Scenario graph id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "scenario_graph": {
+          "title": "Scenario graph",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "turn_count": {
+          "title": "Turn count",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "talk_ratio": {
+          "title": "Talk ratio",
+          "type": "number",
+          "x-nullable": true
+        },
+        "agent_talk_percentage": {
+          "title": "Agent talk percentage",
+          "type": "number",
+          "x-nullable": true
+        },
+        "bot_talk_pct": {
+          "title": "Bot talk pct",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "user_talk_pct": {
+          "title": "User talk pct",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "avg_agent_latency_ms": {
+          "title": "Avg agent latency ms",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "user_wpm": {
+          "title": "User wpm",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "bot_wpm": {
+          "title": "Bot wpm",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "user_interruption_count": {
+          "title": "User interruption count",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "ai_interruption_count": {
+          "title": "Ai interruption count",
+          "type": "integer",
+          "x-nullable": true
         }
       }
     },

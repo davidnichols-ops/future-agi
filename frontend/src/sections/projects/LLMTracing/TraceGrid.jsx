@@ -52,6 +52,10 @@ import {
 import ListCursorContinuationNotice from "./ListCursorContinuationNotice";
 import { getListReadMessage, getListTotalState } from "./listTotalMetadata";
 import { getTraceAttributeRequestKey } from "./traceAttributeRequest";
+import {
+  parseAxiosResult,
+  parseTraceObserveListResponse,
+} from "src/api/project/observe-contracts";
 
 const ROWS_LIMIT = 25;
 const traceRowIdentity = (row) => {
@@ -59,6 +63,12 @@ const traceRowIdentity = (row) => {
   return id ? `${row?.project_id || ""}:${id}` : null;
 };
 const EMPTY_EXTRA_FILTERS = [];
+const loadTraceObservePage = (params) =>
+  axios
+    .get(endpoints.project.getTracesForObserveProject(), { params })
+    .then((response) =>
+      parseAxiosResult(response, parseTraceObserveListResponse),
+    );
 
 const TraceGrid = React.forwardRef(
   (
@@ -322,23 +332,16 @@ const TraceGrid = React.forwardRef(
                   const prefetched = cached;
                   cached = undefined;
                   return (
-                    prefetched ||
-                    axios.get(endpoints.project.getTracesForObserveProject(), {
-                      params: buildParams(pageNumber),
-                    })
+                    prefetched || loadTraceObservePage(buildParams(pageNumber))
                   );
                 },
-                rowsFromResponse: (response) =>
-                  response?.data?.result?.table || [],
-                metadataFromResponse: (response) =>
-                  response?.data?.result?.metadata || {},
+                rowsFromResponse: (response) => response.data.table,
+                metadataFromResponse: (response) => response.data.metadata,
                 rowIdentity: traceRowIdentity,
                 isCurrent: () =>
                   cursorPagination.current.isCurrent(requestGeneration),
                 nextResponse: () =>
-                  axios.get(endpoints.project.getTracesForObserveProject(), {
-                    params: buildParams(pageNumber),
-                  }),
+                  loadTraceObservePage(buildParams(pageNumber)),
               });
               if (!cursorPagination.current.isCurrent(requestGeneration)) {
                 // A newer filter/range owns the grid now. Do not let this stale
@@ -348,7 +351,7 @@ const TraceGrid = React.forwardRef(
               }
 
               const results = exactPage.response;
-              const res = results?.data?.result;
+              const res = results.data;
               const rows = exactPage.rows;
               const metadata = exactPage.metadata;
               if (
@@ -369,9 +372,9 @@ const TraceGrid = React.forwardRef(
                 continuationPending = true;
                 return;
               }
-              const nextReadState = getQueryReadState(results?.data);
+              const nextReadState = getQueryReadState(results.data);
               if (pageNumber === 0 || nextReadState !== "complete") {
-                const nextReadMessage = getListReadMessage(results?.data);
+                const nextReadMessage = getListReadMessage(results.data);
                 readMessageRef.current = nextReadMessage;
                 setReadMessage(nextReadMessage);
               }
@@ -463,10 +466,7 @@ const TraceGrid = React.forwardRef(
 
               // Prefetch next page so scroll feels instant
               if (exactPage.canPrefetch) {
-                axios
-                  .get(endpoints.project.getTracesForObserveProject(), {
-                    params: buildParams(pageNumber + 1),
-                  })
+                loadTraceObservePage(buildParams(pageNumber + 1))
                   .then((res) => {
                     if (cursorPagination.current.isCurrent(requestGeneration)) {
                       prefetchCache.current.set(pageNumber + 1, res);

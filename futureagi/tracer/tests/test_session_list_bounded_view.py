@@ -977,6 +977,7 @@ def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
     from tracer.views.trace_session import TraceSessionView
 
     view, request = _view_and_request()
+    request.query_params = {"cursor_mode": "true", "allow_sampled": "false"}
     project_id = str(uuid.uuid4())
     session_id = str(uuid.uuid4())
     window_start = datetime(2025, 8, 1, tzinfo=UTC)
@@ -1046,6 +1047,7 @@ def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
         "page_number": 0,
         "page_size": 1,
         "cursor_mode": True,
+        "allow_sampled": False,
     }
 
     with (
@@ -1085,6 +1087,9 @@ def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
     assert first_payload["metadata"]["total_rows"] == 0
     assert first_payload["metadata"]["total_rows_is_lower_bound"] is True
     assert first_payload["metadata"]["has_more"] is True
+    assert first_payload["metadata"]["query_complete"] is True
+    assert first_payload["metadata"]["query_status"] == "complete"
+    assert first_payload["metadata"]["query_error_code"] is None
     assert isinstance(cursor, str)
     assert second_status == "ok"
     assert [row["session_id"] for row in second_payload["table"]] == [session_id]

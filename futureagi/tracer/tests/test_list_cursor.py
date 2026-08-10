@@ -18,6 +18,7 @@ from tracer.services.clickhouse.list_cursor import (
     encode_list_cursor,
     exact_total_explicitly_required,
     normalize_cursor_query,
+    normalize_filter_conjunction,
     snapshot_cursor_supported,
 )
 
@@ -186,6 +187,64 @@ def test_cursor_normalizes_filter_order_and_in_value_order():
         ],
     }
     assert normalize_cursor_query(left) == normalize_cursor_query(right)
+
+
+def test_filter_identity_deduplicates_values_without_losing_type_provenance():
+    normalized = normalize_filter_conjunction(
+        [
+            {
+                "column_id": "attempt",
+                "display_name": "Attempt number",
+                "source": "traces",
+                "outputType": "score",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": ["1", 1, "1"],
+                    "attribute_value_types": ["string", "number", "string"],
+                },
+            }
+        ]
+    )
+
+    assert normalized == [
+        {
+            "column_id": "attempt",
+            "source": "traces",
+            "output_type": "score",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "in",
+                "filter_value": ["1", 1],
+                "attribute_value_types": ["string", "number"],
+            },
+        }
+    ]
+
+
+def test_filter_identity_ignores_labels_but_retains_semantic_routing_metadata():
+    base = {
+        "column_id": "quality",
+        "source": "traces",
+        "output_type": "PASS_FAIL",
+        "filter_config": {
+            "col_type": "EVAL_METRIC",
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": True,
+        },
+    }
+    relabeled = {**base, "display_name": "Quality (renamed)"}
+    other_source = {**base, "source": "simulation"}
+
+    assert normalize_filter_conjunction([base]) == normalize_filter_conjunction(
+        [relabeled]
+    )
+    assert normalize_filter_conjunction([base]) != normalize_filter_conjunction(
+        [other_source]
+    )
 
 
 @pytest.mark.parametrize(

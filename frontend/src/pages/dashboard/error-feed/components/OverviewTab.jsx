@@ -858,7 +858,6 @@ TraceGraphView.propTypes = {
 };
 
 // ── Split-with-working graph compare ─────────────────────────────────────────
-// Diff cues only land on graph mode — AgentPath nodes are too compressed for colored rings.
 function CompareLegend({ summary }) {
   const items = [
     summary.failed > 0 && {
@@ -1929,7 +1928,7 @@ function TraceEvidence({ evidence, trace, traceId, workingTraceId }) {
 
       {/* ── Body ── */}
       <Box sx={{ p: 1.75 }}>
-        {/* Agent Graph / Agent Path — single trace, OR split with working. */}
+        {/* Agent Graph / Agent Path — single trace, or split with a working trace. */}
         {isGraphMode &&
           (traceId ? (
             splitView ? (

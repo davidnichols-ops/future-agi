@@ -297,7 +297,7 @@ class SpanAttributeKeysView(APIView):
                         and all(char in "0123456789abcdef" for char in value)
                     ),
                 )
-                if cursor_token and cursor_state.seen_rows != len(seen_state.digests):
+                if cursor_token and cursor_state.seen_rows != seen_state.seen_count:
                     raise ListCursorError(
                         "invalid_cursor",
                         "The continuation cursor is invalid.",
@@ -314,6 +314,8 @@ class SpanAttributeKeysView(APIView):
                     resume_identity=resume_identity,
                     resume_key_offset=resume_key_offset,
                     seen_key_digests=seen_state.digests,
+                    seen_key_contains=seen_state.contains,
+                    seen_key_count=seen_state.seen_count,
                     exact_key=exact_key,
                     continue_operation=not bool(cursor_token),
                 )
@@ -332,9 +334,10 @@ class SpanAttributeKeysView(APIView):
                 published_has_more = page_read.has_more
                 published_browse_status = page_read.browse_status
                 if published_has_more:
-                    appended_digests = page_read.seen_key_digests[
-                        len(seen_state.digests) :
-                    ]
+                    appended_digests = (
+                        page_read.appended_key_digests
+                        or (page_read.seen_key_digests[len(seen_state.digests) :])
+                    )
                     seen_reference = persist_attribute_cursor_seen_state(
                         seen_state,
                         appended_digests,
@@ -362,7 +365,7 @@ class SpanAttributeKeysView(APIView):
                         window_start=window_start,
                         window_end=window_end,
                         order=next_order,
-                        seen_rows=len(page_read.seen_key_digests),
+                        seen_rows=seen_state.seen_count + len(appended_digests),
                     )
                 return Response(
                     {
@@ -564,11 +567,30 @@ class SpanAttributeDetailView(APIView):
             query_params = request.validated_query_data
             project_id = str(query_params["project_id"])
             key = query_params["key"]
+            organization = getattr(request, "organization", None) or getattr(
+                request.user, "organization", None
+            )
+            workspace = getattr(request, "workspace", None) or getattr(
+                request.user, "workspace", None
+            )
+            # Exact workers must carry both tenant dimensions and re-authorize
+            # them before touching ClickHouse.  Missing middleware context is
+            # therefore an authorization failure, never an organization-less
+            # cache identity or a generic programming-error response.
+            if organization is None or workspace is None:
+                logger.warning(
+                    "span_attribute_detail_tenant_context_missing",
+                    project_id=project_id,
+                    has_organization=organization is not None,
+                    has_workspace=workspace is not None,
+                )
+                return self._gm.not_found("Project not found")
             if not _project_is_in_request_scope(request, project_id):
                 return self._gm.not_found("Project not found")
 
             identity = {
-                "workspace_id": str(request.workspace.id),
+                "organization_id": str(organization.id),
+                "workspace_id": str(workspace.id),
                 "project_id": project_id,
                 "attribute_key": key,
                 "horizon_days": 365,

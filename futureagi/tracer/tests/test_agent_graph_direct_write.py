@@ -1,4 +1,4 @@
-"""Exact direct-write and async-snapshot contracts for Agent Graph/Path."""
+"""Exact direct-write and async-snapshot contracts for Agent Graph."""
 
 from datetime import UTC, datetime, timedelta
 from inspect import unwrap
@@ -112,12 +112,12 @@ def test_agent_graph_cache_identity_invalidates_retired_path_payloads(monkeypatc
     assert identity == {
         "project_id": PROJECT_ID,
         "filters": [FINAL_STATUS_FILTER],
-        "payload_version": 4,
+        "payload_version": 5,
     }
 
 
 @pytest.mark.unit
-def test_agent_graph_is_one_latest_state_v2_statement_for_all_outputs():
+def test_agent_graph_is_one_latest_state_v2_statement():
     builder = AgentGraphQueryBuilderV2(
         project_id=PROJECT_ID,
         filters=[FINAL_STATUS_FILTER, PROFILE_FILTER],
@@ -137,21 +137,17 @@ def test_agent_graph_is_one_latest_state_v2_statement_for_all_outputs():
     assert "arrayJoin(arrayConcat(" in query
     assert "'node'" in query
     assert "'hierarchy'" in query
-    assert "'path'" in query
+    assert "'path'" not in query
     assert "arrayFirst(" not in query
     assert "arrayExists(" not in query
     assert "indexOfAssumeSorted(" in query
     assert "arrayFold(" not in query
     assert "graph_execution_groups" not in query
-    # Both visualizations are different presentations of recorded
-    # parent_span_id topology. Timestamp order must never invent a transition
-    # between siblings.
+    # Timestamp order must never invent a transition between siblings. Agent
+    # Path stays unavailable until producers record chronological transitions;
+    # parent_span_id is hierarchy, not execution order.
     assert "graph_chronological_spans" not in query
     assert "range(1, length(graph_chronological_spans))" not in query
-    assert (
-        "'path',\n                                tupleElement(graph_id_sorted_spans["
-        in query
-    )
     assert "uniqExact(trace_id)" not in query
     assert "graph_trace_events AS" in query
     assert "graph_ranked_events AS" in query
@@ -227,7 +223,7 @@ def test_agent_graph_membership_is_global_but_unfiltered_scan_stays_bounded():
 
 
 @pytest.mark.unit
-def test_agent_graph_formatter_projects_recorded_parent_edge_to_both_views():
+def test_agent_graph_formatter_never_relabels_parent_edges_as_path_edges():
     builder = AgentGraphQueryBuilderV2(project_id=PROJECT_ID, filters=[])
     payload = builder.format_result(
         [
@@ -289,7 +285,7 @@ def test_agent_graph_formatter_projects_recorded_parent_edge_to_both_views():
     ]
     assert payload["edges"][0]["source"] == "agent:agent"
     assert payload["edges"][0]["target"] == "tool:lookup"
-    assert payload["path_edges"] == payload["edges"]
+    assert payload["path_edges"] == []
     assert payload["graph_collapsed"] is False
 
 
@@ -347,18 +343,13 @@ def test_agent_graph_real_shapes_never_invent_sibling_chains(recorded_parent_edg
             "error_count": 0,
             "trace_count": 40,
         }
-        rows.extend(
-            [
-                {**common, "row_kind": "hierarchy"},
-                {**common, "row_kind": "path"},
-            ]
-        )
+        rows.append({**common, "row_kind": "hierarchy"})
 
     payload = builder.format_result(rows, [])
 
     expected = set(recorded_parent_edges)
     assert {(edge["source"], edge["target"]) for edge in payload["edges"]} == expected
-    assert payload["path_edges"] == payload["edges"]
+    assert payload["path_edges"] == []
 
 
 @pytest.mark.unit
@@ -381,23 +372,20 @@ def test_agent_graph_formatter_collapses_overflow_without_dropping_counts():
                 "trace_count": 1,
             }
         )
-    rows.extend(
-        [
-            {
-                "row_kind": kind,
-                "source_node": "node-000",
-                "source_type": "tool",
-                "target_node": "node-001",
-                "target_type": "tool",
-                "item_count": 3,
-                "avg_latency_ms": 7,
-                "total_tokens": 5,
-                "total_cost": 0.1,
-                "error_count": 1,
-                "trace_count": 2,
-            }
-            for kind in ("hierarchy", "path")
-        ]
+    rows.append(
+        {
+            "row_kind": "hierarchy",
+            "source_node": "node-000",
+            "source_type": "tool",
+            "target_node": "node-001",
+            "target_type": "tool",
+            "item_count": 3,
+            "avg_latency_ms": 7,
+            "total_tokens": 5,
+            "total_cost": 0.1,
+            "error_count": 1,
+            "trace_count": 2,
+        }
     )
 
     payload = builder.format_result(rows, [])
@@ -410,7 +398,7 @@ def test_agent_graph_formatter_collapses_overflow_without_dropping_counts():
     )
     assert other["span_count"] == sum(range(1, 8))
     assert other["trace_count"] is None
-    assert payload["edges"] == payload["path_edges"]
+    assert payload["path_edges"] == []
     assert payload["edges"][0]["source"] == AGENT_GRAPH_OTHER_NODE_ID
     assert payload["edges"][0]["target"] == AGENT_GRAPH_OTHER_NODE_ID
     assert payload["edges"][0]["transition_count"] == 3
@@ -444,7 +432,7 @@ def test_agent_graph_formatter_preserves_sql_side_exact_other_fold():
             },
             {
                 **common,
-                "row_kind": "path",
+                "row_kind": "hierarchy",
                 "source_node": "__other_nodes__",
                 "source_type": "aggregate",
                 "target_node": "answer",
@@ -477,7 +465,7 @@ def test_agent_graph_formatter_preserves_sql_side_exact_other_fold():
             "member_count": 7,
         }
     ]
-    assert payload["path_edges"][0] == {
+    assert payload["edges"][0] == {
         "source": AGENT_GRAPH_OTHER_NODE_ID,
         "target": "llm:answer",
         "transition_count": 11,
@@ -490,6 +478,7 @@ def test_agent_graph_formatter_preserves_sql_side_exact_other_fold():
         "trace_count_exact": False,
         "is_aggregate": True,
     }
+    assert payload["path_edges"] == []
 
 
 @pytest.mark.unit

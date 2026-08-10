@@ -30,7 +30,7 @@ function retainedPage(keys, overrides = {}) {
       result: keys.map((key) => ({ key, type: "string", count: 1 })),
       query_complete: true,
       query_status: "complete",
-      browse_mode: "retained_catalog",
+      browse_mode: "recent_suggestions",
       browse_status: "exhausted",
       has_more: false,
       next_cursor: null,
@@ -170,6 +170,35 @@ describe("useExactEvalAttributeFields", () => {
       "spans.0.duplicate",
       "spans.0.older",
     ]);
+  });
+
+  it("continues eval-field discovery after a resumable limit_reached batch", async () => {
+    mocks.get
+      .mockResolvedValueOnce(
+        retainedPage(["recent"], {
+          browse_status: "limit_reached",
+          has_more: true,
+          next_cursor: "next-bounded-batch",
+        }),
+      )
+      .mockResolvedValueOnce(retainedPage(["older"]));
+
+    const { result } = renderHook(
+      () =>
+        useExactEvalAttributeFields({
+          projectId: "project-synthetic",
+          rowType: "traces",
+          search: "",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(mocks.get.mock.calls[1][1].params.cursor).toBe("next-bounded-batch");
+    expect(result.current.data).toEqual(["spans.0.recent", "spans.0.older"]);
   });
 
   it("returns control after one bounded chunk and continues older checkpoints on request", async () => {

@@ -8,14 +8,12 @@ explicit degraded API response instead of a falsely exact empty picker.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import blake2b
 from typing import Any, Literal, NotRequired, TypedDict
 
-from tracer.services.clickhouse.attribute_cursor_state import (
-    ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
-)
 from tracer.services.clickhouse.query_builders.voice_call_list import (
     VOICE_CALL_STATUS_FILTER_EXPRESSION,
     VOICE_COST_CENTS_FILTER_EXPRESSION,
@@ -139,6 +137,8 @@ class FilterValueCursorPageRead:
     next_value_after: str | None
     seen_value_digests: tuple[str, ...]
     browse_status: Literal["continuation", "exhausted"]
+    appended_value_digests: tuple[str, ...] = ()
+    seen_value_count: int = 0
 
     def metadata(self) -> FilterValueMetadata:
         return {
@@ -448,6 +448,8 @@ def read_span_system_filter_value_cursor_page(
     segment_start: datetime | None = None,
     value_after: str | None = None,
     seen_value_digests: tuple[str, ...] = (),
+    seen_value_contains: Callable[[str], bool] | None = None,
+    seen_value_count: int | None = None,
 ) -> FilterValueCursorPageRead:
     """Walk exact system values over a frozen retained-data window.
 
@@ -479,6 +481,17 @@ def read_span_system_filter_value_cursor_page(
     ):
         raise ValueError("invalid system filter-value seen state")
     seen_set = set(seen)
+    resolved_seen_count = (
+        len(seen) if seen_value_count is None else int(seen_value_count)
+    )
+    if resolved_seen_count < len(seen) or resolved_seen_count < 0:
+        raise ValueError("invalid system filter-value seen state")
+
+    def value_was_seen(digest: str) -> bool:
+        return digest in seen_set or (
+            seen_value_contains is not None and seen_value_contains(digest)
+        )
+
     project_scope = tuple(dict.fromkeys(str(value) for value in project_ids if value))
     if not project_scope:
         return FilterValueCursorPageRead(
@@ -602,7 +615,7 @@ def read_span_system_filter_value_cursor_page(
         for value in rows:
             digest = _value_digest(value)
             after = value
-            if digest in seen_set or digest in emitted_digests:
+            if value_was_seen(digest) or digest in emitted_digests:
                 continue
             emitted.append(value)
             emitted_digests.append(digest)
@@ -639,8 +652,11 @@ def read_span_system_filter_value_cursor_page(
     next_state = (current_end, next_start, after)
     if has_more and next_state == initial_state:
         raise ReadDeadlineExceeded("Exact system filter-value cursor made no progress")
-    tracked_budget = max(0, ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - len(seen))
-    tracked_emitted_digests = emitted_digests[:tracked_budget]
+    seen_after = (
+        (*seen, *emitted_digests)
+        if resolved_seen_count == len(seen)
+        else tuple(emitted_digests)
+    )
     return FilterValueCursorPageRead(
         tuple(emitted),
         start,
@@ -649,8 +665,10 @@ def read_span_system_filter_value_cursor_page(
         current_end,
         next_start,
         after,
-        (*seen, *tracked_emitted_digests),
+        seen_after,
         "continuation" if has_more else "exhausted",
+        tuple(emitted_digests),
+        resolved_seen_count + len(emitted_digests),
     )
 
 

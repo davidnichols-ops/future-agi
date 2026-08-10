@@ -19,6 +19,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from tracer.constants.dashboard import DASHBOARD_NUMERIC_ONLY_AGGREGATIONS
 from tracer.services.clickhouse.query_builders.expressions import (
     annotation_numeric_value_expr,
 )
@@ -284,15 +285,11 @@ AGGREGATIONS: dict[str, str] = {
     "sum": "sum({col})",
 }
 
+
 # Aggregations that require a numeric operand. ClickHouse raises "Illegal type
 # String of argument for aggregate function ..." when these are applied to a
 # text column (e.g. a string custom attribute). ``count`` / ``count_distinct``
 # work on any type, so they are NOT listed here.
-_NUMERIC_ONLY_AGGREGATIONS = frozenset(
-    {"avg", "sum", "median", "p25", "p50", "p75", "p90", "p95", "p99"}
-)
-
-
 class InvalidMetricCombinationError(ValueError):
     """A metric's aggregation cannot be applied to its value type.
 
@@ -2125,7 +2122,7 @@ class DashboardQueryBuilder:
             attr_map = "span_attr_num"
             col_expr = f"{attr_map}[%({attr_key_param})s]"
         elif attr_type in ("string", "text"):
-            if aggregation in _NUMERIC_ONLY_AGGREGATIONS:
+            if aggregation in DASHBOARD_NUMERIC_ONLY_AGGREGATIONS:
                 raise InvalidMetricCombinationError(
                     f"'{aggregation}' can't be applied to the text attribute "
                     f"'{attr_key}'. Use count or count distinct, or pick a "
@@ -2134,7 +2131,7 @@ class DashboardQueryBuilder:
             attr_map = "span_attr_str"
             col_expr = f"{attr_map}[%({attr_key_param})s]"
         elif attr_type == "boolean":
-            if aggregation in _NUMERIC_ONLY_AGGREGATIONS:
+            if aggregation in DASHBOARD_NUMERIC_ONLY_AGGREGATIONS:
                 raise InvalidMetricCombinationError(
                     f"'{aggregation}' can't be applied to the boolean attribute "
                     f"'{attr_key}'. Use count or count distinct."

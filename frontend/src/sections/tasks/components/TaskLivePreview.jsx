@@ -62,6 +62,14 @@ import {
   NO_VALUE_OPS,
 } from "src/sections/common/EvalsTasks/common";
 import { QUERY_FAILED_RETRY_MESSAGE } from "src/utils/queryReadState";
+import {
+  parseAxiosResult,
+  parseSessionObserveListResponse,
+  parseSpanObserveListResponse,
+  parseTraceObserveListResponse,
+  parseVoiceCallDetailResponse,
+  parseVoiceCallListResponse,
+} from "src/api/project/observe-contracts";
 
 // One form row → one wire entry. No cross-row merging: it would collapse
 // "not_contains A AND not_contains B" into "in [A, B]" (inverting intent) and
@@ -381,14 +389,14 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         };
       };
 
-      const requestList = (url, params, { voice = false } = {}) =>
+      const requestList = (url, params, { voice = false, parser } = {}) =>
         requestListWithLegacyCursorFallback({
           request: (nextParams) =>
             axios.get(url, { params: nextParams, signal }),
           params,
           pageParam: voice ? "page" : "page_number",
           firstPage: voice ? 1 : 0,
-        });
+        }).then((response) => parseAxiosResult(response, parser));
 
       if (rowType === "voiceCalls") {
         const requestParams = buildTaskPreviewListParams({
@@ -401,39 +409,30 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           resumeCursor
             ? listContinuationParams(requestParams, resumeCursor)
             : requestParams,
-          { voice: true },
+          { voice: true, parser: parseVoiceCallListResponse },
         );
         const exactRows = await collectExactListRows({
           initialResponse: resp,
           initialRows: activeListContinuation?.rows || [],
           targetRowCount: requestParams.page_size,
-          rowsFromResponse: (response) => {
-            const result = response?.data?.result || response?.data || {};
-            return result.results || result.data || result.calls || [];
-          },
-          metadataFromResponse: (response) =>
-            response?.data?.result || response?.data || {},
+          rowsFromResponse: (response) => response.data.results,
+          metadataFromResponse: (response) => response.data,
           nextResponse: (cursor) =>
             requestList(
               endpoints.project.getCallLogs,
               listContinuationParams(requestParams, cursor),
-              { voice: true },
+              { voice: true, parser: parseVoiceCallListResponse },
             ),
           onContinuation: recordContinuation,
           isCurrent: () => !signal.aborted,
           rowIdentity: (row) => taskPreviewRowIdentity(rowType, row),
         });
-        const result =
-          exactRows.response?.data?.result || exactRows.response?.data || {};
+        const result = exactRows.response.data;
         const rowsOut = exactRows.rows;
         return {
           rows: rowsOut,
-          total:
-            result.count ??
-            result.total_count ??
-            result.total ??
-            rowsOut.length,
-          columns: [],
+          total: result.count,
+          columns: result.config,
           continuation: exactRows.pending
             ? continuationResult(exactRows.nextCursor, rowsOut)
             : null,
@@ -441,18 +440,23 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
       }
 
       let url;
+      let responseParser;
       switch (rowType) {
         case "traces":
           url = endpoints.project.getTracesForObserveProject();
+          responseParser = parseTraceObserveListResponse;
           break;
         case "spans":
           url = endpoints.project.getSpansForObserveProject();
+          responseParser = parseSpanObserveListResponse;
           break;
         case "sessions":
           url = endpoints.project.projectSessionList();
+          responseParser = parseSessionObserveListResponse;
           break;
         default:
           url = endpoints.project.getSpansForObserveProject();
+          responseParser = parseSpanObserveListResponse;
       }
 
       const requestParams = buildTaskPreviewListParams({
@@ -465,30 +469,28 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         resumeCursor
           ? listContinuationParams(requestParams, resumeCursor)
           : requestParams,
+        { parser: responseParser },
       );
       const exactRows = await collectExactListRows({
         initialResponse: resp,
         initialRows: activeListContinuation?.rows || [],
         targetRowCount: requestParams.page_size,
-        rowsFromResponse: (response) => response?.data?.result?.table || [],
-        metadataFromResponse: (response) =>
-          response?.data?.result?.metadata || {},
+        rowsFromResponse: (response) => response.data.table,
+        metadataFromResponse: (response) => response.data.metadata,
         nextResponse: (cursor) =>
-          requestList(url, listContinuationParams(requestParams, cursor)),
+          requestList(url, listContinuationParams(requestParams, cursor), {
+            parser: responseParser,
+          }),
         onContinuation: recordContinuation,
         isCurrent: () => !signal.aborted,
         rowIdentity: (row) => taskPreviewRowIdentity(rowType, row),
       });
-      const result = exactRows.response?.data?.result || {};
+      const result = exactRows.response.data;
       const rowsOut = exactRows.rows;
       return {
         rows: rowsOut,
-        total:
-          result.metadata?.total_rows ||
-          result.total_count ||
-          result.total ||
-          rowsOut.length,
-        columns: result.config || [],
+        total: result.metadata.total_rows,
+        columns: result.config,
         continuation: exactRows.pending
           ? continuationResult(exactRows.nextCursor, rowsOut)
           : null,
@@ -549,7 +551,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             endpoints.project.getVoiceCallDetail,
             { params: { trace_id: traceId }, signal },
           );
-          const voiceResult = data?.result || data?.data || data || {};
+          const voiceResult = parseVoiceCallDetailResponse(data);
           detailData = { ...currentRow, ...voiceResult };
         } catch {
           detailData = { ...currentRow };

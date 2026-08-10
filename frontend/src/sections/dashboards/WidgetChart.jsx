@@ -23,11 +23,10 @@ import {
 } from "./widgetUtils";
 import { toTimeRangePayload } from "./dashboardDateRange";
 import {
-  AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   AGGREGATION_PREPARING_MESSAGE,
   QUERY_FAILED_RETRY_MESSAGE,
-  getAggregationPollDelay,
+  createAggregationPollController,
   getAggregationRefreshState,
   getExactAggregationReadState,
   getQueryCompletedAt,
@@ -221,8 +220,7 @@ export default function WidgetChart({
     let requestTimer = null;
     let requestController = null;
     let requestGeneration = 0;
-    let pollAttempt = 0;
-    let consecutivePollFailures = 0;
+    const pollingController = createAggregationPollController();
     let refreshWasQueued = false;
     let settled = false;
 
@@ -251,10 +249,20 @@ export default function WidgetChart({
 
     const schedulePoll = () => {
       if (!active || pollTimer !== null) return;
-      const delay = getAggregationPollDelay(pollAttempt);
+      pollingController.start();
+      const delay = pollingController.nextDelay();
+      if (delay === false) {
+        setLatestOutcome({
+          signature: querySignature,
+          unavailable: true,
+          retryUnavailable: true,
+        });
+        settle(null, false);
+        return;
+      }
       pollTimer = window.setTimeout(() => {
         pollTimer = null;
-        pollAttempt += 1;
+        pollingController.recordAttempt();
         executeQuery(false);
       }, delay);
     };
@@ -268,9 +276,7 @@ export default function WidgetChart({
       if (requestTimer !== null) window.clearTimeout(requestTimer);
 
       const handleQueuedTransportFailure = () => {
-        consecutivePollFailures += 1;
-        const exhausted =
-          consecutivePollFailures >= AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES;
+        const exhausted = !pollingController.recordFailure();
         setLatestOutcome({
           signature: querySignature,
           unavailable: true,
@@ -320,7 +326,7 @@ export default function WidgetChart({
             const { isRefreshing, refreshFailed } =
               getAggregationRefreshState(response);
             const readState = getExactAggregationReadState(response);
-            consecutivePollFailures = 0;
+            pollingController.recordSuccess();
             if (snapshot) setLastExactSnapshot(snapshot);
 
             if (

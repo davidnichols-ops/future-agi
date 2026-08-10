@@ -301,6 +301,51 @@ async function runGeneration(schemaPath) {
     return source.slice(0, start) + rewritten + source.slice(end);
   }
 
+  const voiceCallDetailNullableFields = [
+    "provider_call_id",
+    "phone_number",
+    "customer_name",
+    "call_id",
+    "status",
+    "started_at",
+    "ended_at",
+    "created_at",
+    "duration_seconds",
+    "recording_url",
+    "stereo_recording_url",
+    "cost_cents",
+    "cost_breakdown",
+    "error_message",
+    "call_summary",
+    "ended_reason",
+    "overall_score",
+    "response_time_ms",
+    "response_time_seconds",
+    "assistant_id",
+    "assistant_phone_number",
+    "call_type",
+    "message_count",
+    "transcript_available",
+    "transcript",
+    "messages",
+    "analysis_data",
+    "evaluation_data",
+    "call_execution_id",
+    "test_execution_id",
+    "scenario_id",
+    "scenario_name",
+    "scenario_graph_id",
+    "turn_count",
+    "talk_ratio",
+    "agent_talk_percentage",
+    "bot_talk_pct",
+    "user_talk_pct",
+    "avg_agent_latency_ms",
+    "user_wpm",
+    "bot_wpm",
+    "user_interruption_count",
+    "ai_interruption_count",
+  ];
   const schemasOutputPath = path.join(outputDir, "api.schemas.ts");
   if (fs.existsSync(schemasOutputPath)) {
     let schemas = fs.readFileSync(schemasOutputPath, "utf8");
@@ -381,12 +426,29 @@ export type ${jsonAlias} = JsonValueApi;`,
       "SpanPrototypeListResultApiTableItem",
       "SpanObserveListResultApiTableItem",
       "TraceVoiceCallListResponseApiResultsItem",
+      "TraceVoiceCallDetailResultApiTranscriptItem",
+      "TraceVoiceCallDetailResultApiMessagesItem",
+      "TraceVoiceCallDetailResultApiObservationSpanItem",
     ]) {
       schemas = assertReplace(
         schemas,
         `export type ${rowType} = {[key: string]: { [key: string]: unknown }};`,
         `export type ${rowType} = { [key: string]: JsonValueApi };`,
         `${rowType} → recursive JSON row`,
+      );
+    }
+
+    // Orval drops Swagger 2.0 x-nullable from generated TypeScript. Voice
+    // detail deliberately returns null when a provider did not emit an
+    // optional value or a computed metric could not be derived, so preserve
+    // that wire contract in the generated client instead of lying to callers.
+    for (const field of voiceCallDetailNullableFields) {
+      schemas = assertReplaceRegexInNamedBlock(
+        schemas,
+        "export interface TraceVoiceCallDetailResultApi {",
+        new RegExp(`(^\\s*${field}\\??: [^;]+)(;)$`, "m"),
+        "$1 | null$2",
+        `TraceVoiceCallDetailResultApi.${field} nullable`,
       );
     }
 
@@ -534,6 +596,188 @@ const jsonValueSchema: zod.ZodType<JsonValue> =
         /zod\.object\(\{\n\n\}\)\.passthrough\(\)(?=(?:\.(?:optional|nullish|nullable)\(\)|\.default\([^)]*\))*\.describe\('Any valid JSON value\.'\))/g,
         "jsonValueSchema",
         `${exportName} JSON cells → recursive JSON value`,
+      );
+    }
+    zod = assertReplaceRegexInNamedBlock(
+      zod,
+      "export const TracerTraceVoiceCallDetailResponse = zod.object({",
+      /zod\.object\(\{\n\n\}\)\.passthrough\(\)(?=(?:\.(?:optional|nullish|nullable)\(\)|\.default\([^)]*\))*\.describe\('Any valid JSON value\.'\))/g,
+      "jsonValueSchema",
+      "TracerTraceVoiceCallDetailResponse JSON cells → recursive JSON value",
+    );
+
+    // As with the generated TypeScript model above, Orval ignores Swagger
+    // 2.0 x-nullable. Keep the generated runtime parser aligned with the
+    // provider-normalized response so legitimate nulls do not blank the
+    // detail drawer.
+    for (const [anchor, replacement] of [
+      [
+        '"provider_call_id": zod.string().min(1),',
+        '"provider_call_id": zod.string().min(1).nullable(),',
+      ],
+      [
+        '"phone_number": zod.string().min(1).optional(),',
+        '"phone_number": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"customer_name": zod.string().min(1).optional(),',
+        '"customer_name": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"call_id": zod.string().min(1).optional(),',
+        '"call_id": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"status": zod.string().min(1).optional(),',
+        '"status": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"started_at": zod.string().min(1).optional(),',
+        '"started_at": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"ended_at": zod.string().min(1).optional(),',
+        '"ended_at": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"created_at": zod.string().min(1).optional(),',
+        '"created_at": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"duration_seconds": zod.number().optional(),',
+        '"duration_seconds": zod.number().nullish(),',
+      ],
+      [
+        '"recording_url": zod.string().min(1).optional(),',
+        '"recording_url": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"stereo_recording_url": zod.string().min(1).optional(),',
+        '"stereo_recording_url": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"cost_cents": zod.number().optional(),',
+        '"cost_cents": zod.number().nullish(),',
+      ],
+      [
+        '"cost_breakdown": zod.record(zod.string(), zod.unknown()).optional(),',
+        '"cost_breakdown": zod.record(zod.string(), zod.unknown()).nullish(),',
+      ],
+      [
+        '"error_message": zod.string().min(1).optional(),',
+        '"error_message": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"call_summary": zod.string().min(1).optional(),',
+        '"call_summary": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"ended_reason": zod.string().min(1).optional(),',
+        '"ended_reason": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"overall_score": zod.number().optional(),',
+        '"overall_score": zod.number().nullish(),',
+      ],
+      [
+        '"response_time_ms": zod.number().optional(),',
+        '"response_time_ms": zod.number().nullish(),',
+      ],
+      [
+        '"response_time_seconds": zod.number().optional(),',
+        '"response_time_seconds": zod.number().nullish(),',
+      ],
+      [
+        '"assistant_id": zod.string().min(1).optional(),',
+        '"assistant_id": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"assistant_phone_number": zod.string().min(1).optional(),',
+        '"assistant_phone_number": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"call_type": zod.string().min(1).optional(),',
+        '"call_type": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"message_count": zod.number().optional(),',
+        '"message_count": zod.number().nullish(),',
+      ],
+      [
+        '"transcript_available": zod.boolean().optional(),',
+        '"transcript_available": zod.boolean().nullish(),',
+      ],
+      [
+        "\"transcript\": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))).optional(),",
+        "\"transcript\": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))).nullish(),",
+      ],
+      [
+        "\"messages\": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))).optional(),",
+        "\"messages\": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))).nullish(),",
+      ],
+      [
+        '"analysis_data": zod.record(zod.string(), zod.unknown()).optional(),',
+        '"analysis_data": zod.record(zod.string(), zod.unknown()).nullish(),',
+      ],
+      [
+        '"evaluation_data": zod.record(zod.string(), zod.unknown()).optional(),',
+        '"evaluation_data": zod.record(zod.string(), zod.unknown()).nullish(),',
+      ],
+      [
+        '"call_execution_id": zod.string().min(1).optional(),',
+        '"call_execution_id": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"test_execution_id": zod.string().min(1).optional(),',
+        '"test_execution_id": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"scenario_id": zod.string().min(1).optional(),',
+        '"scenario_id": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"scenario_name": zod.string().min(1).optional(),',
+        '"scenario_name": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"scenario_graph_id": zod.string().min(1).optional(),',
+        '"scenario_graph_id": zod.string().min(1).nullish(),',
+      ],
+      ['"turn_count": zod.number(),', '"turn_count": zod.number().nullable(),'],
+      ['"talk_ratio": zod.number(),', '"talk_ratio": zod.number().nullable(),'],
+      [
+        '"agent_talk_percentage": zod.number(),',
+        '"agent_talk_percentage": zod.number().nullable(),',
+      ],
+      [
+        '"bot_talk_pct": zod.number(),',
+        '"bot_talk_pct": zod.number().nullable(),',
+      ],
+      [
+        '"user_talk_pct": zod.number(),',
+        '"user_talk_pct": zod.number().nullable(),',
+      ],
+      [
+        '"avg_agent_latency_ms": zod.number(),',
+        '"avg_agent_latency_ms": zod.number().nullable(),',
+      ],
+      ['"user_wpm": zod.number(),', '"user_wpm": zod.number().nullable(),'],
+      ['"bot_wpm": zod.number(),', '"bot_wpm": zod.number().nullable(),'],
+      [
+        '"user_interruption_count": zod.number(),',
+        '"user_interruption_count": zod.number().nullable(),',
+      ],
+      [
+        '"ai_interruption_count": zod.number()',
+        '"ai_interruption_count": zod.number().nullable()',
+      ],
+    ]) {
+      zod = assertReplaceInNamedBlock(
+        zod,
+        "export const TracerTraceVoiceCallDetailResponse = zod.object({",
+        anchor,
+        replacement,
+        `TracerTraceVoiceCallDetailResponse nullable ${anchor}`,
       );
     }
     const columnConfigNullableZodFields = [

@@ -1,6 +1,10 @@
 from rest_framework import serializers
 
 from accounts.serializers.user import UserSerializer
+from tracer.constants.dashboard import (
+    DASHBOARD_AGGREGATIONS,
+    DASHBOARD_NUMERIC_ONLY_AGGREGATIONS,
+)
 from tracer.models.dashboard import Dashboard, DashboardWidget
 from tracer.serializers.filters import (
     JsonValueField,
@@ -27,26 +31,6 @@ DASHBOARD_TIME_RANGE_PRESETS = (
     "3M",
     "6M",
     "12M",
-)
-DASHBOARD_AGGREGATIONS = (
-    "avg",
-    "median",
-    "max",
-    "min",
-    "p25",
-    "p50",
-    "p75",
-    "p90",
-    "p95",
-    "p99",
-    "count",
-    "count_distinct",
-    "sum",
-    "pass_rate",
-    "fail_rate",
-    "pass_count",
-    "fail_count",
-    "true_rate",
 )
 DASHBOARD_DATA_TYPES = (
     "string",
@@ -131,17 +115,7 @@ class DashboardMetricSerializer(StrictInputSerializer):
                 attrs["attribute_type"] = (
                     "number"
                     if attrs.get("aggregation", "avg")
-                    in {
-                        "avg",
-                        "sum",
-                        "median",
-                        "p25",
-                        "p50",
-                        "p75",
-                        "p90",
-                        "p95",
-                        "p99",
-                    }
+                    in DASHBOARD_NUMERIC_ONLY_AGGREGATIONS
                     else "string"
                 )
             else:
@@ -376,6 +350,15 @@ class DashboardSampleOptInSerializer(StrictInputSerializer):
             "Dashboard aggregates are always exact."
         ),
     )
+
+    class Meta:
+        swagger_schema_fields = {"additionalProperties": False}
+
+
+class DashboardRefreshQuerySerializer(StrictInputSerializer):
+    """Query parameters shared by exact dashboard execution endpoints."""
+
+    refresh = serializers.BooleanField(required=False, default=False)
 
     class Meta:
         swagger_schema_fields = {"additionalProperties": False}

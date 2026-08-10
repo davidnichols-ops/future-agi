@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import pickle
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -25,6 +26,10 @@ BINDING = {"project_id": "project-a", "query": "final_status"}
 
 def _digest(index: int) -> str:
     return hashlib.md5(f"value-{index}".encode(), usedforsecurity=False).hexdigest()
+
+
+def _prefixed_digest(prefix: str, index: int) -> str:
+    return f"{prefix}{index:031x}"
 
 
 def _valid(value: str) -> bool:
@@ -205,7 +210,7 @@ def test_current_cursor_load_uses_one_root_get_and_one_block_mget(monkeypatch):
     ]
 
 
-def test_page_sized_appends_reach_4096_with_bounded_canonical_storage(monkeypatch):
+def test_page_sized_appends_cross_4096_into_bounded_persistent_radix(monkeypatch):
     payloads = {}
     original_add = cache.add
 
@@ -213,6 +218,9 @@ def test_page_sized_appends_reach_4096_with_bounded_canonical_storage(monkeypatc
         if isinstance(value, dict) and value.get("format") in {
             "immutable_blocks",
             "digest_block",
+            "persistent_radix_set",
+            "radix_node",
+            "radix_leaf",
         }:
             payloads[value["id"]] = value
         return original_add(key, value, timeout=timeout, version=version)
@@ -263,9 +271,224 @@ def test_page_sized_appends_reach_4096_with_bounded_canonical_storage(monkeypatc
     assert all(len(pickle.dumps(block)) < 66 * 1024 for block in blocks)
     assert _load(reference).digests == values
 
-    with pytest.raises(AttributeCursorStateError) as overflow:
-        _persist(state, (_digest(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS),))
-    assert overflow.value.code == "cursor_limit_reached"
+    # Isolate the radix-family assertions from the hundreds of deliberately
+    # retained legacy roots above. Django's tiny test LocMem cache otherwise
+    # culls live radix children; production uses the shared cache backend.
+    cache.clear()
+    first_radix_digest = _digest(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS)
+    radix_reference = _persist(
+        AttributeCursorSeenState(values, None),
+        (first_radix_digest,),
+    )
+    radix_root = payloads[radix_reference[1]]
+    radix_state = _load(radix_reference)
+
+    assert radix_reference == (
+        "state",
+        radix_root["id"],
+        ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1,
+    )
+    assert radix_root["format"] == "persistent_radix_set"
+    assert len(pickle.dumps(radix_root)) < 1024
+    assert radix_state.digests == ()
+    assert radix_state.seen_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1
+    assert radix_state.contains(values[0]) is True
+    assert radix_state.contains(values[len(values) // 2]) is True
+    assert radix_state.contains(first_radix_digest) is True
+    assert radix_state.contains(_digest(100_000)) is False
+
+    radix_payloads = [
+        payload
+        for payload in payloads.values()
+        if payload["format"] in {"radix_node", "radix_leaf"}
+    ]
+    assert radix_payloads
+    # A full 512-digest leaf is the largest object. Keeping it below 32 KiB
+    # prevents cache/proxy-size regressions while nibble fanout keeps the
+    # initial migration far below Django LocMem's ordinary entry ceiling.
+    assert all(len(pickle.dumps(payload)) < 32 * 1024 for payload in radix_payloads)
+    assert all(
+        len(payload.get("digests", ())) <= cursor_state._RADIX_LEAF_MAX_DIGESTS
+        for payload in radix_payloads
+    )
+
+    appended = tuple(_digest(index) for index in range(4_097, 4_102))
+    continued_reference = _persist(radix_state, appended)
+    retry_reference = _persist(radix_state, appended)
+    continued_state = _load(continued_reference)
+
+    assert retry_reference == continued_reference
+    assert continued_state.seen_count == 4_102
+    assert all(continued_state.contains(digest) for digest in appended)
+    assert radix_state.contains(appended[-1]) is False
+
+
+def test_radix_membership_and_append_have_bounded_depth_and_preserve_branches(
+    monkeypatch,
+):
+    values = tuple(
+        _digest(index) for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1)
+    )
+    reference = _persist(AttributeCursorSeenState((), None), values)
+    state = _load(reference)
+    get_calls = []
+    original_get = cache.get
+
+    def recording_get(key, *args, **kwargs):
+        if key.startswith(cursor_state._RADIX_CACHE_PREFIX):
+            get_calls.append(key)
+        return original_get(key, *args, **kwargs)
+
+    monkeypatch.setattr(cache, "get", recording_get)
+    assert state.contains(values[-1]) is True
+    assert 1 <= len(get_calls) <= cursor_state._RADIX_MAX_DEPTH + 1
+
+    get_calls.clear()
+    assert state.contains(_digest(999_999)) is False
+    assert 1 <= len(get_calls) <= cursor_state._RADIX_MAX_DEPTH + 1
+
+    branch_a_digest = _digest(200_001)
+    branch_b_digest = _digest(200_002)
+    branch_a_reference = _persist(state, (branch_a_digest,))
+    branch_b_reference = _persist(state, (branch_b_digest,))
+    branch_a = _load(branch_a_reference)
+    branch_b = _load(branch_b_reference)
+
+    assert branch_a_reference != branch_b_reference
+    assert branch_a.contains(branch_a_digest) is True
+    assert branch_a.contains(branch_b_digest) is False
+    assert branch_b.contains(branch_b_digest) is True
+    assert branch_b.contains(branch_a_digest) is False
+    assert state.contains(branch_a_digest) is False
+    assert state.contains(branch_b_digest) is False
+
+
+def test_radix_membership_memoizes_each_verified_object_per_request(monkeypatch):
+    values = tuple(
+        _digest(index) for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1)
+    )
+    reference = _persist(AttributeCursorSeenState((), None), values)
+    state = _load(reference)
+    get_calls: Counter[str] = Counter()
+    original_get = cache.get
+
+    def recording_get(key, *args, **kwargs):
+        if key.startswith(cursor_state._RADIX_CACHE_PREFIX):
+            get_calls[key] += 1
+        return original_get(key, *args, **kwargs)
+
+    monkeypatch.setattr(cache, "get", recording_get)
+
+    assert all(state.contains(digest) for digest in values)
+    assert state.contains(_digest(999_999)) is False
+    assert get_calls
+    assert max(get_calls.values()) == 1
+    assert len(get_calls) <= 16
+
+
+def test_radix_bulk_pages_do_not_evict_untouched_dependencies(monkeypatch):
+    """A full page copies one branch once, not once per appended value."""
+
+    initial = tuple(
+        _digest(index) for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1)
+    )
+    reference = _persist(AttributeCursorSeenState((), None), initial)
+    state = _load(reference)
+    page_a = tuple(_prefixed_digest("a", 100_000 + index) for index in range(100))
+    page_b = tuple(_prefixed_digest("a", 200_000 + index) for index in range(100))
+    radix_writes: list[str] = []
+    original_add = cache.add
+
+    def recording_add(key, value, timeout=None, version=None):
+        if isinstance(value, dict) and value.get("format") in {
+            "radix_node",
+            "radix_leaf",
+        }:
+            radix_writes.append(value["id"])
+        return original_add(key, value, timeout=timeout, version=version)
+
+    monkeypatch.setattr(cache, "add", recording_add)
+    first_continuation = _persist(state, page_a)
+    first = _load(first_continuation)
+    first_page_writes = len(radix_writes)
+    second_continuation = _persist(first, page_b)
+    second = _load(second_continuation)
+    second_page_writes = len(radix_writes) - first_page_writes
+
+    # All values share one top-level selector and remain in its leaf, so each
+    # page needs exactly one leaf and one root-node copy. A per-value loop
+    # creates 200 objects here and reproduces LocMem dependency eviction.
+    assert first_page_writes == 2
+    assert second_page_writes == 2
+    assert second.seen_count == len(initial) + len(page_a) + len(page_b)
+    assert all(second.contains(digest) for digest in (*initial, *page_a, *page_b))
+
+
+def test_radix_tamper_and_missing_descendant_fail_closed():
+    values = tuple(
+        _digest(index) for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1)
+    )
+    reference = _persist(AttributeCursorSeenState((), None), values)
+    state = _load(reference)
+    radix_key = cursor_state._radix_cache_key(state.radix_root_id)
+    radix_root = cache.get(radix_key)
+
+    cache.set(radix_key, {**radix_root, "count": radix_root["count"] - 1})
+    with pytest.raises(AttributeCursorStateError) as tampered:
+        _load(reference)
+    assert tampered.value.code == "invalid_cursor"
+
+    cache.set(radix_key, radix_root)
+    state = _load(reference)
+    child_id = radix_root["children"][0][1]
+    cache.delete(cursor_state._radix_cache_key(child_id))
+    child_selector = radix_root["children"][0][0]
+    matching_digest = next(
+        digest for digest in values if digest.startswith(child_selector)
+    )
+    with pytest.raises(AttributeCursorStateError) as missing:
+        state.contains(matching_digest)
+    assert missing.value.code == "expired_cursor"
+
+
+def test_radix_branches_share_one_absolute_expiry_without_unbounded_refresh(
+    monkeypatch,
+):
+    initial_time = 1_000_000
+    monkeypatch.setattr(cursor_state, "_current_time_seconds", lambda: initial_time)
+    values = tuple(
+        _digest(index) for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1)
+    )
+    reference = _persist(AttributeCursorSeenState((), None), values)
+    state = _load(reference)
+    family_expiry = initial_time + cursor_state._ttl_seconds()
+    original_radix_root = cache.get(cursor_state._radix_cache_key(state.radix_root_id))
+    untouched_child_id = original_radix_root["children"][0][1]
+
+    monkeypatch.setattr(
+        cursor_state,
+        "_current_time_seconds",
+        lambda: family_expiry - 30,
+    )
+    branch_reference = _persist(state, (_digest(300_000),))
+    branch = _load(branch_reference)
+    branch_root = _root(branch_reference)
+    untouched_child = cache.get(cursor_state._radix_cache_key(untouched_child_id))
+
+    assert branch.expires_at == family_expiry
+    assert branch_root["expires_at"] == family_expiry
+    assert untouched_child["expires_at"] == family_expiry
+
+    # Even if a backend retains an expired object briefly, application-level
+    # validation prevents a later branch root from outliving any dependency.
+    monkeypatch.setattr(
+        cursor_state,
+        "_current_time_seconds",
+        lambda: family_expiry,
+    )
+    with pytest.raises(AttributeCursorStateError) as expired:
+        branch.contains(values[0])
+    assert expired.value.code == "expired_cursor"
 
 
 def test_legacy_inline_and_append_log_states_migrate_to_immutable_blocks():

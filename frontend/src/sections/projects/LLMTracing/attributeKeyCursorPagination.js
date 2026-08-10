@@ -1,6 +1,10 @@
 import { followEmptyListContinuations } from "./listCursorPagination";
 
-const TERMINAL_BROWSE_STATUSES = new Set(["exhausted", "limit_reached"]);
+// `limit_reached` describes one bounded backend walk, not necessarily the end
+// of the retained catalog. When the response also carries an advancing signed
+// cursor the next explicit Load more action must be able to continue. Only
+// `exhausted` is an unconditional terminal browse state.
+const TERMINAL_BROWSE_STATUSES = new Set(["exhausted"]);
 const FOLLOWED_CURSORS_KEY = "__attributeKeyFollowedCursors";
 const CURSOR_STOPPED_KEY = "__attributeKeyCursorStopped";
 

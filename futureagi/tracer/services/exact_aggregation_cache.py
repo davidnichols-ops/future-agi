@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -49,6 +50,7 @@ _DEFAULT_REFRESH_STATUS_TIMEOUT_SECONDS = 0.5
 _DEFAULT_REFRESH_FAILURE_SECONDS = 5 * 60
 _CACHE_FENCE_FALLBACK_LOCK = RLock()
 _ALLOWED_EXACT_AGGREGATION_TASK_QUEUES = frozenset({"tasks_xl", "exact_aggregation"})
+_DEFAULT_MAX_INFLIGHT_PER_SCOPE = 2
 
 _REDIS_ATOMIC_REFRESH_CLAIM_SCRIPT = """
 local claimed = redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3], 'NX')
@@ -133,6 +135,45 @@ redis.call('DEL', KEYS[1])
 return 1
 """
 
+_REDIS_CLAIM_SCOPE_ADMISSION_SCRIPT = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+if redis.call('ZSCORE', KEYS[1], ARGV[2]) then
+    redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
+    local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+    local ttl = tonumber(latest[2]) - tonumber(ARGV[1]) + tonumber(ARGV[4])
+    redis.call('PEXPIRE', KEYS[1], math.max(1, ttl))
+    return 1
+end
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[5]) then
+    return 0
+end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
+local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+local ttl = tonumber(latest[2]) - tonumber(ARGV[1]) + tonumber(ARGV[4])
+redis.call('PEXPIRE', KEYS[1], math.max(1, ttl))
+return 1
+"""
+
+_REDIS_RENEW_SCOPE_ADMISSION_SCRIPT = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+if not redis.call('ZSCORE', KEYS[1], ARGV[2]) then
+    return 0
+end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
+local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+local ttl = tonumber(latest[2]) - tonumber(ARGV[1]) + tonumber(ARGV[4])
+redis.call('PEXPIRE', KEYS[1], math.max(1, ttl))
+return 1
+"""
+
+_REDIS_RELEASE_SCOPE_ADMISSION_SCRIPT = """
+local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+if redis.call('ZCARD', KEYS[1]) == 0 then
+    redis.call('DEL', KEYS[1])
+end
+return removed
+"""
+
 
 @dataclass(frozen=True)
 class ExactAggregationSnapshot:
@@ -189,6 +230,168 @@ def normalized_snapshot_identity(identity: Any) -> Any:
     return _json_value(identity)
 
 
+def _utc_filter_bound(value: datetime) -> str:
+    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    return normalized.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def normalize_exact_observe_identity(identity: Any) -> Any:
+    """Freeze and canonicalize one exact Observe query identity.
+
+    HTTP serializers validate the public filter vocabulary. This boundary owns
+    the additional invariants needed by asynchronous exact reads: the rolling
+    default window becomes an explicit half-open interval exactly once, filter
+    conjunction/value ordering cannot multiply equivalent jobs, and UI-only
+    filter metadata never enters either the cache key or worker payload.
+    """
+
+    normalized_identity = normalized_snapshot_identity(identity)
+    if not isinstance(normalized_identity, dict):
+        return normalized_identity
+    # Only Observe query identities carry the public filter conjunction. Keep
+    # low-level lifecycle/test identities byte-for-byte compatible; their
+    # callers do not execute a graph query from this dictionary.
+    if "filters" not in normalized_identity:
+        return normalized_identity
+
+    from tracer.serializers.filters import validate_filter_list_complexity
+    from tracer.services.clickhouse.list_cursor import normalize_filter_conjunction
+    from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
+
+    filters = normalize_filter_conjunction(normalized_identity.get("filters") or [])
+    validate_filter_list_complexity(filters)
+    analyzed = BaseQueryBuilder.analyze_bounded_datetime_filters(
+        filters,
+        strict=True,
+    )
+
+    retained: list[dict[str, Any]] = []
+    for item in filters:
+        column_id = item.get("column_id")
+        if column_id not in {"created_at", "start_time"}:
+            retained.append(item)
+
+    if not analyzed.empty:
+        for exclusion_start, exclusion_end in analyzed.exclusions:
+            # Complements are meaningful only inside the frozen positive base.
+            # Clamp and merge via the analyzer so logically equivalent
+            # not_equals/not_between spellings share one exact job identity.
+            lower = max(analyzed.start, exclusion_start)
+            upper = min(analyzed.end, exclusion_end)
+            if lower >= upper:
+                continue
+            retained.append(
+                {
+                    "column_id": "created_at",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "datetime",
+                        "filter_op": "not_between",
+                        "filter_value": [
+                            _utc_filter_bound(lower),
+                            _utc_filter_bound(upper),
+                        ],
+                    },
+                }
+            )
+
+    retained.append(
+        {
+            "column_id": "created_at",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": [
+                    _utc_filter_bound(analyzed.start),
+                    _utc_filter_bound(analyzed.end),
+                ],
+            },
+        }
+    )
+    normalized_identity["filters"] = normalize_filter_conjunction(retained)
+    return normalized_identity
+
+
+def _observe_identity_alias_key(namespace: str, identity: Any) -> str | None:
+    """Address the frozen window chosen for one stable raw Observe request."""
+
+    normalized_identity = normalized_snapshot_identity(identity)
+    if (
+        not isinstance(normalized_identity, dict)
+        or "filters" not in normalized_identity
+    ):
+        return None
+    from tracer.services.clickhouse.list_cursor import normalize_filter_conjunction
+
+    normalized_identity["filters"] = normalize_filter_conjunction(
+        normalized_identity.get("filters") or []
+    )
+    return f"{snapshot_cache_key(namespace, normalized_identity)}:frozen-identity"
+
+
+def _resolve_exact_observe_identity(
+    namespace: str,
+    identity: Any,
+    *,
+    refresh: bool,
+) -> tuple[Any, Any | None]:
+    """Reuse one frozen default window until an explicit aggregate refresh.
+
+    Without this alias, a no-filter polling request would derive a new
+    microsecond-level upper bound on every poll and never observe the worker it
+    originally scheduled. The alias is cache-only, tenant-keyed, and contains
+    no query result or database state.
+    """
+
+    frozen_identity = normalize_exact_observe_identity(identity)
+    alias_key = _observe_identity_alias_key(namespace, identity)
+    if alias_key is None:
+        return frozen_identity, None
+
+    prior_identity = None
+    try:
+        cached = cache.get(alias_key)
+        if isinstance(cached, dict):
+            prior_identity = normalized_snapshot_identity(cached)
+            if not refresh:
+                return prior_identity, None
+
+            # Refresh-capable clients poll the same endpoint while the exact
+            # worker is running. Do not advance the frozen time window on each
+            # of those polls: the worker would publish under the prior key
+            # after the alias had already moved, leaving every poll pending.
+            # The snapshot check also closes the small race between publishing
+            # the alias and acquiring the atomic refresh claim.
+            prior_state = exact_refresh_state(namespace, prior_identity)
+            if prior_state == "running" or (
+                prior_state is None
+                and read_exact_snapshot(namespace, prior_identity) is None
+            ):
+                return prior_identity, None
+
+        timeout = _ttl_seconds()
+        if refresh:
+            cache.set(alias_key, frozen_identity, timeout=timeout)
+            stale_identity = (
+                prior_identity if prior_identity != frozen_identity else None
+            )
+            return frozen_identity, stale_identity
+
+        if cache.add(alias_key, frozen_identity, timeout=timeout):
+            return frozen_identity, None
+        winner = cache.get(alias_key)
+        if isinstance(winner, dict):
+            return normalized_snapshot_identity(winner), None
+    except Exception:
+        logger.warning(
+            "exact_aggregation_frozen_identity_alias_failed",
+            namespace=namespace,
+            exc_info=True,
+        )
+    return frozen_identity, None
+
+
 def _refresh_lock_key(namespace: str, identity: Any) -> str:
     return f"{snapshot_cache_key(namespace, identity)}:refresh-lock"
 
@@ -199,6 +402,218 @@ def _refresh_state_key(namespace: str, identity: Any) -> str:
 
 def _refresh_reconcile_key(namespace: str, identity: Any) -> str:
     return f"{snapshot_cache_key(namespace, identity)}:refresh-reconcile"
+
+
+def _carry_exact_snapshot_to_refreshed_identity(
+    namespace: str,
+    source_identity: Any,
+    destination_identity: Any,
+) -> None:
+    """Keep the last exact payload visible while a new frozen window refreshes."""
+
+    source_key = snapshot_cache_key(namespace, source_identity)
+    destination_key = snapshot_cache_key(namespace, destination_identity)
+    if source_key == destination_key:
+        return
+    try:
+        stored = cache.get(source_key)
+        if not isinstance(stored, dict) or stored.get("v") != _CACHE_VERSION:
+            return
+        cache.add(destination_key, stored, timeout=_ttl_seconds())
+    except Exception:
+        logger.warning(
+            "exact_aggregation_snapshot_carry_failed",
+            namespace=namespace,
+            exc_info=True,
+        )
+
+
+def _admission_scope(identity: Any) -> str | None:
+    if not isinstance(identity, dict):
+        return None
+    for field in ("project_id", "workspace_id", "organization_id"):
+        value = identity.get(field)
+        if value not in (None, ""):
+            return f"{field}:{value}"
+    return None
+
+
+def _scope_admission_key(identity: Any) -> str | None:
+    scope = _admission_scope(identity)
+    if scope is None:
+        return None
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    return f"exact-aggregation:v{_CACHE_VERSION}:scope-admission:{digest}"
+
+
+def _max_inflight_per_scope() -> int:
+    configured = int(
+        getattr(
+            settings,
+            "EXACT_AGGREGATION_MAX_INFLIGHT_PER_SCOPE",
+            _DEFAULT_MAX_INFLIGHT_PER_SCOPE,
+        )
+    )
+    # This is a safety boundary, not an unbounded deployment tuning knob.
+    return min(16, max(1, configured))
+
+
+def _scope_admission_timeout(members: dict[str, int], now_ms: int) -> int:
+    latest_expiry_ms = max(members.values(), default=now_ms)
+    remaining_seconds = max(1, (latest_expiry_ms - now_ms + 999) // 1_000)
+    return remaining_seconds + 5 * 60
+
+
+def _claim_exact_refresh_admission(
+    identity: Any,
+    token: str,
+    *,
+    lease_seconds: int,
+) -> bool:
+    """Admit a bounded number of distinct exact jobs per tenant scope."""
+
+    admission_key = _scope_admission_key(identity)
+    if admission_key is None:
+        return True
+    now_ms = int(time.time() * 1000)
+    expiry_ms = now_ms + lease_seconds * 1000
+    ttl_margin_ms = 5 * 60 * 1000
+    try:
+        redis_client = _redis_cache_client()
+        if redis_client is not None:
+            raw_client = redis_client.get_client(write=True)
+            return bool(
+                raw_client.eval(
+                    _REDIS_CLAIM_SCOPE_ADMISSION_SCRIPT,
+                    1,
+                    redis_client.make_key(admission_key),
+                    now_ms,
+                    token,
+                    expiry_ms,
+                    ttl_margin_ms,
+                    _max_inflight_per_scope(),
+                )
+            )
+
+        with _CACHE_FENCE_FALLBACK_LOCK:
+            raw_members = cache.get(admission_key)
+            members = dict(raw_members) if isinstance(raw_members, dict) else {}
+            members = {
+                member: expiry
+                for member, expiry in members.items()
+                if isinstance(expiry, int) and expiry > now_ms
+            }
+            if token not in members and len(members) >= _max_inflight_per_scope():
+                cache.set(
+                    admission_key,
+                    members,
+                    timeout=_scope_admission_timeout(members, now_ms),
+                )
+                return False
+            members[token] = expiry_ms
+            cache.set(
+                admission_key,
+                members,
+                timeout=_scope_admission_timeout(members, now_ms),
+            )
+            return True
+    except Exception:
+        logger.warning(
+            "exact_aggregation_scope_admission_failed",
+            exc_info=True,
+        )
+        # Fail closed: cache impairment must not remove the ClickHouse load
+        # boundary for a cold, potentially hour-long aggregation.
+        return False
+
+
+def _renew_exact_refresh_admission(
+    identity: Any,
+    token: str,
+    *,
+    lease_seconds: int,
+) -> bool:
+    admission_key = _scope_admission_key(identity)
+    if admission_key is None:
+        return True
+    now_ms = int(time.time() * 1000)
+    expiry_ms = now_ms + lease_seconds * 1000
+    ttl_margin_ms = 5 * 60 * 1000
+    try:
+        redis_client = _redis_cache_client()
+        if redis_client is not None:
+            raw_client = redis_client.get_client(write=True)
+            return bool(
+                raw_client.eval(
+                    _REDIS_RENEW_SCOPE_ADMISSION_SCRIPT,
+                    1,
+                    redis_client.make_key(admission_key),
+                    now_ms,
+                    token,
+                    expiry_ms,
+                    ttl_margin_ms,
+                )
+            )
+
+        with _CACHE_FENCE_FALLBACK_LOCK:
+            raw_members = cache.get(admission_key)
+            members = dict(raw_members) if isinstance(raw_members, dict) else {}
+            members = {
+                member: expiry
+                for member, expiry in members.items()
+                if isinstance(expiry, int) and expiry > now_ms
+            }
+            if token not in members:
+                return False
+            members[token] = expiry_ms
+            cache.set(
+                admission_key,
+                members,
+                timeout=_scope_admission_timeout(members, now_ms),
+            )
+            return True
+    except Exception:
+        logger.warning(
+            "exact_aggregation_scope_admission_renew_failed",
+            exc_info=True,
+        )
+        return False
+
+
+def _release_exact_refresh_admission(identity: Any, token: str) -> None:
+    admission_key = _scope_admission_key(identity)
+    if admission_key is None or not token:
+        return
+    try:
+        redis_client = _redis_cache_client()
+        if redis_client is not None:
+            raw_client = redis_client.get_client(write=True)
+            raw_client.eval(
+                _REDIS_RELEASE_SCOPE_ADMISSION_SCRIPT,
+                1,
+                redis_client.make_key(admission_key),
+                token,
+            )
+            return
+
+        with _CACHE_FENCE_FALLBACK_LOCK:
+            raw_members = cache.get(admission_key)
+            members = dict(raw_members) if isinstance(raw_members, dict) else {}
+            members.pop(token, None)
+            if members:
+                now_ms = int(time.time() * 1000)
+                cache.set(
+                    admission_key,
+                    members,
+                    timeout=_scope_admission_timeout(members, now_ms),
+                )
+            else:
+                cache.delete(admission_key)
+    except Exception:
+        logger.warning(
+            "exact_aggregation_scope_admission_release_failed",
+            exc_info=True,
+        )
 
 
 def _ttl_seconds() -> int | None:
@@ -807,19 +1222,30 @@ def activate_exact_refresh(namespace: str, identity: Any, token: str) -> bool:
                     return False
                 cache.set(lock_key, token, timeout=running_seconds)
                 cache.set(state_key, running_state, timeout=running_seconds)
-                return True
-
-        raw_client = redis_client.get_client(write=True)
-        return bool(
-            raw_client.eval(
-                _REDIS_FENCED_ACTIVATE_SCRIPT,
-                2,
-                redis_client.make_key(lock_key),
-                redis_client.make_key(state_key),
-                redis_client.encode(token),
-                running_seconds * 1000,
-                redis_client.encode(running_state),
+                activated = True
+        else:
+            raw_client = redis_client.get_client(write=True)
+            activated = bool(
+                raw_client.eval(
+                    _REDIS_FENCED_ACTIVATE_SCRIPT,
+                    2,
+                    redis_client.make_key(lock_key),
+                    redis_client.make_key(state_key),
+                    redis_client.encode(token),
+                    running_seconds * 1000,
+                    redis_client.encode(running_state),
+                )
             )
+        if not activated:
+            return False
+        return _renew_exact_refresh_admission(
+            identity,
+            token,
+            lease_seconds=running_seconds,
+        ) or _claim_exact_refresh_admission(
+            identity,
+            token,
+            lease_seconds=running_seconds,
         )
     except Exception:
         logger.warning(
@@ -876,6 +1302,8 @@ def finish_exact_refresh(
             namespace=namespace,
             exc_info=True,
         )
+    finally:
+        _release_exact_refresh_admission(identity, token)
 
 
 def refresh_claim_is_current(namespace: str, identity: Any, token: str) -> bool:
@@ -998,6 +1426,7 @@ def _release_terminal_dispatch_claim(namespace: str, identity: Any) -> bool:
             state,
         )
         if released:
+            _release_exact_refresh_admission(identity, token)
             logger.info(
                 "exact_aggregation_terminal_dispatch_released",
                 namespace=namespace,
@@ -1027,8 +1456,24 @@ def read_or_schedule_exact_snapshot(
     refresh instead of being resubmitted by every polling request.
     """
 
-    normalized_identity = normalized_snapshot_identity(identity)
+    stale_identity = None
+    if namespace.startswith("observe-"):
+        normalized_identity, stale_identity = _resolve_exact_observe_identity(
+            namespace,
+            identity,
+            refresh=refresh,
+        )
+    else:
+        normalized_identity = normalized_snapshot_identity(identity)
+    if stale_identity is not None:
+        _carry_exact_snapshot_to_refreshed_identity(
+            namespace,
+            stale_identity,
+            normalized_identity,
+        )
     previous = read_exact_snapshot(namespace, normalized_identity)
+    if previous is None and stale_identity is not None:
+        previous = read_exact_snapshot(namespace, stale_identity)
     state = exact_refresh_state(namespace, normalized_identity)
     if previous is not None and not refresh:
         return _decorate_refresh_state(previous, state)
@@ -1044,10 +1489,40 @@ def read_or_schedule_exact_snapshot(
             return _decorate_refresh_state(previous, "failed")
         return _decorate_refresh_state(pending_payload, "failed")
 
+    admission_deferred = False
     token = begin_exact_refresh(namespace, normalized_identity)
+    if token is not None and not _claim_exact_refresh_admission(
+        normalized_identity,
+        token,
+        lease_seconds=_refresh_dispatch_seconds(),
+    ):
+        # Capacity is temporary, not a query failure. Release this identity's
+        # dispatch claim without persisting a failed state; a later bounded poll
+        # can claim the slot after another exact refresh completes.
+        finish_exact_refresh(
+            namespace,
+            normalized_identity,
+            token,
+            succeeded=True,
+        )
+        token = None
+        admission_deferred = True
     if token is None and state == "running":
         if _release_terminal_dispatch_claim(namespace, normalized_identity):
             token = begin_exact_refresh(namespace, normalized_identity)
+            if token is not None and not _claim_exact_refresh_admission(
+                normalized_identity,
+                token,
+                lease_seconds=_refresh_dispatch_seconds(),
+            ):
+                finish_exact_refresh(
+                    namespace,
+                    normalized_identity,
+                    token,
+                    succeeded=True,
+                )
+                token = None
+                admission_deferred = True
     refresh_enqueued = False
     if token is not None:
         try:
@@ -1100,6 +1575,11 @@ def read_or_schedule_exact_snapshot(
     current_state = exact_refresh_state(namespace, normalized_identity)
     if current is not None:
         return _decorate_refresh_state(current, current_state)
+    if previous is not None:
+        fallback_state = current_state
+        if fallback_state is None and (refresh_enqueued or admission_deferred):
+            fallback_state = "running"
+        return _decorate_refresh_state(previous, fallback_state)
     # ``token is None`` is ambiguous: another request may own a healthy claim,
     # or the cache itself may be unavailable.  Trust a persisted running state,
     # and trust the request that successfully enqueued this refresh.  With
@@ -1107,7 +1587,9 @@ def read_or_schedule_exact_snapshot(
     # state for work that was never queued.
     terminal_state = current_state
     if terminal_state is None:
-        terminal_state = "running" if refresh_enqueued else "failed"
+        terminal_state = (
+            "running" if refresh_enqueued or admission_deferred else "failed"
+        )
     return _decorate_refresh_state(pending_payload, terminal_state)
 
 
@@ -1122,6 +1604,7 @@ __all__ = [
     "exact_payload_is_complete",
     "finish_exact_refresh",
     "mark_refresh_failed",
+    "normalize_exact_observe_identity",
     "normalized_snapshot_identity",
     "publish_exact_snapshot",
     "publish_exact_snapshot_for_refresh",

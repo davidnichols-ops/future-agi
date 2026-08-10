@@ -260,7 +260,7 @@ describe("useEvalUsage date params", () => {
     expect(mocks.get).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps a server-confirmed chart refresh pending beyond 500 seconds and accepts completion", async () => {
+  it("bounds a server-confirmed chart refresh and accepts completion after explicit retry", async () => {
     vi.useFakeTimers();
     const pending = {
       data: {
@@ -285,9 +285,13 @@ describe("useEvalUsage date params", () => {
     expect(result.current.data?.queryPending).toBe(true);
 
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
-    expect(result.current.isError).toBe(false);
+    const boundedRequestCount = mocks.get.mock.calls.length;
+    expect(result.current.isError).toBe(true);
     expect(result.current.data?.queryPending).toBe(true);
-    expect(mocks.get.mock.calls.length).toBeGreaterThan(12);
+    expect(boundedRequestCount).toBeLessThanOrEqual(13);
+
+    await act(async () => vi.advanceTimersByTimeAsync(500_000));
+    expect(mocks.get).toHaveBeenCalledTimes(boundedRequestCount);
 
     mocks.get.mockResolvedValueOnce({
       data: {
@@ -296,7 +300,8 @@ describe("useEvalUsage date params", () => {
         }),
       },
     });
-    await act(async () => vi.advanceTimersByTimeAsync(8_010));
+    await act(async () => result.current.refresh());
+    expect(mocks.get).toHaveBeenCalledTimes(boundedRequestCount + 1);
     expect(result.current.isError).toBe(false);
     expect(result.current.data?.chart).toHaveLength(1);
   });
@@ -513,7 +518,7 @@ describe("useEvalUsageLogs response mapping", () => {
     expect(mocks.get).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps a server-confirmed log refresh pending beyond 500 seconds", async () => {
+  it("bounds a server-confirmed log refresh and resumes after explicit retry", async () => {
     vi.useFakeTimers();
     mocks.get.mockResolvedValue({
       data: {
@@ -536,9 +541,13 @@ describe("useEvalUsageLogs response mapping", () => {
     await act(async () => vi.advanceTimersByTimeAsync(0));
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
 
-    expect(result.current.isError).toBe(false);
+    const boundedRequestCount = mocks.get.mock.calls.length;
+    expect(result.current.isError).toBe(true);
     expect(result.current.data?.queryPending).toBe(true);
-    expect(mocks.get.mock.calls.length).toBeGreaterThan(12);
+    expect(boundedRequestCount).toBeLessThanOrEqual(13);
+
+    await act(async () => vi.advanceTimersByTimeAsync(500_000));
+    expect(mocks.get).toHaveBeenCalledTimes(boundedRequestCount);
 
     mocks.get.mockResolvedValueOnce({
       data: {
@@ -548,7 +557,8 @@ describe("useEvalUsageLogs response mapping", () => {
         }),
       },
     });
-    await act(async () => vi.advanceTimersByTimeAsync(8_010));
+    await act(async () => result.current.refresh());
+    expect(mocks.get).toHaveBeenCalledTimes(boundedRequestCount + 1);
     expect(result.current.data?.queryPending).toBe(false);
     expect(result.current.data?.table?.[0]?.row_id).toBe("eventual");
   });

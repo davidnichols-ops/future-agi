@@ -4322,6 +4322,38 @@ def test_filter_value_cursor_proof_result_sentinel_has_a_hard_maximum():
     assert read.browse_status == "exhausted"
 
 
+def test_filter_value_cursor_radix_count_only_state_still_uses_exact_proof():
+    seen_value = "Rechazado"
+    seen_digest = attribute_value_cursor_digest("string", seen_value)
+    executor = RecordingExecutor(
+        lambda *_args: pytest.fail(
+            "a complete radix-backed seen proof must not enter the physical walk"
+        ),
+        distinct_responder=lambda *_args: [
+            _distinct_value_group("string", seen_value, count=100_000)
+        ],
+    )
+
+    read = AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
+        window_end=NOW,
+        seen_value_digests=(),
+        seen_value_contains=lambda digest: digest == seen_digest,
+        seen_value_count=ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1,
+    )
+
+    assert len(executor.calls) == 1
+    assert executor.calls[0].params["distinct_limit"] == 4_108
+    assert read.rows == ()
+    assert read.has_more is False
+    assert read.browse_status == "exhausted"
+    assert read.seen_value_digests == ()
+    assert read.seen_value_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1
+
+
 def test_filter_value_cursor_dynamic_proof_rejects_one_unseen_value():
     seen_values = (
         "AGENT",
@@ -5703,7 +5735,7 @@ def test_filter_value_cursor_exhausts_frozen_window_after_tracking_prefix_is_ful
     assert len(executor.calls) == 2
 
 
-def test_filter_value_cursor_publishes_full_page_past_tracking_prefix(monkeypatch):
+def test_filter_value_cursor_continues_past_legacy_tracking_threshold(monkeypatch):
     identity = (PROJECT_A, "trace-after-cap", "span-after-cap", NOW - timedelta(1))
     selector = AttributeReadSelector(
         RecordingExecutor(), now=NOW, json_attribute_mode="arrays"
@@ -5741,19 +5773,20 @@ def test_filter_value_cursor_publishes_full_page_past_tracking_prefix(monkeypatc
     )
 
     assert [row.value for row in read.rows] == ["after-4096-a", "after-4096-b"]
-    assert len(read.seen_value_digests) == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS
-    assert read.seen_value_digests[-1] == attribute_value_cursor_digest(
+    assert len(read.seen_value_digests) == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1
+    assert read.seen_value_digests[-2] == attribute_value_cursor_digest(
         "array", "after-4096-a"
     )
-    assert (
-        attribute_value_cursor_digest("array", "after-4096-b")
-        not in read.seen_value_digests
+    assert read.seen_value_digests[-1] == attribute_value_cursor_digest(
+        "array", "after-4096-b"
     )
+    assert read.appended_value_digests == read.seen_value_digests[-2:]
+    assert read.seen_value_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1
     assert read.has_more is True
     assert read.browse_status == "continuation"
 
 
-def test_filter_value_cursor_post_cap_duplicates_still_advance_physical_cursor():
+def test_filter_value_cursor_tracks_and_continues_post_threshold_page():
     candidates = [
         _candidate(
             PROJECT_A,
@@ -5800,39 +5833,22 @@ def test_filter_value_cursor_post_cap_duplicates_still_advance_physical_cursor()
         window_end=NOW,
         seen_value_digests=seen,
     )
-    second = AttributeReadSelector(
-        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
-    ).read_value_cursor_page(
-        [PROJECT_A],
-        "final_status",
-        page_size=1,
-        window_start=NOW - timedelta(days=1),
-        window_end=NOW,
-        segment_end=first.next_segment_end,
-        before_identity=first.next_before_identity,
-        seen_value_digests=first.seen_value_digests,
-    )
-
     assert [row.value for row in first.rows] == ["repeated-after-cap"]
-    assert [row.value for row in second.rows] == ["repeated-after-cap"]
-    assert first.seen_value_digests == second.seen_value_digests == seen
+    emitted_digest = attribute_value_cursor_digest("string", "repeated-after-cap")
+    assert first.seen_value_digests == (*seen, emitted_digest)
+    assert first.appended_value_digests == (emitted_digest,)
+    assert first.seen_value_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1
     assert first.next_before_identity == (
         PROJECT_A,
         "trace-post-cap-0",
         "post-cap-0",
         NOW - timedelta(minutes=1),
     )
-    assert second.next_before_identity == (
-        PROJECT_A,
-        "trace-post-cap-1",
-        "post-cap-1",
-        NOW - timedelta(minutes=2),
-    )
-    assert second.next_before_identity[3] < first.next_before_identity[3]
-    assert first.browse_status == second.browse_status == "continuation"
+    assert first.has_more is True
+    assert first.browse_status == "continuation"
 
 
-def test_filter_value_cursor_search_remains_resumable_after_tracking_prefix(
+def test_filter_value_cursor_exact_typed_search_tracks_past_legacy_threshold(
     monkeypatch,
 ):
     identity = (PROJECT_A, "trace-search-cap", "span-search-cap", NOW - timedelta(1))
@@ -5876,7 +5892,10 @@ def test_filter_value_cursor_search_remains_resumable_after_tracking_prefix(
     )
 
     assert [row.value for row in read.rows] == ["Rechazado"]
-    assert read.seen_value_digests == seen
+    rechazada_digest = attribute_value_cursor_digest("string", "Rechazado")
+    assert read.seen_value_digests == (*seen, rechazada_digest)
+    assert read.appended_value_digests == (rechazada_digest,)
+    assert read.seen_value_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1
     assert read.has_more is True
     assert read.browse_status == "continuation"
     assert candidate_calls[0]["predicate_params"] == {"attribute_search": "rechazado"}
@@ -7684,7 +7703,7 @@ def test_span_attribute_key_cursor_remains_pageable_below_state_capacity(monkeyp
     assert page.metadata.query_error_code is None
 
 
-def test_span_attribute_key_cursor_keeps_scanning_at_server_state_capacity(
+def test_span_attribute_key_cursor_reaches_and_continues_at_legacy_threshold(
     monkeypatch,
 ):
     identity = (PROJECT_A, "trace-cap", "span-cap", NOW - timedelta(hours=1))
@@ -7731,11 +7750,13 @@ def test_span_attribute_key_cursor_keeps_scanning_at_server_state_capacity(
 
     assert [item.key for item in page.rows] == ["last_recent_key"]
     assert len(page.seen_key_digests) == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS
+    assert page.appended_key_digests == (page.seen_key_digests[-1],)
+    assert page.seen_key_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS
     assert page.has_more is True
     assert page.browse_status == "continuation"
 
 
-def test_span_attribute_key_cursor_publishes_keys_after_finite_tracking_prefix(
+def test_span_attribute_key_cursor_tracks_continuation_past_legacy_threshold(
     monkeypatch,
 ):
     identity = (PROJECT_A, "trace-cap", "span-cap", NOW - timedelta(hours=1))
@@ -7781,9 +7802,109 @@ def test_span_attribute_key_cursor_publishes_keys_after_finite_tracking_prefix(
     )
 
     assert [item.key for item in page.rows] == ["key_after_tracked_prefix"]
-    assert page.seen_key_digests == seen
+    emitted_digest = attribute_key_cursor_digest("key_after_tracked_prefix")
+    assert page.seen_key_digests == (*seen, emitted_digest)
+    assert page.appended_key_digests == (emitted_digest,)
+    assert page.seen_key_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1
     assert page.has_more is True
     assert page.browse_status == "continuation"
+
+
+def test_span_attribute_key_cursor_dedupes_across_slices_past_legacy_threshold(
+    monkeypatch,
+):
+    duplicate_key = "already_seen_key"
+    unique_key = "older_unique_key"
+    duplicate_identity = (
+        PROJECT_A,
+        "trace-duplicate-slice",
+        "span-duplicate-slice",
+        NOW - timedelta(hours=1),
+    )
+    unique_identity = (
+        PROJECT_A,
+        "trace-unique-slice",
+        "span-unique-slice",
+        NOW - timedelta(hours=7),
+    )
+    identities = (duplicate_identity, unique_identity)
+    rows = {
+        duplicate_identity: {
+            "project_id": PROJECT_A,
+            "trace_id": duplicate_identity[1],
+            "id": duplicate_identity[2],
+            "start_time": duplicate_identity[3],
+            "is_deleted": 0,
+            "string_keys": [duplicate_key],
+            "number_keys": [],
+            "boolean_keys": [],
+            "attributes_extra": "{}",
+        },
+        unique_identity: {
+            "project_id": PROJECT_A,
+            "trace_id": unique_identity[1],
+            "id": unique_identity[2],
+            "start_time": unique_identity[3],
+            "is_deleted": 0,
+            "string_keys": [unique_key],
+            "number_keys": [],
+            "boolean_keys": [],
+            "attributes_extra": "{}",
+        },
+    }
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    scanned_segments: list[tuple[datetime, datetime]] = []
+
+    def candidates(_projects, segment, **_kwargs):
+        scanned_segments.append(segment)
+        return (
+            tuple(
+                identity
+                for identity in identities
+                if segment[0] <= identity[3] < segment[1]
+            ),
+            False,
+            {},
+        )
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **kwargs: [
+            rows[identity] for identity in kwargs.get("candidate_ids", ())
+        ],
+    )
+    seen = (
+        *(
+            attribute_key_cursor_digest(f"prior-{index}")
+            for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - 1)
+        ),
+        attribute_key_cursor_digest(duplicate_key),
+    )
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=1,
+        window_start=NOW - timedelta(hours=18),
+        window_end=NOW,
+        seen_key_digests=seen,
+    )
+
+    assert [item.key for item in page.rows] == [unique_key]
+    unique_digest = attribute_key_cursor_digest(unique_key)
+    assert page.seen_key_digests == (*seen, unique_digest)
+    assert page.appended_key_digests == (unique_digest,)
+    assert page.seen_key_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1
+    assert page.has_more is True
+    assert page.browse_status == "continuation"
+    assert len(scanned_segments) >= 2
+    assert scanned_segments[0] != scanned_segments[1]
 
 
 def test_span_attribute_key_cursor_skips_duplicate_only_page_after_first_state_block(
@@ -7880,7 +8001,12 @@ def test_span_attribute_key_cursor_skips_duplicate_only_page_after_first_state_b
     )
 
     assert [item.key for item in page.rows] == [unique_key]
-    assert page.seen_key_digests == seen
+    unique_digest = attribute_key_cursor_digest(unique_key)
+    assert page.seen_key_digests == (*seen, unique_digest)
+    assert page.appended_key_digests == (unique_digest,)
+    assert page.seen_key_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1
+    assert page.has_more is False
+    assert page.browse_status == "exhausted"
     assert candidate_limits[:5] == [
         64,
         128,
@@ -9645,6 +9771,56 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     assert len(calls) == 2
 
 
+def test_span_attribute_key_api_tracking_limit_is_terminal(monkeypatch):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    seen = tuple(
+        attribute_key_cursor_digest(f"prior-{index}")
+        for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS)
+    )
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "read_key_cursor_page",
+        lambda _self, _project_ids, **kwargs: AttributeKeyCursorPageRead(
+            (AttributeKeyRow("final_verified_key", "string", 1),),
+            _metadata(),
+            False,
+            "limit_reached",
+            kwargs["window_start"],
+            None,
+            None,
+            0,
+            seen,
+        ),
+    )
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "retained_window_start",
+        lambda _self, _projects, *, window_end: window_end - timedelta(days=400),
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._project_is_in_request_scope",
+        lambda _request, _project_id: True,
+    )
+    request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"project_id": PROJECT_A, "page_size": 10},
+    )
+
+    response = SpanAttributeKeysView.as_view()(request)
+
+    assert response.status_code == 200
+    assert response.data["result"][0]["key"] == "final_verified_key"
+    assert response.data["result"][0]["type"] == "string"
+    assert response.data["result"][0]["count"] == 1
+    assert response.data["result"][0]["count_exact"] is False
+    assert response.data["has_more"] is False
+    assert response.data["next_cursor"] is None
+    assert response.data["browse_status"] == "limit_reached"
+    contract = SpanAttributeKeysResponseSerializer(data=response.data)
+    assert contract.is_valid(), contract.errors
+
+
 def test_span_attribute_key_api_cursor_binds_and_continues_exact_search(monkeypatch):
     from tracer.views.span_attributes import SpanAttributeKeysView
 
@@ -10744,6 +10920,31 @@ def test_span_attribute_detail_ownership_gate_precedes_any_ch_read(monkeypatch):
     assert calls == 0
 
 
+def test_span_attribute_detail_missing_tenant_context_fails_closed(monkeypatch):
+    from tracer.views.span_attributes import SpanAttributeDetailView
+
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._project_is_in_request_scope",
+        lambda *_args, **_kwargs: pytest.fail(
+            "tenant-less request queried project scope"
+        ),
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes.read_or_schedule_exact_snapshot",
+        lambda *_args, **_kwargs: pytest.fail("tenant-less request scheduled a worker"),
+    )
+    request = _authenticated_get(
+        "/api/traces/span-attribute-detail/",
+        {"project_id": PROJECT_A, "key": "final_status"},
+    )
+    request.workspace = SimpleNamespace(id="workspace-a")
+
+    response = SpanAttributeDetailView.as_view()(request)
+
+    assert response.status_code == 404
+    assert response.data["result"] == "Project not found"
+
+
 def test_span_attribute_detail_serves_or_schedules_exact_snapshot(monkeypatch):
     from tracer.views.span_attributes import SpanAttributeDetailView
 
@@ -10779,6 +10980,7 @@ def test_span_attribute_detail_serves_or_schedules_exact_snapshot(monkeypatch):
         "/api/traces/span-attribute-detail/",
         {"project_id": PROJECT_A, "key": "final_status", "refresh": "true"},
     )
+    request.organization = SimpleNamespace(id="organization-a")
     request.workspace = SimpleNamespace(id="workspace-a")
 
     response = SpanAttributeDetailView.as_view()(request)
@@ -10799,6 +11001,7 @@ def test_span_attribute_detail_serves_or_schedules_exact_snapshot(monkeypatch):
     assert captured == {
         "namespace": "attribute-detail",
         "identity": {
+            "organization_id": "organization-a",
             "workspace_id": "workspace-a",
             "project_id": PROJECT_A,
             "attribute_key": "final_status",
@@ -10867,6 +11070,7 @@ def test_span_attribute_detail_schedule_failure_is_sanitized(monkeypatch):
         "/api/traces/span-attribute-detail/",
         {"project_id": PROJECT_A, "key": "final_status"},
     )
+    request.organization = SimpleNamespace(id="organization-a")
     request.workspace = SimpleNamespace(id="workspace-a")
 
     response = SpanAttributeDetailView.as_view()(request)

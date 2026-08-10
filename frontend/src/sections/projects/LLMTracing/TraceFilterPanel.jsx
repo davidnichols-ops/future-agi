@@ -923,8 +923,7 @@ export function shouldUseRetainedAttributePages({
 }) {
   const supportedSource = source === "traces" || source === "spans";
   const hasAuthoritativeKeys = (attributes?.length || 0) > 0;
-  const inventoryIsTerminal =
-    browseStatus === "exhausted" || browseStatus === "limit_reached";
+  const inventoryIsTerminal = browseStatus === "exhausted";
 
   // An empty continuation page only proves that its bounded physical slices
   // contained no attributes. Keep the compatibility catalog visible until
@@ -1062,7 +1061,6 @@ function PropertyPicker({
   const exactAttributeDiscoveryTerminal =
     exactAttributeCursorRetryExhausted ||
     exactAttributeBrowseStatus === "exhausted" ||
-    exactAttributeBrowseStatus === "limit_reached" ||
     exactAttributeReadState === "error" ||
     exactAttributeReadState === "degraded";
   const manualAttributeProperty = useMemo(
@@ -1621,14 +1619,10 @@ function ValuePicker({
       Boolean(anchorEl) &&
       (!isIdOnlyField || Boolean(debouncedSearch)),
   });
-  // `browse_status` is the authoritative cursor contract. Never leave a no-op
-  // Load more control visible once the backend has proved that no later
-  // distinct values exist, even if a stale consumer state or an older API pod
-  // still reports `has_more=true` alongside that terminal status.
+  // `exhausted` is the authoritative terminal state. `limit_reached` remains
+  // resumable when the hook validated an advancing signed cursor.
   const hasMoreDashboardValues =
-    Boolean(hasNextDashboardPage) &&
-    dashboardBrowseStatus !== "exhausted" &&
-    dashboardBrowseStatus !== "limit_reached";
+    Boolean(hasNextDashboardPage) && dashboardBrowseStatus !== "exhausted";
   const loadNextDashboardValues = useSingleFlightPageRequest({
     identity: JSON.stringify([
       projectId,

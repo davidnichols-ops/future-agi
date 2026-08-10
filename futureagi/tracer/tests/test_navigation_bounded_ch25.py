@@ -327,10 +327,9 @@ def test_observation_span_fields_redact_internal_failure():
 
 
 @pytest.mark.unit
-def test_observation_span_export_redacts_clickhouse_failure():
+def test_observation_span_export_fails_closed_before_paginated_list():
     from tracer.views.observation_span import ObservationSpanView
 
-    private_error = "secret SQL and internal ClickHouse stack"
     request = SimpleNamespace(query_params={})
     view = ObservationSpanView()
     view.request = request
@@ -343,14 +342,60 @@ def test_observation_span_export_redacts_clickhouse_failure():
             "tracer.views.observation_span.SpanExportQuerySerializer",
             return_value=serializer,
         ),
-        patch.object(
-            view,
-            "list_spans_observe",
-            side_effect=ServerException(private_error, code=159),
-        ),
+        patch.object(view, "list_spans_observe") as list_spans,
     ):
         response = view.get_spans_export_data(request)
 
-    assert response.status_code == 400
-    assert response.data["result"] == "Span export could not be generated"
-    assert private_error not in str(response.data)
+    assert response.status_code == 503
+    assert response.data["code"] == "service_unavailable"
+    assert response.data["result"] == (
+        "A complete span export is temporarily unavailable. Please retry later."
+    )
+    list_spans.assert_not_called()
+
+
+@pytest.mark.unit
+def test_voice_export_fails_closed_before_legacy_postgres_exporter():
+    from tracer.views.trace import TraceView
+
+    request = SimpleNamespace(query_params={})
+    view = TraceView()
+    view.request = request
+
+    serializer = MagicMock()
+    serializer.is_valid.return_value = True
+    serializer.validated_data = {"project_id": "project-1"}
+
+    project = SimpleNamespace(name="voice-project")
+    project_queryset = MagicMock()
+    project_queryset.filter.return_value.first.return_value = project
+
+    reader = MagicMock()
+    reader.has_root_spans_of_type.return_value = True
+    reader_context = MagicMock()
+    reader_context.__enter__.return_value = reader
+
+    with (
+        patch(
+            "tracer.views.trace.TraceExportQuerySerializer",
+            return_value=serializer,
+        ),
+        patch(
+            "tracer.views.trace._project_queryset_for_request",
+            return_value=project_queryset,
+        ),
+        patch(
+            "tracer.services.clickhouse.v2.get_reader",
+            return_value=reader_context,
+        ),
+        patch.object(view, "_export_voice_calls") as legacy_export,
+    ):
+        response = view.get_trace_export_data(request)
+
+    assert response.status_code == 503
+    assert response.data["code"] == "service_unavailable"
+    assert response.data["result"] == (
+        "A complete voice call export is temporarily unavailable. Please retry later."
+    )
+    reader.has_root_spans_of_type.assert_called_once_with("project-1", "conversation")
+    legacy_export.assert_not_called()

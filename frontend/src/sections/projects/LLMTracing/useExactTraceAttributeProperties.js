@@ -24,10 +24,7 @@ export function getAttributeKeyPageReadState(page, { exact = false } = {}) {
     // authoritative and must not inherit browse-sampling UI.
     return "complete";
   }
-  if (
-    page?.browse_mode === "retained_catalog" ||
-    page?.browse_mode === "recent_suggestions"
-  ) {
+  if (page?.browse_mode === "recent_suggestions") {
     return page?.query_complete === true &&
       page?.query_status === "complete" &&
       ATTRIBUTE_BROWSE_STATUSES.has(page?.browse_status)
@@ -273,7 +270,7 @@ export function useExactTraceAttributeProperties({
     queryReadState,
     browseStatus,
     browseLimit: retainedLastPage?.browse_limit,
-    browseLimitReached: browseStatus === "limit_reached",
+    browseLimitReached: browseStatus === "limit_reached" && !hasNextPage,
     // This is intentionally raw-key/backend identity, not the picker's fuzzy
     // punctuation-normalized match. Consumers may use it to terminate search
     // pagination without conflating keys such as `trace_id` and `trace.id`.

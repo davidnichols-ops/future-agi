@@ -59,6 +59,19 @@ describe("attribute key cursor pagination", () => {
     ).toBeUndefined();
   });
 
+  it("continues a bounded limit_reached page when its cursor advances", () => {
+    const checkpoint = page([], {
+      browse_status: "limit_reached",
+      has_more: true,
+      next_cursor: "next-bounded-batch",
+    });
+
+    expect(getAttributeKeyNextCursor(checkpoint)).toBe("next-bounded-batch");
+    expect(
+      getNextAttributeKeyPageParam(checkpoint, [checkpoint], null, [null]),
+    ).toBe("next-bounded-batch");
+  });
+
   it("stops a repeated cursor instead of looping or surfacing an error", async () => {
     const requestPage = vi
       .fn()

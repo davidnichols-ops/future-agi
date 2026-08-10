@@ -38,7 +38,7 @@ GRAPH_EVENT_LIMIT = 2_000
 # Part of the cache identity, not a database schema version. Incrementing this
 # prevents a rolling deploy from serving a 30-day cached payload produced by
 # the retired hierarchy-as-path projection.
-AGENT_GRAPH_PAYLOAD_VERSION = 4
+AGENT_GRAPH_PAYLOAD_VERSION = 5
 # A short-window selector may prove as many as 4,096 trace matches. Decoration
 # fans each trace set into child-span reads, so keep the same finite 40-trace
 # envelope used by the long-window sampler before any decoration query runs.
@@ -848,7 +848,7 @@ def fetch_agent_graph_ch(
     filters: list[dict[str, Any]],
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """Read or schedule one exact Agent Graph/Path snapshot.
+    """Read or schedule one exact Agent Graph snapshot.
 
     Agent topology is an aggregation, not a list.  A cold request therefore
     returns an explicit non-renderable pending envelope; a manual refresh keeps

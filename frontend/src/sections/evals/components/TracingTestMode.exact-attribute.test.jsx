@@ -121,6 +121,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
       if (url === "/spans/") {
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -138,6 +139,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
       if (url === "/traces/trace-1/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-1" },
               observation_spans: [
@@ -200,6 +202,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
       if (url === "/spans/") {
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -260,10 +263,12 @@ describe("TracingTestMode exact task attribute mapping", () => {
         if (callIndex < 13) {
           return {
             data: {
+              status: true,
               result: {
                 config: [],
                 table: [],
                 metadata: {
+                  total_rows: 0,
                   has_more: true,
                   next_cursor: `checkpoint-${callIndex}`,
                   total_rows_is_lower_bound: true,
@@ -274,6 +279,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
         }
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -295,6 +301,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
       if (url === "/traces/trace-rare/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-rare" },
               observation_spans: [
@@ -359,6 +366,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
         if (callIndex < 13) {
           return {
             data: {
+              status: true,
               result: {
                 config: [],
                 table:
@@ -372,6 +380,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
                       ]
                     : [],
                 metadata: {
+                  total_rows: callIndex === 0 ? 1 : 0,
                   has_more: true,
                   next_cursor: `checkpoint-${callIndex}`,
                   total_rows_is_lower_bound: true,
@@ -382,6 +391,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
         }
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -403,6 +413,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
       if (url === "/traces/trace-buffered/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-buffered" },
               observation_spans: [
@@ -472,6 +483,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
         }
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -489,6 +501,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
       if (url === "/traces/trace-after-cold-retry/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-after-cold-retry" },
               observation_spans: [
@@ -541,6 +554,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
         expect(config.params).not.toHaveProperty("cursor_mode");
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -558,6 +572,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
       if (url === "/traces/trace-legacy-eval/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-legacy-eval" },
               observation_spans: [

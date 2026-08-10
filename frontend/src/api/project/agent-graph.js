@@ -1,11 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import {
-  AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   awaitAggregationRequestWithDeadline,
-  getAggregationPollDelay,
+  createAggregationPollController,
   getAggregationRefreshState,
   getExactAggregationReadState,
 } from "src/utils/queryReadState";
@@ -16,6 +15,7 @@ export const getAgentGraphPresentationState = (query) => {
     ? getExactAggregationReadState(query.data)
     : null;
   const hasExactSnapshot = readState === "complete";
+  const exactSnapshot = hasExactSnapshot ? query.data : query.previousExactData;
   const { refreshFailed } = getAggregationRefreshState(query.data);
   const failedPendingRefresh =
     readState === "pending" && (refreshFailed || query.isError);
@@ -23,23 +23,24 @@ export const getAgentGraphPresentationState = (query) => {
     Boolean(query.data) && readState !== "complete" && readState !== "pending";
 
   return {
-    data: hasExactSnapshot ? query.data : undefined,
+    data: exactSnapshot,
     isLoading:
-      !hasExactSnapshot &&
+      !exactSnapshot &&
       !query.isError &&
       (query.isLoading || (readState === "pending" && !failedPendingRefresh)),
     // A polling transport/refresh failure must never hide an exact snapshot
     // already returned by the server. Cold failures still render the generic,
     // retryable error state below the exactness gate.
     isError:
-      !hasExactSnapshot &&
+      !exactSnapshot &&
       (query.isError || hasUnreadablePayload || failedPendingRefresh),
     queryReadState: readState,
+    refreshUnavailable: query.refreshUnavailable === true,
   };
 };
 
 /**
- * Fetch an exact aggregate Agent Graph/Path snapshot.
+ * Fetch an exact aggregate Agent Graph snapshot.
  *
  * Cold reads are background jobs: the hook polls their explicit pending
  * envelope and never exposes its empty arrays as a completed graph. A manual
@@ -52,10 +53,13 @@ export const useAgentGraph = (
   { enabled = true } = {},
 ) => {
   const forceRefreshRef = useRef(false);
-  const pollAttemptRef = useRef(0);
-  const consecutiveFailureRef = useRef(0);
+  const pollingControllerRef = useRef(null);
+  if (pollingControllerRef.current === null) {
+    pollingControllerRef.current = createAggregationPollController();
+  }
   const serverPendingRef = useRef(false);
   const requestScopeRef = useRef(null);
+  const lastExactSnapshotRef = useRef(null);
   const [aggregationTransportFailed, setAggregationTransportFailed] =
     useState(false);
 
@@ -65,15 +69,17 @@ export const useAgentGraph = (
       const requestScope = JSON.stringify(queryKey);
       if (requestScopeRef.current !== requestScope) {
         requestScopeRef.current = requestScope;
-        pollAttemptRef.current = 0;
-        consecutiveFailureRef.current = 0;
+        pollingControllerRef.current.reset();
         serverPendingRef.current = false;
+        lastExactSnapshotRef.current = null;
         setAggregationTransportFailed(false);
       }
+      pollingControllerRef.current.recordAttempt();
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
+      let response;
       try {
-        const response = await awaitAggregationRequestWithDeadline(
+        response = await awaitAggregationRequestWithDeadline(
           (requestSignal) =>
             axios.get(endpoints.project.getAgentGraph(), {
               params: {
@@ -85,30 +91,42 @@ export const useAgentGraph = (
             }),
           { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS, signal },
         );
-        const result = parseAgentGraphResponse(response.data);
-        const { isRefreshing, refreshFailed } =
-          getAggregationRefreshState(result);
-        const readState = getExactAggregationReadState(result);
-        serverPendingRef.current =
-          isRefreshing &&
-          !refreshFailed &&
-          (readState === "pending" || readState === "complete");
-        consecutiveFailureRef.current = 0;
-        setAggregationTransportFailed(false);
-        return result;
       } catch (error) {
         if (!signal.aborted && serverPendingRef.current) {
-          consecutiveFailureRef.current += 1;
-          if (
-            consecutiveFailureRef.current >=
-            AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES
-          ) {
+          if (!pollingControllerRef.current.recordFailure()) {
             serverPendingRef.current = false;
             setAggregationTransportFailed(true);
           }
         }
         throw error;
       }
+
+      let result;
+      try {
+        result = parseAgentGraphResponse(response.data);
+      } catch (error) {
+        // A 2xx body that violates the generated contract cannot become valid
+        // by polling the same snapshot. Stop immediately and leave any prior
+        // exact graph visible until an explicit refresh starts a new budget.
+        pollingControllerRef.current.terminate();
+        serverPendingRef.current = false;
+        setAggregationTransportFailed(true);
+        throw error;
+      }
+
+      const { isRefreshing, refreshFailed } =
+        getAggregationRefreshState(result);
+      const readState = getExactAggregationReadState(result);
+      if (readState === "complete") lastExactSnapshotRef.current = result;
+      serverPendingRef.current =
+        isRefreshing &&
+        !refreshFailed &&
+        (readState === "pending" || readState === "complete");
+      pollingControllerRef.current.recordSuccess();
+      if (serverPendingRef.current) pollingControllerRef.current.start();
+      else pollingControllerRef.current.stop();
+      setAggregationTransportFailed(false);
+      return result;
     },
     enabled: !!projectId && enabled,
     staleTime: Infinity,
@@ -120,18 +138,20 @@ export const useAgentGraph = (
         getAggregationRefreshState(payload);
       const readState = getExactAggregationReadState(payload);
       if (
-        consecutiveFailureRef.current >=
-          AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES ||
         !isRefreshing ||
         refreshFailed ||
         (readState !== "pending" && readState !== "complete")
       ) {
-        pollAttemptRef.current = 0;
+        pollingControllerRef.current.stop();
         serverPendingRef.current = false;
         return false;
       }
-      const delay = getAggregationPollDelay(pollAttemptRef.current);
-      pollAttemptRef.current += 1;
+      pollingControllerRef.current.start();
+      const delay = pollingControllerRef.current.nextDelay();
+      if (delay === false) {
+        serverPendingRef.current = false;
+        setAggregationTransportFailed(true);
+      }
       return delay;
     },
     refetchIntervalInBackground: false,
@@ -139,6 +159,14 @@ export const useAgentGraph = (
     meta: { errorHandled: true },
   });
   const { refetch } = query;
+
+  const refresh = useCallback(() => {
+    forceRefreshRef.current = true;
+    pollingControllerRef.current.reset();
+    serverPendingRef.current = false;
+    setAggregationTransportFailed(false);
+    return refetch({ cancelRefetch: true });
+  }, [refetch]);
 
   useEffect(() => {
     const handleRefresh = (event) => {
@@ -149,23 +177,20 @@ export const useAgentGraph = (
       ) {
         return;
       }
-      forceRefreshRef.current = true;
-      pollAttemptRef.current = 0;
-      consecutiveFailureRef.current = 0;
-      serverPendingRef.current = false;
-      setAggregationTransportFailed(false);
-      refetch({ cancelRefetch: true });
+      refresh();
     };
     window.addEventListener("observe-refresh", handleRefresh);
     return () => window.removeEventListener("observe-refresh", handleRefresh);
-  }, [enabled, projectId, refetch]);
+  }, [enabled, projectId, refresh]);
 
   const pollingTransportError =
     query.isError &&
     serverPendingRef.current &&
-    consecutiveFailureRef.current < AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES;
+    pollingControllerRef.current.isActive();
   const presentationState = getAgentGraphPresentationState({
     ...query,
+    previousExactData: lastExactSnapshotRef.current,
+    refreshUnavailable: aggregationTransportFailed,
     isError:
       aggregationTransportFailed || (query.isError && !pollingTransportError),
   });
@@ -173,5 +198,6 @@ export const useAgentGraph = (
   return {
     ...query,
     ...presentationState,
+    refresh,
   };
 };

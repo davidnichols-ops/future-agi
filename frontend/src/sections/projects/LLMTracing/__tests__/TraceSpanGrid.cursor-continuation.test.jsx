@@ -150,6 +150,7 @@ const listResponse = ({
   lowerBound = false,
 } = {}) => ({
   data: {
+    status: true,
     result: {
       config: [],
       table: rows,
@@ -311,6 +312,7 @@ describe.each([
       })
       .mockResolvedValueOnce({
         data: {
+          status: true,
           result: {
             config: [],
             table: [row],

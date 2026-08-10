@@ -14,7 +14,9 @@ import { followEmptyListContinuations } from "src/sections/projects/LLMTracing/l
 const LOAD_MORE_OPTION = Object.freeze({ __loadMore: true });
 const RETRY_OPTION = Object.freeze({ __retry: true });
 const LIST_OPERATORS = new Set(LIST_FILTER_OPS);
-const TERMINAL_BROWSE_STATUSES = new Set(["exhausted", "limit_reached"]);
+// `limit_reached` is resumable when the backend supplies an advancing cursor;
+// only an explicit exhaustion proof is unconditionally terminal.
+const TERMINAL_BROWSE_STATUSES = new Set(["exhausted"]);
 const EMPTY_CONTINUATION_GUARD_EXHAUSTED = "empty_continuation_guard_exhausted";
 const FOLLOWED_CURSORS_KEY = "followed_value_cursors";
 const CURSOR_STOPPED_KEY = "filter_value_cursor_stopped";

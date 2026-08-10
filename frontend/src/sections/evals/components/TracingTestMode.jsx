@@ -74,6 +74,14 @@ import {
   mergeTracingFieldNames,
   useExactEvalAttributeFields,
 } from "./useExactEvalAttributeFields";
+import {
+  parseAxiosResult,
+  parseSessionObserveListResponse,
+  parseSpanObserveListResponse,
+  parseTraceObserveListResponse,
+  parseVoiceCallDetailResponse,
+  parseVoiceCallListResponse,
+} from "src/api/project/observe-contracts";
 
 const ROW_TYPE_OPTIONS = [
   { value: "Span", label: "Spans", icon: "solar:layers-outline" },
@@ -612,14 +620,18 @@ const TracingTestMode = React.forwardRef(
             }
             requestedCursors.add(nextCursor);
           };
-          const requestList = (endpoint, params, { voice = false } = {}) =>
+          const requestList = (
+            endpoint,
+            params,
+            { voice = false, parser } = {},
+          ) =>
             requestListWithLegacyCursorFallback({
               request: (nextParams) =>
                 axios.get(endpoint, { params: nextParams }),
               params,
               pageParam: voice ? "page" : "page_number",
               firstPage: voice ? 1 : 0,
-            });
+            }).then((response) => parseAxiosResult(response, parser));
           if (rowType === "VoiceCall") {
             const requestParams = buildTracingVoicePreviewListParams({
               selectedProjectId,
@@ -631,24 +643,19 @@ const TracingTestMode = React.forwardRef(
             const response = await requestList(
               endpoints.project.getCallLogs,
               initialParams,
-              { voice: true },
+              { voice: true, parser: parseVoiceCallListResponse },
             );
             const exactRows = await collectExactListRows({
               initialResponse: response,
               initialRows: startingRows,
               targetRowCount: requestParams.page_size,
-              rowsFromResponse: (nextResponse) => {
-                const result =
-                  nextResponse?.data?.result || nextResponse?.data || {};
-                return result.results || result.data || result.calls || [];
-              },
-              metadataFromResponse: (nextResponse) =>
-                nextResponse?.data?.result || nextResponse?.data || {},
+              rowsFromResponse: (nextResponse) => nextResponse.data.results,
+              metadataFromResponse: (nextResponse) => nextResponse.data,
               nextResponse: (cursor) =>
                 requestList(
                   endpoints.project.getCallLogs,
                   listContinuationParams(requestParams, cursor),
-                  { voice: true },
+                  { voice: true, parser: parseVoiceCallListResponse },
                 ),
               rowIdentity: (row) => tracingPreviewRowIdentity(rowType, row),
               onContinuation: recordContinuation,
@@ -656,7 +663,7 @@ const TracingTestMode = React.forwardRef(
             });
             const { data } = exactRows.response;
             if (cancelled) return;
-            const result = data?.result || data || {};
+            const result = data;
             const rowsOut = exactRows.rows;
             if (exactRows.pending) {
               listContinuationRef.current = {
@@ -685,25 +692,17 @@ const TracingTestMode = React.forwardRef(
                 ? "complete"
                 : nextReadState,
             );
-            setColumns([]);
+            setColumns(result.config);
             setRows(rowsOut);
-            setTotalRows(
-              result.count ??
-                result.total_count ??
-                result.total ??
-                rowsOut.length,
-            );
-            setTotalRowsIsLowerBound(
-              result.count_is_lower_bound === true ||
-                result.total_count_is_lower_bound === true ||
-                result.total_is_lower_bound === true,
-            );
+            setTotalRows(result.count);
+            setTotalRowsIsLowerBound(result.count_is_lower_bound === true);
             setCurrentRowIndex(0);
             setListContinuationPending(false);
             return;
           }
 
           let endpoint;
+          let responseParser;
           const params = buildTracingPreviewListParams({
             selectedProjectId,
             effectiveFilters,
@@ -714,32 +713,37 @@ const TracingTestMode = React.forwardRef(
 
           if (rowType === "Span") {
             endpoint = endpoints.project.getSpansForObserveProject();
+            responseParser = parseSpanObserveListResponse;
           } else if (rowType === "Trace") {
             endpoint = endpoints.project.getTracesForObserveProject();
+            responseParser = parseTraceObserveListResponse;
           } else {
             endpoint = endpoints.project.projectSessionList();
+            responseParser = parseSessionObserveListResponse;
           }
 
-          const response = await requestList(endpoint, initialParams);
+          const response = await requestList(endpoint, initialParams, {
+            parser: responseParser,
+          });
           const exactRows = await collectExactListRows({
             initialResponse: response,
             initialRows: startingRows,
             targetRowCount: params.page_size,
-            rowsFromResponse: (nextResponse) =>
-              nextResponse?.data?.result?.table || [],
-            metadataFromResponse: (nextResponse) =>
-              nextResponse?.data?.result?.metadata || {},
+            rowsFromResponse: (nextResponse) => nextResponse.data.table,
+            metadataFromResponse: (nextResponse) => nextResponse.data.metadata,
             nextResponse: (cursor) =>
-              requestList(endpoint, listContinuationParams(params, cursor)),
+              requestList(endpoint, listContinuationParams(params, cursor), {
+                parser: responseParser,
+              }),
             rowIdentity: (row) => tracingPreviewRowIdentity(rowType, row),
             onContinuation: recordContinuation,
             isCurrent: () => !cancelled,
           });
           const { data } = exactRows.response;
           if (cancelled) return;
-          const res = data?.result || {};
+          const res = data;
 
-          const cols = res.config || [];
+          const cols = res.config;
           const tableRows = exactRows.rows;
           if (exactRows.pending) {
             listContinuationRef.current = {
@@ -911,7 +915,7 @@ const TracingTestMode = React.forwardRef(
                 endpoints.project.getVoiceCallDetail,
                 { params: { trace_id: traceId } },
               );
-              const voiceResult = data?.result || data?.data || data || {};
+              const voiceResult = parseVoiceCallDetailResponse(data);
               // Spread row-list fields first as a fallback so we never
               // lose data that was only present on the list row.
               detailData = { ...currentRow, ...voiceResult };

@@ -14,6 +14,7 @@ from tracer.serializers.cursor_pagination import (
 )
 from tracer.serializers.filters import (
     BOUNDED_PAGE_NUMBER_HELP_TEXT,
+    JsonObjectField,
     SortParamListQueryParamField,
     StrictInputSerializer,
     bounded_filter_list_query_param_field,
@@ -395,6 +396,124 @@ class TraceVoiceCallListResponseSerializer(serializers.Serializer):
     query_complete = serializers.BooleanField()
     query_status = serializers.ChoiceField(choices=("complete", "degraded"))
     query_error_code = serializers.CharField(required=False)
+
+
+class TraceVoiceCallDetailQuerySerializer(StrictInputSerializer):
+    """Strict compatibility contract for the voice-call detail identity."""
+
+    trace_id = serializers.UUIDField(
+        required=False,
+        help_text="Voice-call trace UUID. Supply this or the legacy traceId alias.",
+    )
+    traceId = serializers.UUIDField(  # noqa: N815 - public compatibility alias
+        required=False,
+        help_text="Legacy alias for trace_id; when both are supplied they must match.",
+    )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        trace_id = attrs.get("trace_id")
+        legacy_trace_id = attrs.get("traceId")
+        if trace_id is None and legacy_trace_id is None:
+            raise serializers.ValidationError(
+                {"trace_id": "Supply trace_id or the legacy traceId alias."}
+            )
+        if (
+            trace_id is not None
+            and legacy_trace_id is not None
+            and trace_id != legacy_trace_id
+        ):
+            raise serializers.ValidationError(
+                {"traceId": "traceId must match trace_id when both are supplied."}
+            )
+        attrs["trace_id"] = trace_id or legacy_trace_id
+        attrs.pop("traceId", None)
+        return attrs
+
+
+class TraceVoiceCallDetailResultSerializer(serializers.Serializer):
+    """Stable voice-call detail shape shared by every provider adapter.
+
+    Provider payloads are normalized by ``ObservabilityService`` before this
+    response is built.  Keep the normalized fields explicit here: documenting
+    the whole result as an arbitrary JSON object made generated clients unable
+    to distinguish a valid detail response from any other object.
+    """
+
+    id = serializers.CharField()
+    trace_id = serializers.CharField()
+    project_id = serializers.CharField()
+    provider_call_id = serializers.CharField(allow_null=True)
+
+    phone_number = serializers.CharField(required=False, allow_null=True)
+    customer_name = serializers.CharField(required=False, allow_null=True)
+    call_id = serializers.CharField(required=False, allow_null=True)
+    status = serializers.CharField(required=False, allow_null=True)
+    started_at = serializers.CharField(required=False, allow_null=True)
+    ended_at = serializers.CharField(required=False, allow_null=True)
+    created_at = serializers.CharField(required=False, allow_null=True)
+    duration_seconds = serializers.IntegerField(required=False, allow_null=True)
+    recording_url = serializers.CharField(required=False, allow_null=True)
+    stereo_recording_url = serializers.CharField(required=False, allow_null=True)
+    cost_cents = serializers.FloatField(required=False, allow_null=True)
+    cost_breakdown = JsonObjectField(required=False, allow_null=True)
+    error_message = serializers.CharField(required=False, allow_null=True)
+    call_summary = serializers.CharField(required=False, allow_null=True)
+    ended_reason = serializers.CharField(required=False, allow_null=True)
+    overall_score = serializers.FloatField(required=False, allow_null=True)
+    response_time_ms = serializers.FloatField(required=False, allow_null=True)
+    response_time_seconds = serializers.FloatField(required=False, allow_null=True)
+    assistant_id = serializers.CharField(required=False, allow_null=True)
+    assistant_phone_number = serializers.CharField(required=False, allow_null=True)
+    call_type = serializers.CharField(required=False, allow_null=True)
+    message_count = serializers.IntegerField(required=False, allow_null=True)
+    transcript_available = serializers.BooleanField(required=False, allow_null=True)
+
+    transcript = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True)),
+        required=False,
+        allow_null=True,
+    )
+    messages = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True)),
+        required=False,
+        allow_null=True,
+    )
+    analysis_data = JsonObjectField(required=False, allow_null=True)
+    evaluation_data = JsonObjectField(required=False, allow_null=True)
+
+    recording = JsonObjectField()
+    recording_available = serializers.BooleanField()
+    call_metadata = JsonObjectField()
+    observation_span = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True))
+    )
+    eval_outputs = JsonObjectField()
+
+    call_execution_id = serializers.CharField(required=False, allow_null=True)
+    test_execution_id = serializers.CharField(required=False, allow_null=True)
+    scenario_id = serializers.CharField(required=False, allow_null=True)
+    scenario_name = serializers.CharField(required=False, allow_null=True)
+    scenario_graph_id = serializers.CharField(required=False, allow_null=True)
+    scenario_graph = JsonObjectField(required=False)
+
+    turn_count = serializers.IntegerField(allow_null=True)
+    talk_ratio = serializers.FloatField(allow_null=True)
+    agent_talk_percentage = serializers.FloatField(allow_null=True)
+    bot_talk_pct = serializers.IntegerField(allow_null=True)
+    user_talk_pct = serializers.IntegerField(allow_null=True)
+    avg_agent_latency_ms = serializers.IntegerField(allow_null=True)
+    user_wpm = serializers.IntegerField(allow_null=True)
+    bot_wpm = serializers.IntegerField(allow_null=True)
+    user_interruption_count = serializers.IntegerField(allow_null=True)
+    ai_interruption_count = serializers.IntegerField(allow_null=True)
+
+
+class TraceVoiceCallDetailResponseSerializer(serializers.Serializer):
+    """GeneralMethods envelope for one normalized voice-call detail."""
+
+    status = serializers.BooleanField()
+    result = TraceVoiceCallDetailResultSerializer()
 
 
 class TraceIndexQuerySerializer(StrictInputSerializer):

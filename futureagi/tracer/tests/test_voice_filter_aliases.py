@@ -204,6 +204,75 @@ def test_voice_normalized_aliases_rewrite_to_ch25_columns():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("column_id", ["latency", "latency_ms"])
+def test_voice_root_latency_contract_is_preserved_before_pagination(column_id):
+    """Legacy and canonical root latency keep their historical meaning."""
+
+    where, direct_params = VoiceCallFilterBuilderV2().translate(
+        [_system_filter(column_id, "number", "greater_than", 578)]
+    )
+    assert "latency_ms" in where
+    assert "attrs_number['avg_agent_latency_ms']" not in where
+    assert 578.0 in direct_params.values()
+
+    builder = _voice_builder(_system_filter(column_id, "number", "greater_than", 578))
+    seed_query, seed_params = builder.build_filter_seed_page(
+        slice_start=WINDOW_START,
+        slice_end=WINDOW_END,
+        limit=50,
+    )
+    match_query, match_params = (
+        builder.build_filter_identity_match_query_from_seed_rows(
+            [
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": "trace-a",
+                    "root_span_id": "root-a",
+                    "start_time": WINDOW_END - timedelta(minutes=1),
+                }
+            ]
+        )
+    )
+
+    for query in (seed_query, match_query):
+        assert "latency_ms" in query
+        assert "attrs_number['avg_agent_latency_ms']" not in query
+    assert 578.0 in seed_params.values()
+    assert 578.0 in match_params.values()
+
+
+@pytest.mark.unit
+def test_voice_avg_agent_latency_filter_is_applied_before_pagination():
+    """The displayed Avg Agent Latency uses its explicit metric id."""
+
+    builder = _voice_builder(
+        _system_filter("avg_agent_latency_ms", "number", "greater_than", 578)
+    )
+    seed_query, seed_params = builder.build_filter_seed_page(
+        slice_start=WINDOW_START,
+        slice_end=WINDOW_END,
+        limit=50,
+    )
+    match_query, match_params = (
+        builder.build_filter_identity_match_query_from_seed_rows(
+            [
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": "trace-a",
+                    "root_span_id": "root-a",
+                    "start_time": WINDOW_END - timedelta(minutes=1),
+                }
+            ]
+        )
+    )
+
+    for query in (seed_query, match_query):
+        assert "attrs_number['avg_agent_latency_ms']" in query
+    assert 578.0 in seed_params.values()
+    assert 578.0 in match_params.values()
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("filter_item", "sql_markers", "forbidden_marker"),
     [

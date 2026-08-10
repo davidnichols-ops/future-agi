@@ -25,8 +25,8 @@ const edgePairs = (graph) =>
 const pathPairs = (graph) =>
   graph.path_edges.map((edge) => `${edge.source}->${edge.target}`).sort();
 
-describe("buildTraceGraph inferred execution", () => {
-  it("builds a local fork and joins the next sibling from every branch", () => {
+describe("buildTraceGraph recorded hierarchy", () => {
+  it("keeps every sibling on its authoritative parent edge", () => {
     const graph = buildTraceGraph([
       entry(
         "root",
@@ -57,16 +57,11 @@ describe("buildTraceGraph inferred execution", () => {
     ]);
 
     expect(edgePairs(graph)).toEqual([
-      "agent:guard->agent:answer",
-      "agent:lookup->agent:answer",
-      "agent:root->agent:guard",
-      "agent:root->agent:lookup",
-    ]);
-    expect(pathPairs(graph)).toEqual([
       "agent:root->agent:answer",
       "agent:root->agent:guard",
       "agent:root->agent:lookup",
     ]);
+    expect(pathPairs(graph)).toEqual([]);
   });
 
   it("does not connect unrelated branches that happen at adjacent times", () => {
@@ -105,7 +100,7 @@ describe("buildTraceGraph inferred execution", () => {
     expect(edgePairs(graph)).not.toContain("agent:branch-b->agent:branch-a");
   });
 
-  it("joins the next sibling from the prior subtree terminal", () => {
+  it("does not infer a sibling path from non-overlapping timestamps", () => {
     const graph = buildTraceGraph([
       entry(
         "root",
@@ -138,16 +133,14 @@ describe("buildTraceGraph inferred execution", () => {
     ]);
 
     expect(edgePairs(graph)).toEqual([
-      "agent:answer->agent:evaluation",
       "agent:generation->agent:answer",
+      "agent:root->agent:evaluation",
       "agent:root->agent:generation",
     ]);
-    expect(edgePairs(graph)).not.toContain(
-      "agent:generation->agent:evaluation",
-    );
+    expect(pathPairs(graph)).toEqual([]);
   });
 
-  it("fails closed to hierarchy when a sibling timestamp is malformed", () => {
+  it("uses hierarchy regardless of malformed sibling timestamps", () => {
     const graph = buildTraceGraph([
       entry("root", "root", "bad", "bad", [
         entry("a", "a", "bad", "bad"),

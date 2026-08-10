@@ -707,41 +707,84 @@ describe("AutocompleteTextValueSelector", () => {
     ).not.toBeInTheDocument();
   });
 
-  it.each(["exhausted", "limit_reached"])(
-    "stops on terminal %s metadata even when stale cursor fields claim more data",
-    async (browseStatus) => {
-      mocks.get.mockResolvedValue({
+  it("stops on exhausted metadata even when stale cursor fields claim more data", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: {
+          values: [],
+          query_complete: true,
+          query_status: "complete",
+          browse_status: "exhausted",
+          has_more: true,
+          next_cursor: "stale-terminal-cursor",
+        },
+      },
+    });
+
+    render(
+      <AutocompleteTextValueSelector
+        definition={{ propertyId: "terminal.status", type: "text" }}
+        filter={{ id: "filter-1", filter_config: { filter_value: "" } }}
+        updateFilter={vi.fn()}
+      />,
+      { wrapper: Wrapper },
+    );
+
+    fireEvent.mouseDown(screen.getByRole("combobox"));
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledOnce());
+    await waitFor(() =>
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByRole("option", { name: /load more|retry loading/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("loads the next bounded batch after a resumable limit_reached page", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
         data: {
           result: {
-            values: [],
+            values: [{ value: "recent", type: "string" }],
             query_complete: true,
             query_status: "complete",
-            browse_status: browseStatus,
+            browse_status: "limit_reached",
             has_more: true,
-            next_cursor: "stale-terminal-cursor",
+            next_cursor: "next-bounded-batch",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "older", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
           },
         },
       });
 
-      render(
-        <AutocompleteTextValueSelector
-          definition={{ propertyId: "terminal.status", type: "text" }}
-          filter={{ id: "filter-1", filter_config: { filter_value: "" } }}
-          updateFilter={vi.fn()}
-        />,
-        { wrapper: Wrapper },
-      );
+    render(
+      <AutocompleteTextValueSelector
+        definition={{ propertyId: "bounded.status", type: "text" }}
+        filter={{ id: "filter-1", filter_config: { filter_value: "" } }}
+        updateFilter={vi.fn()}
+      />,
+      { wrapper: Wrapper },
+    );
 
-      fireEvent.mouseDown(screen.getByRole("combobox"));
-      await waitFor(() => expect(mocks.get).toHaveBeenCalledOnce());
-      await waitFor(() =>
-        expect(screen.queryByRole("progressbar")).not.toBeInTheDocument(),
-      );
-      expect(
-        screen.queryByRole("option", { name: /load more|retry loading/i }),
-      ).not.toBeInTheDocument();
-    },
-  );
+    fireEvent.mouseDown(screen.getByRole("combobox"));
+    expect(await screen.findByRole("option", { name: "recent" })).toBeVisible();
+    fireEvent.click(screen.getByRole("option", { name: "Load more values" }));
+    expect(await screen.findByRole("option", { name: "older" })).toBeVisible();
+    expect(mocks.get.mock.calls[1][1].params.cursor).toBe("next-bounded-batch");
+    expect(
+      screen.queryByRole("option", { name: /load more|retry loading/i }),
+    ).not.toBeInTheDocument();
+  });
 
   it("queries all typed stores when an attribute has mixed storage types", async () => {
     mocks.get.mockResolvedValue({

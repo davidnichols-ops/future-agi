@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID
 
 import structlog
@@ -31,6 +32,7 @@ from tracer.serializers.dashboard import (
     DashboardPreviewQuerySerializer,
     DashboardQueryApiResponseSerializer,
     DashboardQuerySerializer,
+    DashboardRefreshQuerySerializer,
     DashboardSampleOptInSerializer,
     DashboardSerializer,
     DashboardWidgetSerializer,
@@ -127,6 +129,12 @@ def _materialize_dashboard_query_scope(
     """
 
     scoped = {**query_config}
+    organization = workspace.organization
+    scope_request = SimpleNamespace(
+        organization=organization,
+        workspace=workspace,
+        user=SimpleNamespace(organization=organization, workspace=workspace),
+    )
     if trace_metrics:
         try:
             requested_project_ids = [
@@ -136,7 +144,7 @@ def _materialize_dashboard_query_scope(
             raise DashboardQueryScopeError(
                 "One or more project_ids are invalid"
             ) from exc
-        project_queryset = Project.objects.filter(workspace=workspace)
+        project_queryset = project_queryset_for_request(scope_request)
         if requested_project_ids:
             project_queryset = project_queryset.filter(id__in=requested_project_ids)
         project_ids = sorted(
@@ -149,7 +157,7 @@ def _materialize_dashboard_query_scope(
         scoped["project_ids"] = project_ids
 
     if dataset_metrics:
-        from model_hub.models.develop_dataset import Dataset
+        from model_hub.utils.workspace_scope import scoped_dataset_queryset
 
         try:
             requested_dataset_ids = [
@@ -159,10 +167,7 @@ def _materialize_dashboard_query_scope(
             raise DashboardQueryScopeError(
                 "Some dataset_ids are invalid or not in this workspace"
             ) from exc
-        dataset_queryset = Dataset.objects.filter(
-            workspace=workspace,
-            deleted=False,
-        )
+        dataset_queryset = scoped_dataset_queryset(scope_request)
         if requested_dataset_ids:
             dataset_queryset = dataset_queryset.filter(id__in=requested_dataset_ids)
         dataset_ids = sorted(
@@ -791,6 +796,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
 
     @validated_request(
         request_serializer=DashboardReadQuerySerializer,
+        query_serializer=DashboardRefreshQuerySerializer,
         responses={
             200: DashboardQueryApiResponseSerializer,
             400: ApiErrorResponseSerializer,
@@ -842,10 +848,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         except DashboardQueryScopeError as exc:
             return self._gm.bad_request(str(exc))
 
-        refresh = str(request.query_params.get("refresh", "false")).lower() in {
-            "1",
-            "true",
-        }
+        refresh = request.validated_query_data["refresh"]
         cache_identity = {
             "workspace_id": str(request.workspace.id),
             "query_config": query_config,
@@ -1533,8 +1536,8 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             and all(char in "0123456789abcdef" for char in value)
                         ),
                     )
-                    if cursor_token and cursor_state.seen_rows != len(
-                        seen_state.digests
+                    if cursor_token and (
+                        cursor_state.seen_rows != seen_state.seen_count
                     ):
                         raise ListCursorError(
                             "invalid_cursor",
@@ -1552,12 +1555,15 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         segment_start=segment_start,
                         value_after=value_after,
                         seen_value_digests=seen_state.digests,
+                        seen_value_contains=seen_state.contains,
+                        seen_value_count=seen_state.seen_count,
                     )
                     next_cursor = None
                     if page_read.has_more:
-                        appended_digests = page_read.seen_value_digests[
-                            len(seen_state.digests) :
-                        ]
+                        appended_digests = (
+                            page_read.appended_value_digests
+                            or (page_read.seen_value_digests[len(seen_state.digests) :])
+                        )
                         seen_reference = persist_attribute_cursor_seen_state(
                             seen_state,
                             appended_digests,
@@ -1581,7 +1587,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 page_read.next_value_after or "",
                                 seen_reference,
                             ),
-                            seen_rows=len(page_read.seen_value_digests),
+                            seen_rows=(seen_state.seen_count + len(appended_digests)),
                         )
                     return self._gm.success_response(
                         {
@@ -2003,8 +2009,8 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 and all(char in "0123456789abcdef" for char in value)
                             ),
                         )
-                        if cursor_token and cursor_state.seen_rows != len(
-                            seen_state.digests
+                        if cursor_token and (
+                            cursor_state.seen_rows != seen_state.seen_count
                         ):
                             raise ListCursorError(
                                 "invalid_cursor",
@@ -2023,6 +2029,8 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             resume_identity=resume_identity,
                             resume_member_offset=resume_member_offset,
                             seen_value_digests=seen_state.digests,
+                            seen_value_contains=seen_state.contains,
+                            seen_value_count=seen_state.seen_count,
                             search=search,
                             attribute_type=attribute_type,
                             continue_operation=not bool(cursor_token),
@@ -2054,9 +2062,14 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         ]
                         next_cursor = None
                         if page_read.has_more:
-                            appended_digests = page_read.seen_value_digests[
-                                len(seen_state.digests) :
-                            ]
+                            appended_digests = (
+                                page_read.appended_value_digests
+                                or (
+                                    page_read.seen_value_digests[
+                                        len(seen_state.digests) :
+                                    ]
+                                )
+                            )
                             seen_reference = persist_attribute_cursor_seen_state(
                                 seen_state,
                                 appended_digests,
@@ -2083,7 +2096,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                     page_read.next_resume_member_offset,
                                     seen_reference,
                                 ),
-                                seen_rows=len(page_read.seen_value_digests),
+                                seen_rows=(
+                                    seen_state.seen_count + len(appended_digests)
+                                ),
                                 scan_slice_start=page_read.next_segment_start,
                                 scan_slice_end=(
                                     page_read.next_segment_end
@@ -2935,6 +2950,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
 
     @validated_request(
         request_serializer=DashboardSampleOptInSerializer,
+        query_serializer=DashboardRefreshQuerySerializer,
         responses={
             200: DashboardQueryApiResponseSerializer,
             400: ApiErrorResponseSerializer,
@@ -2960,10 +2976,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "allow_sampled": False,
             }
 
-            refresh = str(request.query_params.get("refresh", "false")).lower() in {
-                "1",
-                "true",
-            }
+            refresh = request.validated_query_data["refresh"]
             return self._execute_ch_query_config(
                 query_config,
                 request.workspace,
@@ -2988,6 +3001,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
 
     @validated_request(
         request_serializer=DashboardPreviewQuerySerializer,
+        query_serializer=DashboardRefreshQuerySerializer,
         responses={
             200: DashboardQueryApiResponseSerializer,
             400: ApiErrorResponseSerializer,
@@ -3008,10 +3022,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "allow_sampled": False,
             }
 
-            refresh = str(request.query_params.get("refresh", "false")).lower() in {
-                "1",
-                "true",
-            }
+            refresh = request.validated_query_data["refresh"]
             return self._execute_ch_query_config(
                 query_config,
                 request.workspace,

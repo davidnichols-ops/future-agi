@@ -1,4 +1,4 @@
-"""Direct-write CH25 Agent Graph/Path query builder."""
+"""Direct-write CH25 Agent Graph query builder."""
 
 from tracer.services.clickhouse.query_builders.agent_graph import (
     AgentGraphQueryBuilder,

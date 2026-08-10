@@ -46,7 +46,7 @@ from tracer.services.exact_aggregation_cache import (
     exact_payload_is_complete,
     exact_refresh_state,
     finish_exact_refresh,
-    normalized_snapshot_identity,
+    normalize_exact_observe_identity,
     publish_exact_snapshot,
     publish_exact_snapshot_for_refresh,
     read_exact_snapshot,
@@ -610,10 +610,11 @@ def test_observe_snapshot_survives_temporal_json_round_trip_and_poll_with_rows()
 
     task_kwargs = enqueue.call_args.kwargs["kwargs"]
     wire_identity = json.loads(json.dumps(task_kwargs["identity"]))
-    assert wire_identity == normalized_snapshot_identity(identity)
-    assert snapshot_cache_key("observe-system-graph", identity) == snapshot_cache_key(
-        "observe-system-graph", wire_identity
-    )
+    canonical_identity = normalize_exact_observe_identity(identity)
+    assert wire_identity == canonical_identity
+    assert snapshot_cache_key(
+        "observe-system-graph", canonical_identity
+    ) == snapshot_cache_key("observe-system-graph", wire_identity)
     assert first["query_status"] == "pending"
 
     points = [
@@ -650,6 +651,123 @@ def test_observe_snapshot_survives_temporal_json_round_trip_and_poll_with_rows()
     assert polled["query_sampled"] is False
     assert polled["query_cached"] is True
     assert polled["query_refreshing"] is False
+
+
+@pytest.mark.unit
+@override_settings(EXACT_AGGREGATION_TASK_QUEUE="exact_aggregation")
+def test_repeated_observe_refresh_poll_keeps_worker_identity_until_publish():
+    """Refresh polling must not outrun the worker's frozen cache identity."""
+
+    cache.clear()
+    identity = {
+        "project_id": "22222222-2222-4222-8222-222222222222",
+        "filters": [],
+        "interval": "day",
+        "metric_id": "latency",
+        "observe_type": "trace",
+    }
+    pending = {
+        "metric_name": "latency",
+        "data": [],
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+    }
+
+    def frozen_identity(end: str) -> dict:
+        return {
+            **identity,
+            "filters": [
+                {
+                    "column_id": "created_at",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "datetime",
+                        "filter_op": "between",
+                        "filter_value": ["2026-07-01T00:00:00Z", end],
+                    },
+                }
+            ],
+        }
+
+    frozen_first = frozen_identity("2026-08-01T00:00:00Z")
+    frozen_next = frozen_identity("2026-08-01T00:00:01Z")
+    points = [
+        {
+            "timestamp": "2026-07-31T00:00:00+00:00",
+            "value": 1085.25,
+            "primary_traffic": 14,
+        }
+    ]
+
+    with (
+        patch(
+            "tracer.services.exact_aggregation_cache.normalize_exact_observe_identity",
+            side_effect=[frozen_first, frozen_next, frozen_next],
+        ),
+        patch(
+            "tracer.tasks.exact_aggregation."
+            "refresh_exact_aggregation_snapshot.apply_async"
+        ) as enqueue,
+    ):
+        first = read_or_schedule_exact_snapshot(
+            "observe-system-graph",
+            identity,
+            refresh=True,
+            pending_payload=pending,
+        )
+        repeated_poll = read_or_schedule_exact_snapshot(
+            "observe-system-graph",
+            identity,
+            refresh=True,
+            pending_payload=pending,
+        )
+
+        assert first["query_status"] == "pending"
+        assert repeated_poll["query_status"] == "pending"
+        assert enqueue.call_count == 1
+        first_task_kwargs = enqueue.call_args_list[0].kwargs["kwargs"]
+        assert first_task_kwargs["identity"] == frozen_first
+
+        published = publish_exact_snapshot_for_refresh(
+            "observe-system-graph",
+            frozen_first,
+            {
+                "metric_name": "latency",
+                "data": points,
+                "query_complete": True,
+                "query_status": "complete",
+                "query_sampled": False,
+            },
+            first_task_kwargs["refresh_token"],
+        )
+        assert published is not None
+        finish_exact_refresh(
+            "observe-system-graph",
+            frozen_first,
+            first_task_kwargs["refresh_token"],
+            succeeded=True,
+        )
+
+        refreshing = read_or_schedule_exact_snapshot(
+            "observe-system-graph",
+            identity,
+            refresh=True,
+            pending_payload=pending,
+        )
+
+    assert enqueue.call_count == 2
+    second_task_kwargs = enqueue.call_args_list[1].kwargs["kwargs"]
+    assert second_task_kwargs["identity"] == frozen_next
+    assert refreshing["data"] == points
+    assert refreshing["query_status"] == "complete"
+    assert refreshing["query_refreshing"] is True
+    finish_exact_refresh(
+        "observe-system-graph",
+        frozen_next,
+        second_task_kwargs["refresh_token"],
+        succeeded=True,
+    )
 
 
 @pytest.mark.unit

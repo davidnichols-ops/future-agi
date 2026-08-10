@@ -234,6 +234,59 @@ describe("GraphSection exact graph boundary", () => {
     expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
   });
 
+  it("renders a complete empty graph as empty, not loading or a chart", async () => {
+    axios.post.mockResolvedValue({
+      data: {
+        status: true,
+        result: {
+          metric_name: "latency",
+          data: [],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    });
+
+    renderGraph();
+    fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
+
+    expect(
+      await screen.findByText("No data available for this time range"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+  });
+
+  it("treats nullable exact buckets without values as an empty graph", async () => {
+    axios.post.mockResolvedValue({
+      data: {
+        status: true,
+        result: {
+          metric_name: "latency",
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: null,
+              primary_traffic: null,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    });
+
+    renderGraph();
+    fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
+
+    expect(
+      await screen.findByText("No data available for this time range"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
+  });
+
   it("refetches a span graph with the newly selected metric configuration", async () => {
     axios.post.mockResolvedValue({
       data: {
@@ -269,7 +322,7 @@ describe("GraphSection exact graph boundary", () => {
     );
   });
 
-  it("keeps polling a server-confirmed exact refresh beyond 500 seconds", async () => {
+  it("stops a pending graph at the finite budget and resumes only after explicit refresh", async () => {
     vi.useFakeTimers();
     axios.post.mockResolvedValue({
       data: {
@@ -289,13 +342,14 @@ describe("GraphSection exact graph boundary", () => {
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
 
-    expect(axios.post.mock.calls.length).toBeGreaterThan(12);
-    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+    const boundedRequestCount = axios.post.mock.calls.length;
+    expect(boundedRequestCount).toBeLessThanOrEqual(13);
     expect(
-      screen.queryByText(
-        "We couldn't load this data. Please retry in a moment.",
-      ),
-    ).not.toBeInTheDocument();
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+
+    await act(async () => vi.advanceTimersByTimeAsync(500_000));
+    expect(axios.post).toHaveBeenCalledTimes(boundedRequestCount);
 
     axios.post.mockResolvedValueOnce({
       data: {
@@ -316,8 +370,10 @@ describe("GraphSection exact graph boundary", () => {
         },
       },
     });
-    await act(async () => vi.advanceTimersByTimeAsync(8_010));
+    act(() => window.dispatchEvent(new CustomEvent("observe-refresh")));
+    await act(async () => vi.advanceTimersByTimeAsync(10));
 
+    expect(axios.post).toHaveBeenCalledTimes(boundedRequestCount + 1);
     expect(screen.getByTestId("apex-chart")).toHaveAttribute(
       "data-primary-first-y",
       "18",

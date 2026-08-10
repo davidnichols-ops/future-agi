@@ -1113,6 +1113,7 @@ import type {
   TraceTagsUpdateApi,
   TraceToGraphRequestApi,
   TraceToGraphResponseApi,
+  TraceVoiceCallDetailResponseApi,
   TraceVoiceCallListResponseApi,
   TracerChartsFetchGraph200,
   TracerChartsFetchGraphParams,
@@ -1124,10 +1125,13 @@ import type {
   TracerDashboardList200,
   TracerDashboardListParams,
   TracerDashboardMetricsParams,
+  TracerDashboardQueryParams,
   TracerDashboardSimulationAgents200,
   TracerDashboardSimulationAgentsParams,
+  TracerDashboardWidgetsExecuteQueryParams,
   TracerDashboardWidgetsList200,
   TracerDashboardWidgetsListParams,
+  TracerDashboardWidgetsPreviewQueryParams,
   TracerDatasetList200,
   TracerDatasetListParams,
   TracerEvalTaskGetEvalDetails200,
@@ -1223,7 +1227,6 @@ import type {
   TracerTraceSessionList200,
   TracerTraceSessionListParams,
   TracerTraceSessionListSessionsParams,
-  TracerTraceVoiceCallDetail200,
   TracerTraceVoiceCallDetailParams,
   TracerUserAlertLogsList200,
   TracerUserAlertLogsListAll200,
@@ -58754,12 +58757,23 @@ export type tracerDashboardQueryResponseError = (tracerDashboardQueryResponse400
 
 export type tracerDashboardQueryResponse = (tracerDashboardQueryResponseSuccess | tracerDashboardQueryResponseError)
 
-export const getTracerDashboardQueryUrl = () => {
+export const getTracerDashboardQueryUrl = (params?: TracerDashboardQueryParams,) => {
+  const normalizedParams = new URLSearchParams();
 
+  Object.entries(params || {}).forEach(([key, value]) => {
 
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
 
+  const stringifiedParams = normalizedParams.toString();
 
-  return `/tracer/dashboard/query/`
+  return stringifiedParams.length > 0 ? `/tracer/dashboard/query/?${stringifiedParams}` : `/tracer/dashboard/query/`
 }
 
 /**
@@ -58771,9 +58785,10 @@ Each metric is validated against the canonical query contract before
 it reaches any query builder.
  * @summary Execute a widget query and return chart data.
  */
-export const tracerDashboardQuery = async (dashboardQueryApi: DashboardQueryApi, options?: RequestInit): Promise<tracerDashboardQueryResponse> => {
+export const tracerDashboardQuery = async (dashboardQueryApi: DashboardQueryApi,
+    params?: TracerDashboardQueryParams, options?: RequestInit): Promise<tracerDashboardQueryResponse> => {
 
-  return apiMutator<tracerDashboardQueryResponse>(getTracerDashboardQueryUrl(),
+  return apiMutator<tracerDashboardQueryResponse>(getTracerDashboardQueryUrl(params),
   {
     ...options,
     method: 'POST',
@@ -58968,21 +58983,34 @@ export type tracerDashboardWidgetsPreviewQueryResponseError = (tracerDashboardWi
 
 export type tracerDashboardWidgetsPreviewQueryResponse = (tracerDashboardWidgetsPreviewQueryResponseSuccess | tracerDashboardWidgetsPreviewQueryResponseError)
 
-export const getTracerDashboardWidgetsPreviewQueryUrl = (dashboardPk: string,) => {
+export const getTracerDashboardWidgetsPreviewQueryUrl = (dashboardPk: string,
+    params?: TracerDashboardWidgetsPreviewQueryParams,) => {
+  const normalizedParams = new URLSearchParams();
 
+  Object.entries(params || {}).forEach(([key, value]) => {
 
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
 
+  const stringifiedParams = normalizedParams.toString();
 
-  return `/tracer/dashboard/${dashboardPk}/widgets/preview/`
+  return stringifiedParams.length > 0 ? `/tracer/dashboard/${dashboardPk}/widgets/preview/?${stringifiedParams}` : `/tracer/dashboard/${dashboardPk}/widgets/preview/`
 }
 
 /**
  * Execute an ad-hoc query_config without saving, for live preview.
  */
 export const tracerDashboardWidgetsPreviewQuery = async (dashboardPk: string,
-    dashboardPreviewQueryApi: DashboardPreviewQueryApi, options?: RequestInit): Promise<tracerDashboardWidgetsPreviewQueryResponse> => {
+    dashboardPreviewQueryApi: DashboardPreviewQueryApi,
+    params?: TracerDashboardWidgetsPreviewQueryParams, options?: RequestInit): Promise<tracerDashboardWidgetsPreviewQueryResponse> => {
 
-  return apiMutator<tracerDashboardWidgetsPreviewQueryResponse>(getTracerDashboardWidgetsPreviewQueryUrl(dashboardPk),
+  return apiMutator<tracerDashboardWidgetsPreviewQueryResponse>(getTracerDashboardWidgetsPreviewQueryUrl(dashboardPk,params),
   {
     ...options,
     method: 'POST',
@@ -59293,12 +59321,24 @@ export type tracerDashboardWidgetsExecuteQueryResponseError = (tracerDashboardWi
 export type tracerDashboardWidgetsExecuteQueryResponse = (tracerDashboardWidgetsExecuteQueryResponseSuccess | tracerDashboardWidgetsExecuteQueryResponseError)
 
 export const getTracerDashboardWidgetsExecuteQueryUrl = (dashboardPk: string,
-    id: string,) => {
+    id: string,
+    params?: TracerDashboardWidgetsExecuteQueryParams,) => {
+  const normalizedParams = new URLSearchParams();
 
+  Object.entries(params || {}).forEach(([key, value]) => {
 
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
 
+  const stringifiedParams = normalizedParams.toString();
 
-  return `/tracer/dashboard/${dashboardPk}/widgets/${id}/query/`
+  return stringifiedParams.length > 0 ? `/tracer/dashboard/${dashboardPk}/widgets/${id}/query/?${stringifiedParams}` : `/tracer/dashboard/${dashboardPk}/widgets/${id}/query/`
 }
 
 /**
@@ -59306,9 +59346,10 @@ export const getTracerDashboardWidgetsExecuteQueryUrl = (dashboardPk: string,
  */
 export const tracerDashboardWidgetsExecuteQuery = async (dashboardPk: string,
     id: string,
-    dashboardSampleOptInApi: DashboardSampleOptInApi, options?: RequestInit): Promise<tracerDashboardWidgetsExecuteQueryResponse> => {
+    dashboardSampleOptInApi: DashboardSampleOptInApi,
+    params?: TracerDashboardWidgetsExecuteQueryParams, options?: RequestInit): Promise<tracerDashboardWidgetsExecuteQueryResponse> => {
 
-  return apiMutator<tracerDashboardWidgetsExecuteQueryResponse>(getTracerDashboardWidgetsExecuteQueryUrl(dashboardPk,id),
+  return apiMutator<tracerDashboardWidgetsExecuteQueryResponse>(getTracerDashboardWidgetsExecuteQueryUrl(dashboardPk,id,params),
   {
     ...options,
     method: 'POST',
@@ -66880,7 +66921,9 @@ export const getTracerTraceAgentGraphUrl = (params: TracerTraceAgentGraphParams,
 }
 
 /**
- * Return one cached exact Agent Graph and chronological Agent Path.
+ * ``path_edges`` remains an empty compatibility field until telemetry
+records authoritative chronological execution transitions.
+ * @summary Return one cached exact Agent Graph.
  */
 export const tracerTraceAgentGraph = async (params: TracerTraceAgentGraphParams, options?: RequestInit): Promise<tracerTraceAgentGraphResponse> => {
 
@@ -67571,19 +67614,39 @@ export const tracerTraceListVoiceCalls = async (params: TracerTraceListVoiceCall
 
 
 export type tracerTraceVoiceCallDetailResponse200 = {
-  data: TracerTraceVoiceCallDetail200
+  data: TraceVoiceCallDetailResponseApi
   status: 200
+}
+
+export type tracerTraceVoiceCallDetailResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceVoiceCallDetailResponse404 = {
+  data: ApiErrorResponseApi
+  status: 404
+}
+
+export type tracerTraceVoiceCallDetailResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceVoiceCallDetailResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
 }
 
 export type tracerTraceVoiceCallDetailResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 500 | 503>
 }
 
 export type tracerTraceVoiceCallDetailResponseSuccess = (tracerTraceVoiceCallDetailResponse200) & {
   headers: Headers;
 };
-export type tracerTraceVoiceCallDetailResponseError = (tracerTraceVoiceCallDetailResponseDefault) & {
+export type tracerTraceVoiceCallDetailResponseError = (tracerTraceVoiceCallDetailResponse400 | tracerTraceVoiceCallDetailResponse404 | tracerTraceVoiceCallDetailResponse500 | tracerTraceVoiceCallDetailResponse503 | tracerTraceVoiceCallDetailResponseDefault) & {
   headers: Headers;
 };
 
@@ -67610,7 +67673,7 @@ export const getTracerTraceVoiceCallDetailUrl = (params?: TracerTraceVoiceCallDe
 
 /**
  * Query params:
-- trace_id (required) — UUID of the voice call trace.
+- trace_id or legacy traceId (required) — UUID of the voice call trace.
  * @summary Return the heavy / detail-only fields for a single voice call.
  */
 export const tracerTraceVoiceCallDetail = async (params?: TracerTraceVoiceCallDetailParams, options?: RequestInit): Promise<tracerTraceVoiceCallDetailResponse> => {

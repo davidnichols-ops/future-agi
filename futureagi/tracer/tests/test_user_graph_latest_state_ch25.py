@@ -411,11 +411,12 @@ def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client)
                 row("root", "", "agent", 100, 0, 1, 0),
                 row("root", "", "agent", 10, 0, 2, 0),
                 # Two overlapping direct siblings start at the same instant
-                # and are both recorded children of root. Neither Agent Graph
-                # nor Agent Path may invent a sibling-to-sibling transition.
+                # and are both recorded children of root. Agent Graph may not
+                # invent a sibling-to-sibling transition; hierarchy alone is
+                # insufficient to publish an Agent Path.
                 row("lookup", "root", "lookup", 20, 0, 1, 1, 4, "tool"),
                 row("search", "root", "search", 25, 0, 1, 1, 2, "retriever"),
-                # A later sibling remains a direct child in both projections.
+                # A later sibling remains a direct child in the hierarchy.
                 row("answer", "root", "answer", 30, 0, 1, 6, 1, "llm"),
                 # The newest physical version is a tombstone and contributes
                 # neither a node nor a transition.
@@ -472,12 +473,7 @@ def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client)
             ("agent:agent", "retriever:search"),
             ("agent:agent", "llm:answer"),
         }
-        assert {(edge["source"], edge["target"]) for edge in payload["path_edges"]} == {
-            ("agent:agent", "tool:lookup"),
-            ("agent:agent", "retriever:search"),
-            ("agent:agent", "llm:answer"),
-        }
-        assert payload["path_edges"] == payload["edges"]
+        assert payload["path_edges"] == []
 
         remote_builder = AgentGraphQueryBuilderV2(
             project_id=project_id,

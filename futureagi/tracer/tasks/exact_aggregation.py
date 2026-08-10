@@ -184,15 +184,28 @@ def _eval_usage_payload(identity: dict[str, Any]) -> Any:
 def _attribute_detail_payload(identity: dict[str, Any]) -> Any:
     """Re-authorize then compute one exact span-attribute snapshot."""
 
-    from tracer.models.project import Project
+    from accounts.models import Workspace
     from tracer.services.clickhouse.exact_attribute_detail import (
         read_exact_attribute_detail,
     )
+    from tracer.utils.workspace_scope import project_queryset_for_request
 
-    if not Project.objects.filter(
-        id=identity["project_id"],
-        workspace_id=identity["workspace_id"],
-    ).exists():
+    workspace = Workspace.objects.select_related("organization").get(
+        id=identity["workspace_id"],
+        organization_id=identity["organization_id"],
+        is_active=True,
+    )
+    organization = workspace.organization
+    scope_request = SimpleNamespace(
+        organization=organization,
+        workspace=workspace,
+        user=SimpleNamespace(organization=organization, workspace=workspace),
+    )
+    if (
+        not project_queryset_for_request(scope_request)
+        .filter(id=identity["project_id"])
+        .exists()
+    ):
         raise ValueError("attribute detail project scope is unavailable")
     return read_exact_attribute_detail(
         project_id=str(identity["project_id"]),

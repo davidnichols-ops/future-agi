@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   AGGREGATION_POLL_MAX_ATTEMPTS,
+  AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES,
   AGGREGATION_POLL_TIMEOUT_MS,
   awaitAggregationRequestWithDeadline,
+  createAggregationPollController,
   failServerSideGridRead,
   getAttributeLookupMessage,
   getAggregationPollDelay,
@@ -82,13 +84,11 @@ describe("queryReadState", () => {
 
   it("recognizes a queued exact aggregation as pending but non-chartable", () => {
     const payload = {
-      result: {
-        data: [],
-        query_complete: false,
-        query_status: "pending",
-        query_sampled: false,
-        query_refreshing: true,
-      },
+      data: [],
+      query_complete: false,
+      query_status: "pending",
+      query_sampled: false,
+      query_refreshing: true,
     };
 
     expect(getQueryReadState(payload)).toBe("degraded");
@@ -102,17 +102,15 @@ describe("queryReadState", () => {
 
   it("keeps a cached exact snapshot chartable while its replacement is queued", () => {
     const payload = {
-      result: {
-        data: [{ timestamp: "2026-08-03T00:00:00Z", value: 2 }],
-        query_complete: true,
-        query_status: "complete",
-        query_sampled: false,
-        query_refreshing: true,
-      },
+      data: [{ timestamp: "2026-08-03T00:00:00Z", value: 2 }],
+      query_complete: true,
+      query_status: "complete",
+      query_sampled: false,
+      query_refreshing: true,
     };
 
     expect(getExactAggregationReadState(payload)).toBe("complete");
-    expect(getExactGraphData(payload)).toEqual(payload.result.data);
+    expect(getExactGraphData(payload)).toEqual(payload.data);
     expect(getAggregationRefreshState(payload).isRefreshing).toBe(true);
   });
 
@@ -178,6 +176,41 @@ describe("queryReadState", () => {
         now: 1000 + AGGREGATION_POLL_TIMEOUT_MS,
       }),
     ).toBe(true);
+  });
+
+  it("uses one finite polling lifecycle until an explicit reset", () => {
+    let now = 1_000;
+    const controller = createAggregationPollController({ now: () => now });
+
+    expect(controller.start()).toBe(true);
+    for (let index = 0; index < AGGREGATION_POLL_MAX_ATTEMPTS; index += 1) {
+      expect(controller.nextDelay()).not.toBe(false);
+      expect(controller.recordAttempt()).toBe(true);
+    }
+    expect(controller.nextDelay()).toBe(false);
+    expect(controller.isExhausted()).toBe(true);
+    expect(controller.start()).toBe(false);
+
+    controller.reset();
+    expect(controller.start()).toBe(true);
+    now += AGGREGATION_POLL_TIMEOUT_MS;
+    expect(controller.nextDelay()).toBe(false);
+  });
+
+  it("terminates a polling lifecycle after bounded consecutive failures", () => {
+    const controller = createAggregationPollController();
+    controller.start();
+
+    for (
+      let index = 1;
+      index < AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES;
+      index += 1
+    ) {
+      expect(controller.recordFailure()).toBe(true);
+    }
+    expect(controller.recordFailure()).toBe(false);
+    expect(controller.isActive()).toBe(false);
+    expect(controller.isExhausted()).toBe(true);
   });
 
   it("aborts the underlying aggregation request at its transport deadline and ignores late completion", async () => {

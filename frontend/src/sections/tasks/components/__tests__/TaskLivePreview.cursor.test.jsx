@@ -62,6 +62,23 @@ PreviewHarness.propTypes = {
   projectId: PropTypes.string,
 };
 
+const voiceListPage = ({ results = [], hasMore, nextCursor }) => ({
+  data: {
+    count: results.length,
+    count_is_lower_bound: hasMore,
+    total_pages: 1,
+    current_page: 1,
+    next: null,
+    previous: null,
+    results,
+    config: [],
+    has_more: hasMore,
+    next_cursor: nextCursor,
+    query_complete: true,
+    query_status: "complete",
+  },
+});
+
 describe("TaskLivePreview sparse cursor continuation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -76,10 +93,12 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         if (callIndex < 12) {
           return {
             data: {
+              status: true,
               result: {
                 config: [],
                 table: [],
                 metadata: {
+                  total_rows: 0,
                   has_more: true,
                   next_cursor: `checkpoint-${callIndex}`,
                   total_rows_is_lower_bound: true,
@@ -90,6 +109,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         }
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -111,6 +131,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/traces/trace-rare/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-rare" },
               observation_spans: [
@@ -162,26 +183,16 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         const callIndex = listCalls;
         listCalls += 1;
         if (callIndex < 24) {
-          return {
-            data: {
-              result: {
-                results: [],
-                has_more: true,
-                next_cursor: `voice-checkpoint-${callIndex}`,
-              },
-            },
-          };
+          return voiceListPage({
+            hasMore: true,
+            nextCursor: `voice-checkpoint-${callIndex}`,
+          });
         }
-        return {
-          data: {
-            result: {
-              results: [{ id: "call-rare", trace_id: "trace-voice-rare" }],
-              has_more: false,
-              next_cursor: null,
-              count: 1,
-            },
-          },
-        };
+        return voiceListPage({
+          results: [{ id: "call-rare", trace_id: "trace-voice-rare" }],
+          hasMore: false,
+          nextCursor: null,
+        });
       }
       if (url === "/calls/detail/") {
         return { data: { result: { status: "completed" } } };
@@ -227,10 +238,12 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         if (callIndex < 24) {
           return {
             data: {
+              status: true,
               result: {
                 config: [],
                 table: [],
                 metadata: {
+                  total_rows: 0,
                   has_more: true,
                   next_cursor: `checkpoint-${callIndex}`,
                   total_rows_is_lower_bound: true,
@@ -241,6 +254,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         }
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -258,6 +272,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/traces/trace-beyond-budget/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-beyond-budget" },
               observation_spans: [
@@ -317,10 +332,12 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (callIndex < 13) {
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [],
               metadata: {
+                total_rows: 0,
                 has_more: true,
                 next_cursor: `terminal-checkpoint-${callIndex}`,
               },
@@ -330,6 +347,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       }
       return {
         data: {
+          status: true,
           result: {
             config: [],
             table: [],
@@ -371,6 +389,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         if (callIndex < 13) {
           return {
             data: {
+              status: true,
               result: {
                 config: [],
                 table:
@@ -384,6 +403,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
                       ]
                     : [],
                 metadata: {
+                  total_rows: 0,
                   has_more: true,
                   next_cursor: `retry-checkpoint-${callIndex}`,
                 },
@@ -396,6 +416,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         }
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -413,6 +434,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/traces/trace-after-retry/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-after-retry" },
               observation_spans: [
@@ -431,6 +453,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/traces/trace-retained/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-retained" },
               observation_spans: [
@@ -504,6 +527,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         }
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -521,6 +545,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/traces/trace-after-cold-retry/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-after-cold-retry" },
               observation_spans: [
@@ -583,6 +608,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         expect(config.params).not.toHaveProperty("cursor_mode");
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -600,6 +626,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/traces/trace-legacy/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-legacy" },
               observation_spans: [
@@ -641,10 +668,12 @@ describe("TaskLivePreview sparse cursor continuation", () => {
   it("fails closed without looping when the API repeats a signed cursor", async () => {
     mocks.get.mockResolvedValue({
       data: {
+        status: true,
         result: {
           config: [],
           table: [],
           metadata: {
+            total_rows: 0,
             has_more: true,
             next_cursor: "repeated-cursor",
             total_rows_is_lower_bound: true,
@@ -678,10 +707,12 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       spanListCalls += 1;
       return {
         data: {
+          status: true,
           result: {
             config: [],
             table: [],
             metadata: {
+              total_rows: 0,
               has_more: true,
               next_cursor: callIndex === 25 ? "cycle-0" : `cycle-${callIndex}`,
               total_rows_is_lower_bound: true,
@@ -727,6 +758,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/spans/" && options.params?.project_id === "project-new") {
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -744,6 +776,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/traces/trace-new/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-new" },
               observation_spans: [
@@ -782,6 +815,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
     await act(async () => {
       resolveOldResponse({
         data: {
+          status: true,
           result: {
             config: [],
             table: [
@@ -816,10 +850,12 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         if (callIndex < 13) {
           return {
             data: {
+              status: true,
               result: {
                 config: [],
                 table: [],
                 metadata: {
+                  total_rows: 0,
                   has_more: true,
                   next_cursor: `old-checkpoint-${callIndex}`,
                   total_rows_is_lower_bound: true,
@@ -834,6 +870,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/spans/" && options.params?.project_id === "project-new") {
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -851,6 +888,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/traces/trace-new-scope/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-new-scope" },
               observation_spans: [
@@ -900,6 +938,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
     await act(async () => {
       resolveOldResume({
         data: {
+          status: true,
           result: {
             config: [],
             table: [
@@ -930,10 +969,12 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         if (callIndex < 13) {
           return {
             data: {
+              status: true,
               result: {
                 config: [],
                 table: [],
                 metadata: {
+                  total_rows: 0,
                   has_more: true,
                   next_cursor: `old-scope-checkpoint-${callIndex}`,
                 },
@@ -943,6 +984,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
         }
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -960,6 +1002,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/spans/" && projectId === "project-new") {
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -977,6 +1020,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/traces/trace-new/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-new" },
               observation_spans: [
@@ -995,6 +1039,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/traces/trace-old-fresh/") {
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-old-fresh" },
               observation_spans: [
@@ -1052,6 +1097,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/spans/") {
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [
@@ -1072,6 +1118,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
           detailCalls === 1 ? "old project detail" : "new project detail";
         return {
           data: {
+            status: true,
             result: {
               trace: { trace_id: "trace-shared" },
               observation_spans: [
@@ -1115,6 +1162,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       if (url === "/spans/") {
         return {
           data: {
+            status: true,
             result: {
               config: [],
               table: [

@@ -143,6 +143,7 @@ import axios, { endpoints } from "src/utils/axios";
 import { PROJECT_SOURCE } from "src/utils/constants";
 import { useLLMTracingFilters } from "./useLLMTracingFilters";
 import { isTraceListProjectReady } from "./projectSourceMode";
+import { canonicalObserveViewMode } from "./viewMode";
 import {
   generateObserveTraceFilterDefinition,
   generateSpanObserveFilterDefinition,
@@ -220,7 +221,6 @@ import CustomDateRangePicker from "src/components/custom-datepicker/DatePicker";
 // Lazy load graph components — only loaded when viewMode changes
 const PrimaryGraph = lazy(() => import("./GraphSection/PrimaryGraph"));
 const AgentGraph = lazy(() => import("./GraphSection/AgentGraph"));
-const AgentPath = lazy(() => import("./GraphSection/AgentPath"));
 
 // Lazy load conditionally rendered components (modals, drawers)
 const CallLogsGrid = lazy(
@@ -901,16 +901,12 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
     useCreateReplaySessions();
 
   useEffect(() => {
-    // Ensure graph mode defaults to "graph" on mount (not stale agentGraph from URL)
-    if (viewMode !== "graph") {
-      setViewMode("graph");
-    }
     return () => {
       resetStates();
       resetSpanGridStore();
       resetTraceGridStore();
     };
-  }, [resetStates]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [resetStates]);
 
   // // Initialize graph height
   // useEffect(() => {
@@ -1040,10 +1036,18 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
     allowOrgScope: isUserMode,
   });
 
-  const effectiveViewMode =
-    projectSource === PROJECT_SOURCE.SIMULATOR && viewMode !== "graph"
-      ? "graph"
-      : viewMode;
+  const effectiveViewMode = canonicalObserveViewMode({
+    viewMode,
+    isSimulator: projectSource === PROJECT_SOURCE.SIMULATOR,
+  });
+
+  // Canonicalize the Zustand/URL state as well as the first rendered frame so
+  // reloads and saved-view hydration cannot keep restoring removed modes.
+  useEffect(() => {
+    if (projectSource && effectiveViewMode !== viewMode) {
+      setViewMode(effectiveViewMode);
+    }
+  }, [effectiveViewMode, projectSource, setViewMode, viewMode]);
 
   const defaultDateFilter = useMemo(
     () => getDefaultDateRangeForMode(isUserMode, "7D"),
@@ -1249,7 +1253,8 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
     [userScopeFilter, compareSpansValidatedFiltersRaw],
   );
 
-  // Agent graph data — fetched when viewMode is agentGraph or agentPath.
+  // Agent Graph is the only topology view. Legacy Agent Path URLs are mapped
+  // to Agent Graph above because hierarchy does not prove execution order.
   // Disabled entirely in user mode (no project context to scope to).
   const {
     data: agentGraphData,
@@ -1261,10 +1266,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       ? primaryTraceValidatedFilters
       : primarySpanValidatedFilters,
     {
-      enabled:
-        !isUserMode &&
-        (effectiveViewMode === "agentGraph" ||
-          effectiveViewMode === "agentPath"),
+      enabled: !isUserMode && effectiveViewMode === "agentGraph",
     },
   );
 
@@ -1279,11 +1281,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       ? compareTraceValidatedFilters
       : compareSpansValidatedFilters,
     {
-      enabled:
-        !isUserMode &&
-        showCompare &&
-        (effectiveViewMode === "agentGraph" ||
-          effectiveViewMode === "agentPath"),
+      enabled: !isUserMode && showCompare && effectiveViewMode === "agentGraph",
     },
   );
 
@@ -3555,86 +3553,6 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                       onNodeClick={handleAgentNodeClick}
                     />
                   </Box>
-                </Box>
-              )}
-            </>
-          )}
-
-          {/* Agent Path — sequential flow */}
-          {effectiveViewMode === "agentPath" && (
-            <>
-              <Box>
-                {showCompare && (
-                  <Box sx={{ mx: 2, mt: 1 }}>
-                    <CompareGraphHeader
-                      compareType="primary"
-                      dateFilter={
-                        selectedTab === "trace"
-                          ? primaryTraceDateFilter
-                          : primarySpanDateFilter
-                      }
-                      setDateFilter={
-                        selectedTab === "trace"
-                          ? setPrimaryTraceDateFilter
-                          : setPrimarySpanDateFilter
-                      }
-                      onFilterToggle={(e) =>
-                        handleCompareFilterToggle(e, "primary")
-                      }
-                      hasActiveFilter={extraFilters?.length > 0}
-                      extraFilters={extraFilters}
-                      fieldLabelMap={filterChipLabelMap}
-                      onRemoveFilter={(idx) =>
-                        setExtraFilters((prev) =>
-                          prev.filter((_, i) => i !== idx),
-                        )
-                      }
-                      onClearFilters={() => setExtraFilters([])}
-                    />
-                  </Box>
-                )}
-                <AgentPath
-                  data={agentGraphData}
-                  isLoading={isAgentGraphLoading}
-                  isError={isAgentGraphError}
-                  onNodeClick={handleAgentNodeClick}
-                />
-              </Box>
-              {showCompare && (
-                <Box>
-                  <Box sx={{ mx: 2, mt: 1 }}>
-                    <CompareGraphHeader
-                      compareType="compare"
-                      dateFilter={
-                        selectedTab === "trace"
-                          ? compareTraceDateFilter
-                          : compareSpansDateFilter
-                      }
-                      setDateFilter={
-                        selectedTab === "trace"
-                          ? setCompareTraceDateFilter
-                          : setCompareSpansDateFilter
-                      }
-                      onFilterToggle={(e) =>
-                        handleCompareFilterToggle(e, "compare")
-                      }
-                      hasActiveFilter={compareExtraFilters?.length > 0}
-                      extraFilters={compareExtraFilters}
-                      fieldLabelMap={filterChipLabelMap}
-                      onRemoveFilter={(idx) =>
-                        setCompareExtraFilters((prev) =>
-                          prev.filter((_, i) => i !== idx),
-                        )
-                      }
-                      onClearFilters={() => setCompareExtraFilters([])}
-                    />
-                  </Box>
-                  <AgentPath
-                    data={compareAgentGraphData}
-                    isLoading={isCompareAgentGraphLoading}
-                    isError={isCompareAgentGraphError}
-                    onNodeClick={handleAgentNodeClick}
-                  />
                 </Box>
               )}
             </>

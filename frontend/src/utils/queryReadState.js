@@ -414,6 +414,123 @@ export function isAggregationPollBudgetExhausted({
   );
 }
 
+/**
+ * Own the finite browser-side lifecycle of one exact-aggregation job.
+ *
+ * Every aggregation surface used to keep its own attempt refs and, in
+ * practice, most of them forgot to apply the elapsed/attempt budget.  This
+ * controller keeps those rules in one place.  It is intentionally framework
+ * agnostic so React Query hooks, mutation-driven dashboard widgets, and unit
+ * tests all use identical semantics.
+ */
+export function createAggregationPollController({
+  now = () => Date.now(),
+} = {}) {
+  let attempt = 0;
+  let startedAt = null;
+  let consecutiveFailures = 0;
+  let active = false;
+  let exhausted = false;
+
+  const reset = () => {
+    attempt = 0;
+    startedAt = null;
+    consecutiveFailures = 0;
+    active = false;
+    exhausted = false;
+  };
+
+  const start = () => {
+    // Exhaustion is terminal for this observation window.  Only an explicit
+    // reset (the user-facing Refresh/Retry action) may start a fresh budget.
+    if (exhausted) return false;
+    if (!active) {
+      attempt = 0;
+      startedAt = now();
+      consecutiveFailures = 0;
+    }
+    active = true;
+    return true;
+  };
+
+  const stop = () => {
+    attempt = 0;
+    startedAt = null;
+    consecutiveFailures = 0;
+    active = false;
+  };
+
+  const exhaust = () => {
+    active = false;
+    exhausted = true;
+    return false;
+  };
+
+  const nextDelay = () => {
+    if (!active) return false;
+    const currentTime = now();
+    if (
+      isAggregationPollBudgetExhausted({
+        attempt,
+        startedAt,
+        now: currentTime,
+      })
+    ) {
+      return exhaust();
+    }
+
+    const delay = getAggregationPollDelay(attempt);
+    // Do not schedule a request whose timer itself crosses the elapsed-time
+    // ceiling.  The server-owned job remains intact and an explicit refresh
+    // can start a fresh bounded observation window.
+    if (currentTime + delay - startedAt >= AGGREGATION_POLL_TIMEOUT_MS) {
+      return exhaust();
+    }
+    return delay;
+  };
+
+  // React Query may evaluate `refetchInterval` multiple times while settling
+  // one response. Count the actual poll request, not interval calculations.
+  const recordAttempt = () => {
+    if (!active || exhausted) return false;
+    attempt += 1;
+    return true;
+  };
+
+  const recordSuccess = () => {
+    consecutiveFailures = 0;
+  };
+
+  const recordFailure = () => {
+    if (!active) return false;
+    consecutiveFailures += 1;
+    if (consecutiveFailures >= AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES) {
+      return exhaust();
+    }
+    return true;
+  };
+
+  return {
+    reset,
+    start,
+    stop,
+    terminate: exhaust,
+    nextDelay,
+    recordAttempt,
+    recordSuccess,
+    recordFailure,
+    isActive: () => active,
+    isExhausted: () => exhausted,
+    snapshot: () => ({
+      attempt,
+      startedAt,
+      consecutiveFailures,
+      active,
+      exhausted,
+    }),
+  };
+}
+
 export function getQueryReadMessage(state) {
   if (state === "sampled") return QUERY_READ_SAMPLED_MESSAGE;
   if (state === "degraded") return QUERY_READ_RETRY_MESSAGE;
@@ -486,7 +603,7 @@ export function getAttributeLookupMessage(state) {
 export function getExactGraphData(payload) {
   if (getExactAggregationReadState(payload) !== "complete") return [];
 
-  const data = payload?.data ?? payload?.result?.data;
+  const data = payload?.data;
   return Array.isArray(data) ? data : [];
 }
 

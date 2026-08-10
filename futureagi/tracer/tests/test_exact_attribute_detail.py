@@ -8,6 +8,9 @@ from uuid import uuid4
 
 import pytest
 
+from accounts.models.workspace import Workspace
+from model_hub.models.ai_model import AIModel
+from tracer.models.project import Project
 from tracer.serializers.dashboard import DashboardFilterValuesQuerySerializer
 from tracer.serializers.span_attributes import SpanAttributeDetailResponseSerializer
 from tracer.services.clickhouse.attribute_reads import AttributeQueryPage
@@ -448,6 +451,80 @@ def test_attribute_detail_exact_worker_namespace_dispatches(monkeypatch):
         exact_aggregation._load_exact_payload("attribute-detail", identity) == expected
     )
     assert captured == [identity]
+
+
+@pytest.mark.django_db
+def test_attribute_detail_worker_uses_canonical_default_workspace_scope(
+    monkeypatch, organization, workspace, user
+):
+    from tracer.tasks import exact_aggregation
+
+    legacy_project = Project.no_workspace_objects.create(
+        name="Legacy null attribute project",
+        organization=organization,
+        workspace=None,
+        model_type=AIModel.ModelTypes.GENERATIVE_LLM,
+        trace_type="observe",
+        metadata={},
+    )
+    expected = {"query_complete": True, "query_status": "complete"}
+
+    def read(**_kwargs):
+        return expected
+
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.exact_attribute_detail.read_exact_attribute_detail",
+        read,
+    )
+
+    payload = exact_aggregation._attribute_detail_payload(
+        {
+            "organization_id": str(organization.id),
+            "workspace_id": str(workspace.id),
+            "project_id": str(legacy_project.id),
+            "attribute_key": "final_status",
+            "horizon_days": 365,
+        }
+    )
+
+    assert payload is expected
+
+
+@pytest.mark.django_db
+def test_attribute_detail_worker_rejects_non_default_workspace_project(
+    monkeypatch, organization, workspace, user
+):
+    from tracer.tasks import exact_aggregation
+
+    other_workspace = Workspace.objects.create(
+        name="Other attribute workspace",
+        organization=organization,
+        is_active=True,
+        created_by=user,
+    )
+    other_project = Project.no_workspace_objects.create(
+        name="Other workspace attribute project",
+        organization=organization,
+        workspace=other_workspace,
+        model_type=AIModel.ModelTypes.GENERATIVE_LLM,
+        trace_type="observe",
+        metadata={},
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.exact_attribute_detail.read_exact_attribute_detail",
+        lambda **_kwargs: pytest.fail("unauthorized project reached ClickHouse"),
+    )
+
+    with pytest.raises(ValueError, match="project scope is unavailable"):
+        exact_aggregation._attribute_detail_payload(
+            {
+                "organization_id": str(organization.id),
+                "workspace_id": str(workspace.id),
+                "project_id": str(other_project.id),
+                "attribute_key": "final_status",
+                "horizon_days": 365,
+            }
+        )
 
 
 def test_attribute_contracts_accept_all_types_and_pending_exact_response():

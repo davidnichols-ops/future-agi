@@ -147,6 +147,28 @@ def _load_usage_temporal_registry(name: str) -> Callable[[], list] | None:
     return None
 
 
+def _register_usage_temporal_workflows() -> None:
+    """Register optional usage workflows without masking packaging failures."""
+    get_workflows = _load_usage_temporal_registry("get_workflows")
+    if get_workflows is not None:
+        register_for_queues(
+            queues=["default"],
+            workflows=get_workflows(),
+        )
+
+
+def _register_usage_temporal_activities(log) -> None:
+    """Register optional usage activities without masking packaging failures."""
+    get_activities = _load_usage_temporal_registry("get_activities")
+    if get_activities is not None:
+        activities = get_activities()
+        register_for_queues(
+            queues=["default"],
+            activities=activities,
+        )
+        log.info("registered_usage_metering_activities", count=len(activities))
+
+
 def _ensure_workflows_registered() -> None:
     """
     Load workflows only. Does NOT import Django.
@@ -377,18 +399,7 @@ def _ensure_workflows_registered() -> None:
 
     # Register billing/usage workflows for default queue
     # UsageConsumerWorkflow (long-running singleton) + MonthlyResetWorkflow
-    try:
-        get_billing_workflows = _load_usage_temporal_registry("get_workflows")
-
-        if get_billing_workflows is not None:
-            register_for_queues(
-                queues=["default"],
-                workflows=get_billing_workflows(),
-            )
-    except ImportError as e:
-        from tfc.logging.temporal import get_logger
-
-        get_logger(__name__).warning("could_not_load_billing_workflows", error=str(e))
+    _register_usage_temporal_workflows()
 
     try:
         from tfc.temporal.billing.workflows import MonthlyClosingWorkflow
@@ -807,20 +818,7 @@ def _ensure_activities_registered() -> None:
         log.warning("could_not_load_billing_activities", error=str(e))
 
     # Register usage metering activities (consumer, sync, monthly reset)
-    try:
-        get_usage_activities = _load_usage_temporal_registry("get_activities")
-
-        if get_usage_activities is not None:
-            usage_activities = get_usage_activities()
-            register_for_queues(
-                queues=["default"],
-                activities=usage_activities,
-            )
-            log.info(
-                "registered_usage_metering_activities", count=len(usage_activities)
-            )
-    except ImportError as e:
-        log.warning("could_not_load_usage_metering_activities", error=str(e))
+    _register_usage_temporal_activities(log)
 
     _activities_registered = True
 

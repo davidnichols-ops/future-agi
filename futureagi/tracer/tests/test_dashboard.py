@@ -10,6 +10,7 @@ Covers:
 - Query execution (mocked ClickHouse)
 """
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -24,6 +25,7 @@ from django.core import signing
 
 from accounts.models.workspace import Workspace
 from model_hub.models.ai_model import AIModel
+from model_hub.models.develop_dataset import Dataset
 from tracer.models.dashboard import Dashboard, DashboardWidget
 from tracer.models.project import Project
 from tracer.serializers.dashboard import (
@@ -35,6 +37,9 @@ from tracer.serializers.dashboard import (
 )
 from tracer.services.clickhouse.attribute_cursor_state import (
     ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
+    AttributeCursorSeenState,
+    load_attribute_cursor_seen_state,
+    persist_attribute_cursor_seen_state,
 )
 from tracer.services.clickhouse.attribute_reads import (
     AttributeReadMetadata,
@@ -43,7 +48,12 @@ from tracer.services.clickhouse.attribute_reads import (
     AttributeValueRow,
     attribute_value_cursor_digest,
 )
-from tracer.services.clickhouse.list_cursor import CURSOR_SALT
+from tracer.services.clickhouse.filter_value_reads import _value_digest
+from tracer.services.clickhouse.list_cursor import (
+    CURSOR_SALT,
+    decode_list_cursor,
+    encode_list_cursor,
+)
 from tracer.services.clickhouse.query_builders.dashboard import (
     AGGREGATIONS,
     FILTER_OPERATORS,
@@ -2430,6 +2440,109 @@ class TestMetricsEndpoint:
             minutes=5
         )
         assert "LIMIT %(result_limit)s" in call.args[0]
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
+    def test_filter_values_system_metric_roundtrips_radix_state_past_4096(
+        self,
+        mock_analytics_cls,
+        auth_client,
+        observe_project,
+    ):
+        scope = {"test_principal": "system-radix-roundtrip"}
+        page_size = 1
+        window_end = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        window_start = window_end - timedelta(minutes=5)
+        cursor_query = {
+            "metric_name": "status",
+            "metric_type": "system_metric",
+            "source": "traces",
+            "project_ids": [str(observe_project.id)],
+            "search": "",
+        }
+        state_binding = {
+            "scope": scope,
+            "query": cursor_query,
+            "page_size": page_size,
+            "window_start": window_start,
+            "window_end": window_end,
+        }
+        legacy_digests = (
+            _value_digest("completed"),
+            *(
+                hashlib.md5(  # noqa: S324 - deterministic non-security test digest
+                    f"legacy-system-{index}".encode(),
+                    usedforsecurity=False,
+                ).hexdigest()
+                for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS)
+            ),
+        )
+        seen_reference = persist_attribute_cursor_seen_state(
+            AttributeCursorSeenState((), None),
+            legacy_digests,
+            resource="dashboard_system_filter_values",
+            binding=state_binding,
+            validate_digest=lambda value: (
+                len(value) == 32
+                and all(char in "0123456789abcdef" for char in value)
+            ),
+        )
+        cursor = encode_list_cursor(
+            resource="dashboard_system_filter_values",
+            scope=scope,
+            query=cursor_query,
+            page_size=page_size,
+            window_start=window_start,
+            window_end=window_end,
+            order=(window_end, window_start, "", seen_reference),
+            seen_rows=ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 1,
+        )
+        mock_analytics_cls.return_value.execute_ch_query.return_value = MagicMock(
+            data=[{"val": "completed"}, {"val": "new-status"}]
+        )
+
+        with patch(
+            "tracer.views.dashboard.cursor_scope_for_request",
+            return_value=scope,
+        ):
+            response = auth_client.get(
+                "/tracer/dashboard/filter_values/",
+                {
+                    "metric_name": "status",
+                    "metric_type": "system_metric",
+                    "project_ids": str(observe_project.id),
+                    "source": "traces",
+                    "page_size": page_size,
+                    "cursor": cursor,
+                },
+            )
+
+        assert response.status_code == 200
+        payload = response.json()["result"]
+        assert payload["values"] == [
+            {"value": "new-status", "label": "new-status"}
+        ]
+        assert payload["has_more"] is True
+        continued = decode_list_cursor(
+            payload["next_cursor"],
+            resource="dashboard_system_filter_values",
+            scope=scope,
+            query=cursor_query,
+            page_size=page_size,
+        )
+        assert continued.seen_rows == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 2
+        continued_state = load_attribute_cursor_seen_state(
+            continued.order[3],
+            resource="dashboard_system_filter_values",
+            binding=state_binding,
+            validate_digest=lambda value: (
+                len(value) == 32
+                and all(char in "0123456789abcdef" for char in value)
+            ),
+        )
+        assert continued_state.seen_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 2
+        assert continued_state.contains(_value_digest("completed")) is True
+        assert continued_state.contains(_value_digest("new-status")) is True
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.V2AnalyticsQueryService")
@@ -6582,6 +6695,36 @@ class TestDashboardQuerySerializer:
         assert "avg(attrs_number[%(custom_metric_attr_key)s])" in sql
         assert params["custom_metric_attr_key"] == "call.total_turns"
 
+    @pytest.mark.parametrize("aggregation", ["min", "max"])
+    def test_min_max_custom_metric_infer_numeric_map_when_type_is_omitted(
+        self, aggregation
+    ):
+        data = {
+            "workflow": "observability",
+            "project_ids": ["proj-1"],
+            "time_range": {"preset": "6M"},
+            "granularity": "month",
+            "metrics": [
+                {
+                    "name": "call.total_turns",
+                    "type": "custom_attribute",
+                    "aggregation": aggregation,
+                    "attribute_key": "call.total_turns",
+                }
+            ],
+        }
+
+        serializer = DashboardQuerySerializer(data=data)
+
+        assert serializer.is_valid(), serializer.errors
+        metric = serializer.validated_data["metrics"][0]
+        assert metric["attribute_type"] == "number"
+        sql, params = DashboardQueryBuilderV2(
+            serializer.validated_data
+        ).build_metric_query(metric)
+        assert f"{aggregation}(attrs_number[%(custom_metric_attr_key)s])" in sql
+        assert params["custom_metric_attr_key"] == "call.total_turns"
+
     def test_text_custom_metric_count_keeps_string_default_when_type_is_omitted(self):
         data = {
             "workflow": "observability",
@@ -8242,6 +8385,22 @@ class TestInvalidMetricCombination:
         assert "span_attr_str[%(custom_metric_attr_key)s]" in sql
         assert params["custom_metric_attr_key"] == "bot_wpm"
 
+    @pytest.mark.parametrize("aggregation", ["min", "max"])
+    def test_min_max_of_text_attribute_raise(self, aggregation):
+        config = _single_metric_config(
+            {
+                "id": "final_status",
+                "name": "final_status",
+                "type": "custom_attribute",
+                "aggregation": aggregation,
+                "attribute_key": "final_status",
+                "attribute_type": "string",
+            }
+        )
+
+        with pytest.raises(InvalidMetricCombinationError):
+            DashboardQueryBuilder(config).build_all_queries()
+
     def test_avg_of_numeric_attribute_is_allowed(self):
         config = _single_metric_config(
             {
@@ -8588,14 +8747,14 @@ class TestDashboardQueryValidation:
 
         with (
             patch(
-                "tracer.views.dashboard.Project.objects.filter",
+                "tracer.views.dashboard.project_queryset_for_request",
                 side_effect=[
                     scoped_queryset([first_project_id, second_project_id]),
                     scoped_queryset([first_project_id]),
                 ],
             ),
             patch(
-                "model_hub.models.develop_dataset.Dataset.objects.filter",
+                "model_hub.utils.workspace_scope.scoped_dataset_queryset",
                 side_effect=[
                     scoped_queryset([first_dataset_id, second_dataset_id]),
                     scoped_queryset([first_dataset_id]),
@@ -8638,6 +8797,65 @@ class TestDashboardQueryValidation:
         assert current_scope["project_ids"] == [str(first_project_id)]
         assert current_scope["dataset_ids"] == [str(first_dataset_id)]
         assert current_key != first_key
+
+    @pytest.mark.django_db
+    def test_default_workspace_scope_includes_legacy_null_resources(
+        self, organization, workspace, user, project
+    ):
+        legacy_project = Project.no_workspace_objects.create(
+            name="Legacy null project",
+            organization=organization,
+            workspace=None,
+            model_type=AIModel.ModelTypes.GENERATIVE_LLM,
+            trace_type="observe",
+            metadata={},
+        )
+        legacy_dataset = Dataset.no_workspace_objects.create(
+            name="Legacy null dataset",
+            organization=organization,
+            workspace=None,
+            user=user,
+        )
+        other_workspace = Workspace.objects.create(
+            name="Other workspace",
+            organization=organization,
+            is_active=True,
+            created_by=user,
+        )
+        excluded_project = Project.no_workspace_objects.create(
+            name="Other workspace project",
+            organization=organization,
+            workspace=other_workspace,
+            model_type=AIModel.ModelTypes.GENERATIVE_LLM,
+            trace_type="observe",
+            metadata={},
+        )
+        excluded_dataset = Dataset.no_workspace_objects.create(
+            name="Other workspace dataset",
+            organization=organization,
+            workspace=other_workspace,
+            user=user,
+        )
+        query_config = {
+            "project_ids": [],
+            "dataset_ids": [],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [],
+        }
+
+        scoped = _materialize_dashboard_query_scope(
+            query_config,
+            workspace,
+            trace_metrics=[{"source": "traces"}],
+            dataset_metrics=[{"source": "datasets"}],
+        )
+
+        assert str(project.id) in scoped["project_ids"]
+        assert str(legacy_project.id) in scoped["project_ids"]
+        assert str(excluded_project.id) not in scoped["project_ids"]
+        assert str(legacy_dataset.id) in scoped["dataset_ids"]
+        assert str(excluded_dataset.id) not in scoped["dataset_ids"]
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.AnalyticsQueryService")
@@ -9575,7 +9793,7 @@ def test_dashboard_query_defers_exact_read_without_inline_clickhouse(
         ),
     ):
         response = auth_client.post(
-            "/tracer/dashboard/query/",
+            "/tracer/dashboard/query/?refresh=true",
             {
                 "project_ids": [str(observe_project.id)],
                 "granularity": "day",
@@ -9602,6 +9820,7 @@ def test_dashboard_query_defers_exact_read_without_inline_clickhouse(
     assert captured["identity"]["query_config"]["project_ids"] == [
         str(observe_project.id)
     ]
+    assert captured["options"]["refresh"] is True
 
 
 @pytest.mark.django_db
@@ -9685,7 +9904,10 @@ def test_widget_query_defers_exact_read_without_inline_clickhouse(
     dashboard_widget.query_config = query_config
     dashboard_widget.save(update_fields=["query_config"])
 
+    captured = {}
+
     def _pending(_namespace, _identity, **kwargs):
+        captured.update(kwargs)
         return kwargs["pending_payload"]
 
     with (
@@ -9706,11 +9928,12 @@ def test_widget_query_defers_exact_read_without_inline_clickhouse(
     ):
         if action == "execute":
             response = auth_client.post(
-                f"/tracer/dashboard/{dashboard.id}/widgets/{dashboard_widget.id}/query/"
+                f"/tracer/dashboard/{dashboard.id}/widgets/"
+                f"{dashboard_widget.id}/query/?refresh=true"
             )
         else:
             response = auth_client.post(
-                f"/tracer/dashboard/{dashboard.id}/widgets/preview/",
+                f"/tracer/dashboard/{dashboard.id}/widgets/preview/?refresh=true",
                 {"query_config": query_config},
                 format="json",
             )
@@ -9721,3 +9944,4 @@ def test_widget_query_defers_exact_read_without_inline_clickhouse(
     assert result["query_complete"] is False
     assert result["query_sampled"] is False
     assert result["query_refreshing"] is True
+    assert captured["refresh"] is True

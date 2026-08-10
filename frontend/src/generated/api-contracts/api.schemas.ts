@@ -22721,6 +22721,110 @@ export interface TraceVoiceCallListResponseApi {
   query_error_code?: string;
 }
 
+export type TraceVoiceCallDetailResultApiCostBreakdown = { [key: string]: unknown };
+
+export type TraceVoiceCallDetailResultApiTranscriptItem = { [key: string]: JsonValueApi };
+
+export type TraceVoiceCallDetailResultApiMessagesItem = { [key: string]: JsonValueApi };
+
+export type TraceVoiceCallDetailResultApiAnalysisData = { [key: string]: unknown };
+
+export type TraceVoiceCallDetailResultApiEvaluationData = { [key: string]: unknown };
+
+export type TraceVoiceCallDetailResultApiRecording = { [key: string]: unknown };
+
+export type TraceVoiceCallDetailResultApiCallMetadata = { [key: string]: unknown };
+
+export type TraceVoiceCallDetailResultApiObservationSpanItem = { [key: string]: JsonValueApi };
+
+export type TraceVoiceCallDetailResultApiEvalOutputs = { [key: string]: unknown };
+
+export type TraceVoiceCallDetailResultApiScenarioGraph = { [key: string]: unknown };
+
+export interface TraceVoiceCallDetailResultApi {
+  /** @minLength 1 */
+  id: string;
+  /** @minLength 1 */
+  trace_id: string;
+  /** @minLength 1 */
+  project_id: string;
+  /** @minLength 1 */
+  provider_call_id: string | null;
+  /** @minLength 1 */
+  phone_number?: string | null;
+  /** @minLength 1 */
+  customer_name?: string | null;
+  /** @minLength 1 */
+  call_id?: string | null;
+  /** @minLength 1 */
+  status?: string | null;
+  /** @minLength 1 */
+  started_at?: string | null;
+  /** @minLength 1 */
+  ended_at?: string | null;
+  /** @minLength 1 */
+  created_at?: string | null;
+  duration_seconds?: number | null;
+  /** @minLength 1 */
+  recording_url?: string | null;
+  /** @minLength 1 */
+  stereo_recording_url?: string | null;
+  cost_cents?: number | null;
+  cost_breakdown?: TraceVoiceCallDetailResultApiCostBreakdown | null;
+  /** @minLength 1 */
+  error_message?: string | null;
+  /** @minLength 1 */
+  call_summary?: string | null;
+  /** @minLength 1 */
+  ended_reason?: string | null;
+  overall_score?: number | null;
+  response_time_ms?: number | null;
+  response_time_seconds?: number | null;
+  /** @minLength 1 */
+  assistant_id?: string | null;
+  /** @minLength 1 */
+  assistant_phone_number?: string | null;
+  /** @minLength 1 */
+  call_type?: string | null;
+  message_count?: number | null;
+  transcript_available?: boolean | null;
+  transcript?: TraceVoiceCallDetailResultApiTranscriptItem[] | null;
+  messages?: TraceVoiceCallDetailResultApiMessagesItem[] | null;
+  analysis_data?: TraceVoiceCallDetailResultApiAnalysisData | null;
+  evaluation_data?: TraceVoiceCallDetailResultApiEvaluationData | null;
+  recording: TraceVoiceCallDetailResultApiRecording;
+  recording_available: boolean;
+  call_metadata: TraceVoiceCallDetailResultApiCallMetadata;
+  observation_span: TraceVoiceCallDetailResultApiObservationSpanItem[];
+  eval_outputs: TraceVoiceCallDetailResultApiEvalOutputs;
+  /** @minLength 1 */
+  call_execution_id?: string | null;
+  /** @minLength 1 */
+  test_execution_id?: string | null;
+  /** @minLength 1 */
+  scenario_id?: string | null;
+  /** @minLength 1 */
+  scenario_name?: string | null;
+  /** @minLength 1 */
+  scenario_graph_id?: string | null;
+  scenario_graph?: TraceVoiceCallDetailResultApiScenarioGraph;
+  turn_count: number | null;
+  talk_ratio: number | null;
+  agent_talk_percentage: number | null;
+  bot_talk_pct: number | null;
+  user_talk_pct: number | null;
+  avg_agent_latency_ms: number | null;
+  user_wpm: number | null;
+  bot_wpm: number | null;
+  user_interruption_count: number | null;
+  ai_interruption_count: number | null;
+}
+
+export interface TraceVoiceCallDetailResponseApi {
+  status: boolean;
+  result: TraceVoiceCallDetailResultApi;
+}
+
 export type TraceDetailResultApiTrace = { [key: string]: unknown };
 
 export type TraceDetailResultApiObservationSpansItem = { [key: string]: unknown };
@@ -27362,6 +27466,10 @@ page?: number;
 limit?: number;
 };
 
+export type TracerDashboardQueryParams = {
+refresh?: boolean;
+};
+
 export type TracerDashboardSimulationAgentsParams = {
 /**
  * A page number within the paginated result set.
@@ -27396,6 +27504,14 @@ export type TracerDashboardWidgetsList200 = {
   next?: string;
   previous?: string;
   results: DashboardWidgetApi[];
+};
+
+export type TracerDashboardWidgetsPreviewQueryParams = {
+refresh?: boolean;
+};
+
+export type TracerDashboardWidgetsExecuteQueryParams = {
+refresh?: boolean;
 };
 
 export type TracerDatasetListParams = {
@@ -28631,20 +28747,13 @@ allow_sampled?: boolean;
 
 export type TracerTraceVoiceCallDetailParams = {
 /**
- * A page number within the paginated result set.
+ * Voice-call trace UUID. Supply this or the legacy traceId alias.
  */
-page?: number;
+trace_id?: string;
 /**
- * Number of results to return per page.
+ * Legacy alias for trace_id; when both are supplied they must match.
  */
-limit?: number;
-};
-
-export type TracerTraceVoiceCallDetail200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: TraceApi[];
+traceId?: string;
 };
 
 export type TracerUserAlertLogsListParams = {

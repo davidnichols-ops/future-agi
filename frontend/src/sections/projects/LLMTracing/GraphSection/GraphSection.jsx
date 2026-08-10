@@ -33,17 +33,17 @@ import { logger } from "src/utils/logger";
 import { FILTER_FOR_HAS_EVAL, toBackendFilters } from "../common";
 import { buildDefaultDateEntry } from "./graphFilterUtils";
 import {
-  AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   GRAPH_LOADING_MESSAGE,
   QUERY_FAILED_RETRY_MESSAGE,
-  getAggregationPollDelay,
+  createAggregationPollController,
   getAggregationRefreshState,
   getExactAggregationReadState,
   getExactGraphData,
   getQueryCompletedAt,
   awaitAggregationRequestWithDeadline,
 } from "src/utils/queryReadState";
+import { parseTraceGraphResponse } from "src/api/project/observe-contracts";
 
 const deltaObject = {
   hour: { hours: 1 },
@@ -147,9 +147,11 @@ const GraphSection = ({
     setSelectedGraphConfig(config ? { ...config } : null);
   };
   const forceRefreshRef = useRef(false);
-  const pollAttemptRef = useRef(0);
   const pollingRef = useRef(false);
-  const consecutiveFailureRef = useRef(0);
+  const pollingControllerRef = useRef(null);
+  if (pollingControllerRef.current === null) {
+    pollingControllerRef.current = createAggregationPollController();
+  }
   const [aggregationTransportFailed, setAggregationTransportFailed] =
     useState(false);
   const requestScopeRef = useRef(null);
@@ -158,9 +160,8 @@ const GraphSection = ({
   const resetAggregationBudget = useCallback(() => {
     requestGenerationRef.current += 1;
     requestScopeRef.current = null;
-    pollAttemptRef.current = 0;
+    pollingControllerRef.current.reset();
     pollingRef.current = false;
-    consecutiveFailureRef.current = 0;
     setAggregationTransportFailed(false);
   }, []);
 
@@ -169,9 +170,8 @@ const GraphSection = ({
       if (requestScopeRef.current !== scopeKey) {
         requestGenerationRef.current += 1;
         requestScopeRef.current = scopeKey;
-        pollAttemptRef.current = 0;
+        pollingControllerRef.current.reset();
         pollingRef.current = false;
-        consecutiveFailureRef.current = 0;
         setAggregationTransportFailed(false);
       }
 
@@ -186,7 +186,7 @@ const GraphSection = ({
   );
 
   const recordAggregationResponse = useCallback((response) => {
-    consecutiveFailureRef.current = 0;
+    pollingControllerRef.current.recordSuccess();
     setAggregationTransportFailed(false);
     const { isRefreshing, refreshFailed } =
       getAggregationRefreshState(response);
@@ -196,21 +196,23 @@ const GraphSection = ({
       !refreshFailed &&
       (readState === "complete" || readState === "pending");
     if (!shouldPoll) {
-      pollAttemptRef.current = 0;
+      pollingControllerRef.current.stop();
       pollingRef.current = false;
       return;
     }
-    pollingRef.current = true;
+    pollingRef.current = pollingControllerRef.current.start();
   }, []);
   const recordAggregationFailure = useCallback(() => {
     if (!pollingRef.current) return;
-    consecutiveFailureRef.current += 1;
-    if (
-      consecutiveFailureRef.current >= AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES
-    ) {
+    if (!pollingControllerRef.current.recordFailure()) {
       pollingRef.current = false;
       setAggregationTransportFailed(true);
     }
+  }, []);
+  const recordAggregationTerminalFailure = useCallback(() => {
+    pollingControllerRef.current.terminate();
+    pollingRef.current = false;
+    setAggregationTransportFailed(true);
   }, []);
 
   // Graph APIs
@@ -233,7 +235,7 @@ const GraphSection = ({
       selectedGraphConfig,
     ],
     queryFn: async ({ queryKey, signal }) => {
-      if (pollingRef.current) pollAttemptRef.current += 1;
+      pollingControllerRef.current.recordAttempt();
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
       let response;
@@ -264,13 +266,17 @@ const GraphSection = ({
         if (!signal.aborted) recordAggregationFailure();
         throw error;
       }
-      recordAggregationResponse(response);
-      return response;
+      let result;
+      try {
+        result = parseTraceGraphResponse(response.data);
+      } catch (error) {
+        recordAggregationTerminalFailure();
+        throw error;
+      }
+      recordAggregationResponse(result);
+      return result;
     },
     enabled: selectedTab === "trace" && Boolean(selectedGraphConfig?.id),
-    // Preserve wrapper-level exactness and refresh metadata. Dropping this
-    // envelope turns a legitimate queued read into an apparent empty result.
-    select: (data) => data.data,
     staleTime: Infinity,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
@@ -284,17 +290,21 @@ const GraphSection = ({
       );
       const readState = getExactAggregationReadState(query.state.data);
       if (
-        consecutiveFailureRef.current >=
-          AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES ||
         !isRefreshing ||
         refreshFailed ||
         (readState !== "complete" && readState !== "pending")
       ) {
-        pollAttemptRef.current = 0;
+        pollingControllerRef.current.stop();
         pollingRef.current = false;
         return false;
       }
-      return getAggregationPollDelay(pollAttemptRef.current);
+      pollingControllerRef.current.start();
+      const delay = pollingControllerRef.current.nextDelay();
+      if (delay === false) {
+        pollingRef.current = false;
+        setAggregationTransportFailed(true);
+      }
+      return delay;
     },
     refetchIntervalInBackground: false,
     retry: false,
@@ -320,7 +330,7 @@ const GraphSection = ({
       selectedGraphConfig,
     ],
     queryFn: async ({ queryKey, signal }) => {
-      if (pollingRef.current) pollAttemptRef.current += 1;
+      pollingControllerRef.current.recordAttempt();
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
       let response;
@@ -351,13 +361,17 @@ const GraphSection = ({
         if (!signal.aborted) recordAggregationFailure();
         throw error;
       }
-      recordAggregationResponse(response);
-      return response;
+      let result;
+      try {
+        result = parseTraceGraphResponse(response.data);
+      } catch (error) {
+        recordAggregationTerminalFailure();
+        throw error;
+      }
+      recordAggregationResponse(result);
+      return result;
     },
     enabled: selectedTab === "spans" && Boolean(selectedGraphConfig?.id),
-    // Preserve wrapper-level exactness and refresh metadata. Dropping this
-    // envelope turns a legitimate queued read into an apparent empty result.
-    select: (data) => data.data,
     staleTime: Infinity,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
@@ -370,17 +384,21 @@ const GraphSection = ({
       );
       const readState = getExactAggregationReadState(query.state.data);
       if (
-        consecutiveFailureRef.current >=
-          AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES ||
         !isRefreshing ||
         refreshFailed ||
         (readState !== "complete" && readState !== "pending")
       ) {
-        pollAttemptRef.current = 0;
+        pollingControllerRef.current.stop();
         pollingRef.current = false;
         return false;
       }
-      return getAggregationPollDelay(pollAttemptRef.current);
+      pollingControllerRef.current.start();
+      const delay = pollingControllerRef.current.nextDelay();
+      if (delay === false) {
+        pollingRef.current = false;
+        setAggregationTransportFailed(true);
+      }
+      return delay;
     },
     refetchIntervalInBackground: false,
     retry: false,
@@ -735,6 +753,9 @@ const GraphSection = ({
     isCollapsed,
     isDark,
   ]);
+  const hasExactGraphPoints = chartData.series.some((series) =>
+    series.data.some((point) => point.y != null),
+  );
 
   const handleZoomIn = () => {
     const chart = chartRef.current?.chart;
@@ -977,7 +998,8 @@ const GraphSection = ({
                   selectedGraphEvals?.length > 0 ||
                   Object.keys(selectedGraphAttributes || {}).length > 0) &&
                 !apiGraphLoading &&
-                Boolean(exactSnapshot)
+                Boolean(exactSnapshot) &&
+                hasExactGraphPoints
               }
             >
               <ShowComponent condition={Boolean(apiGraphReadMessage)}>
@@ -997,6 +1019,30 @@ const GraphSection = ({
                 type="line"
                 height={isCollapsed ? 124 : 248}
               />
+            </ShowComponent>
+
+            <ShowComponent
+              condition={
+                !apiGraphLoading &&
+                Boolean(exactSnapshot) &&
+                !hasExactGraphPoints
+              }
+            >
+              <Box
+                role="status"
+                sx={{
+                  minHeight: isCollapsed ? 124 : 248,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  color: "text.secondary",
+                }}
+              >
+                <Typography fontSize="12px">
+                  {apiGraphReadMessage ||
+                    "No data available for this time range"}
+                </Typography>
+              </Box>
             </ShowComponent>
 
             <ShowComponent condition={apiGraphLoading}>

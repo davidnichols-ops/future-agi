@@ -111,11 +111,12 @@ ATTRIBUTE_READ_MAX_PROJECTS = 64
 # of consecutive ``completed`` calls) without allowing one request to become
 # an unbounded distinct scan.
 ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE = 50
-# Maximum SQL/result sentinel for a continuation proof: the exact signed/cache-
-# backed de-duplication prefix, every value that could already have been emitted
-# while resuming the current page, and one overflow row. DISTINCT state remains
-# bounded by the independent read-row, read-byte, memory, statement, and wall
-# limits below rather than max_rows_in_distinct, which races the SQL LIMIT.
+# Maximum SQL/result sentinel for a continuation proof. The server-held exact
+# de-duplication prefix can grow beyond this optimization ceiling; in that case
+# an overflowing proof simply falls back to the ordinary exact physical walk at
+# the unchanged frontier. DISTINCT state remains bounded by the independent
+# read-row, read-byte, memory, statement, and wall limits below rather than
+# max_rows_in_distinct, which races the SQL LIMIT.
 ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS = (
     ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE + 1
 )
@@ -408,6 +409,8 @@ class AttributeValueCursorPageRead:
     # execution bound, not result state: old cursors may omit it and safely
     # fall back to the legacy six-hour width.
     next_segment_start: datetime | None = None
+    appended_value_digests: tuple[str, ...] = ()
+    seen_value_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -428,6 +431,8 @@ class AttributeKeyCursorPageRead:
     # proven progress into the legacy six-hour checkpoint shape; exact lookup
     # keeps a narrower active slice when that is required for safe replay.
     next_segment_start: datetime | None = None
+    appended_key_digests: tuple[str, ...] = ()
+    seen_key_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -3346,6 +3351,8 @@ class AttributeReadSelector:
         resume_identity: PhysicalSpanIdentity | None = None,
         resume_key_offset: int = 0,
         seen_key_digests: Iterable[str] = (),
+        seen_key_contains: Callable[[str], bool] | None = None,
+        seen_key_count: int | None = None,
         exact_key: str | None = None,
         continue_operation: bool = False,
     ) -> AttributeKeyCursorPageRead:
@@ -3462,14 +3469,20 @@ class AttributeReadSelector:
         ):
             raise ValueError("invalid attribute-key seen state")
         seen_set = set(seen)
-        tracked_key_budget = ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - len(seen)
-        if tracked_key_budget < 0:
+        resolved_seen_count = (
+            len(seen) if seen_key_count is None else int(seen_key_count)
+        )
+        if resolved_seen_count < len(seen) or resolved_seen_count < 0:
             raise ValueError("invalid attribute-key seen state")
-        # The cache tracks a finite exact de-duplication prefix, not a result
-        # ceiling.  Once that prefix is full the physical cursor keeps moving
-        # and may repeat later keys; API consumers already merge keys by exact
-        # name.  This keeps the cursor token/cache bounded while guaranteeing
-        # that a key after the 4,096th distinct name remains reachable.
+
+        def key_was_seen(digest: str) -> bool:
+            return digest in seen_set or (
+                seen_key_contains is not None and seen_key_contains(digest)
+            )
+
+        # Small continuations remain materialized for rolling compatibility;
+        # large ones use exact persistent-radix membership supplied by the API
+        # boundary. Neither representation imposes a browse-result ceiling.
         # An exact search is satisfied by the first verified occurrence. The
         # row remains conservatively multi-typed to downstream filters unless a
         # separate exact-coverage read certifies otherwise.
@@ -3567,7 +3580,7 @@ class AttributeReadSelector:
             for index in range(key_offset, len(keys)):
                 key, attr_type = keys[index]
                 digest = attribute_key_cursor_digest(key)
-                if digest in seen_set:
+                if key_was_seen(digest):
                     continue
                 prior = emitted.get(digest)
                 if prior is not None:
@@ -4044,8 +4057,11 @@ class AttributeReadSelector:
             or current_segment_end <= start
             and next_resume_identity is None
         )
-        tracked_emitted_digests = emitted_digests[:tracked_key_budget]
-        seen_after = (*seen, *tracked_emitted_digests)
+        seen_after = (
+            (*seen, *emitted_digests)
+            if resolved_seen_count == len(seen)
+            else tuple(emitted_digests)
+        )
         browse_status: AttributeKeyBrowseStatus = (
             "exhausted" if exhausted else "continuation"
         )
@@ -4089,8 +4105,7 @@ class AttributeReadSelector:
         # A successful cursor page is a complete request, not a sampled
         # aggregate. Endpoint-specific browse_status communicates whether the
         # retained-data walk can continue or exhausted its frozen window. The
-        # finite de-duplication prefix is an implementation bound, never a
-        # published vocabulary/result bound.
+        # persistent exact de-duplication set keeps every continuation safe.
         metadata = self._metadata(
             complete=True,
             error_code=None,
@@ -4109,6 +4124,8 @@ class AttributeReadSelector:
             next_resume_key_offset,
             seen_after,
             next_segment_start,
+            tuple(emitted_digests),
+            resolved_seen_count + len(emitted_digests),
         )
 
     def read_value_cursor_page(
@@ -4125,6 +4142,8 @@ class AttributeReadSelector:
         resume_identity: PhysicalSpanIdentity | None = None,
         resume_member_offset: int = 0,
         seen_value_digests: Iterable[str] = (),
+        seen_value_contains: Callable[[str], bool] | None = None,
+        seen_value_count: int | None = None,
         search: str | None = None,
         attribute_type: AttributeType | None = None,
         continue_operation: bool = False,
@@ -4139,10 +4158,10 @@ class AttributeReadSelector:
         pages neither repeat options nor trust client state. Each page resolves
         current state independently because ClickHouse 25.3 cannot preserve a
         historical ReplacingMergeTree snapshot after background merges. The
-        server tracks an exact finite de-duplication prefix; after that prefix
-        is full, later pages can repeat a typed value and consumers merge it.
-        Physical keyset progress remains monotonic, so the bound never becomes
-        a retained-value ceiling.
+        server tracks an exact persistent de-duplication set. Its signed
+        reference remains constant-size while the server-side radix grows with
+        the values already published, so no page repeats a prior value and no
+        retained-value ceiling is exposed to callers.
 
         Each returned page is exact for its ordered continuation prefix. A
         finite per-request scan budget yields another continuation rather than
@@ -4266,16 +4285,20 @@ class AttributeReadSelector:
         ):
             raise ValueError("invalid filter-value seen-value state")
         seen_set = set(seen)
-        tracked_value_budget = ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - len(seen)
-        if tracked_value_budget < 0:
+        resolved_seen_count = (
+            len(seen) if seen_value_count is None else int(seen_value_count)
+        )
+        if resolved_seen_count < len(seen) or resolved_seen_count < 0:
             raise ValueError("invalid filter-value seen-value state")
-        # The server-side digest log is an exact de-duplication prefix, not a
-        # vocabulary ceiling.  Once it is full, keep walking the frozen
-        # physical keyset and publishing verified values. Values discovered
-        # after the tracked prefix may repeat on a later page; API consumers
-        # merge them by typed value while the physical cursor guarantees
-        # deterministic forward progress and makes every retained value
-        # reachable without growing cursor/cache state without bound.
+
+        def value_was_seen(digest: str) -> bool:
+            return digest in seen_set or (
+                seen_value_contains is not None and seen_value_contains(digest)
+            )
+
+        # The API boundary supplies lazy exact membership once the legacy
+        # materialized prefix grows large. This keeps each request bounded
+        # without terminating high-cardinality value browsing.
         effective_page_size = page_size
         emitted_digests: list[str] = []
         emitted: dict[str, AttributeValueRow] = {}
@@ -4474,7 +4497,7 @@ class AttributeReadSelector:
                 if needle and needle not in display.casefold():
                     continue
                 digest = attribute_value_cursor_digest(attr_type, value)
-                if digest in seen_set:
+                if value_was_seen(digest):
                     continue
                 prior = emitted.get(digest)
                 if prior is not None:
@@ -4547,7 +4570,7 @@ class AttributeReadSelector:
         skip_physical_walk = False
         distinct_proof_supported = unpinned_cursor_read or typed_cursor_read
         if (
-            (seen_set or needle)
+            (resolved_seen_count or needle)
             and distinct_proof_supported
             and next_resume_identity is None
             and len(emitted) < effective_page_size
@@ -4623,7 +4646,10 @@ class AttributeReadSelector:
                 # this page's maximum resumable emissions, and one overflow
                 # sentinel; a vocabulary larger than that remains an ordinary
                 # ordered fallback at the unchanged physical frontier.
-                distinct_limit = len(seen_set) + effective_page_size + 1
+                distinct_limit = min(
+                    resolved_seen_count + effective_page_size + 1,
+                    ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS,
+                )
                 proof_timeout_ms = planned_proof_timeout_ms
                 try:
                     distinct_rows = self._seen_value_slice_groups(
@@ -4675,7 +4701,6 @@ class AttributeReadSelector:
                     break
 
                 proof_is_complete = len(distinct_rows) < distinct_limit
-                known_digests = seen_set.union(emitted)
                 if proof_is_complete:
                     for distinct_row in distinct_rows:
                         decoded = self._decode_seen_value_slice_group(
@@ -4701,8 +4726,13 @@ class AttributeReadSelector:
                             or needle in _value_search_text(candidate).casefold()
                         )
                         if any(
-                            attribute_value_cursor_digest(attr_type, candidate)
-                            not in known_digests
+                            (
+                                attribute_value_cursor_digest(attr_type, candidate)
+                                not in emitted
+                                and not value_was_seen(
+                                    attribute_value_cursor_digest(attr_type, candidate)
+                                )
+                            )
                             for candidate in relevant_candidates
                         ):
                             proof_is_complete = False
@@ -5089,8 +5119,11 @@ class AttributeReadSelector:
             )
 
         exhausted = current_segment_end <= start and next_resume_identity is None
-        tracked_emitted_digests = emitted_digests[:tracked_value_budget]
-        seen_after = (*seen, *tracked_emitted_digests)
+        seen_after = (
+            (*seen, *emitted_digests)
+            if resolved_seen_count == len(seen)
+            else tuple(emitted_digests)
+        )
         browse_status: AttributeValueBrowseStatus = (
             "exhausted" if exhausted else "continuation"
         )
@@ -5132,6 +5165,8 @@ class AttributeReadSelector:
             seen_after,
             browse_status,
             next_segment_start,
+            tuple(emitted_digests),
+            resolved_seen_count + len(emitted_digests),
         )
 
     def read_detail(

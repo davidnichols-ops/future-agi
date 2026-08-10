@@ -93,7 +93,7 @@ import {
 } from "./widgetUtils";
 import {
   AGGREGATION_PREPARING_MESSAGE,
-  getAggregationPollDelay,
+  createAggregationPollController,
   getAggregationRefreshState,
   getExactAggregationReadState,
 } from "src/utils/queryReadState";
@@ -1897,7 +1897,7 @@ export default function WidgetEditorView() {
       previewGenerationRef.current = generation;
       clearTimeout(previewPollTimerRef.current);
       previewPollTimerRef.current = null;
-      let pollAttempt = 0;
+      const pollingController = createAggregationPollController();
       let refreshWasQueued = false;
 
       const isCurrent = () =>
@@ -1906,10 +1906,15 @@ export default function WidgetEditorView() {
 
       const schedulePoll = () => {
         if (!isCurrent() || previewPollTimerRef.current !== null) return;
-        const delay = getAggregationPollDelay(pollAttempt);
-        pollAttempt += 1;
+        pollingController.start();
+        const delay = pollingController.nextDelay();
+        if (delay === false) {
+          setIsPreviewRefreshing(false);
+          return;
+        }
         previewPollTimerRef.current = window.setTimeout(() => {
           previewPollTimerRef.current = null;
+          pollingController.recordAttempt();
           execute(false);
         }, delay);
       };
@@ -1925,6 +1930,7 @@ export default function WidgetEditorView() {
               const { isRefreshing, refreshFailed } =
                 getAggregationRefreshState(response);
               const readState = getExactAggregationReadState(response);
+              pollingController.recordSuccess();
               if (exactResult) {
                 setLastExactPreview({ signature, result: exactResult });
               }
@@ -1942,7 +1948,7 @@ export default function WidgetEditorView() {
             },
             onError: () => {
               if (!isCurrent()) return;
-              if (refreshWasQueued) {
+              if (refreshWasQueued && pollingController.recordFailure()) {
                 schedulePoll();
                 return;
               }

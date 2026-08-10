@@ -366,7 +366,7 @@ describe("WidgetChart — queued exact refresh", () => {
     );
   });
 
-  it("keeps cached exact data while a refresh runs beyond 500 seconds, then publishes completion", async () => {
+  it("keeps cached exact data, stops at the finite budget, and resumes on explicit refresh", async () => {
     vi.useFakeTimers();
     const cachedResponse = queryResult([
       { timestamp: "2026-07-09T00:00:00Z", value: 12 },
@@ -391,12 +391,13 @@ describe("WidgetChart — queued exact refresh", () => {
       options?.onSuccess?.(pendingResponse),
     );
 
-    render(
+    const { rerender } = render(
       <WidgetChart
         widget={baseWidget}
         dashboardId="dashboard-1"
         globalDateRange={null}
         onQuerySettled={onQuerySettled}
+        refreshRequestId={0}
       />,
     );
 
@@ -404,20 +405,36 @@ describe("WidgetChart — queued exact refresh", () => {
     expect(h.query.mutate).toHaveBeenCalledOnce();
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
 
+    const boundedRequestCount = h.query.mutate.mock.calls.length;
+    expect(boundedRequestCount).toBeLessThanOrEqual(13);
     expect(screen.getByTestId("apex-line")).toBeInTheDocument();
     expect(
-      screen.queryByText(
+      screen.getByText(
         "We couldn't load this data. Please retry in a moment.",
       ),
-    ).not.toBeInTheDocument();
-    expect(onQuerySettled).not.toHaveBeenCalled();
-    expect(h.query.mutate.mock.calls.length).toBeGreaterThan(12);
+    ).toBeInTheDocument();
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({ exact: false }),
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(500_000));
+    expect(h.query.mutate).toHaveBeenCalledTimes(boundedRequestCount);
 
     h.query.mutate.mockImplementationOnce((_request, options) =>
       options?.onSuccess?.(completedResponse),
     );
-    await act(async () => vi.advanceTimersByTimeAsync(8_010));
+    rerender(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+        refreshRequestId={1}
+      />,
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(10));
 
+    expect(h.query.mutate).toHaveBeenCalledTimes(boundedRequestCount + 1);
     expect(onQuerySettled).toHaveBeenCalledWith(
       expect.objectContaining({ exact: true }),
     );

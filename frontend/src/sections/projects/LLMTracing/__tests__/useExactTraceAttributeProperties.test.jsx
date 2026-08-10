@@ -121,6 +121,53 @@ describe("useExactTraceAttributeProperties", () => {
     expect(result.current.browseLimitReached).toBe(false);
   });
 
+  it("continues a resumable limit_reached catalog into its next batch", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: [{ key: "recent.attribute", type: "string", count: 1 }],
+          query_complete: true,
+          query_status: "complete",
+          browse_mode: "recent_suggestions",
+          browse_status: "limit_reached",
+          has_more: true,
+          next_cursor: "next-bounded-batch",
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: [{ key: "older.attribute", type: "string", count: 1 }],
+          query_complete: true,
+          query_status: "complete",
+          browse_mode: "recent_suggestions",
+          browse_status: "exhausted",
+          has_more: false,
+          next_cursor: null,
+        },
+      });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    expect(result.current.browseLimitReached).toBe(false);
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(mocks.get.mock.calls[1][1].params.cursor).toBe("next-bounded-batch");
+    expect(result.current.data.map(({ id }) => id)).toEqual([
+      "recent.attribute",
+      "older.attribute",
+    ]);
+  });
+
   it("returns control after one bounded chunk and continues older retained checkpoints on request", async () => {
     mocks.get.mockImplementation((_url, { params }) => {
       if (!params.cursor) {
@@ -262,7 +309,7 @@ describe("useExactTraceAttributeProperties", () => {
         result: [{ key: "final_status", type: "string", count: 1 }],
         query_complete: true,
         query_status: "complete",
-        browse_mode: "retained_catalog",
+        browse_mode: "recent_suggestions",
         browse_status: "exhausted",
         has_more: false,
         next_cursor: null,
@@ -548,7 +595,7 @@ describe("useExactTraceAttributeProperties", () => {
             }
           : {
               result: [{ key: "trace_id", type: "string", count: 1 }],
-              browse_mode: "retained_catalog",
+              browse_mode: "recent_suggestions",
               browse_status: "continuation",
               has_more: true,
               next_cursor: "catalog-page-2",
@@ -593,7 +640,7 @@ describe("useExactTraceAttributeProperties", () => {
             }
           : {
               result: [{ key: "customer_context", type: "string", count: 1 }],
-              browse_mode: "retained_catalog",
+              browse_mode: "recent_suggestions",
               browse_status: "continuation",
               has_more: true,
               next_cursor: "catalog-page-2",

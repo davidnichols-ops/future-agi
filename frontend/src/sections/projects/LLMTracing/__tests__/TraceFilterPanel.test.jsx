@@ -1318,45 +1318,63 @@ describe("filter-value picker bounded-read UX", () => {
     document.body.removeChild(anchorEl);
   });
 
-  it.each(["exhausted", "limit_reached"])(
-    "hides a stale Load more control after %s proves no next distinct value",
-    (browseStatus) => {
-      const fetchNextPage = vi.fn();
-      dashboardFilterValuesMock.mockReturnValue({
-        ...defaultDashboardFilterValues(),
-        data: [{ value: "CONVERSATION", label: "CONVERSATION" }],
-        // Model the dev failure: the last response is terminal, while a stale
-        // continuation flag still says there is another page. Terminal browse
-        // metadata must win.
-        browseStatus,
-        hasNextPage: true,
-        fetchNextPage,
-      });
-      const { anchorEl } = renderPanel({
-        currentFilters,
-        properties: [statusProperty],
-      });
+  it("hides a stale Load more control after exhaustion proves no next value", () => {
+    const fetchNextPage = vi.fn();
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [{ value: "CONVERSATION", label: "CONVERSATION" }],
+      // Model the dev failure: the last response is terminal, while a stale
+      // continuation flag still says there is another page. Terminal browse
+      // metadata must win.
+      browseStatus: "exhausted",
+      hasNextPage: true,
+      fetchNextPage,
+    });
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [statusProperty],
+    });
 
-      openValuePicker();
-      expect(screen.getByText("CONVERSATION")).toBeInTheDocument();
-      expect(
-        screen.queryByRole("button", { name: "Load more" }),
-      ).not.toBeInTheDocument();
+    openValuePicker();
+    expect(screen.getByText("CONVERSATION")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Load more" }),
+    ).not.toBeInTheDocument();
 
-      const optionsList = document.querySelector(
-        "[data-filter-value-options-list]",
-      );
-      Object.defineProperties(optionsList, {
-        scrollTop: { configurable: true, value: 180 },
-        clientHeight: { configurable: true, value: 220 },
-        scrollHeight: { configurable: true, value: 400 },
-      });
-      fireEvent.scroll(optionsList);
-      expect(fetchNextPage).not.toHaveBeenCalled();
+    const optionsList = document.querySelector(
+      "[data-filter-value-options-list]",
+    );
+    Object.defineProperties(optionsList, {
+      scrollTop: { configurable: true, value: 180 },
+      clientHeight: { configurable: true, value: 220 },
+      scrollHeight: { configurable: true, value: 400 },
+    });
+    fireEvent.scroll(optionsList);
+    expect(fetchNextPage).not.toHaveBeenCalled();
 
-      document.body.removeChild(anchorEl);
-    },
-  );
+    document.body.removeChild(anchorEl);
+  });
+
+  it("keeps Load more actionable at a resumable limit_reached checkpoint", () => {
+    const fetchNextPage = vi.fn();
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [{ value: "CONVERSATION", label: "CONVERSATION" }],
+      browseStatus: "limit_reached",
+      hasNextPage: true,
+      fetchNextPage,
+    });
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [statusProperty],
+    });
+
+    openValuePicker();
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+
+    document.body.removeChild(anchorEl);
+  });
 
   it("does not drain every value cursor page from one bottom-scroll gesture", () => {
     const fetchNextPage = vi.fn();

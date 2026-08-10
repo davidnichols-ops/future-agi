@@ -560,28 +560,65 @@ describe("useDashboardFilterValues bounded-read state", () => {
     expect(mocks.get.mock.calls[2][1].params.cursor).toBe("outer-page");
   });
 
-  it.each(["exhausted", "limit_reached"])(
-    "treats %s as terminal even when has_more is malformed",
-    async (browseStatus) => {
-      mocks.get.mockResolvedValueOnce({
+  it("treats exhausted as terminal even when has_more is malformed", async () => {
+    mocks.get.mockResolvedValueOnce({
+      data: {
+        result: {
+          values: [],
+          query_complete: true,
+          query_status: "complete",
+          browse_status: "exhausted",
+          has_more: true,
+          next_cursor: "must-not-be-requested",
+        },
+      },
+    });
+    const { result } = renderValues({ pageSize: 10 });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.hasNextPage).toBe(false);
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+  });
+
+  it("continues after limit_reached when an advancing cursor is present", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
         data: {
           result: {
-            values: [],
+            values: [{ value: "recent", type: "string" }],
             query_complete: true,
             query_status: "complete",
-            browse_status: browseStatus,
+            browse_status: "limit_reached",
             has_more: true,
-            next_cursor: "must-not-be-requested",
+            next_cursor: "next-bounded-batch",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "older", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
           },
         },
       });
-      const { result } = renderValues({ pageSize: 10 });
+    const { result } = renderValues({ pageSize: 10 });
 
-      await waitFor(() => expect(result.current.isSuccess).toBe(true));
-      expect(result.current.hasNextPage).toBe(false);
-      expect(mocks.get).toHaveBeenCalledTimes(1);
-    },
-  );
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    expect(result.current.browseLimitReached).toBe(false);
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(mocks.get.mock.calls[1][1].params.cursor).toBe("next-bounded-batch");
+    expect(result.current.data).toEqual([
+      { value: "recent", type: "string" },
+      { value: "older", type: "string" },
+    ]);
+  });
 
   it("bounds empty auto-follow and resumes until an exact value arrives", async () => {
     let responseIndex = 0;

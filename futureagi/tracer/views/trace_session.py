@@ -2775,10 +2775,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     error_code=bounded_page.error_code,
                     query_count=bounded_page.query_count,
                 )
-                if not cursor_enabled or (
-                    not bounded_page.rows
-                    and bounded_page.continuation_slice_end is None
-                ):
+                if not cursor_enabled or bounded_page.continuation_slice_end is None:
                     return self._gm.custom_error_response(
                         drf_status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Filtered session data is temporarily unavailable. Please retry.",
@@ -3198,15 +3195,20 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             # The selector proves page membership and whether another page
             # exists, but it may stop once that ordered prefix is proved.  Its
             # count is therefore a lower bound, not an exact full-window count.
+            public_chunk_complete = bounded_page.complete or cursor_has_more
             metadata.update(
                 {
                     "total_rows_is_lower_bound": True,
                     "has_more": cursor_has_more
                     if cursor_enabled
                     else bounded_page.has_more,
-                    "query_complete": bounded_page.complete,
-                    "query_status": bounded_page.status,
-                    "query_error_code": bounded_page.error_code,
+                    "query_complete": public_chunk_complete,
+                    "query_status": (
+                        "complete" if public_chunk_complete else bounded_page.status
+                    ),
+                    "query_error_code": (
+                        None if public_chunk_complete else bounded_page.error_code
+                    ),
                 }
             )
         if not candidate_cursor:
@@ -3233,7 +3235,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             )
         if metadata.get(
             "total_rows_is_lower_bound"
-        ) and exact_total_explicitly_required(request, validated_data):
+        ) and exact_total_explicitly_required(
+            request,
+            validated_data,
+            allow_exact_cursor_lower_bound=True,
+        ):
             return self._gm.custom_error_response(
                 drf_status.HTTP_503_SERVICE_UNAVAILABLE,
                 "Session data is temporarily unavailable. Please retry.",

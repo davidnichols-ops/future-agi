@@ -199,6 +199,7 @@ describe("PrimaryGraph", () => {
         query_complete: false,
         query_status: "degraded",
         result: {
+          metric_name: "latency",
           data: [
             {
               timestamp: "2026-08-03T00:00:00Z",
@@ -229,6 +230,7 @@ describe("PrimaryGraph", () => {
     axios.post.mockResolvedValue({
       data: {
         result: {
+          metric_name: "latency",
           data: [
             {
               timestamp: "2026-08-03T00:00:00Z",
@@ -290,6 +292,7 @@ describe("PrimaryGraph", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
+            metric_name: "latency",
             data: [
               {
                 timestamp: "2026-08-03T00:00:00Z",
@@ -298,8 +301,8 @@ describe("PrimaryGraph", () => {
               },
               {
                 timestamp: "2026-08-03T01:00:00Z",
-                value: null,
-                primary_traffic: null,
+                value: 0,
+                primary_traffic: 0,
               },
             ],
             query_complete: true,
@@ -312,6 +315,7 @@ describe("PrimaryGraph", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
+            metric_name: "latency",
             data: [
               {
                 timestamp: "2026-08-03T00:00:00Z",
@@ -363,6 +367,7 @@ describe("PrimaryGraph", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
+            metric_name: "latency",
             data: [],
             query_complete: false,
             query_status: "pending",
@@ -374,6 +379,7 @@ describe("PrimaryGraph", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
+            metric_name: "latency",
             data: [
               {
                 timestamp: "2026-08-03T00:00:00Z",
@@ -417,11 +423,12 @@ describe("PrimaryGraph", () => {
     );
   });
 
-  it("keeps a cold exact refresh neutral beyond 500 seconds and publishes its eventual snapshot", async () => {
+  it("stops a cold pending graph at the finite budget and resumes only after explicit refresh", async () => {
     vi.useFakeTimers();
     const pendingResponse = {
       data: {
         result: {
+          metric_name: "latency",
           data: [],
           query_complete: false,
           query_status: "pending",
@@ -438,18 +445,20 @@ describe("PrimaryGraph", () => {
     );
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
 
-    expect(axios.post.mock.calls.length).toBeGreaterThan(12);
-    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+    const boundedRequestCount = axios.post.mock.calls.length;
+    expect(boundedRequestCount).toBeLessThanOrEqual(13);
     expect(
-      screen.queryByText(
-        "We couldn't load this data. Please retry in a moment.",
-      ),
-    ).not.toBeInTheDocument();
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
+
+    await act(async () => vi.advanceTimersByTimeAsync(500_000));
+    expect(axios.post).toHaveBeenCalledTimes(boundedRequestCount);
 
     axios.post.mockResolvedValueOnce({
       data: {
         result: {
+          metric_name: "latency",
           data: [
             {
               timestamp: "2026-08-03T00:00:00Z",
@@ -465,8 +474,10 @@ describe("PrimaryGraph", () => {
         },
       },
     });
-    await act(async () => vi.advanceTimersByTimeAsync(8_010));
+    act(() => window.dispatchEvent(new CustomEvent("observe-refresh")));
+    await act(async () => vi.advanceTimersByTimeAsync(10));
 
+    expect(axios.post).toHaveBeenCalledTimes(boundedRequestCount + 1);
     expect(screen.getByTestId("apex-chart")).toHaveAttribute(
       "data-primary-first-y",
       "42",
@@ -490,6 +501,7 @@ describe("PrimaryGraph", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
+            metric_name: "latency",
             data: [],
             query_complete: false,
             query_status: "pending",
@@ -541,6 +553,7 @@ describe("PrimaryGraph", () => {
     const exactResponse = {
       data: {
         result: {
+          metric_name: "latency",
           data: [
             {
               timestamp: "2026-08-03T00:00:00Z",
@@ -593,6 +606,7 @@ describe("PrimaryGraph", () => {
     resolveLateRefresh({
       data: {
         result: {
+          metric_name: "latency",
           data: [
             {
               timestamp: "2026-08-03T00:00:00Z",
@@ -617,6 +631,7 @@ describe("PrimaryGraph", () => {
     axios.post.mockResolvedValueOnce({
       data: {
         result: {
+          metric_name: "latency",
           data: [
             {
               timestamp: "2026-08-03T00:00:00Z",
@@ -671,6 +686,7 @@ describe("PrimaryGraph", () => {
     axios.post.mockResolvedValueOnce({
       data: {
         result: {
+          metric_name: "latency",
           data: [
             {
               timestamp: "2026-08-03T00:00:00Z",
@@ -713,6 +729,7 @@ describe("PrimaryGraph", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
+            metric_name: "latency",
             data: [
               {
                 timestamp: "2026-08-03T00:00:00Z",
@@ -763,6 +780,7 @@ describe("PrimaryGraph", () => {
     axios.post.mockResolvedValue({
       data: {
         result: {
+          metric_name: "latency",
           data: [
             {
               timestamp: "2026-08-03T00:00:00Z",

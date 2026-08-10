@@ -4,8 +4,10 @@ import { TracerTraceAgentGraphResponse } from "src/generated/api-contracts/api.z
  * Validate the complete Agent Graph HTTP response at the network boundary.
  *
  * Presentation code consumes the canonical snake_case result returned by the
- * generated contract. Missing metrics, missing path_edges, and legacy aliases
- * are contract failures; none are repaired or defaulted in the browser.
+ * generated contract. ``path_edges`` is retained as an empty compatibility
+ * field until telemetry records authoritative execution-path transitions.
+ * Missing metrics and legacy aliases are contract failures; none are repaired
+ * or defaulted in the browser.
  */
 export const parseAgentGraphResponse = (payload) => {
   const response = TracerTraceAgentGraphResponse.parse(payload);

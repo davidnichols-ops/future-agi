@@ -91,6 +91,17 @@ FILTER_LIST_QUERY_PARAM_SCHEMA = {
     "type": "string",
     "description": "JSON-encoded canonical filter list.",
 }
+
+# Public filter payloads are compiled into ClickHouse expressions and, for
+# exact aggregates, persisted in background-work identities.  Bound the shape
+# before either operation so one authenticated request cannot create an
+# unbounded AST, driver parameter set, or cache/work-queue cardinality.
+FILTER_LIST_MAX_ITEMS = 32
+FILTER_LIST_MAX_VALUES = 64
+FILTER_VALUE_MAX_DEPTH = 8
+FILTER_STRING_MAX_UTF8_BYTES = 4_096
+FILTER_LIST_MAX_TOTAL_STRING_UTF8_BYTES = 65_536
+FILTER_CONFIG_MAX_UTF8_BYTES = 128 * 1_024
 BOUNDED_LIST_DATETIME_FILTER_OPS = frozenset(
     {
         "equals",
@@ -262,13 +273,122 @@ def parse_filter_list_payload(data):
     if isinstance(data, str):
         try:
             data = json.loads(data)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
             raise serializers.ValidationError("Filters must be valid JSON.") from exc
     if data is None:
         return []
     if not isinstance(data, list):
         raise serializers.ValidationError("Filters must be a list.")
     return data
+
+
+def validate_filter_list_complexity(filters: list[Any]) -> None:
+    """Reject filter payloads whose finite shape exceeds the public contract."""
+
+    if len(filters) > FILTER_LIST_MAX_ITEMS:
+        raise serializers.ValidationError(
+            f"At most {FILTER_LIST_MAX_ITEMS} filters may be applied at once."
+        )
+
+    total_string_bytes = 0
+
+    def check_string(value: str, *, field: str) -> None:
+        nonlocal total_string_bytes
+        try:
+            encoded = value.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise serializers.ValidationError(f"{field} must be valid UTF-8.") from exc
+        if len(encoded) > FILTER_STRING_MAX_UTF8_BYTES:
+            raise serializers.ValidationError(
+                f"{field} must be at most {FILTER_STRING_MAX_UTF8_BYTES} "
+                f"UTF-8 bytes ({FILTER_STRING_MAX_UTF8_BYTES} UTF-8 byte limit)."
+            )
+        total_string_bytes += len(encoded)
+        if total_string_bytes > FILTER_LIST_MAX_TOTAL_STRING_UTF8_BYTES:
+            raise serializers.ValidationError(
+                "Filter strings exceed the "
+                f"{FILTER_LIST_MAX_TOTAL_STRING_UTF8_BYTES} UTF-8 byte request limit."
+            )
+
+    def check_value(value: Any, *, field: str, depth: int = 0) -> None:
+        if depth > FILTER_VALUE_MAX_DEPTH:
+            raise serializers.ValidationError(
+                f"{field} supports at most {FILTER_VALUE_MAX_DEPTH} nested levels."
+            )
+        if isinstance(value, str):
+            check_string(value, field=field)
+            return
+        if isinstance(value, list):
+            if len(value) > FILTER_LIST_MAX_VALUES:
+                raise serializers.ValidationError(
+                    f"{field} supports at most {FILTER_LIST_MAX_VALUES} values."
+                )
+            for item in value:
+                check_value(item, field=field, depth=depth + 1)
+            return
+        if isinstance(value, dict):
+            if len(value) > FILTER_LIST_MAX_VALUES:
+                raise serializers.ValidationError(
+                    f"{field} supports at most {FILTER_LIST_MAX_VALUES} object members."
+                )
+            for key, item in value.items():
+                if isinstance(key, str):
+                    check_string(key, field=f"{field} key")
+                check_value(item, field=field, depth=depth + 1)
+
+    for index, item in enumerate(filters):
+        if not isinstance(item, dict):
+            # FilterItemField owns the canonical type error. Complexity checking
+            # deliberately remains safe for partially malformed input.
+            continue
+        column_id = item.get("column_id")
+        if isinstance(column_id, str):
+            check_string(column_id, field=f"Filter {index + 1} column_id")
+        for optional_key in ("display_name", "source", "output_type"):
+            optional_value = item.get(optional_key)
+            if isinstance(optional_value, str):
+                check_string(
+                    optional_value,
+                    field=f"Filter {index + 1} {optional_key}",
+                )
+        config = item.get("filter_config")
+        if not isinstance(config, dict):
+            continue
+        try:
+            config_bytes = len(
+                json.dumps(
+                    config,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8", errors="strict")
+            )
+        except (TypeError, ValueError, UnicodeEncodeError):
+            # Canonical value/type validators below provide the precise error.
+            config_bytes = 0
+        if config_bytes > FILTER_CONFIG_MAX_UTF8_BYTES:
+            raise serializers.ValidationError(
+                "Filter config exceeds the "
+                f"{FILTER_CONFIG_MAX_UTF8_BYTES} UTF-8 byte request limit."
+            )
+        for config_key in ("filter_type", "filter_op", "col_type"):
+            config_value = config.get(config_key)
+            if isinstance(config_value, str):
+                check_string(
+                    config_value,
+                    field=f"Filter {index + 1} {config_key}",
+                )
+        if "filter_value" in config:
+            check_value(
+                config["filter_value"],
+                field=f"Filter {index + 1} value",
+            )
+        if "attribute_value_types" in config:
+            check_value(
+                config["attribute_value_types"],
+                field=f"Filter {index + 1} attribute value types",
+            )
 
 
 class FilterItemField(serializers.JSONField):
@@ -579,7 +699,9 @@ class FilterListField(serializers.ListField):
         swagger_schema_fields = FILTER_LIST_SCHEMA
 
     def to_internal_value(self, data):
-        return super().to_internal_value(parse_filter_list_payload(data))
+        parsed = parse_filter_list_payload(data)
+        validate_filter_list_complexity(parsed)
+        return super().to_internal_value(parsed)
 
 
 class BoundedFilterListField(FilterListField):

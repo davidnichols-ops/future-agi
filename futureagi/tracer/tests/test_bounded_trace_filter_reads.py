@@ -6851,7 +6851,7 @@ def test_observe_span_long_filter_cursor_reaches_bounded_reader() -> None:
     analytics.execute_ch_query.assert_not_called()
 
 
-def test_observe_span_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
+def test_observe_span_cursor_publishes_safe_checkpoint_after_failed_attempt() -> None:
     from tracer.views.observation_span import ObservationSpanView
 
     bounded_page = BoundedFilterPage(
@@ -6888,7 +6888,7 @@ def test_observe_span_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
     request = SimpleNamespace(
         organization=organization,
         user=SimpleNamespace(organization=organization),
-        query_params={"cursor_mode": "true"},
+        query_params={"cursor_mode": "true", "allow_sampled": "false"},
     )
     analytics = mock.MagicMock()
 
@@ -6915,15 +6915,21 @@ def test_observe_span_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
                 "page_number": 0,
                 "page_size": 25,
                 "cursor_mode": True,
+                "allow_sampled": False,
             },
             analytics=analytics,
             org_project_ids=None,
             org=organization,
         )
 
-    assert response[0] == "error"
-    assert response[1][0] == 503
-    assert response[2] == {"code": "service_unavailable"}
+    assert response[0] == "ok"
+    payload = response[1]
+    assert payload["table"] == []
+    assert payload["metadata"]["query_complete"] is True
+    assert payload["metadata"]["query_status"] == "complete"
+    assert payload["metadata"]["query_error_code"] is None
+    assert payload["metadata"]["has_more"] is True
+    assert isinstance(payload["metadata"]["next_cursor"], str)
     bounded_reader.assert_called_once()
     analytics.execute_ch_query.assert_not_called()
 
@@ -7139,6 +7145,8 @@ def test_observe_trace_exact_cursor_chunk_is_enriched_ordered_and_continuable(
         rows_returned=400,
         result_payload_bytes=8_192,
         attempts=(),
+        continuation_slice_start=START,
+        continuation_slice_end=END,
     )
 
     class RecordingAnalytics:
@@ -7211,7 +7219,7 @@ def test_observe_trace_exact_cursor_chunk_is_enriched_ordered_and_continuable(
     assert len(analytics.calls) == 3
 
 
-def test_observe_trace_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
+def test_observe_trace_cursor_publishes_safe_checkpoint_after_failed_attempt() -> None:
     bounded_page = BoundedFilterPage(
         rows=[],
         has_more=False,
@@ -7241,7 +7249,9 @@ def test_observe_trace_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
     response, bounded_reader, analytics, _request = (
         _call_observe_trace_list_with_bounded_page(
             bounded_page=bounded_page,
-            request=_observe_trace_request({"cursor_mode": "true"}),
+            request=_observe_trace_request(
+                {"cursor_mode": "true", "allow_sampled": "false"}
+            ),
             validated_data={
                 "filters": [
                     _time_filter(),
@@ -7250,13 +7260,19 @@ def test_observe_trace_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
                 "page_number": 0,
                 "page_size": 25,
                 "cursor_mode": True,
+                "allow_sampled": False,
             },
         )
     )
 
-    assert response[0] == "error"
-    assert response[1][0] == 503
-    assert response[2] == {"code": "service_unavailable"}
+    assert response[0] == "ok"
+    payload = response[1]
+    assert payload["table"] == []
+    assert payload["metadata"]["query_complete"] is True
+    assert payload["metadata"]["query_status"] == "complete"
+    assert payload["metadata"]["query_error_code"] is None
+    assert payload["metadata"]["has_more"] is True
+    assert isinstance(payload["metadata"]["next_cursor"], str)
     bounded_reader.assert_called_once()
     analytics.execute_ch_query.assert_not_called()
 
@@ -7843,7 +7859,7 @@ def test_voice_page_size_500_cursor_publishes_safe_exact_partial_chunk() -> None
     assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
 
 
-def test_voice_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
+def test_voice_cursor_publishes_safe_checkpoint_after_failed_attempt() -> None:
     from tracer.views.trace import TraceView
 
     bounded_page = BoundedFilterPage(
@@ -7893,7 +7909,7 @@ def test_voice_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
         ) as bounded_reader,
     ):
         response = view._list_voice_calls_clickhouse(
-            _observe_trace_request({"cursor_mode": "true"}),
+            _observe_trace_request({"cursor_mode": "true", "allow_sampled": "false"}),
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
@@ -7903,14 +7919,19 @@ def test_voice_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
                 "page": 1,
                 "page_size": 25,
                 "cursor_mode": True,
+                "allow_sampled": False,
             },
             remove_simulation_calls=False,
             analytics=analytics,
         )
 
-    assert response[0] == "error"
-    assert response[1][0] == 503
-    assert response[2] == {"code": "service_unavailable"}
+    assert response.status_code == 200
+    assert response.data["results"] == []
+    assert response.data["query_complete"] is True
+    assert response.data["query_status"] == "complete"
+    assert "query_error_code" not in response.data
+    assert response.data["has_more"] is True
+    assert isinstance(response.data["next_cursor"], str)
     bounded_reader.assert_called_once()
     analytics.execute_ch_query.assert_not_called()
 

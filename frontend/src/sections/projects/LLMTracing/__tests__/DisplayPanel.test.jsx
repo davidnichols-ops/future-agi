@@ -85,9 +85,8 @@ describe("DisplayPanel — interactive controls", () => {
     );
 
     await user.click(screen.getByText("Agent Graph"));
-    await user.click(screen.getByText("Agent Path"));
     expect(onViewModeChange).toHaveBeenNthCalledWith(1, "agentGraph");
-    expect(onViewModeChange).toHaveBeenNthCalledWith(2, "agentPath");
+    expect(screen.queryByText("Agent Path")).not.toBeInTheDocument();
 
     await user.click(screen.getByText("Row height"));
     await user.click(screen.getByText("Medium"));
@@ -118,7 +117,7 @@ describe("DisplayPanel — interactive controls", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it("disables agent graph and path for voice projects", () => {
+  it("disables agent graph for voice projects and does not expose agent path", () => {
     const onViewModeChange = vi.fn();
     render(
       <DisplayPanel
@@ -129,7 +128,7 @@ describe("DisplayPanel — interactive controls", () => {
     );
 
     expect(screen.getByText("Agent Graph").closest("button")).toBeDisabled();
-    expect(screen.getByText("Agent Path").closest("button")).toBeDisabled();
+    expect(screen.queryByText("Agent Path")).not.toBeInTheDocument();
     expect(onViewModeChange).not.toHaveBeenCalled();
   });
 });

@@ -5,8 +5,8 @@
  * 1. **Explicit**: If any span carries `graph.node.id` in its
  *    span_attributes, group by that ID and derive edges from
  *    `graph.node.parent_id`.
- * 2. **Inferred**: Group spans by `(observation_type, name)`,
- *    assign steps via timing overlap analysis, connect consecutive steps.
+ * 2. **Inferred nodes**: Group spans by `(observation_type, name)` and derive
+ *    edges only from the authoritative span-parent relation.
  *
  * Returns: { nodes: [...], edges: [...] } ready for AgentGraph/React Flow.
  */
@@ -102,8 +102,8 @@ function finalizeRecordedEdges(edges) {
   }));
 }
 
-/** Collapse the recorded span-parent relation into graph-node transitions. */
-function buildRecordedPathEdges(flatSpans, nodeIdForItem) {
+/** Collapse the recorded span-parent relation into graph-node edges. */
+function buildRecordedHierarchyEdges(flatSpans, nodeIdForItem) {
   const nodeIdBySpanId = new Map();
   flatSpans.forEach((item) => {
     const spanId = item.span?.id;
@@ -209,15 +209,14 @@ function buildExplicitGraph(flatSpans) {
   return {
     nodes,
     edges: finalizeRecordedEdges(Object.values(edgeMap)),
-    path_edges: buildRecordedPathEdges(flatSpans, (item) =>
-      getGraphNodeId(item.span),
-    ),
+    // graph.node.parent_id is topology, not chronological execution order.
+    path_edges: [],
     nodeToSpanIds,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 2: Timing-based inference
+// Strategy 2: Inferred nodes with recorded span hierarchy
 // ---------------------------------------------------------------------------
 
 /** Group key for a span: "type:name" */
@@ -225,51 +224,6 @@ function spanGroupKey(span) {
   const type = span.observation_type || "unknown";
   const name = span.name || "unnamed";
   return `${type}:${name}`;
-}
-
-function finiteInterval(item) {
-  const start = Date.parse(item?.span?.start_time);
-  const end = Date.parse(item?.span?.end_time);
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
-    return null;
-  }
-  return { start, end };
-}
-
-/**
- * Partition direct siblings into local execution groups.
- *
- * Overlapping siblings form one fork. A later non-overlapping group starts
- * only after every active branch in the prior group has ended, so the next
- * group is joined from each prior branch terminal. The calculation never
- * compares unrelated branches elsewhere in the trace.
- */
-function localSiblingGroups(siblings) {
-  const timed = siblings.map((item) => ({
-    item,
-    interval: finiteInterval(item),
-  }));
-  if (timed.some(({ interval }) => !interval)) return null;
-
-  timed.sort(
-    (a, b) =>
-      a.interval.start - b.interval.start ||
-      a.interval.end - b.interval.end ||
-      String(a.item.span.id || "").localeCompare(String(b.item.span.id || "")),
-  );
-
-  const groups = [];
-  let activeEnd = -Infinity;
-  for (const entry of timed) {
-    if (groups.length === 0 || entry.interval.start >= activeEnd) {
-      groups.push([entry.item]);
-      activeEnd = entry.interval.end;
-      continue;
-    }
-    groups[groups.length - 1].push(entry.item);
-    activeEnd = Math.max(activeEnd, entry.interval.end);
-  }
-  return groups;
 }
 
 function buildInferredGraph(flatSpans) {
@@ -319,70 +273,6 @@ function buildInferredGraph(flatSpans) {
     if (entryAnnotations.length) node.annotations.push(...entryAnnotations);
   }
 
-  // Build execution edges independently inside each direct-sibling set. The
-  // previous implementation assigned global time buckets and connected every
-  // node in one bucket to every node in the next, inventing transitions across
-  // unrelated branches of the trace.
-  const edgeMap = {};
-  const addEdge = (sourceItem, targetItem) => {
-    if (!sourceItem || !targetItem) return;
-    const source = spanGroupKey(sourceItem.span);
-    const target = spanGroupKey(targetItem.span);
-    const edgeKey = `${source}->${target}`;
-    if (!edgeMap[edgeKey]) {
-      edgeMap[edgeKey] = createRecordedEdge(source, target);
-    }
-    addTargetSpanMetrics(edgeMap[edgeKey], targetItem.span);
-  };
-
-  const itemByEntry = new Map(flatSpans.map((item) => [item.entry, item]));
-  const childrenOf = (item) =>
-    (item?.entry?.children || [])
-      .map((childEntry) => itemByEntry.get(childEntry))
-      .filter(Boolean);
-
-  // Return the terminal span(s) of each subtree while building its local
-  // execution edges. Connecting the next sibling group from subtree terminals
-  // is important: when `generation` contains an LLM child and `evaluation`
-  // follows generation, the real transition is LLM -> evaluation, not a fork
-  // generation -> {LLM, evaluation}.
-  const processItem = (item) => {
-    const children = childrenOf(item);
-    if (children.length === 0) return [item];
-    return processSiblingSet(children, item);
-  };
-
-  const processSiblingSet = (siblings, parentItem) => {
-    const groups = localSiblingGroups(siblings);
-
-    // Missing/malformed timing is not a license to invent execution order.
-    // Fall back to the authoritative hierarchy for this local sibling set.
-    if (!groups) {
-      if (parentItem) siblings.forEach((child) => addEdge(parentItem, child));
-      return siblings.flatMap((child) => processItem(child));
-    }
-
-    if (parentItem) {
-      groups[0].forEach((child) => addEdge(parentItem, child));
-    }
-
-    let previousTerminals = [];
-    groups.forEach((group, index) => {
-      if (index > 0) {
-        previousTerminals.forEach((source) => {
-          group.forEach((target) => addEdge(source, target));
-        });
-      }
-      previousTerminals = group.flatMap((child) => processItem(child));
-    });
-    return previousTerminals;
-  };
-
-  processSiblingSet(
-    flatSpans.filter((item) => item.depth === 0),
-    null,
-  );
-
   // Compute averages
   const nodes = Object.values(nodeMap).map(
     ({ _total_latency_ms: latencyTotal, ...node }) => ({
@@ -394,10 +284,12 @@ function buildInferredGraph(flatSpans) {
 
   return {
     nodes,
-    edges: finalizeRecordedEdges(Object.values(edgeMap)),
-    path_edges: buildRecordedPathEdges(flatSpans, (item) =>
+    edges: buildRecordedHierarchyEdges(flatSpans, (item) =>
       spanGroupKey(item.span),
     ),
+    // Parent/child hierarchy plus timestamps is a partial order. It cannot
+    // prove one chronological path through concurrent or sibling spans.
+    path_edges: [],
     nodeToSpanIds,
   };
 }

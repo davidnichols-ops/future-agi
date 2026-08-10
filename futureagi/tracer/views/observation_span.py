@@ -1,6 +1,5 @@
 import concurrent.futures
 import hashlib
-import io
 import json
 import uuid
 from collections import defaultdict
@@ -8,7 +7,6 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
-import pandas as pd
 import structlog
 from django.core.cache import cache as django_cache
 from django.db import close_old_connections
@@ -27,7 +25,6 @@ from django.db.models import (
     When,
 )
 from django.db.models.functions import JSONObject, Round
-from django.http import FileResponse
 from django.utils import timezone
 from rest_framework import serializers, status
 from rest_framework.decorators import action
@@ -1974,7 +1971,10 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     ),
                     None,
                 )
-                if failed_attempt is not None:
+                safe_cursor_checkpoint = bool(
+                    cursor_enabled and bounded_page.continuation_slice_end is not None
+                )
+                if failed_attempt is not None and not safe_cursor_checkpoint:
                     logger.warning(
                         "span_list_bounded_statement_failed",
                         project_id=str(project_id) if project_id else None,
@@ -1986,16 +1986,20 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         "Filtered span data is temporarily unavailable. Please retry.",
                         code="service_unavailable",
                     )
+                if failed_attempt is not None:
+                    logger.warning(
+                        "span_list_bounded_statement_checkpoint_published",
+                        project_id=str(project_id) if project_id else None,
+                        page_number=page_number,
+                        error_code=failed_attempt.error_code,
+                    )
                 logger.warning(
                     "span_list_bounded_read_incomplete",
                     project_id=str(project_id) if project_id else None,
                     page_number=page_number,
                     error_code=bounded_page.error_code,
                 )
-                if not cursor_enabled or (
-                    not bounded_page.rows
-                    and bounded_page.continuation_slice_end is None
-                ):
+                if not cursor_enabled or bounded_page.continuation_slice_end is None:
                     return self._gm.custom_error_response(
                         status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Filtered span data is temporarily unavailable. Please retry.",
@@ -2553,13 +2557,18 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
         metadata = {"total_rows": total_count}
         if bounded_page is not None:
+            public_chunk_complete = bounded_page.complete or cursor_has_more
             metadata.update(
                 {
                     "total_rows_is_lower_bound": True,
                     "has_more": cursor_has_more,
-                    "query_complete": bounded_page.complete,
-                    "query_status": bounded_page.status,
-                    "query_error_code": bounded_page.error_code,
+                    "query_complete": public_chunk_complete,
+                    "query_status": (
+                        "complete" if public_chunk_complete else bounded_page.status
+                    ),
+                    "query_error_code": (
+                        None if public_chunk_complete else bounded_page.error_code
+                    ),
                     "query_elapsed_ms": round(read_deadline.elapsed_ms(), 3),
                     "query_count": query_count,
                     "query_rows_returned": query_rows_returned,
@@ -2579,7 +2588,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         )
         if metadata.get(
             "total_rows_is_lower_bound"
-        ) and exact_total_explicitly_required(request, validated_data):
+        ) and exact_total_explicitly_required(
+            request,
+            validated_data,
+            allow_exact_cursor_lower_bound=True,
+        ):
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "Span data is temporarily unavailable. Please retry.",
@@ -3627,37 +3640,15 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             serializer = SpanExportQuerySerializer(data=request.query_params)
             if not serializer.is_valid():
                 return self._gm.bad_request(serializer.errors)
-            validated_data = serializer.validated_data
 
-            response = self.list_spans_observe(request, export=True)
-
-            if response.status_code != 200:
-                return response
-
-            project_id = str(validated_data["project_id"])
-            project = Project.objects.get(
-                _project_workspace_scope_q(self.request, project_prefix=""),
-                id=project_id,
-                organization=_get_request_organization(request),
+            # Observe span reads are intentionally bounded and paginated. Until an
+            # exact ClickHouse export collector exists, exporting that first page
+            # would silently produce an incomplete CSV.
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "A complete span export is temporarily unavailable. Please retry later.",
+                code="service_unavailable",
             )
-
-            result = response.data.get("result")
-            table_data = result.get("table", None)
-
-            df = pd.DataFrame(table_data)
-
-            # Convert to CSV buffer
-            buffer = io.BytesIO()
-            df.to_csv(buffer, index=False, encoding="utf-8")
-            buffer.seek(0)
-
-            # Create the response with the file
-            filename = f"{project.name or 'project'}_spans.csv"
-            response = FileResponse(
-                buffer, as_attachment=True, filename=filename, content_type="text/csv"
-            )
-
-            return response
 
         except Exception as exc:
             logger.exception(

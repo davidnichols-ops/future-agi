@@ -6,22 +6,23 @@ of already-published logical values.  Copying that set into every signed URL
 eventually exceeds proxy request-line limits; copying the complete set into a
 new cache value on every page also has quadratic storage cost.
 
-New cursors use immutable content-addressed digest blocks arranged like a
-binary counter. Appending values creates only new singleton/carry blocks and a
-small immutable root; it never rewrites state referenced by an older cursor.
-Identical retries converge on the same root while divergent branches receive
-different roots, so correctness does not depend on a cache lock or lease. A
-load reads one root plus at most one block per set bit in the published count.
-Legacy append-log, linked, and vector formats remain readable for rolling
-deploy compatibility and migrate on their next continuation.
+Small and rolling-deploy cursors use immutable content-addressed digest blocks.
+Once that legacy representation reaches 4,096 values, it migrates to an
+immutable persistent radix set. A page append copies each affected radix
+branch once, never once per value, and never rewrites state referenced by an
+older cursor. Identical retries converge on the same root while divergent
+branches receive different roots, so correctness does not depend on a cache
+lock or lease. Legacy append-log, linked, vector, and immutable-block formats
+remain readable for rolling deploy compatibility and migrate as needed.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from django.conf import settings
@@ -30,10 +31,13 @@ from django.core.cache import cache
 ATTRIBUTE_CURSOR_STATE_VERSION = 1
 ATTRIBUTE_CURSOR_STATE_TTL_SECONDS = 24 * 60 * 60
 ATTRIBUTE_CURSOR_STATE_CHUNK_SIZE = 64
-# Recent suggestions are deliberately finite. Exact key/value search is the
-# unbounded path; retaining millions of high-cardinality URL digests in Redis
-# would turn a picker cursor into tenant-controlled cache exhaustion.
+# Legacy immutable-block states materialize at most this many digests.  Once a
+# continuation grows beyond the threshold it is migrated to the persistent
+# radix set below: the cursor remains constant-size and each membership/append
+# touches a bounded number of small cache objects, so this is no longer a
+# user-visible browse ceiling.
 ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS = 4_096
+ATTRIBUTE_CURSOR_STATE_MAX_COUNT = (1 << 63) - 1
 _PACKED_DIGEST_BYTES = 16
 _PACKED_DIGEST_VECTOR_BYTES = ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS * _PACKED_DIGEST_BYTES
 # Existing deployed cursors embed a tuple of digests.  Keep accepting those
@@ -45,6 +49,13 @@ _APPEND_LOG_FORMAT = "append_log"
 _IMMUTABLE_BLOCKS_FORMAT = "immutable_blocks"
 _IMMUTABLE_BLOCK_FORMAT = "digest_block"
 _BLOCK_CACHE_PREFIX = "attribute-cursor-block"
+_RADIX_ROOT_FORMAT = "persistent_radix_set"
+_RADIX_NODE_FORMAT = "radix_node"
+_RADIX_LEAF_FORMAT = "radix_leaf"
+_RADIX_CACHE_PREFIX = "attribute-cursor-radix"
+_RADIX_LEAF_MAX_DIGESTS = 512
+_RADIX_DIGEST_BYTES = 16
+_RADIX_MAX_DEPTH = _RADIX_DIGEST_BYTES * 2
 
 
 class AttributeCursorStateError(ValueError):
@@ -62,6 +73,47 @@ class AttributeCursorSeenState:
     digests: tuple[str, ...]
     state_id: str | None
     block_refs: tuple[tuple[str, int], ...] = ()
+    count: int | None = None
+    radix_root_id: str | None = None
+    resource: str | None = None
+    binding_digest: str | None = None
+    expires_at: int | None = None
+    # One state instance lives for one API request. Cache only payloads that
+    # were fully content-verified by this request so thousands of candidate
+    # membership probes do not turn into thousands of sequential Redis GETs.
+    radix_object_cache: dict[str, dict[str, Any]] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+
+    @property
+    def seen_count(self) -> int:
+        return len(self.digests) if self.count is None else int(self.count)
+
+    def contains(self, digest: str) -> bool:
+        """Return exact membership without materializing a large continuation."""
+
+        if digest in self.digests:
+            return True
+        if self.radix_root_id is None:
+            return False
+        if (
+            self.resource is None
+            or self.binding_digest is None
+            or self.expires_at is None
+        ):
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        return _radix_contains(
+            self.radix_root_id,
+            digest,
+            resource=self.resource,
+            binding_digest=self.binding_digest,
+            expires_at=self.expires_at,
+            object_cache=self.radix_object_cache,
+        )
 
 
 def _ttl_seconds() -> int:
@@ -75,6 +127,22 @@ def _ttl_seconds() -> int:
             )
         ),
     )
+
+
+def _current_time_seconds() -> int:
+    """Return an integer clock so a radix family shares one exact deadline."""
+
+    return int(time.time())
+
+
+def _remaining_ttl(expires_at: int) -> int:
+    remaining = int(expires_at) - _current_time_seconds()
+    if remaining <= 0:
+        raise AttributeCursorStateError(
+            "expired_cursor",
+            "The continuation cursor has expired. Please restart the search.",
+        )
+    return remaining
 
 
 def _canonical(value: Any) -> str:
@@ -104,6 +172,49 @@ def _cache_key(state_id: str) -> str:
 
 def _block_cache_key(block_id: str) -> str:
     return f"{_BLOCK_CACHE_PREFIX}:v{ATTRIBUTE_CURSOR_STATE_VERSION}:{block_id}"
+
+
+def _radix_cache_key(object_id: str) -> str:
+    return f"{_RADIX_CACHE_PREFIX}:v{ATTRIBUTE_CURSOR_STATE_VERSION}:{object_id}"
+
+
+def _radix_object_id(
+    *,
+    resource: str,
+    binding_digest: str,
+    payload: dict[str, Any],
+) -> str:
+    return hashlib.sha256(
+        _canonical(
+            {
+                "resource": resource,
+                "binding": binding_digest,
+                **payload,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _radix_root_id(
+    *,
+    resource: str,
+    binding_digest: str,
+    count: int,
+    radix_root_id: str,
+    expires_at: int,
+) -> str:
+    return hashlib.sha256(
+        _canonical(
+            {
+                "format": _RADIX_ROOT_FORMAT,
+                "resource": resource,
+                "binding": binding_digest,
+                "count": count,
+                "radix_root": radix_root_id,
+                "expires_at": expires_at,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _immutable_block_id(
@@ -156,6 +267,419 @@ def _validate_digest_tuple(
             "invalid_cursor", "The continuation cursor is invalid."
         )
     return normalized
+
+
+def _radix_add_object(
+    payload: dict[str, Any],
+    *,
+    resource: str,
+    binding_digest: str,
+    expires_at: int,
+) -> str:
+    """Content-address and persist one immutable radix object."""
+
+    if payload.get("expires_at") != expires_at:
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        )
+    object_id = _radix_object_id(
+        resource=resource,
+        binding_digest=binding_digest,
+        payload=payload,
+    )
+    stored = {
+        "v": ATTRIBUTE_CURSOR_STATE_VERSION,
+        "resource": resource,
+        "binding": binding_digest,
+        "id": object_id,
+        **payload,
+    }
+    key = _radix_cache_key(object_id)
+    timeout = _remaining_ttl(expires_at)
+    try:
+        created = cache.add(key, stored, timeout=timeout)
+        if created:
+            return object_id
+        existing = cache.get(key)
+    except Exception as exc:
+        raise AttributeCursorStateError(
+            "cursor_state_unavailable",
+            "A continuation could not be created. Please retry.",
+        ) from exc
+    if existing != stored:
+        raise AttributeCursorStateError(
+            "cursor_state_unavailable",
+            "A continuation could not be created. Please retry.",
+        )
+    return object_id
+
+
+def _radix_load_object(
+    object_id: str,
+    *,
+    resource: str,
+    binding_digest: str,
+    expires_at: int,
+    object_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Load and content-verify one immutable radix object."""
+
+    _remaining_ttl(expires_at)
+    if not isinstance(object_id, str) or len(object_id) != 64:
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        )
+    if object_cache is not None and object_id in object_cache:
+        return object_cache[object_id]
+    try:
+        stored = cache.get(_radix_cache_key(object_id))
+    except Exception as exc:
+        raise AttributeCursorStateError(
+            "expired_cursor",
+            "The continuation cursor has expired. Please restart the search.",
+        ) from exc
+    if not isinstance(stored, dict):
+        raise AttributeCursorStateError(
+            "expired_cursor",
+            "The continuation cursor has expired. Please restart the search.",
+        )
+    if (
+        stored.get("v") != ATTRIBUTE_CURSOR_STATE_VERSION
+        or stored.get("resource") != resource
+        or stored.get("binding") != binding_digest
+        or stored.get("id") != object_id
+        or stored.get("expires_at") != expires_at
+    ):
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        )
+    object_format = stored.get("format")
+    try:
+        depth = int(stored["depth"])
+        count = int(stored["count"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        ) from exc
+    if (
+        not 0 <= depth <= _RADIX_MAX_DEPTH
+        or not 1 <= count <= ATTRIBUTE_CURSOR_STATE_MAX_COUNT
+    ):
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        )
+    if object_format == _RADIX_LEAF_FORMAT:
+        raw_digests = stored.get("digests")
+        if not isinstance(raw_digests, (tuple, list)):
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        digests = tuple(str(value) for value in raw_digests)
+        if (
+            count != len(digests)
+            or not 1 <= len(digests) <= _RADIX_LEAF_MAX_DIGESTS
+            or tuple(sorted(set(digests))) != digests
+            or any(
+                len(value) != _RADIX_DIGEST_BYTES * 2
+                or any(char not in "0123456789abcdef" for char in value)
+                for value in digests
+            )
+        ):
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        payload = {
+            "format": _RADIX_LEAF_FORMAT,
+            "depth": depth,
+            "count": count,
+            "digests": digests,
+            "expires_at": expires_at,
+        }
+    elif object_format == _RADIX_NODE_FORMAT:
+        raw_children = stored.get("children")
+        if not isinstance(raw_children, (tuple, list)) or depth >= _RADIX_MAX_DEPTH:
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        children: list[tuple[str, str, int]] = []
+        for raw_child in raw_children:
+            if not isinstance(raw_child, (tuple, list)) or len(raw_child) != 3:
+                raise AttributeCursorStateError(
+                    "invalid_cursor", "The continuation cursor is invalid."
+                )
+            selector, child_id, raw_count = raw_child
+            try:
+                child_count = int(raw_count)
+            except (TypeError, ValueError) as exc:
+                raise AttributeCursorStateError(
+                    "invalid_cursor", "The continuation cursor is invalid."
+                ) from exc
+            if (
+                not isinstance(selector, str)
+                or len(selector) != 1
+                or any(char not in "0123456789abcdef" for char in selector)
+                or not isinstance(child_id, str)
+                or len(child_id) != 64
+                or not 1 <= child_count <= ATTRIBUTE_CURSOR_STATE_MAX_COUNT
+            ):
+                raise AttributeCursorStateError(
+                    "invalid_cursor", "The continuation cursor is invalid."
+                )
+            children.append((selector, child_id, child_count))
+        normalized_children = tuple(children)
+        if (
+            not 1 <= len(normalized_children) <= 16
+            or tuple(sorted(normalized_children)) != normalized_children
+            or len({selector for selector, _child, _count in normalized_children})
+            != len(normalized_children)
+            or sum(
+                child_count for _selector, _child, child_count in normalized_children
+            )
+            != count
+        ):
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        payload = {
+            "format": _RADIX_NODE_FORMAT,
+            "depth": depth,
+            "count": count,
+            "children": normalized_children,
+            "expires_at": expires_at,
+        }
+    else:
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        )
+    if object_id != _radix_object_id(
+        resource=resource,
+        binding_digest=binding_digest,
+        payload=payload,
+    ):
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        )
+    if object_cache is not None:
+        object_cache[object_id] = payload
+    return payload
+
+
+def _radix_build(
+    digests: Iterable[str],
+    *,
+    depth: int,
+    resource: str,
+    binding_digest: str,
+    expires_at: int,
+) -> tuple[str, int]:
+    values = tuple(sorted(set(digests)))
+    if not values:
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        )
+    if len(values) <= _RADIX_LEAF_MAX_DIGESTS:
+        payload = {
+            "format": _RADIX_LEAF_FORMAT,
+            "depth": depth,
+            "count": len(values),
+            "digests": values,
+            "expires_at": expires_at,
+        }
+        return (
+            _radix_add_object(
+                payload,
+                resource=resource,
+                binding_digest=binding_digest,
+                expires_at=expires_at,
+            ),
+            len(values),
+        )
+    if depth >= _RADIX_MAX_DEPTH:
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        )
+    groups: dict[str, list[str]] = {}
+    for digest in values:
+        groups.setdefault(digest[depth : depth + 1], []).append(digest)
+    children = []
+    for selector, group in sorted(groups.items()):
+        child_id, child_count = _radix_build(
+            group,
+            depth=depth + 1,
+            resource=resource,
+            binding_digest=binding_digest,
+            expires_at=expires_at,
+        )
+        children.append((selector, child_id, child_count))
+    payload = {
+        "format": _RADIX_NODE_FORMAT,
+        "depth": depth,
+        "count": len(values),
+        "children": tuple(children),
+        "expires_at": expires_at,
+    }
+    return (
+        _radix_add_object(
+            payload,
+            resource=resource,
+            binding_digest=binding_digest,
+            expires_at=expires_at,
+        ),
+        len(values),
+    )
+
+
+def _radix_contains(
+    root_id: str,
+    digest: str,
+    *,
+    resource: str,
+    binding_digest: str,
+    expires_at: int,
+    object_cache: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    _remaining_ttl(expires_at)
+    if (
+        not isinstance(digest, str)
+        or len(digest) != _RADIX_DIGEST_BYTES * 2
+        or any(char not in "0123456789abcdef" for char in digest)
+    ):
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        )
+    current_id = root_id
+    while True:
+        payload = _radix_load_object(
+            current_id,
+            resource=resource,
+            binding_digest=binding_digest,
+            expires_at=expires_at,
+            object_cache=object_cache,
+        )
+        if payload["format"] == _RADIX_LEAF_FORMAT:
+            return digest in payload["digests"]
+        depth = payload["depth"]
+        selector = digest[depth : depth + 1]
+        child = next(
+            (
+                child_id
+                for child_selector, child_id, _count in payload["children"]
+                if child_selector == selector
+            ),
+            None,
+        )
+        if child is None:
+            return False
+        current_id = child
+
+
+def _radix_insert_many(
+    root_id: str,
+    digests: Iterable[str],
+    *,
+    resource: str,
+    binding_digest: str,
+    expires_at: int,
+) -> tuple[str, int, int]:
+    """Copy each affected radix branch once for one exact page append.
+
+    Inserting values one at a time creates a new leaf and every ancestor for
+    every value. Besides Redis write amplification, those obsolete immutable
+    versions can evict untouched children that the newly published root still
+    references in bounded caches. Grouping the page by selector produces one
+    new object per affected branch level while retaining the same immutable,
+    content-addressed retry and branching semantics.
+    """
+
+    values = tuple(sorted(set(digests)))
+    if not values:
+        payload = _radix_load_object(
+            root_id,
+            resource=resource,
+            binding_digest=binding_digest,
+            expires_at=expires_at,
+        )
+        return root_id, payload["count"], 0
+    payload = _radix_load_object(
+        root_id,
+        resource=resource,
+        binding_digest=binding_digest,
+        expires_at=expires_at,
+    )
+    if payload["format"] == _RADIX_LEAF_FORMAT:
+        prior_values = set(payload["digests"])
+        if any(digest in prior_values for digest in values):
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        return (
+            *_radix_build(
+                (*payload["digests"], *values),
+                depth=payload["depth"],
+                resource=resource,
+                binding_digest=binding_digest,
+                expires_at=expires_at,
+            ),
+            len(values),
+        )
+
+    depth = payload["depth"]
+    children = {
+        child_selector: (child_id, child_count)
+        for child_selector, child_id, child_count in payload["children"]
+    }
+    grouped: dict[str, list[str]] = {}
+    for digest in values:
+        grouped.setdefault(digest[depth : depth + 1], []).append(digest)
+
+    added_count = 0
+    for selector, group in sorted(grouped.items()):
+        prior_child = children.get(selector)
+        if prior_child is None:
+            child_id, child_count = _radix_build(
+                group,
+                depth=depth + 1,
+                resource=resource,
+                binding_digest=binding_digest,
+                expires_at=expires_at,
+            )
+            child_added_count = len(group)
+        else:
+            child_id, child_count, child_added_count = _radix_insert_many(
+                prior_child[0],
+                group,
+                resource=resource,
+                binding_digest=binding_digest,
+                expires_at=expires_at,
+            )
+        if child_added_count != len(group):
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        added_count += child_added_count
+        children[selector] = (child_id, child_count)
+    normalized_children = tuple(
+        (child_selector, stored_id, stored_count)
+        for child_selector, (stored_id, stored_count) in sorted(children.items())
+    )
+    count = payload["count"] + added_count
+    new_payload = {
+        "format": _RADIX_NODE_FORMAT,
+        "depth": depth,
+        "count": count,
+        "children": normalized_children,
+        "expires_at": expires_at,
+    }
+    return (
+        _radix_add_object(
+            new_payload,
+            resource=resource,
+            binding_digest=binding_digest,
+            expires_at=expires_at,
+        ),
+        count,
+        added_count,
+    )
 
 
 def _pack_digest_vector(values: tuple[str, ...]) -> bytes:
@@ -313,7 +837,7 @@ def load_attribute_cursor_seen_state(
             raise AttributeCursorStateError(
                 "invalid_cursor", "The continuation cursor is invalid."
             ) from exc
-        if not 1 <= prefix_count <= ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS:
+        if not 1 <= prefix_count <= ATTRIBUTE_CURSOR_STATE_MAX_COUNT:
             raise AttributeCursorStateError(
                 "invalid_cursor", "The continuation cursor is invalid."
             )
@@ -333,6 +857,67 @@ def load_attribute_cursor_seen_state(
         raise AttributeCursorStateError(
             "expired_cursor",
             "The continuation cursor has expired. Please restart the search.",
+        )
+    if isinstance(leaf, dict) and leaf.get("format") == _RADIX_ROOT_FORMAT:
+        if (
+            leaf.get("v") != ATTRIBUTE_CURSOR_STATE_VERSION
+            or leaf.get("resource") != resource
+            or leaf.get("binding") != binding_digest
+            or leaf.get("id") != state_id
+        ):
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        try:
+            stored_count = int(leaf["count"])
+            expires_at = int(leaf["expires_at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            ) from exc
+        radix_root_id = leaf.get("radix_root")
+        if (
+            not 1 <= stored_count <= ATTRIBUTE_CURSOR_STATE_MAX_COUNT
+            or isinstance(leaf.get("expires_at"), bool)
+            or leaf.get("expires_at") != expires_at
+            or prefix_count not in (None, stored_count)
+            or not isinstance(radix_root_id, str)
+            or len(radix_root_id) != 64
+            or state_id
+            != _radix_root_id(
+                resource=resource,
+                binding_digest=binding_digest,
+                count=stored_count,
+                radix_root_id=radix_root_id,
+                expires_at=expires_at,
+            )
+        ):
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        radix_payload = _radix_load_object(
+            radix_root_id,
+            resource=resource,
+            binding_digest=binding_digest,
+            expires_at=expires_at,
+        )
+        if radix_payload["count"] != stored_count:
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        # Radix continuations have one absolute 24-hour lifetime. Do not renew
+        # only the tiny root while untouched descendants approach expiry; a
+        # partially renewed exact set could otherwise fail open on a duplicate.
+        return AttributeCursorSeenState(
+            (),
+            state_id,
+            (),
+            stored_count,
+            radix_root_id,
+            resource,
+            binding_digest,
+            expires_at,
+            {radix_root_id: radix_payload},
         )
     if isinstance(leaf, dict) and leaf.get("format") == _IMMUTABLE_BLOCKS_FORMAT:
         if (
@@ -718,29 +1303,20 @@ def persist_attribute_cursor_seen_state(
     retries and branches cannot corrupt one another even if a worker stalls.
     """
 
-    prior_values = _validate_digest_tuple(prior.digests, validate_digest)
-    new_digests = _validate_digest_tuple(appended, validate_digest)
-    prior_digests = set(prior_values)
-    if any(value in prior_digests for value in new_digests):
-        raise AttributeCursorStateError(
-            "invalid_cursor", "The continuation cursor is invalid."
-        )
-    all_values = (*prior_values, *new_digests)
-    if not all_values:
-        return ()
-    if len(all_values) > ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS:
-        raise AttributeCursorStateError(
-            "cursor_limit_reached",
-            "The recent suggestion limit was reached. Search for an exact value.",
-        )
-
     binding_digest = attribute_cursor_binding_digest(resource=resource, binding=binding)
 
-    def add_immutable(key: str, stored: dict[str, Any]) -> None:
+    def add_immutable(
+        key: str,
+        stored: dict[str, Any],
+        *,
+        timeout: int | None = None,
+        renew: bool = True,
+    ) -> None:
         """Create or verify one content-addressed cache object."""
 
+        resolved_timeout = _ttl_seconds() if timeout is None else timeout
         try:
-            created = cache.add(key, stored, timeout=_ttl_seconds())
+            created = cache.add(key, stored, timeout=resolved_timeout)
             if created:
                 return
             existing = cache.get(key)
@@ -754,7 +1330,106 @@ def persist_attribute_cursor_seen_state(
                 "cursor_state_unavailable",
                 "A continuation could not be created. Please retry.",
             )
-        _touch_or_fail(key)
+        if renew:
+            _touch_or_fail(key)
+
+    prior_values = _validate_digest_tuple(prior.digests, validate_digest)
+    new_digests = _validate_digest_tuple(appended, validate_digest)
+    if prior.radix_root_id is not None:
+        if (
+            prior_values
+            or prior.block_refs
+            or prior.state_id is None
+            or prior.resource != resource
+            or prior.binding_digest != binding_digest
+            or prior.expires_at is None
+            or not 1 <= prior.seen_count <= ATTRIBUTE_CURSOR_STATE_MAX_COUNT
+        ):
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        radix_root_id = prior.radix_root_id
+        count = prior.seen_count
+        expires_at = prior.expires_at
+        remaining_ttl = _remaining_ttl(expires_at)
+        if not new_digests:
+            return ("state", prior.state_id, count)
+        radix_root_id, next_count, added_count = _radix_insert_many(
+            radix_root_id,
+            new_digests,
+            resource=resource,
+            binding_digest=binding_digest,
+            expires_at=expires_at,
+        )
+        if added_count != len(new_digests) or next_count != count + added_count:
+            raise AttributeCursorStateError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+        count = next_count
+        root_id = _radix_root_id(
+            resource=resource,
+            binding_digest=binding_digest,
+            count=count,
+            radix_root_id=radix_root_id,
+            expires_at=expires_at,
+        )
+        add_immutable(
+            _cache_key(root_id),
+            {
+                "v": ATTRIBUTE_CURSOR_STATE_VERSION,
+                "format": _RADIX_ROOT_FORMAT,
+                "resource": resource,
+                "binding": binding_digest,
+                "id": root_id,
+                "count": count,
+                "radix_root": radix_root_id,
+                "expires_at": expires_at,
+            },
+            timeout=remaining_ttl,
+            renew=False,
+        )
+        return ("state", root_id, count)
+
+    prior_digests = set(prior_values)
+    if any(value in prior_digests for value in new_digests):
+        raise AttributeCursorStateError(
+            "invalid_cursor", "The continuation cursor is invalid."
+        )
+    all_values = (*prior_values, *new_digests)
+    if not all_values:
+        return ()
+    if len(all_values) > ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS:
+        expires_at = _current_time_seconds() + _ttl_seconds()
+        radix_root_id, count = _radix_build(
+            all_values,
+            depth=0,
+            resource=resource,
+            binding_digest=binding_digest,
+            expires_at=expires_at,
+        )
+        root_id = _radix_root_id(
+            resource=resource,
+            binding_digest=binding_digest,
+            count=count,
+            radix_root_id=radix_root_id,
+            expires_at=expires_at,
+        )
+        add_immutable(
+            _cache_key(root_id),
+            {
+                "v": ATTRIBUTE_CURSOR_STATE_VERSION,
+                "format": _RADIX_ROOT_FORMAT,
+                "resource": resource,
+                "binding": binding_digest,
+                "id": root_id,
+                "count": count,
+                "radix_root": radix_root_id,
+                "expires_at": expires_at,
+            },
+            timeout=_remaining_ttl(expires_at),
+            renew=False,
+        )
+        return ("state", root_id, count)
 
     def add_block(values: tuple[str, ...]) -> tuple[str, int]:
         packed = _pack_digest_log(values)
