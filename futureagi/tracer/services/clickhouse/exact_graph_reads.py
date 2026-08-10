@@ -158,11 +158,13 @@ EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ = 20 * 1024 * 1024 * 1024
 # Witness work runs only in the exact-snapshot background activity; public
 # graph polls never wait on an individual statement.  Production qualification
 # includes raw witness slices whose valid bounded reads exceed the former
-# three-second ceiling. The identity-scoped classifier was production-qualified
-# at five thousand candidates below five seconds; adaptive bisection preserves
-# fail-closed behavior when a tenant-specific batch exceeds that ceiling.
+# three-second ceiling. A deployed-credential Coletia replay measured the
+# identity-scoped 5k classifier at 6.9 seconds, so its ceiling must leave bounded
+# headroom instead of repeatedly discarding successful work at five seconds.
+# Adaptive bisection preserves fail-closed behavior when a tenant-specific batch
+# exceeds the ten-second ceiling.
 EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS = 15_000
-EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 5_000
+EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 10_000
 EXACT_GRAPH_TRACE_INITIAL_SLICE = timedelta(minutes=5)
 # A failed raw witness slice is retried at the same upper bound so no interval
 # is skipped. Thirty seconds bounds retry fan-out while still allowing a hot
