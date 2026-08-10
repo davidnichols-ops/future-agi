@@ -164,6 +164,7 @@ def test_no_filter_poll_at_a_later_time_reuses_the_original_frozen_job(monkeypat
 
 
 @pytest.mark.unit
+@pytest.mark.django_db
 @override_settings(EXACT_AGGREGATION_TASK_QUEUE="exact_aggregation")
 def test_system_graph_worker_publication_is_visible_to_a_later_http_poll(
     monkeypatch,
