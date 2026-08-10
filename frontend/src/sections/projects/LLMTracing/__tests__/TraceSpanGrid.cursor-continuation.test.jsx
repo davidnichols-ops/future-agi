@@ -406,7 +406,54 @@ describe.each(["trace", "span"])("%s grid loading lifecycle", (kind) => {
     });
     expect(params.fail).not.toHaveBeenCalled();
     if (kind === "trace") {
-      expect(params.api.showNoRowsOverlay).toHaveBeenCalledOnce();
+      expect(params.api.showNoRowsOverlay).not.toHaveBeenCalled();
+      expect(gridState.props.noRowsOverlayComponent().props.children).toBe(
+        "No traces found",
+      );
     }
+  });
+});
+
+describe("trace grid empty-state lifecycle", () => {
+  beforeEach(() => {
+    getMock.mockReset();
+    gridState.api = null;
+    gridState.props = null;
+    resetMetricIds.mockReset();
+  });
+
+  it("does not publish a false empty state while the first exact read is pending", async () => {
+    let resolveResponse;
+    getMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveResponse = resolve;
+        }),
+    );
+
+    renderGrid("trace");
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const params = makeParams();
+    let pendingRead;
+    act(() => {
+      pendingRead = gridState.props.serverSideDatasource.getRows(params);
+    });
+    await waitFor(() => expect(resolveResponse).toBeTypeOf("function"));
+
+    expect(gridState.props.loading).toBe(true);
+    expect(gridState.props.noRowsOverlayComponent()).toBeNull();
+    expect(params.api.showNoRowsOverlay).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveResponse(listResponse());
+      await pendingRead;
+    });
+
+    await waitFor(() => expect(gridState.props.loading).toBe(false));
+    expect(gridState.props.noRowsOverlayComponent().props.children).toBe(
+      "No traces found",
+    );
+    expect(params.api.showNoRowsOverlay).not.toHaveBeenCalled();
   });
 });

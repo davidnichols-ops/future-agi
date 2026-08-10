@@ -452,12 +452,6 @@ const TraceGrid = React.forwardRef(
               });
               setContinuationNotice(null);
 
-              if (pageNumber === 0 && rows.length === 0) {
-                params.api?.showNoRowsOverlay();
-              } else {
-                params.api?.hideOverlay();
-              }
-
               // Collect all loaded trace IDs for prev/next navigation
               setTimeout(() => {
                 const ids = [];
@@ -693,6 +687,8 @@ const TraceGrid = React.forwardRef(
         validatedSteps[currentStep - 1]
       );
     }, [openReplaySessionDrawer, currentStep, validatedSteps]);
+    const isGridReadPending =
+      gridLoading || previousFilterRequestKeyRef.current !== filterRequestKey;
 
     return (
       <Box
@@ -756,12 +752,9 @@ const TraceGrid = React.forwardRef(
           suppressServerSideFullWidthLoadingRow={true}
           rowModelType="serverSide"
           serverSideDatasource={dataSource}
-          loading={
-            gridLoading ||
-            previousFilterRequestKeyRef.current !== filterRequestKey
-          }
+          loading={isGridReadPending}
           noRowsOverlayComponent={() =>
-            continuationNotice
+            isGridReadPending || continuationNotice
               ? null
               : NoRowsOverlay(
                   <Typography
