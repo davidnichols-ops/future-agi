@@ -69,6 +69,9 @@ from tracer.services.clickhouse.query_builders.dashboard import (
 from tracer.services.clickhouse.query_builders.dashboard_base import (
     DashboardQueryBuilderBase,
 )
+from tracer.services.clickhouse.query_builders.dataset_dashboard import (
+    DatasetQueryBuilder,
+)
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 from tracer.services.clickhouse.server_readonly import without_query_settings
 from tracer.services.clickhouse.v2.query_builders.dashboard import (
@@ -151,6 +154,49 @@ class _DashboardFullWindowAnalytics:
             data=[{"time_bucket": params["start_date"], "value": 1}],
             columns=["time_bucket", "value"],
         )
+
+
+def _recording_dashboard_builder(configs):
+    class RecordingDashboardBuilder:
+        def __init__(self, config):
+            self.config = config
+            self.metrics = config["metrics"]
+            configs.append(config)
+
+        def parse_time_range(self):
+            time_range = self.config["time_range"]
+            if time_range.get("custom_start") and time_range.get("custom_end"):
+                return (
+                    datetime.fromisoformat(time_range["custom_start"]),
+                    datetime.fromisoformat(time_range["custom_end"]),
+                )
+            return (
+                datetime(2026, 7, 1, tzinfo=UTC),
+                datetime(2026, 8, 1, tzinfo=UTC),
+            )
+
+        def build_metric_query(self, metric):
+            window = self.config["time_range"]
+            return (
+                f"SELECT exact {metric['id']} metric",
+                {
+                    "start_date": datetime.fromisoformat(window["custom_start"]),
+                    "end_date": datetime.fromisoformat(window["custom_end"]),
+                },
+            )
+
+        @staticmethod
+        def metric_info(metric):
+            return dict(metric)
+
+        def format_results(self, metric_results, **_kwargs):
+            return {
+                "metrics": [metric_info for metric_info, _rows in metric_results],
+                "time_range": self.config["time_range"],
+                "granularity": self.config["granularity"],
+            }
+
+    return RecordingDashboardBuilder
 
 
 def _dashboard_full_window_params(*, days):
@@ -313,6 +359,7 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
 
     analytics = _DashboardFullWindowAnalytics()
     project_queryset = MagicMock()
+    project_queryset.filter.return_value = project_queryset
     project_queryset.count.return_value = 1
     project_queryset.values_list.return_value = []
 
@@ -322,6 +369,10 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
             side_effect=lambda config, *_args, **_kwargs: config,
         ),
         patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard._project_queryset_for_dashboard_scope",
+            return_value=project_queryset,
+        ),
         patch(
             "tracer.views.dashboard.Project.objects.filter",
             return_value=project_queryset,
@@ -379,6 +430,393 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
     assert "query_snapshot_version_ceiling" not in result
     assert "query_snapshot_capture_count" not in result
     assert "query_snapshot_relation_count" not in result
+
+
+@pytest.mark.django_db
+def test_dashboard_worker_accepts_legacy_null_project_in_default_workspace_scope(
+    organization,
+    workspace,
+):
+    workspace_project = Project.no_workspace_objects.create(
+        name="Workspace project",
+        organization=organization,
+        workspace=workspace,
+        model_type=AIModel.ModelTypes.GENERATIVE_LLM,
+        trace_type="observe",
+        metadata={},
+    )
+    legacy_project = Project.no_workspace_objects.create(
+        name="Legacy null project",
+        organization=organization,
+        workspace=workspace,
+        model_type=AIModel.ModelTypes.GENERATIVE_LLM,
+        trace_type="observe",
+        metadata={},
+    )
+    Project.no_workspace_objects.filter(id=legacy_project.id).update(workspace=None)
+    legacy_project.refresh_from_db()
+    assert legacy_project.workspace_id is None
+    query_config = {
+        "project_ids": [str(workspace_project.id), str(legacy_project.id)],
+        "granularity": "day",
+        "time_range": {"preset": "30D"},
+        "metrics": [
+            {
+                "id": "project",
+                "name": "project",
+                "type": "system_metric",
+                "source": "traces",
+                "aggregation": "avg",
+            }
+        ],
+        "filters": [],
+        "breakdowns": [],
+    }
+    builder_configs = []
+
+    class FakeTraceBuilder:
+        def __init__(self, config):
+            self.config = config
+            self.metrics = config["metrics"]
+            builder_configs.append(config)
+
+        def build_metric_query(self, metric):
+            window = self.config["time_range"]
+            return (
+                "SELECT exact project metric FROM spans FINAL",
+                {
+                    "start_date": datetime.fromisoformat(window["custom_start"]),
+                    "end_date": datetime.fromisoformat(window["custom_end"]),
+                },
+            )
+
+        @staticmethod
+        def metric_info(metric):
+            return dict(metric)
+
+        def format_results(self, metric_results, **_kwargs):
+            return {
+                "metrics": [metric_info for metric_info, _rows in metric_results],
+                "time_range": self.config["time_range"],
+                "granularity": self.config["granularity"],
+            }
+
+    analytics = _DashboardFullWindowAnalytics()
+    with (
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard.DashboardQueryBuilderV2",
+            FakeTraceBuilder,
+        ),
+        patch(
+            "tracer.views.dashboard.V2AnalyticsQueryService",
+            return_value=analytics,
+        ),
+    ):
+        response = DashboardWidgetViewSet()._execute_ch_query_config(
+            query_config,
+            workspace,
+            _exact_worker=True,
+            cache_identity_override={
+                "workspace_id": str(workspace.id),
+                "query_config": query_config,
+            },
+        )
+
+    assert response.status_code == 200
+    assert len(analytics.calls) == 1
+    assert builder_configs
+    assert set(builder_configs[0]["project_ids"]) == {
+        str(workspace_project.id),
+        str(legacy_project.id),
+    }
+    assert response.data["result"]["query_complete"] is True
+
+
+@pytest.mark.django_db
+def test_dashboard_worker_keeps_frozen_empty_project_scope_after_project_added(
+    organization,
+    workspace,
+):
+    query_config = {
+        "project_ids": [],
+        "granularity": "day",
+        "time_range": {"preset": "30D"},
+        "metrics": [
+            {
+                "id": "latency",
+                "name": "latency",
+                "type": "system_metric",
+                "source": "traces",
+                "aggregation": "avg",
+            }
+        ],
+        "filters": [],
+        "breakdowns": [],
+    }
+    cache_identity = {
+        "workspace_id": str(workspace.id),
+        "query_config": json.loads(json.dumps(query_config)),
+    }
+
+    # This project did not exist when the API materialized the concrete empty
+    # cache identity above. Worker replay must not reinterpret [] as "all".
+    Project.no_workspace_objects.create(
+        name="Added after cache identity",
+        organization=organization,
+        workspace=workspace,
+        model_type=AIModel.ModelTypes.GENERATIVE_LLM,
+        trace_type="observe",
+        metadata={},
+    )
+
+    builder_configs = []
+    analytics = _DashboardFullWindowAnalytics()
+    with (
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard.DashboardQueryBuilderV2",
+            _recording_dashboard_builder(builder_configs),
+        ),
+        patch(
+            "tracer.views.dashboard.V2AnalyticsQueryService",
+            return_value=analytics,
+        ),
+    ):
+        response = DashboardWidgetViewSet()._execute_ch_query_config(
+            query_config,
+            workspace,
+            _exact_worker=True,
+            cache_identity_override=cache_identity,
+        )
+
+    assert response.status_code == 200
+    assert analytics.calls == []
+    assert builder_configs
+    assert all(config["project_ids"] == [] for config in builder_configs)
+    metric = response.data["result"]["metrics"][0]
+    assert metric["query_complete"] is True
+    assert metric["query_status"] == "complete"
+
+
+@pytest.mark.django_db
+def test_dashboard_dataset_worker_replays_internal_concrete_scope(
+    organization,
+    workspace,
+    user,
+):
+    dataset = Dataset.no_workspace_objects.create(
+        name="Worker dataset",
+        organization=organization,
+        workspace=workspace,
+        user=user,
+    )
+    query_config = {
+        "project_ids": [],
+        "dataset_ids": [str(dataset.id)],
+        "granularity": "day",
+        "time_range": {"preset": "30D"},
+        "metrics": [
+            {
+                "id": "row_count",
+                "name": "row_count",
+                "type": "system_metric",
+                "source": "datasets",
+                "aggregation": "count",
+            }
+        ],
+        "filters": [],
+        "breakdowns": [],
+    }
+    builder_configs = []
+    analytics = _DashboardFullWindowAnalytics()
+
+    with (
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard.DatasetQueryBuilder",
+            _recording_dashboard_builder(builder_configs),
+        ),
+        patch("tracer.views.dashboard.get_clickhouse_client", return_value=object()),
+        patch(
+            "tracer.views.dashboard.AnalyticsQueryService",
+            return_value=analytics,
+        ),
+    ):
+        response = DashboardWidgetViewSet()._execute_ch_query_config(
+            query_config,
+            workspace,
+            _exact_worker=True,
+            cache_identity_override={
+                "workspace_id": str(workspace.id),
+                "query_config": query_config,
+            },
+        )
+
+    assert response.status_code == 200
+    assert len(analytics.calls) == 1
+    assert any(
+        config.get("dataset_ids") == [str(dataset.id)] for config in builder_configs
+    )
+    assert response.data["result"]["query_complete"] is True
+
+    # dataset_ids remains internal cache state; the public contract stays
+    # strict and rejects clients that try to submit it directly.
+    public_response = DashboardWidgetViewSet()._execute_ch_query_config(
+        query_config,
+        workspace,
+    )
+    assert public_response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_dashboard_dataset_worker_keeps_frozen_empty_scope_after_dataset_added(
+    organization,
+    workspace,
+    user,
+):
+    query_config = {
+        "project_ids": [],
+        "dataset_ids": [],
+        "granularity": "day",
+        "time_range": {"preset": "30D"},
+        "metrics": [
+            {
+                "id": "row_count",
+                "name": "row_count",
+                "type": "system_metric",
+                "source": "datasets",
+                "aggregation": "count",
+            }
+        ],
+        "filters": [],
+        "breakdowns": [],
+    }
+    cache_identity = {
+        "workspace_id": str(workspace.id),
+        "query_config": json.loads(json.dumps(query_config)),
+    }
+    Dataset.no_workspace_objects.create(
+        name="Added after cache identity",
+        organization=organization,
+        workspace=workspace,
+        user=user,
+    )
+
+    builder_configs = []
+    analytics = _DashboardFullWindowAnalytics()
+    with (
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard.DatasetQueryBuilder",
+            _recording_dashboard_builder(builder_configs),
+        ),
+        patch("tracer.views.dashboard.get_clickhouse_client", return_value=object()),
+        patch(
+            "tracer.views.dashboard.AnalyticsQueryService",
+            return_value=analytics,
+        ),
+    ):
+        response = DashboardWidgetViewSet()._execute_ch_query_config(
+            query_config,
+            workspace,
+            _exact_worker=True,
+            cache_identity_override=cache_identity,
+        )
+
+    assert response.status_code == 200
+    assert analytics.calls == []
+    assert builder_configs
+    assert all(config["dataset_ids"] == [] for config in builder_configs)
+    metric = response.data["result"]["metrics"][0]
+    assert metric["query_complete"] is True
+    assert metric["query_status"] == "complete"
+
+
+@pytest.mark.django_db
+def test_dashboard_dataset_worker_includes_authorized_legacy_null_dataset(
+    organization,
+    workspace,
+    user,
+):
+    legacy_dataset = Dataset.no_workspace_objects.create(
+        name="Legacy null dataset",
+        organization=organization,
+        workspace=workspace,
+        user=user,
+    )
+    Dataset.no_workspace_objects.filter(id=legacy_dataset.id).update(workspace=None)
+    legacy_dataset.refresh_from_db()
+    assert legacy_dataset.workspace_id is None
+
+    query_config = {
+        "project_ids": [],
+        "dataset_ids": [str(legacy_dataset.id)],
+        "granularity": "day",
+        "time_range": {"preset": "30D"},
+        "metrics": [
+            {
+                "id": "row_count",
+                "name": "row_count",
+                "type": "system_metric",
+                "source": "datasets",
+                "aggregation": "count",
+            }
+        ],
+        "filters": [],
+        "breakdowns": [],
+    }
+    builder_configs = []
+    built_queries = []
+
+    class RecordingRealDatasetBuilder(DatasetQueryBuilder):
+        def __init__(self, config):
+            super().__init__(config)
+            builder_configs.append(config)
+
+        def build_metric_query(self, metric):
+            sql, params = super().build_metric_query(metric)
+            built_queries.append((sql, params))
+            return sql, params
+
+        def format_results(self, metric_results, **_kwargs):
+            return {
+                "metrics": [metric_info for metric_info, _rows in metric_results],
+                "time_range": self.config["time_range"],
+                "granularity": self.config["granularity"],
+            }
+
+    analytics = _DashboardFullWindowAnalytics()
+    with (
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard.DatasetQueryBuilder",
+            RecordingRealDatasetBuilder,
+        ),
+        patch("tracer.views.dashboard.get_clickhouse_client", return_value=object()),
+        patch(
+            "tracer.views.dashboard.AnalyticsQueryService",
+            return_value=analytics,
+        ),
+    ):
+        response = DashboardWidgetViewSet()._execute_ch_query_config(
+            query_config,
+            workspace,
+            _exact_worker=True,
+            cache_identity_override={
+                "workspace_id": str(workspace.id),
+                "query_config": query_config,
+            },
+        )
+
+    assert response.status_code == 200
+    assert len(analytics.calls) == 1
+    assert built_queries
+    sql, params = built_queries[0]
+    assert "c.dataset_id IN %(dataset_ids)s" in sql
+    assert "workspace_id = toUUID(%(workspace_id)s)" not in sql
+    assert params["dataset_ids"] == [str(legacy_dataset.id)]
+    assert any(config.get("workspace_id") == "" for config in builder_configs)
 
 
 def test_join_alias_prefixing_never_rewrites_quoted_customer_data():
@@ -8812,6 +9250,12 @@ class TestDashboardQueryValidation:
             workspace=None,
             user=user,
         )
+        Project.no_workspace_objects.filter(id=legacy_project.id).update(workspace=None)
+        Dataset.no_workspace_objects.filter(id=legacy_dataset.id).update(workspace=None)
+        legacy_project.refresh_from_db()
+        legacy_dataset.refresh_from_db()
+        assert legacy_project.workspace_id is None
+        assert legacy_dataset.workspace_id is None
         other_workspace = Workspace.objects.create(
             name="Other workspace",
             organization=organization,

@@ -112,12 +112,25 @@ class DashboardQueryScopeError(ValueError):
     """A requested dashboard scope is outside the current workspace."""
 
 
+def _project_queryset_for_dashboard_scope(workspace):
+    """Return the canonical project scope used by dashboard cache and worker reads."""
+
+    organization = workspace.organization
+    scope_request = SimpleNamespace(
+        organization=organization,
+        workspace=workspace,
+        user=SimpleNamespace(organization=organization, workspace=workspace),
+    )
+    return project_queryset_for_request(scope_request)
+
+
 def _materialize_dashboard_query_scope(
     query_config,
     workspace,
     *,
     trace_metrics,
     dataset_metrics,
+    expand_empty_scopes=True,
 ):
     """Freeze every implicit all-resource scope into the exact cache identity.
 
@@ -125,16 +138,12 @@ def _materialize_dashboard_query_scope(
     the API boundary. Keeping that sentinel in a long-lived cache key can serve
     a project after it moves out of the workspace or omit a resource added
     later. Resolve, authorize, stringify, and sort the concrete IDs before any
-    cache read or refresh is scheduled.
+    cache read or refresh is scheduled. Worker replay sets
+    ``expand_empty_scopes=False`` because an empty list in the frozen identity
+    is a concrete empty scope, not the public all-resources sentinel.
     """
 
     scoped = {**query_config}
-    organization = workspace.organization
-    scope_request = SimpleNamespace(
-        organization=organization,
-        workspace=workspace,
-        user=SimpleNamespace(organization=organization, workspace=workspace),
-    )
     if trace_metrics:
         try:
             requested_project_ids = [
@@ -144,12 +153,14 @@ def _materialize_dashboard_query_scope(
             raise DashboardQueryScopeError(
                 "One or more project_ids are invalid"
             ) from exc
-        project_queryset = project_queryset_for_request(scope_request)
-        if requested_project_ids:
-            project_queryset = project_queryset.filter(id__in=requested_project_ids)
-        project_ids = sorted(
-            str(value) for value in project_queryset.values_list("id", flat=True)
-        )
+        project_ids = []
+        if requested_project_ids or expand_empty_scopes:
+            project_queryset = _project_queryset_for_dashboard_scope(workspace)
+            if requested_project_ids:
+                project_queryset = project_queryset.filter(id__in=requested_project_ids)
+            project_ids = sorted(
+                str(value) for value in project_queryset.values_list("id", flat=True)
+            )
         if requested_project_ids and len(project_ids) != len(requested_project_ids):
             raise DashboardQueryScopeError(
                 "One or more project_ids do not belong to this workspace"
@@ -159,6 +170,12 @@ def _materialize_dashboard_query_scope(
     if dataset_metrics:
         from model_hub.utils.workspace_scope import scoped_dataset_queryset
 
+        organization = workspace.organization
+        scope_request = SimpleNamespace(
+            organization=organization,
+            workspace=workspace,
+            user=SimpleNamespace(organization=organization, workspace=workspace),
+        )
         try:
             requested_dataset_ids = [
                 str(UUID(str(value))) for value in scoped.get("dataset_ids") or []
@@ -167,12 +184,14 @@ def _materialize_dashboard_query_scope(
             raise DashboardQueryScopeError(
                 "Some dataset_ids are invalid or not in this workspace"
             ) from exc
-        dataset_queryset = scoped_dataset_queryset(scope_request)
-        if requested_dataset_ids:
-            dataset_queryset = dataset_queryset.filter(id__in=requested_dataset_ids)
-        dataset_ids = sorted(
-            str(value) for value in dataset_queryset.values_list("id", flat=True)
-        )
+        dataset_ids = []
+        if requested_dataset_ids or expand_empty_scopes:
+            dataset_queryset = scoped_dataset_queryset(scope_request)
+            if requested_dataset_ids:
+                dataset_queryset = dataset_queryset.filter(id__in=requested_dataset_ids)
+            dataset_ids = sorted(
+                str(value) for value in dataset_queryset.values_list("id", flat=True)
+            )
         if requested_dataset_ids and len(dataset_ids) != len(requested_dataset_ids):
             raise DashboardQueryScopeError(
                 "Some dataset_ids are invalid or not in this workspace"
@@ -233,6 +252,24 @@ def _pending_dashboard_payload(query_config):
         "query_sampled": False,
         "query_refreshing": True,
     }
+
+
+def _complete_empty_metric_results(builder, source):
+    """Return exact empty rows for a concrete resource scope with no members."""
+
+    results = []
+    for metric in builder.metrics:
+        metric_info = builder.metric_info(metric)
+        metric_info.update(
+            {
+                "source": source,
+                "query_complete": True,
+                "query_status": "complete",
+                "query_sampled": False,
+            }
+        )
+        results.append((metric_info, []))
+    return results
 
 
 DASHBOARD_FILTER_COL_TYPE_TO_METRIC_TYPE = {
@@ -2698,6 +2735,13 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         read_query_config = _canonicalize_persisted_dashboard_query_filters_for_read(
             query_config
         )
+        frozen_dataset_ids = serializers.empty
+        if _exact_worker and cache_identity_override is not None:
+            # ``dataset_ids`` is internal cache-identity state, not part of the
+            # public query contract. Remove it for strict public-shape
+            # validation, then restore it before scope reauthorization.
+            read_query_config = dict(read_query_config)
+            frozen_dataset_ids = read_query_config.pop("dataset_ids", serializers.empty)
         serializer = DashboardQuerySerializer(data=read_query_config)
         if not serializer.is_valid():
             logger.warning(
@@ -2706,6 +2750,8 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             )
             return self._gm.bad_request("Dashboard query configuration is invalid.")
         query_config = _normalize_dashboard_query_filters(serializer.validated_data)
+        if frozen_dataset_ids is not serializers.empty:
+            query_config["dataset_ids"] = frozen_dataset_ids
         query_config["allow_sampled"] = False
 
         query_config["metrics"] = self._normalize_metric_sources(
@@ -2730,6 +2776,9 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 workspace,
                 trace_metrics=trace_metrics,
                 dataset_metrics=dataset_metrics,
+                expand_empty_scopes=not (
+                    _exact_worker and cache_identity_override is not None
+                ),
             )
         except DashboardQueryScopeError as exc:
             return self._gm.bad_request(str(exc))
@@ -2783,38 +2832,52 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "require_versioned_snapshot": True,
             }
             project_ids = trace_config.get("project_ids", [])
-            if not project_ids:
-                project_ids = list(
-                    Project.objects.filter(
-                        workspace=workspace,
-                    ).values_list("id", flat=True)
+            # Reuse the exact same scope helper as cache-key materialization.
+            # Default workspaces deliberately include legacy workspace-null
+            # projects; strict ``workspace=`` equality rejected those already
+            # authorized IDs before ClickHouse could run.
+            valid_count = (
+                _project_queryset_for_dashboard_scope(workspace)
+                .filter(id__in=project_ids)
+                .count()
+            )
+            if valid_count != len(project_ids):
+                return self._gm.bad_request(
+                    "Some project_ids are invalid or not in this workspace"
                 )
-                trace_config["project_ids"] = [str(pid) for pid in project_ids]
-                query_config["project_ids"] = trace_config["project_ids"]
-            else:
-                valid_count = Project.objects.filter(
-                    id__in=project_ids,
-                    workspace=workspace,
-                ).count()
-                if valid_count != len(project_ids):
-                    return self._gm.bad_request(
-                        "Some project_ids are invalid or not in this workspace"
-                    )
+            trace_config["project_ids"] = [str(pid) for pid in project_ids]
+            query_config["project_ids"] = trace_config["project_ids"]
             trace_config["organization_id"] = str(workspace.organization_id)
             trace_config["workspace_id"] = str(workspace.id)
             trace_analytics = V2AnalyticsQueryService()
             trace_builder = DashboardQueryBuilderV2(trace_config)
-            trace_prepared = DashboardViewSet._prepare_metric_queries(trace_builder)
+            if project_ids:
+                trace_prepared = DashboardViewSet._prepare_metric_queries(trace_builder)
+            else:
+                metric_results.extend(
+                    _complete_empty_metric_results(trace_builder, "traces")
+                )
 
         if dataset_metrics:
             ds_config = {
                 **query_config,
                 "metrics": dataset_metrics,
-                "workspace_id": str(workspace.id),
+                # ``dataset_ids`` is the concrete, PG-authorized scope. A
+                # strict ClickHouse workspace predicate would silently drop
+                # legacy workspace-null datasets that belong to a default
+                # workspace's canonical scope.
+                "workspace_id": "",
                 "exact_snapshot_dimensions": True,
             }
             dataset_builder = DatasetQueryBuilder(ds_config)
-            dataset_prepared = DashboardViewSet._prepare_metric_queries(dataset_builder)
+            if query_config.get("dataset_ids"):
+                dataset_prepared = DashboardViewSet._prepare_metric_queries(
+                    dataset_builder
+                )
+            else:
+                metric_results.extend(
+                    _complete_empty_metric_results(dataset_builder, "datasets")
+                )
 
         if simulation_metrics:
             sim_config = {
