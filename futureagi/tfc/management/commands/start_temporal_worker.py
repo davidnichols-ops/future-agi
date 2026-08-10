@@ -24,6 +24,22 @@ def _generic_all_queues(registered_queues: list[str]) -> list[str]:
     return [queue for queue in registered_queues if queue not in _DEDICATED_TASK_QUEUES]
 
 
+def _workflow_cache_kwargs(queue_name: str) -> dict[str, int]:
+    """Return queue-specific Temporal workflow cache settings.
+
+    Exact aggregation uses a single workflow-task slot as part of its strict
+    admission boundary. Temporal requires at least two workflow-task slots
+    when sticky workflow caching is enabled. These workflows are one-shot
+    activity runners, so caching them has no reuse benefit; disabling the
+    cache also keeps new work on the normal queue instead of waiting behind
+    sticky long polls.
+    """
+
+    if queue_name == "exact_aggregation":
+        return {"max_cached_workflows": 0}
+    return {}
+
+
 class Command(BaseCommand):
     help = "Start a Temporal worker for processing workflows and activities"
 
@@ -311,6 +327,7 @@ class Command(BaseCommand):
                     "graceful_shutdown_timeout": timedelta(seconds=graceful_timeout),
                     "max_heartbeat_throttle_interval": timedelta(seconds=5),
                 }
+                kwargs.update(_workflow_cache_kwargs(queue_name))
 
                 # Resource-based tuning is disabled by default due to a known
                 # bug where workers stop polling queues.

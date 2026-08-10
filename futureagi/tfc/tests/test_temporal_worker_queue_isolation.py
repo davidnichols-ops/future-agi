@@ -2,7 +2,10 @@ from pathlib import Path
 
 import pytest
 
-from tfc.management.commands.start_temporal_worker import _generic_all_queues
+from tfc.management.commands.start_temporal_worker import (
+    _generic_all_queues,
+    _workflow_cache_kwargs,
+)
 
 
 @pytest.mark.unit
@@ -21,6 +24,16 @@ def test_generic_all_queue_worker_preserves_other_queue_order():
     registered = ["agent_compass", "tasks_s", "tasks_l"]
 
     assert _generic_all_queues(registered) == registered
+
+
+@pytest.mark.unit
+def test_exact_worker_disables_sticky_workflow_cache_for_single_slot_queue():
+    assert _workflow_cache_kwargs("exact_aggregation") == {"max_cached_workflows": 0}
+
+
+@pytest.mark.unit
+def test_other_workers_keep_temporal_default_workflow_cache():
+    assert _workflow_cache_kwargs("default") == {}
 
 
 @pytest.mark.unit
