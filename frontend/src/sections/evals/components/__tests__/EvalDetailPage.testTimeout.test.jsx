@@ -81,6 +81,17 @@ vi.mock("src/auth/hooks", () => ({
   useAuthContext: () => ({ role: "Owner" }),
 }));
 
+vi.mock("src/hooks/useCapabilities", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    useFeatureAllowed: () => ({ allowed: true, isLoading: false }),
+    useFeatureLocked: () => ({ locked: false, isLoading: false }),
+    useCapabilities: () => ({ data: undefined, isLoading: false }),
+  };
+});
+
+
 vi.mock("src/hooks/useDeploymentMode", () => ({
   useDeploymentMode: () => ({ isOSS: false }),
 }));
