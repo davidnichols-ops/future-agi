@@ -5,6 +5,7 @@ import uuid
 from unittest.mock import patch
 
 import pytest
+from temporalio.common import WorkflowIDConflictPolicy
 
 from tracer.models.observation_span import (
     EvalEntryStatus,
@@ -208,6 +209,13 @@ class TestReseedEvalClusteringHook:
             _reseed_eval_clustering(entry, _PID)
         m.assert_called_once()
         assert m.call_args.kwargs["task_id"] == f"eval-cluster-{_PID}"
+        # The conflict policy is the load-bearing half of the coalescing
+        # contract: without it a per-eval trigger burst either stampedes one
+        # drain per eval or errors outright on the duplicate workflow id.
+        assert (
+            m.call_args.kwargs["id_conflict_policy"]
+            == WorkflowIDConflictPolicy.USE_EXISTING
+        )
 
     def test_dispatches_on_float_below_one(self):
         entry = EvalLogger(

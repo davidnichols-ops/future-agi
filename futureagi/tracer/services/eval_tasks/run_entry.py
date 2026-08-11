@@ -85,12 +85,11 @@ def _reseed_eval_clustering(entry: EvalLogger, project_id) -> None:
     covers both (a per-task-completion hook would miss continuous tasks, which
     never finalize).
 
-    Coalesced per project via the fixed ``eval-cluster-{project_id}`` id +
-    USE_EXISTING; ``cluster_eval_results_task`` drains the project's backlog in
-    one run, so a burst of triggers collapses onto one draining run and loses
-    nothing. Fail-open, but at WARNING — never DEBUG: a silently swallowed
-    dispatch is exactly what hid the cutover regression. A clustering hiccup must
-    not fail an eval that already produced a result, but it must stay visible.
+    The dispatch itself (per-project coalescing, fail-open logging) lives in
+    ``dispatch_eval_clustering`` — shared with the span-eval wrapper, which is
+    the trigger for feedback-driven re-evals that never reach ``run_entry``.
+    A coalesced trigger that lands mid-drain is dropped by design; the
+    ``sweep-eval-clustering`` schedule is the backstop that re-dispatches it.
     """
     # Mirror _FAILING_EVAL_Q's failure clause. A failing eval with no explanation
     # has nothing to embed/cluster, so skip the no-op dispatch RPC.
@@ -100,22 +99,11 @@ def _reseed_eval_clustering(entry: EvalLogger, project_id) -> None:
     ) and entry.eval_explanation
     if not is_clusterable_failure:
         return
-    try:
-        # Lazy import: cluster_eval_results_task's module pulls the tracer task
-        # graph, so importing at module top risks a cycle (mirrors eval.py).
-        from temporalio.common import WorkflowIDConflictPolicy
+    # Lazy import: the tasks module pulls the tracer task graph, so importing at
+    # module top risks a cycle (mirrors eval.py).
+    from tracer.tasks.eval_clustering import dispatch_eval_clustering
 
-        from tracer.tasks.eval_clustering import cluster_eval_results_task
-
-        cluster_eval_results_task.apply_async(
-            args=(str(project_id),),
-            task_id=f"eval-cluster-{project_id}",
-            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
-        )
-    except Exception:
-        logger.warning(
-            "eval_clustering_dispatch_failed for project %s", project_id, exc_info=True
-        )
+    dispatch_eval_clustering(project_id)
 
 
 def _run_for_target(entry: EvalLogger, config: CustomEvalConfig) -> None:

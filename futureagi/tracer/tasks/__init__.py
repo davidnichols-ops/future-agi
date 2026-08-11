@@ -24,8 +24,8 @@ from tracer.tasks.error_analysis import (
 
 # Eval Clustering Tasks
 from tracer.tasks.eval_clustering import (
-    cluster_eval_results_for_projects,
     cluster_eval_results_task,
+    sweep_eval_clustering,
 )
 
 # External Eval Tasks
@@ -40,7 +40,7 @@ __all__ = [
     "run_deep_analysis_on_demand",
     # Eval Clustering
     "cluster_eval_results_task",
-    "cluster_eval_results_for_projects",
+    "sweep_eval_clustering",
     # External Eval
     "process_external_evals",
     # Dataset

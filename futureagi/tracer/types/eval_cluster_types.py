@@ -43,10 +43,11 @@ class EvalClusteringSummary:
     new_clusters: int = 0
     assigned: int = 0
     # Rows fetched this batch (before clustering). A full batch (== the batch
-    # cap) means more may remain; the task-level drain loop keys its termination
-    # on this, NOT on ``clustered`` — a row can be "assigned" without producing a
-    # new junction row (trace/session-level dedup), so ``clustered > 0`` alone
-    # can never signal "done".
+    # cap) means more may remain, so the task-level drain loop keys termination
+    # on this rather than on ``clustered``. Every clustered row now leaves a
+    # junction row carrying its ``eval_logger_id`` — including the provenance-only
+    # row written when a session is already a member — so the fetchable set
+    # strictly shrinks and a short batch really does mean "drained".
     fetched: int = 0
 
 

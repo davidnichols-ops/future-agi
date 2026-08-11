@@ -457,44 +457,74 @@ def assign_to_cluster(
     """Assign an eval result to an existing cluster and update centroid."""
     cluster = TraceErrorGroup.objects.get(cluster_id=cluster_id, project_id=project_id)
 
-    cluster.error_count = (cluster.error_count or 0) + 1
-    cluster.total_events = (cluster.total_events or 0) + 1
-    cluster.last_seen = timezone.now()
-    cluster.save(
-        update_fields=["error_count", "total_events", "last_seen", "updated_at"]
-    )
+    # One junction row per eval result — ALWAYS. The row is what marks the eval
+    # as processed: ``get_unclustered_eval_results`` excludes on the presence of
+    # an ``eval_logger_id`` in the junction, so an eval that mutates the counters
+    # without leaving a row is re-fetched by every subsequent batch, forever. It
+    # sits at the head of the oldest-first window, so it also blocks the rows
+    # behind it while re-inflating counters and re-shifting the centroid on each
+    # pass. Counter + membership are written in one transaction so a mid-row
+    # activity kill can't leave the +1 without its row and reopen that loop.
+    with transaction.atomic():
+        if result.target_type == "session":
+            # (cluster, trace_session) is a real unique constraint — both
+            # columns non-null — so a second failing eval on a session already
+            # in this cluster cannot carry the session. Record it as a
+            # provenance-only row instead (every target FK left NULL, which both
+            # unique keys treat as distinct): membership is unchanged, but the
+            # eval is still marked processed and leaves the fetchable set.
+            session_already_member = ErrorClusterTraces.objects.filter(
+                cluster=cluster, trace_session_id=result.session_id
+            ).exists()
+            ErrorClusterTraces.objects.create(
+                cluster=cluster,
+                trace_session_id=None if session_already_member else result.session_id,
+                eval_logger_id=result.eval_logger_id,
+            )
+        else:
+            # Unique key is (cluster, trace, span) with span NULL here, and
+            # Postgres treats NULLs as distinct — so repeat failures on one trace
+            # each get their own row. Reads are unit-aware already (they count
+            # DISTINCT traces or dedup into sets), so the duplicates don't leak
+            # into any membership figure.
+            ErrorClusterTraces.objects.create(
+                cluster=cluster,
+                trace_id=result.trace_id,
+                eval_logger_id=result.eval_logger_id,
+            )
 
-    # Create junction entry, keyed on the membership unit so a re-run can't
-    # double-link. Session evals dedup on (cluster, trace_session) — a real
-    # unique constraint, so get_or_create is safe. Trace/span evals can't use
-    # get_or_create: the unique key is (cluster, trace, span) with span left
-    # NULL here, so duplicate (cluster, trace) rows accumulate and
-    # get_or_create's internal .get() raises MultipleObjectsReturned — guard
-    # with exists()+create instead.
-    if result.target_type == "session":
-        ErrorClusterTraces.objects.get_or_create(
-            cluster=cluster,
-            trace_session_id=result.session_id,
-            defaults={"eval_logger_id": result.eval_logger_id},
+        # Occurrence counters move per eval; ``unique_traces`` carries the
+        # distinct-unit meaning. Provenance rows have no unit, so they're
+        # excluded from the DISTINCT count rather than landing in a NULL group.
+        if result.target_type == "session":
+            unique = (
+                cluster.clusters.exclude(trace_session__isnull=True)
+                .values("trace_session")
+                .distinct()
+                .count()
+            )
+        else:
+            unique = (
+                cluster.clusters.exclude(trace__isnull=True)
+                .values("trace")
+                .distinct()
+                .count()
+            )
+        cluster.error_count = (cluster.error_count or 0) + 1
+        cluster.total_events = (cluster.total_events or 0) + 1
+        cluster.last_seen = timezone.now()
+        cluster.unique_traces = unique
+        cluster.combined_impact = _compute_cluster_impact(cluster)
+        cluster.save(
+            update_fields=[
+                "error_count",
+                "total_events",
+                "last_seen",
+                "unique_traces",
+                "combined_impact",
+                "updated_at",
+            ]
         )
-    elif not ErrorClusterTraces.objects.filter(
-        cluster=cluster, trace_id=result.trace_id
-    ).exists():
-        ErrorClusterTraces.objects.create(
-            cluster=cluster,
-            trace_id=result.trace_id,
-            eval_logger_id=result.eval_logger_id,
-        )
-
-    # Refresh the unique-membership count + recompute impact from avg score.
-    # The unit is sessions for session clusters, traces otherwise.
-    if result.target_type == "session":
-        unique = cluster.clusters.values("trace_session").distinct().count()
-    else:
-        unique = cluster.clusters.values("trace").distinct().count()
-    cluster.unique_traces = unique
-    cluster.combined_impact = _compute_cluster_impact(cluster)
-    cluster.save(update_fields=["unique_traces", "combined_impact", "updated_at"])
 
     # Incrementally update centroid in ClickHouse
     family = _eval_family(result.eval_name, result.target_type)

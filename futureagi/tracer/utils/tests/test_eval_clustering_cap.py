@@ -11,7 +11,11 @@ concurrently with the next per-eval trigger and double-counted. These tests pin:
   * the inner batch is bounded and never self-continues, and
   * the caller's drain loop terminates on a short batch (backlog drained) or on
     zero progress (downstream down), aggregates counters across batches, and is
-    backstopped for the pathological full-batch-of-re-fetched-rows case.
+    backstopped so one dispatch can't run away on a very large backlog.
+
+Termination is sound because every clustered row leaves a junction row and so
+drops out of the next fetch — that invariant is pinned in
+``tracer/tests/test_eval_clustering_membership.py``.
 """
 
 from unittest.mock import MagicMock, patch
@@ -167,8 +171,9 @@ def test_drain_stops_on_zero_progress():
 
 @pytest.mark.django_db
 def test_drain_backstops_at_max_batches():
-    """Pathological: every batch is full AND clusters (assigned-but-not-
-    junctioned rows re-fetch forever), so the loop never self-terminates. The
-    ``_MAX_DRAIN_BATCHES`` backstop bounds it."""
+    """A backlog bigger than the loop can drain in one dispatch: every batch
+    comes back full AND makes progress, so nothing self-terminates it. The
+    ``_MAX_DRAIN_BATCHES`` backstop bounds the dispatch; the next trigger (or the
+    sweep) picks the remainder up."""
     result, n = _drain_with([_full(1)])  # always full + progress
     assert n == _MAX_DRAIN_BATCHES
