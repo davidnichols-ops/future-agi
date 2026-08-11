@@ -7,15 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag to publish (e.g. v2.1.0-dev)'
+        description: "Version tag to publish (e.g. v2.1.0-dev)"
         required: true
         type: string
       branch:
-        description: 'Branch to build from'
+        description: "Branch to build from"
         required: true
-        default: 'main'
-        type: choice
-        options: [main, dev]
+        default: "main"
+        type: string
 
 permissions:
   contents: read
