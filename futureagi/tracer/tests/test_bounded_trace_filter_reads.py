@@ -1570,7 +1570,7 @@ def test_call_type_trace_filter_skips_unindexed_window_anchor() -> None:
     assert "JSONExtract" not in ordered_sql
     assert "parent_span_id IS NULL" in ordered_sql
     assert "JSONExtract" in match_sql
-    assert builder.recommended_filter_seed_batch_size() == 200
+    assert builder.recommended_filter_seed_batch_size() == 50
     assert builder.recommended_filter_classify_batch_size() == 20
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
@@ -2091,7 +2091,8 @@ def test_span_match_compiles_typed_map_json_and_multi_filter_at_latest_state() -
     assert "latest_attr_exists_1" in sql
     assert "latest_attr_exists_2" in sql
     assert "latest_attr_exists_3" in sql
-    assert "latest_json_value_4" in sql
+    assert "latest_expression_value_4" in sql
+    assert "observation_type = 'conversation'" in sql
     assert "GROUP BY project_id, trace_id, id, start_time" in sql
 
 
@@ -3240,7 +3241,7 @@ def test_empty_or_malformed_filter_values_emit_no_bounded_query(
         builder.build_filter_match_query(["span-a"])
 
 
-def test_call_type_json_sources_and_unknown_values_fail_closed() -> None:
+def test_call_type_json_sources_match_provider_normalization() -> None:
     builder = SpanListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[_time_filter(), _system_filter("call_type", "inbound")],
@@ -3255,8 +3256,9 @@ def test_call_type_json_sources_and_unknown_values_fail_closed() -> None:
     )
     assert "JSONExtractString(span_attr_str['raw_log'], 'type')" in sql
     assert "= 'inboundPhoneCall', 'inbound'" in sql
-    assert "= 'outboundPhoneCall', 'outbound'" in sql
-    assert "'outbound', null)" in sql
+    assert "= 'inboundPhoneCall', 'inbound', 'outbound')" in sql
+    assert "outboundPhoneCall" not in sql
+    assert "'raw_log', 'direction'" in sql
 
 
 def test_v2_bounded_builders_emit_only_ch25_columns() -> None:

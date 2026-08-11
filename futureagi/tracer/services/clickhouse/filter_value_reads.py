@@ -14,9 +14,12 @@ from datetime import UTC, datetime, timedelta
 from hashlib import blake2b
 from typing import Any, Literal, NotRequired, TypedDict
 
-from tracer.services.clickhouse.query_builders.voice_call_list import (
+from tracer.services.clickhouse.query_builders.voice_filter_expressions import (
+    VOICE_CALL_ID_FILTER_EXPRESSION,
     VOICE_CALL_STATUS_FILTER_EXPRESSION,
+    VOICE_CALL_TYPE_FILTER_EXPRESSION,
     VOICE_COST_CENTS_FILTER_EXPRESSION,
+    VOICE_ENDED_REASON_FILTER_EXPRESSION,
 )
 from tracer.services.clickhouse.query_service import QueryExecutor
 from tracer.services.clickhouse.read_budget import (
@@ -76,6 +79,9 @@ _SYSTEM_VALUE_SOURCE_COLUMNS = {
 _VOICE_SYSTEM_VALUE_EXPRESSIONS = {
     "call_status": rewrite_v1_sql_to_v2(VOICE_CALL_STATUS_FILTER_EXPRESSION),
     "cost_cents": rewrite_v1_sql_to_v2(VOICE_COST_CENTS_FILTER_EXPRESSION),
+    "call_id": rewrite_v1_sql_to_v2(VOICE_CALL_ID_FILTER_EXPRESSION),
+    "call_type": rewrite_v1_sql_to_v2(VOICE_CALL_TYPE_FILTER_EXPRESSION),
+    "ended_reason": rewrite_v1_sql_to_v2(VOICE_ENDED_REASON_FILTER_EXPRESSION),
 }
 SYSTEM_FILTER_VALUE_METRICS = frozenset(
     {*_SYSTEM_VALUE_SOURCE_COLUMNS, *_VOICE_SYSTEM_VALUE_EXPRESSIONS}

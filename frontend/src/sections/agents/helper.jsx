@@ -20,6 +20,12 @@ import {
   listContinuationParams,
   loadExactListPage,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
+import { getVoiceCallFilterField } from "src/sections/projects/LLMTracing/voiceCallFilterFields";
+
+const voiceColumnLabel = (responseKey) => {
+  const field = getVoiceCallFilterField(responseKey);
+  return field?.columnLabel || field?.label || responseKey;
+};
 
 export const agentDefinitionSections = [
   {
@@ -648,7 +654,7 @@ export const getCallLogsColumnDefs = (
       cellRenderer: CallLogsCellRenderer,
     },
     {
-      headerName: "Status",
+      headerName: voiceColumnLabel("status"),
       field: "status",
       flex: 0,
       minWidth: 100,
@@ -656,7 +662,7 @@ export const getCallLogsColumnDefs = (
       cellRenderer: CallLogsCellRenderer,
     },
     {
-      headerName: "Duration",
+      headerName: voiceColumnLabel("duration_seconds"),
       field: "duration_seconds",
       flex: 0,
       minWidth: 90,
@@ -665,21 +671,21 @@ export const getCallLogsColumnDefs = (
 
     // ── Performance ───────────────────────────────────────────────────
     {
-      headerName: "Avg Latency",
+      headerName: voiceColumnLabel("avg_agent_latency_ms"),
       field: "avg_agent_latency_ms",
       flex: 0,
       minWidth: 140,
       cellRenderer: VoiceLatencyCell,
     },
     {
-      headerName: "Turn Count",
+      headerName: voiceColumnLabel("turn_count"),
       field: "turn_count",
       flex: 0,
       minWidth: 110,
       cellRenderer: CallLogsCellRenderer,
     },
     {
-      headerName: "Talk Ratio",
+      headerName: voiceColumnLabel("talk_ratio"),
       field: "talk_ratio",
       flex: 0,
       minWidth: 120,
@@ -689,14 +695,14 @@ export const getCallLogsColumnDefs = (
 
     // ── Resources ─────────────────────────────────────────────────────
     {
-      headerName: "Tokens",
+      headerName: voiceColumnLabel("gen_ai.usage.total_tokens"),
       field: "gen_ai.usage.total_tokens",
       flex: 0,
       minWidth: 220,
       cellRenderer: VoiceTokenCell,
     },
     {
-      headerName: "Cost",
+      headerName: voiceColumnLabel("cost_cents"),
       field: "cost_cents",
       flex: 0,
       minWidth: 120,
@@ -705,21 +711,21 @@ export const getCallLogsColumnDefs = (
 
     // ── Conversation quality ──────────────────────────────────────────
     {
-      headerName: "User Interrupts",
+      headerName: voiceColumnLabel("user_interruption_count"),
       field: "user_interruption_count",
       flex: 0,
       minWidth: 140,
       cellRenderer: CallLogsCellRenderer,
     },
     {
-      headerName: "Agent Interrupts",
+      headerName: voiceColumnLabel("ai_interruption_count"),
       field: "ai_interruption_count",
       flex: 0,
       minWidth: 140,
       cellRenderer: CallLogsCellRenderer,
     },
     {
-      headerName: "Ended Reason",
+      headerName: voiceColumnLabel("ended_reason"),
       field: "ended_reason",
       flex: 1,
       minWidth: 120,
@@ -735,28 +741,28 @@ export const getCallLogsColumnDefs = (
       cellRenderer: CallLogsCellRenderer,
     },
     {
-      headerName: "Type",
+      headerName: voiceColumnLabel("call_type"),
       field: "call_type",
       flex: 0,
       minWidth: 90,
       cellRenderer: CallLogsCellRenderer,
     },
     {
-      headerName: "User WPM",
+      headerName: voiceColumnLabel("user_wpm"),
       field: "user_wpm",
       flex: 0,
       minWidth: 110,
       cellRenderer: CallLogsCellRenderer,
     },
     {
-      headerName: "Agent WPM",
+      headerName: voiceColumnLabel("bot_wpm"),
       field: "bot_wpm",
       flex: 0,
       minWidth: 110,
       cellRenderer: CallLogsCellRenderer,
     },
     {
-      headerName: "Agent Talk (%)",
+      headerName: voiceColumnLabel("agent_talk_percentage"),
       field: "agent_talk_percentage",
       flex: 0,
       minWidth: 130,
@@ -780,7 +786,7 @@ export const getCallLogsColumnDefs = (
       cellRenderer: CallLogsCellRenderer,
     },
     {
-      headerName: "Call ID",
+      headerName: voiceColumnLabel("call_id"),
       field: "call_id",
       flex: 1,
       minWidth: 120,

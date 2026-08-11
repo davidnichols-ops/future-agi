@@ -919,6 +919,7 @@ describe("list cursor pagination", () => {
     });
     expect(page.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
     expect(page.pending).toBe(false);
+    expect(page.nextCursor).toBe("after-3");
   });
 
   it("returns resumable rows and cursor when a preview hits its hop bound", async () => {
@@ -935,5 +936,36 @@ describe("list cursor pagination", () => {
     expect(page.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
     expect(page.pending).toBe(true);
     expect(page.nextCursor).toBe("after-3");
+  });
+
+  it.each([
+    { has_more: false, next_cursor: "unexpected" },
+    { has_more: "yes", next_cursor: "after-1" },
+    { has_more: true },
+  ])("rejects invalid exact-preview cursor metadata: %o", async (metadata) => {
+    await expect(
+      collectExactListRows({
+        initialResponse: { rows: [{ id: 1 }], metadata },
+        targetRowCount: 1,
+        rowsFromResponse: (response) => response.rows,
+        metadataFromResponse: (response) => response.metadata,
+        nextResponse: vi.fn(),
+        rowIdentity: (row) => row.id,
+      }),
+    ).rejects.toThrow(/cursor metadata|continuation cursor/);
+  });
+
+  it("keeps accepting a legacy exact-preview response with no cursor fields", async () => {
+    const page = await collectExactListRows({
+      initialResponse: { rows: [{ id: 1 }], metadata: {} },
+      targetRowCount: 1,
+      rowsFromResponse: (response) => response.rows,
+      metadataFromResponse: (response) => response.metadata,
+      nextResponse: vi.fn(),
+      rowIdentity: (row) => row.id,
+    });
+
+    expect(page.rows).toEqual([{ id: 1 }]);
+    expect(page.nextCursor).toBeNull();
   });
 });

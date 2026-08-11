@@ -11,6 +11,7 @@ import { useWatch } from "react-hook-form";
 import Iconify from "src/components/iconify";
 import { getRandomId } from "src/utils/utils";
 import TraceFilterPanel, {
+  findTraceFilterProperty,
   parseMapFilterValue,
   useTraceFilterProperties,
 } from "src/sections/projects/LLMTracing/TraceFilterPanel";
@@ -120,20 +121,31 @@ const OP_DISPLAY = {
 // eslint-disable-next-line react-refresh/only-export-components
 export function convertNewToOld(newFilters, { rowType } = {}) {
   const isVoiceCalls = String(rowType || "").toLowerCase() === "voicecalls";
-  const toApiValue = (fieldId, value) =>
-    isVoiceCalls ? toVoiceCallApiValue(fieldId, value) : value;
   const out = [];
   (newFilters || []).forEach((f) => {
     if (!f?.field) return;
-    const voiceField = isVoiceCalls
-      ? getVoiceCallFilterField(f.field)
-      : undefined;
+    // A simulator project still exposes raw span attributes. Matching an
+    // attribute named `call.status` must not turn it into the normalized
+    // lifecycle SYSTEM_METRIC merely because the row type is voiceCalls.
+    const isExplicitAttribute =
+      f.fieldCategory === "attribute" || f.apiColType === "SPAN_ATTRIBUTE";
+    const voiceField =
+      isVoiceCalls && !isExplicitAttribute
+        ? getVoiceCallFilterField(f.field)
+        : undefined;
     const canonicalField = voiceField?.value || f.field;
-    const fieldCategory = voiceField?.category || f.fieldCategory;
+    const fieldCategory =
+      voiceField?.category ||
+      (isExplicitAttribute ? "attribute" : f.fieldCategory);
     const isAttribute = fieldCategory === "attribute";
     const fieldType = voiceField?.type || f.fieldType || "string";
     const filterType = canonicalTaskFilterType(fieldType, f.value);
     const op = f.operator || "equals";
+    // Panel values use the canonical field's displayed units. Legacy wire
+    // scaling is applied only while hydrating old form rows; once edited, the
+    // request is emitted under the canonical id and canonical units.
+    const encodeValue = (value) =>
+      voiceField ? toVoiceCallApiValue(canonicalField, value) : value;
 
     const base = {
       property: isAttribute ? "attributes" : canonicalField,
@@ -196,10 +208,7 @@ export function convertNewToOld(newFilters, { rowType } = {}) {
         filterConfig: {
           filterType,
           filterOp: op,
-          filterValue: toApiValue(
-            canonicalField,
-            coerceForType(arr.slice(0, 2), fieldType),
-          ),
+          filterValue: encodeValue(coerceForType(arr.slice(0, 2), fieldType)),
         },
       });
       return;
@@ -216,10 +225,7 @@ export function convertNewToOld(newFilters, { rowType } = {}) {
         filterConfig: {
           filterType,
           filterOp: op,
-          filterValue: toApiValue(
-            canonicalField,
-            coerceForType(arr, fieldType),
-          ),
+          filterValue: encodeValue(coerceForType(arr, fieldType)),
           ...(isAttribute &&
             Array.isArray(f.valueTypes) &&
             f.valueTypes.length === arr.length && {
@@ -241,7 +247,7 @@ export function convertNewToOld(newFilters, { rowType } = {}) {
         filterConfig: {
           filterType,
           filterOp: op,
-          filterValue: toApiValue(canonicalField, coerceForType(v, fieldType)),
+          filterValue: encodeValue(coerceForType(v, fieldType)),
         },
       });
     });
@@ -258,18 +264,21 @@ export function convertNewToOld(newFilters, { rowType } = {}) {
 // eslint-disable-next-line react-refresh/only-export-components
 export function convertOldToNew(oldFilters, { rowType } = {}) {
   const isVoiceCalls = String(rowType || "").toLowerCase() === "voicecalls";
-  const fromApiValue = (fieldId, value) =>
-    isVoiceCalls ? fromVoiceCallApiValue(fieldId, value) : value;
   const groups = new Map();
   const result = [];
   (oldFilters || []).forEach((f) => {
     if (!f) return;
-    const isAttribute = f.property === "attributes";
+    const isAttribute =
+      f.property === "attributes" ||
+      f.fieldCategory === "attribute" ||
+      f.apiColType === "SPAN_ATTRIBUTE" ||
+      f?.filterConfig?.colType === "SPAN_ATTRIBUTE";
     const persistedField = isAttribute ? f.propertyId : f.property;
     if (!persistedField) return;
-    const voiceField = isVoiceCalls
-      ? getVoiceCallFilterField(persistedField)
-      : undefined;
+    const voiceField =
+      isVoiceCalls && !isAttribute
+        ? getVoiceCallFilterField(persistedField)
+        : undefined;
     const field = voiceField?.value || persistedField;
 
     const rawOp = f?.filterConfig?.filterOp || "equals";
@@ -334,7 +343,9 @@ export function convertOldToNew(oldFilters, { rowType } = {}) {
 
     if (NO_VALUE_OPS.has(op)) return;
 
-    const val = fromApiValue(persistedField, f?.filterConfig?.filterValue);
+    const val = voiceField
+      ? fromVoiceCallApiValue(persistedField, f?.filterConfig?.filterValue)
+      : f?.filterConfig?.filterValue;
     const valueTypes = f?.filterConfig?.attributeValueTypes;
     if (RANGE_OPS.has(op)) {
       entry.value = Array.isArray(val) ? val : [];
@@ -468,12 +479,6 @@ const TaskFilterBar = ({
   const { data: properties = [] } = useTraceFilterProperties(projectId, {
     isSimulator,
   });
-  const propertyById = useMemo(() => {
-    const map = {};
-    for (const p of properties) map[p.id] = p;
-    return map;
-  }, [properties]);
-
   // Resolve annotator user UUIDs → "Name (email)" for chip values.
   const hasAnnotatorFilter = panelFilters.some((f) => f.field === "annotator");
   const { data: annotatorOptions = [] } = useDashboardFilterValues({
@@ -498,7 +503,7 @@ const TaskFilterBar = ({
   const enrichedFilters = useMemo(
     () =>
       panelFilters.map((f) => {
-        const prop = propertyById[f.field];
+        const prop = findTraceFilterProperty(properties, f);
         let next = f;
         if (!f.fieldName && f.fieldLabel === f.field && prop) {
           next = { ...next, fieldLabel: prop.name };
@@ -512,7 +517,7 @@ const TaskFilterBar = ({
         }
         return next;
       }),
-    [panelFilters, propertyById, annotatorLabelById],
+    [panelFilters, properties, annotatorLabelById],
   );
 
   // Keep local panel state in sync with form filters when they change externally

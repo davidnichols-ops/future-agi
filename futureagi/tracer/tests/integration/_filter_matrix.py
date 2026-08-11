@@ -1216,8 +1216,6 @@ def _v_str_values(op, sample):
 def _voice_text_leaves():
     leaves = []
     for col_id, seed_key, formula in VOICE_STR_SPEC:
-        if col_id == "call_type":
-            continue  # filter reads raw_log.type, not this key (known bug)
         sample = _v_str_decode(col_id, formula(0))
         for op in _V_STR_OPS:
             for val, suf in _v_str_values(op, sample):

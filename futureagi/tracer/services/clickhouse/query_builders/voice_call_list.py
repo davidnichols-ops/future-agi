@@ -17,7 +17,7 @@ The result sets are merged in Python, with raw_log processing delegated to
 the existing ``ObservabilityService.process_raw_logs()``.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
@@ -70,180 +70,8 @@ _VOICE_ROOT_FILTER = {
 }
 
 
-def _raw_log_has_key(key: str) -> str:
-    """Return a code-owned predicate for a key in either raw-log encoding."""
-
-    return (
-        "(JSONHas(span_attributes_raw, 'raw_log', '"
-        f"{key}') OR "
-        "JSONHas(JSONExtractString(span_attributes_raw, 'raw_log'), '"
-        f"{key}') OR "
-        "JSONHas(span_attr_str['raw_log'], '"
-        f"{key}'))"
-    )
-
-
-def _raw_log_number(path: tuple[str, ...]) -> str:
-    """Read one provider number from object, encoded-string, or Map raw_log."""
-
-    quoted_path = ", ".join(f"'{part}'" for part in path)
-    nested_path = f"'raw_log', {quoted_path}"
-    encoded_raw_log = "JSONExtractString(span_attributes_raw, 'raw_log')"
-    map_raw_log = "span_attr_str['raw_log']"
-    return (
-        "coalesce("
-        f"if(JSONHas(span_attributes_raw, {nested_path}), "
-        f"JSONExtractFloat(span_attributes_raw, {nested_path}), null), "
-        f"if(JSONHas({encoded_raw_log}, {quoted_path}), "
-        f"JSONExtractFloat({encoded_raw_log}, {quoted_path}), null), "
-        f"if(JSONHas({map_raw_log}, {quoted_path}), "
-        f"JSONExtractFloat({map_raw_log}, {quoted_path}), null)"
-        ")"
-    )
-
-
-def _raw_log_string(path: tuple[str, ...]) -> str:
-    """Read one provider string from object or encoded-string raw_log."""
-
-    quoted_path = ", ".join(f"'{part}'" for part in path)
-    nested_path = f"'raw_log', {quoted_path}"
-    encoded_raw_log = "JSONExtractString(span_attributes_raw, 'raw_log')"
-    map_raw_log = "span_attr_str['raw_log']"
-    return (
-        "coalesce("
-        f"nullIf(JSONExtractString(span_attributes_raw, {nested_path}), ''), "
-        f"nullIf(JSONExtractString({encoded_raw_log}, {quoted_path}), ''), "
-        f"nullIf(JSONExtractString({map_raw_log}, {quoted_path}), '')"
-        ")"
-    )
-
-
-_RAW_RETELL_COST_CENTS = _raw_log_number(("call_cost", "combined_cost"))
-_RAW_VAPI_COST_DOLLARS = _raw_log_number(("cost",))
-_RAW_ELEVEN_LABS_COST_CENTS = _raw_log_number(("metadata", "cost"))
-_RAW_PRICE_DOLLARS = _raw_log_number(("price",))
-_VOICE_PROVIDER = "lowerUTF8(toString(provider))"
-_VOICE_GEN_AI_SYSTEM = (
-    "lowerUTF8(toString(if(mapContains(span_attr_str, 'gen_ai.system'), "
-    "span_attr_str['gen_ai.system'], '')))"
-)
-_VOICE_RESOLVED_PROVIDER = (
-    "multiIf("
-    f"{_VOICE_PROVIDER} IN ('vapi', 'retell', 'eleven_labs', 'bland', 'twilio'), "
-    f"{_VOICE_PROVIDER}, "
-    f"{_VOICE_GEN_AI_SYSTEM} IN "
-    "('vapi', 'retell', 'eleven_labs', 'bland', 'twilio'), "
-    f"{_VOICE_GEN_AI_SYSTEM}, 'vapi')"
-)
-_VOICE_COST_CENTS_EXPR = (
-    "coalesce("
-    f"({_RAW_RETELL_COST_CENTS}), "
-    f"nullIf(({_RAW_VAPI_COST_DOLLARS}), 0) * 100, "
-    f"({_RAW_ELEVEN_LABS_COST_CENTS}), "
-    f"abs(({_RAW_PRICE_DOLLARS})) * 100, "
-    "if(mapContains(span_attr_num, 'combined_cost'), "
-    "span_attr_num['combined_cost'], null), "
-    "if(mapContains(span_attr_num, 'cost_breakdown.total'), "
-    "span_attr_num['cost_breakdown.total'] * 100, null), "
-    "multiIf("
-    f"{_VOICE_PROVIDER} IN ('retell', 'eleven_labs'), toFloat64(cost), "
-    f"{_VOICE_PROVIDER} IN ('vapi', 'bland', 'twilio'), "
-    "abs(toFloat64(cost)) * 100, "
-    "CAST(NULL AS Nullable(Float64))))"
-)
-
-_VOICE_RAW_STATUS = (
-    "if(mapContains(span_attr_str, 'call.status'), "
-    "nullIf(span_attr_str['call.status'], ''), null)"
-)
-_VOICE_CANONICAL_RAW_STATUS = (
-    "multiIf("
-    f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
-    "('ended', 'done', 'complete', 'completed', 'success', 'succeeded', 'ok'), "
-    "'completed', "
-    f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
-    "('in-progress', 'in_progress', 'ongoing', 'started', 'ringing', "
-    "'queued', 'pending'), 'in-progress', "
-    f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
-    "('failed', 'failure', 'error', 'errored'), 'failed', "
-    f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
-    "('dropped', 'cancelled', 'canceled', 'aborted', 'hung-up', 'hung_up'), "
-    "'dropped', "
-    f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
-    "('not-connected', 'not_connected', 'no-answer', 'no_answer', "
-    "'unanswered', 'busy'), 'not-connected', "
-    f"lowerUTF8(toString({_VOICE_RAW_STATUS})))"
-)
-_VOICE_HAS_RAW_LOG = (
-    "(JSONHas(span_attributes_raw, 'raw_log') OR mapContains(span_attr_str, 'raw_log'))"
-)
-_VOICE_HAS_NONEMPTY_RAW_LOG = (
-    "((JSONHas(span_attributes_raw, 'raw_log') AND "
-    "JSONExtractRaw(span_attributes_raw, 'raw_log') NOT IN "
-    "('', '{}', 'null', '\"\"', '\"{}\"', '\"null\"')) OR "
-    "(mapContains(span_attr_str, 'raw_log') AND "
-    "span_attr_str['raw_log'] NOT IN ('', '{}', 'null')))"
-)
-_VOICE_IS_RETELL = _raw_log_has_key("call_status")
-_VOICE_IS_ELEVEN_LABS = _raw_log_has_key("conversation_id")
-_VOICE_IS_BLAND = _raw_log_has_key("call_length")
-_VOICE_IS_TWILIO = _raw_log_has_key("sid")
-_VOICE_IS_VAPI = f"({_raw_log_has_key('startedAt')} OR {_raw_log_has_key('createdAt')})"
-_VOICE_OTLP_CALL_ID = (
-    "nullIf(JSONExtractString(span_attributes_raw, 'metadata', "
-    "'call_execution_id'), '')"
-)
-_VOICE_CALL_ID_EXPR = (
-    "multiIf("
-    f"NOT {_VOICE_HAS_NONEMPTY_RAW_LOG}, {_VOICE_OTLP_CALL_ID}, "
-    f"({_VOICE_RESOLVED_PROVIDER}) = 'retell', {_raw_log_string(('call_id',))}, "
-    f"({_VOICE_RESOLVED_PROVIDER}) = 'eleven_labs', "
-    f"{_raw_log_string(('conversation_id',))}, "
-    f"({_VOICE_RESOLVED_PROVIDER}) = 'bland', {_raw_log_string(('call_id',))}, "
-    f"({_VOICE_RESOLVED_PROVIDER}) = 'twilio', {_raw_log_string(('sid',))}, "
-    f"{_raw_log_string(('id',))})"
-)
-_VOICE_CALL_STATUS_EXPR = (
-    "multiIf("
-    f"NOT {_VOICE_HAS_RAW_LOG}, "
-    f"coalesce({_VOICE_CANONICAL_RAW_STATUS}, 'completed'), "
-    f"({_VOICE_IS_RETELL} OR {_VOICE_IS_VAPI} "
-    f"OR {_VOICE_PROVIDER} IN ('retell', 'vapi')), "
-    f"if({_VOICE_CANONICAL_RAW_STATUS} = 'completed', "
-    f"'completed', 'in-progress'), "
-    f"({_VOICE_IS_ELEVEN_LABS} OR {_VOICE_PROVIDER} = 'eleven_labs'), "
-    f"{_VOICE_CANONICAL_RAW_STATUS}, "
-    f"({_VOICE_IS_BLAND} OR {_VOICE_IS_TWILIO} "
-    f"OR {_VOICE_PROVIDER} IN ('bland', 'twilio')), "
-    f"{_VOICE_CANONICAL_RAW_STATUS}, "
-    f"{_VOICE_CANONICAL_RAW_STATUS})"
-)
-
-# Public, code-owned expressions used by the voice list and its filter-value
-# suggestions.  They intentionally retain legacy column tokens here; the CH25
-# compiler rewrites those tokens once at its normal schema boundary.
-VOICE_CALL_STATUS_FILTER_EXPRESSION = _VOICE_CALL_STATUS_EXPR
-VOICE_COST_CENTS_FILTER_EXPRESSION = _VOICE_COST_CENTS_EXPR
-VOICE_CALL_ID_FILTER_EXPRESSION = _VOICE_CALL_ID_EXPR
-
-
 class VoiceCallFilterBuilder(ClickHouseFilterBuilder):
-    """Voice-list-only aliases matching the normalized list response."""
-
-    VOICE_SYSTEM_METRIC_EXPRS = {
-        **ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_EXPRS,
-        "cost_cents": VOICE_COST_CENTS_FILTER_EXPRESSION,
-    }
-    VOICE_SYSTEM_METRIC_STR_MAP = {
-        key: value
-        for key, value in ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_STR_MAP.items()
-        if key != "call_status"
-    }
-    VOICE_SYSTEM_METRIC_STR_EXPRS = {
-        **ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_STR_EXPRS,
-        "call_status": VOICE_CALL_STATUS_FILTER_EXPRESSION,
-        "call_id": VOICE_CALL_ID_FILTER_EXPRESSION,
-    }
+    """Voice-list filter compiler using the shared normalized public aliases."""
 
 
 class VoiceCallListQueryBuilder(BaseQueryBuilder):
@@ -398,6 +226,24 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         """Retain the trace selector's filter-shape-specific safety ceiling."""
 
         return self._bounded_delegate().recommended_filter_classify_batch_size()
+
+    def recommended_filter_unindexed_micro_seed_width(self) -> timedelta | None:
+        """Expose the delegated bounded JSON probe for provider call type."""
+
+        return self._bounded_delegate().recommended_filter_unindexed_micro_seed_width()
+
+    def recommended_filter_unindexed_micro_seed_strata(self) -> int | None:
+        return self._bounded_delegate().recommended_filter_unindexed_micro_seed_strata()
+
+    def build_filter_unindexed_micro_seed_page(
+        self, **kwargs: Any
+    ) -> tuple[str, dict[str, Any]]:
+        return self._bounded_delegate().build_filter_unindexed_micro_seed_page(**kwargs)
+
+    def filter_unindexed_micro_seed_proves_result_order(self) -> bool:
+        return (
+            self._bounded_delegate().filter_unindexed_micro_seed_proves_result_order()
+        )
 
     def _filter_exact_zero_probe_plans(self) -> tuple[Any, list[Any]] | None:
         """Return scalar Map leaves accepted by the legacy temporal probe.

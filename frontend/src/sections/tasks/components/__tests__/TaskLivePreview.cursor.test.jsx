@@ -62,9 +62,14 @@ PreviewHarness.propTypes = {
   projectId: PropTypes.string,
 };
 
-const voiceListPage = ({ results = [], hasMore, nextCursor }) => ({
+const voiceListPage = ({
+  results = [],
+  count = results.length,
+  hasMore,
+  nextCursor,
+}) => ({
   data: {
-    count: results.length,
+    count,
     count_is_lower_bound: hasMore,
     total_pages: 1,
     current_page: 1,
@@ -76,6 +81,28 @@ const voiceListPage = ({ results = [], hasMore, nextCursor }) => ({
     next_cursor: nextCursor,
     query_complete: true,
     query_status: "complete",
+  },
+});
+
+const observeListPage = ({
+  rows = [],
+  total = rows.length,
+  hasMore,
+  nextCursor,
+  totalIsLowerBound = false,
+}) => ({
+  data: {
+    status: true,
+    result: {
+      config: [],
+      table: rows,
+      metadata: {
+        total_rows: total,
+        total_rows_is_lower_bound: totalIsLowerBound,
+        has_more: hasMore,
+        next_cursor: nextCursor,
+      },
+    },
   },
 });
 
@@ -174,6 +201,428 @@ describe("TaskLivePreview sparse cursor continuation", () => {
     await waitFor(() =>
       expect(screen.queryByText("No matching rows")).not.toBeInTheDocument(),
     );
+  });
+
+  it("loads trace previews one row at a time without eager list fan-out", async () => {
+    let listCalls = 0;
+    let resolveSecondPage;
+    const secondPage = new Promise((resolve) => {
+      resolveSecondPage = resolve;
+    });
+    mocks.get.mockImplementation(async (url) => {
+      if (url === "/traces/") {
+        listCalls += 1;
+        if (listCalls === 1) {
+          return observeListPage({
+            rows: [{ trace_id: "trace-first" }],
+            total: 37,
+            totalIsLowerBound: true,
+            hasMore: true,
+            nextCursor: "trace-checkpoint-1",
+          });
+        }
+        if (listCalls === 2) return secondPage;
+        if (listCalls === 3) {
+          return observeListPage({
+            rows: [{ trace_id: "trace-third" }],
+            total: 3,
+            hasMore: false,
+            nextCursor: null,
+          });
+        }
+        throw new Error("Trace preview requested an extra list page");
+      }
+      if (url.startsWith("/traces/trace-") && url.endsWith("/")) {
+        const traceId = url.slice("/traces/".length, -1);
+        return {
+          data: {
+            status: true,
+            result: {
+              trace: { trace_id: traceId, input: `${traceId} detail` },
+              observation_spans: [],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness rowType="traces" />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText(/Row 1 of 1/);
+    await screen.findByText(/trace-first detail/);
+    expect(listCalls).toBe(1);
+    expect(
+      mocks.get.mock.calls.filter(([url]) => url === "/traces/trace-first/"),
+    ).toHaveLength(1);
+    expect(screen.getByText(/≥37 matching total/)).toBeVisible();
+    const firstListRequest = mocks.get.mock.calls.find(
+      ([url]) => url === "/traces/",
+    );
+    expect(firstListRequest[1].params).toEqual(
+      expect.objectContaining({
+        page_number: 0,
+        page_size: 1,
+        cursor_mode: true,
+        filters: "[]",
+      }),
+    );
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Next row" }).click();
+    });
+    await waitFor(() => expect(listCalls).toBe(2));
+
+    // The current row/detail remains visible while the exact next match is in
+    // flight, and clicking Next issues only the one signed continuation read.
+    expect(screen.getByText(/Row 1 of 1/)).toBeVisible();
+    expect(screen.getByText(/trace-first detail/)).toBeVisible();
+    const secondListRequest = mocks.get.mock.calls.filter(
+      ([url]) => url === "/traces/",
+    )[1];
+    expect(secondListRequest[1].params).toEqual(
+      expect.objectContaining({
+        page_size: 1,
+        cursor_mode: true,
+        cursor: "trace-checkpoint-1",
+      }),
+    );
+    expect(secondListRequest[1].params).not.toHaveProperty("page_number");
+
+    await act(async () => {
+      resolveSecondPage(
+        observeListPage({
+          rows: [{ trace_id: "trace-second" }],
+          total: 2,
+          hasMore: true,
+          nextCursor: "trace-checkpoint-2",
+        }),
+      );
+      await secondPage;
+    });
+
+    await screen.findByText(/Row 2 of 2/);
+    await screen.findByText(/trace-second detail/);
+    expect(listCalls).toBe(2);
+    expect(screen.getByText(/≥37 matching total/)).toBeVisible();
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Next row" }).click();
+    });
+    await screen.findByText(/Row 3 of 3/);
+    await screen.findByText(/trace-third detail/);
+    expect(listCalls).toBe(3);
+    const thirdListRequest = mocks.get.mock.calls.filter(
+      ([url]) => url === "/traces/",
+    )[2];
+    expect(thirdListRequest[1].params).toEqual(
+      expect.objectContaining({
+        page_size: 1,
+        cursor_mode: true,
+        cursor: "trace-checkpoint-2",
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Next row" })).toBeDisabled();
+  });
+
+  it.each([
+    ["spans", "/spans/"],
+    ["sessions", "/sessions/"],
+  ])(
+    "uses one-row signed continuation requests for %s previews",
+    async (rowType, listUrl) => {
+      let listCalls = 0;
+      const row = (suffix) =>
+        rowType === "spans"
+          ? {
+              span_id: `span-${suffix}`,
+              trace_id: `trace-${suffix}`,
+            }
+          : { session_id: `session-${suffix}` };
+      mocks.get.mockImplementation(async (url) => {
+        if (url === listUrl) {
+          listCalls += 1;
+          return listCalls === 1
+            ? observeListPage({
+                rows: [row("first")],
+                total: 2,
+                hasMore: true,
+                nextCursor: `${rowType}-checkpoint`,
+              })
+            : observeListPage({
+                rows: [row("second")],
+                total: 2,
+                hasMore: false,
+                nextCursor: null,
+              });
+        }
+        if (rowType === "spans" && url.startsWith("/traces/trace-")) {
+          const traceId = url.slice("/traces/".length, -1);
+          const suffix = traceId.replace("trace-", "");
+          return {
+            data: {
+              status: true,
+              result: {
+                trace: { trace_id: traceId },
+                observation_spans: [
+                  {
+                    observation_span: { id: `span-${suffix}` },
+                    children: [],
+                  },
+                ],
+              },
+            },
+          };
+        }
+        if (rowType === "sessions" && url.startsWith("/sessions/session-")) {
+          const sessionId = url.slice("/sessions/".length, -1);
+          return {
+            data: {
+              status: true,
+              result: {
+                session_metadata: { session_id: sessionId },
+                response: [],
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected GET ${url}`);
+      });
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+
+      render(
+        <QueryClientProvider client={queryClient}>
+          <PreviewHarness rowType={rowType} />
+        </QueryClientProvider>,
+      );
+
+      await screen.findByText(/Row 1 of 1/);
+      await waitFor(() =>
+        expect(
+          mocks.get.mock.calls.filter(([url]) => url !== listUrl),
+        ).toHaveLength(1),
+      );
+      expect(listCalls).toBe(1);
+      const firstRequest = mocks.get.mock.calls.find(
+        ([url]) => url === listUrl,
+      );
+      expect(firstRequest[1].params).toEqual(
+        expect.objectContaining({
+          page_number: 0,
+          page_size: 1,
+          cursor_mode: true,
+        }),
+      );
+
+      await act(async () => {
+        screen.getByRole("button", { name: "Next row" }).click();
+      });
+      await screen.findByText(/Row 2 of 2/);
+      expect(listCalls).toBe(2);
+      const continuationRequest = mocks.get.mock.calls.filter(
+        ([url]) => url === listUrl,
+      )[1];
+      expect(continuationRequest[1].params).toEqual(
+        expect.objectContaining({
+          page_size: 1,
+          cursor_mode: true,
+          cursor: `${rowType}-checkpoint`,
+        }),
+      );
+      expect(continuationRequest[1].params).not.toHaveProperty("page_number");
+      expect(screen.getByRole("button", { name: "Next row" })).toBeDisabled();
+    },
+  );
+
+  it("renders the first non-empty voice-call preview batch without filling the page", async () => {
+    let listCalls = 0;
+    let resolveSecondPage;
+    const secondPage = new Promise((resolve) => {
+      resolveSecondPage = resolve;
+    });
+    mocks.get.mockImplementation(async (url) => {
+      if (url === "/calls/") {
+        const callIndex = listCalls;
+        listCalls += 1;
+        if (callIndex === 0) {
+          return voiceListPage({
+            results: [{ id: "call-fast", trace_id: "trace-voice-fast" }],
+            count: 37,
+            hasMore: true,
+            nextCursor: "voice-fast-checkpoint-0",
+          });
+        }
+        if (callIndex === 1) return secondPage;
+        throw new Error("Voice preview requested more than one lazy row");
+      }
+      if (url === "/calls/detail/") {
+        return { data: { result: { status: "completed" } } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness rowType="voiceCalls" />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText(/Row 1 of 1/);
+    await waitFor(() =>
+      expect(
+        mocks.get.mock.calls.filter(([url]) => url === "/calls/detail/"),
+      ).toHaveLength(1),
+    );
+    expect(listCalls).toBe(1);
+    expect(screen.getByText(/≥37 matching total/)).toBeVisible();
+    const firstListRequest = mocks.get.mock.calls.filter(
+      ([url]) => url === "/calls/",
+    )[0];
+    expect(firstListRequest[1].params).toEqual(
+      expect.objectContaining({
+        page: 1,
+        page_size: 1,
+        cursor_mode: true,
+        filters: "[]",
+      }),
+    );
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Next row" }).click();
+    });
+    await waitFor(() => expect(listCalls).toBe(2));
+
+    // The current row and its detail stay mounted while the cursor request is
+    // unresolved; one click must not trigger a second detail read or fan out.
+    expect(screen.getByText(/Row 1 of 1/)).toBeVisible();
+    expect(
+      mocks.get.mock.calls.filter(([url]) => url === "/calls/detail/"),
+    ).toHaveLength(1);
+    const secondListRequest = mocks.get.mock.calls.filter(
+      ([url]) => url === "/calls/",
+    )[1];
+    expect(secondListRequest[1].params).toEqual(
+      expect.objectContaining({
+        page_size: 1,
+        cursor_mode: true,
+        cursor: "voice-fast-checkpoint-0",
+      }),
+    );
+
+    await act(async () => {
+      resolveSecondPage(
+        voiceListPage({
+          results: [{ id: "call-second", trace_id: "trace-voice-second" }],
+          count: 2,
+          hasMore: false,
+          nextCursor: null,
+        }),
+      );
+      await secondPage;
+    });
+
+    await screen.findByText(/Row 2 of 2/);
+    await waitFor(() =>
+      expect(
+        mocks.get.mock.calls.filter(([url]) => url === "/calls/detail/"),
+      ).toHaveLength(2),
+    );
+    expect(listCalls).toBe(2);
+    expect(screen.getByText(/≥37 matching total/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Next row" })).toBeDisabled();
+  });
+
+  it("disables backward navigation while a lazy next row is pending", async () => {
+    let listCalls = 0;
+    let resolveSecondPage;
+    let resolveThirdPage;
+    const secondPage = new Promise((resolve) => {
+      resolveSecondPage = resolve;
+    });
+    const thirdPage = new Promise((resolve) => {
+      resolveThirdPage = resolve;
+    });
+    mocks.get.mockImplementation(async (url) => {
+      if (url === "/calls/") {
+        listCalls += 1;
+        if (listCalls === 1) {
+          return voiceListPage({
+            results: [{ id: "call-first", trace_id: "trace-voice-first" }],
+            count: 3,
+            hasMore: true,
+            nextCursor: "voice-second-checkpoint",
+          });
+        }
+        if (listCalls === 2) return secondPage;
+        if (listCalls === 3) return thirdPage;
+        throw new Error("Voice preview requested more than two lazy rows");
+      }
+      if (url === "/calls/detail/") {
+        return { data: { result: { status: "completed" } } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness rowType="voiceCalls" />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText(/Row 1 of 1/);
+    await act(async () => {
+      screen.getByRole("button", { name: "Next row" }).click();
+    });
+    await waitFor(() => expect(listCalls).toBe(2));
+    await act(async () => {
+      resolveSecondPage(
+        voiceListPage({
+          results: [{ id: "call-second", trace_id: "trace-voice-second" }],
+          count: 3,
+          hasMore: true,
+          nextCursor: "voice-third-checkpoint",
+        }),
+      );
+      await secondPage;
+    });
+    await screen.findByText(/Row 2 of 2/);
+    expect(screen.getByRole("button", { name: "Previous row" })).toBeEnabled();
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Next row" }).click();
+    });
+    await waitFor(() => expect(listCalls).toBe(3));
+    expect(screen.getByRole("button", { name: "Previous row" })).toBeDisabled();
+
+    await act(async () => {
+      resolveThirdPage(
+        voiceListPage({
+          results: [{ id: "call-third", trace_id: "trace-voice-third" }],
+          count: 3,
+          hasMore: false,
+          nextCursor: null,
+        }),
+      );
+      await thirdPage;
+    });
+
+    await screen.findByText(/Row 3 of 3/);
+    expect(screen.getByRole("button", { name: "Previous row" })).toBeEnabled();
   });
 
   it("resumes a sparse voice-call preview beyond the first hop budget", async () => {
@@ -481,10 +930,11 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       </QueryClientProvider>,
     );
 
-    const continueSearch = await screen.findByRole("button", {
-      name: "Continue search",
+    await screen.findByText("Row 1 of 1");
+    expect(screen.getByText(/retained preview row/)).toBeVisible();
+    await act(async () => {
+      screen.getByRole("button", { name: "Next row" }).click();
     });
-    await act(async () => continueSearch.click());
 
     const retrySearch = await screen.findByRole("button", {
       name: "Retry search",

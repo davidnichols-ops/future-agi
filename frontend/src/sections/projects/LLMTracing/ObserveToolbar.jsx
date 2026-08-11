@@ -114,6 +114,10 @@ const ObserveToolbar = ({
   const [dateAnchor, setDateAnchor] = useState(null);
   const [customDateOpen, setCustomDateOpen] = useState(false);
   const dateButtonRef = useRef(null);
+  // Simulator projects render CallLogsGrid in the trace slot. The URL/tab
+  // remains `trace`, but the visible rows and list endpoint use the canonical
+  // voice-call field contract.
+  const effectiveFilterTab = isSimulator ? "voiceCalls" : tab;
   const setFilterButtonNode = useCallback((node) => {
     filterButtonRef.current = node;
     setFilterButtonEl(node);
@@ -417,7 +421,7 @@ const ObserveToolbar = ({
             onClose={onFilterToggle}
             currentFilters={panelFilters}
             filterFields={filterFields}
-            tab={tab}
+            tab={effectiveFilterTab}
             isSimulator={isSimulator}
             isSpansView={isSpansView}
             source={
@@ -612,7 +616,7 @@ ObserveToolbar.propTypes = {
   onClearExtraFilters: PropTypes.func,
   onClearCompareExtraFilters: PropTypes.func,
   filterFields: PropTypes.array,
-  tab: PropTypes.oneOf(["trace", "spans"]),
+  tab: PropTypes.oneOf(["trace", "spans", "voiceCalls"]),
   graphFilters: PropTypes.array,
   onResetView: PropTypes.func,
   onSetDefaultView: PropTypes.func,

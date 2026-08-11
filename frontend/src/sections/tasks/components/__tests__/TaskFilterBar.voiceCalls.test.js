@@ -14,9 +14,51 @@ import {
   buildTaskPreviewListParams,
 } from "../TaskLivePreview";
 import { convertNewToOld, convertOldToNew } from "../TaskFilterBar";
+import { VOICE_CALL_FILTER_FIELDS } from "src/sections/projects/LLMTracing/voiceCallFilterFields";
 
 describe("TaskFilterBar voice-call filter contract", () => {
-  it("requires a complete filtered voice-call preview page without exact-count mode", () => {
+  it("encodes and hydrates all 15 canonical Task picker fields", () => {
+    const panelRows = VOICE_CALL_FILTER_FIELDS.map((field) => ({
+      field: field.value,
+      fieldName: field.label,
+      fieldCategory: field.category,
+      fieldType: field.type,
+      apiColType: field.apiColType,
+      operator: field.type === "number" ? "equals" : "in",
+      value:
+        field.value === "call_status"
+          ? ["completed"]
+          : field.type === "number"
+            ? 1
+            : ["sample"],
+    }));
+
+    const formRows = convertNewToOld(panelRows, { rowType: "voiceCalls" });
+    const requests = buildApiFilterArray(formRows);
+
+    expect(requests).toHaveLength(15);
+    requests.forEach((request, index) => {
+      const field = VOICE_CALL_FILTER_FIELDS[index];
+      expect(request).toMatchObject({
+        column_id: field.value,
+        filter_config: {
+          filter_type: field.type === "number" ? "number" : "text",
+          filter_op: field.type === "number" ? "equals" : "in",
+          col_type: "SYSTEM_METRIC",
+        },
+      });
+    });
+    expect(
+      convertOldToNew(formRows, { rowType: "voiceCalls" }).map((row) => [
+        row.field,
+        row.fieldLabel,
+      ]),
+    ).toEqual(
+      VOICE_CALL_FILTER_FIELDS.map((field) => [field.value, field.label]),
+    );
+  });
+
+  it("requests one exact voice-call preview row without exact-count mode", () => {
     const params = buildTaskPreviewListParams({
       rowType: "voiceCalls",
       projectId: "project-1",
@@ -36,14 +78,14 @@ describe("TaskFilterBar voice-call filter contract", () => {
     expect(params).toMatchObject({
       project_id: "project-1",
       page: 1,
-      page_size: 50,
+      page_size: 1,
       cursor_mode: true,
     });
     expect(JSON.parse(params.filters)).toHaveLength(1);
     expect(params).not.toHaveProperty("allow_sampled");
   });
 
-  it("requires a complete filtered trace preview page without exact-count mode", () => {
+  it("requests one trace preview row with signed continuation", () => {
     const params = buildTaskPreviewListParams({
       rowType: "traces",
       projectId: "project-1",
@@ -53,26 +95,29 @@ describe("TaskFilterBar voice-call filter contract", () => {
     expect(params).toMatchObject({
       project_id: "project-1",
       page_number: 0,
-      page_size: 50,
+      page_size: 1,
       cursor_mode: true,
     });
     expect(params).not.toHaveProperty("allow_sampled");
   });
 
-  it("uses signed bounded continuation for session previews", () => {
-    const params = buildTaskPreviewListParams({
-      rowType: "sessions",
-      projectId: "project-1",
-      apiFilters: [{ column_id: "final_status" }],
-    });
+  it.each(["spans", "sessions"])(
+    "requests one %s preview row with signed continuation",
+    (rowType) => {
+      const params = buildTaskPreviewListParams({
+        rowType,
+        projectId: "project-1",
+        apiFilters: [{ column_id: "final_status" }],
+      });
 
-    expect(params).toMatchObject({
-      project_id: "project-1",
-      page_number: 0,
-      page_size: 50,
-      cursor_mode: true,
-    });
-  });
+      expect(params).toMatchObject({
+        project_id: "project-1",
+        page_number: 0,
+        page_size: 1,
+        cursor_mode: true,
+      });
+    },
+  );
 
   it("maps Live Preview Status to the normalized voice-list alias", () => {
     const formRows = convertNewToOld(
@@ -209,6 +254,99 @@ describe("TaskFilterBar voice-call filter contract", () => {
     ]);
   });
 
+  it("round-trips safe and Task-known legacy system aliases canonically", () => {
+    const aliases = [
+      ["duration_seconds", 42],
+      ["agent_latency", 350],
+      ["tokens", 10],
+      ["total_tokens", 11],
+      ["total_cost", 0.122],
+      ["user_interruptions", 2],
+      ["ai_interruptions", 3],
+    ].map(([property, filterValue]) => ({
+      property,
+      propertyId: property,
+      fieldCategory: "system",
+      apiColType: "SYSTEM_METRIC",
+      filterConfig: {
+        filterType: "number",
+        filterOp: "equals",
+        filterValue,
+      },
+    }));
+
+    const panelRows = convertOldToNew(aliases, { rowType: "voiceCalls" });
+    expect(panelRows).toEqual([
+      expect.objectContaining({ field: "duration", value: [42] }),
+      expect.objectContaining({
+        field: "avg_agent_latency_ms",
+        value: [350],
+      }),
+      expect.objectContaining({
+        field: "gen_ai.usage.total_tokens",
+        value: [10],
+      }),
+      expect.objectContaining({
+        field: "gen_ai.usage.total_tokens",
+        value: [11],
+      }),
+      expect.objectContaining({ field: "cost_cents", value: [12.2] }),
+      expect.objectContaining({ field: "user_interruption_count", value: [2] }),
+      expect.objectContaining({ field: "ai_interruption_count", value: [3] }),
+    ]);
+
+    expect(
+      convertNewToOld(panelRows, { rowType: "voiceCalls" }).map((row) => [
+        row.property,
+        row.filterConfig.filterValue,
+      ]),
+    ).toEqual([
+      ["duration", 42],
+      ["avg_agent_latency_ms", 350],
+      ["gen_ai.usage.total_tokens", 10],
+      ["gen_ai.usage.total_tokens", 11],
+      ["cost_cents", 12.2],
+      ["user_interruption_count", 2],
+      ["ai_interruption_count", 3],
+    ]);
+  });
+
+  it("canonicalizes safe and Task-known alias ids entering convertNewToOld", () => {
+    const aliases = [
+      ["duration_seconds", 42],
+      ["agent_latency", 350],
+      ["tokens", 10],
+      ["total_tokens", 11],
+      // Task panel values are already displayed in canonical cents even when
+      // an old in-memory row still carries the total_cost id.
+      ["total_cost", 12.2],
+      ["user_interruptions", 2],
+      ["ai_interruptions", 3],
+    ].map(([field, value]) => ({
+      field,
+      fieldCategory: "system",
+      fieldType: "number",
+      apiColType: "SYSTEM_METRIC",
+      operator: "equals",
+      value,
+    }));
+
+    expect(
+      convertNewToOld(aliases, { rowType: "voiceCalls" }).map((row) => [
+        row.property,
+        row.filterConfig.filterValue,
+      ]),
+    ).toEqual([
+      ["duration", 42],
+      ["avg_agent_latency_ms", 350],
+      ["gen_ai.usage.total_tokens", 10],
+      ["gen_ai.usage.total_tokens", 11],
+      ["cost_cents", 12.2],
+      ["user_interruption_count", 2],
+      ["ai_interruption_count", 3],
+    ]);
+  });
+
   it("repairs legacy voice status rows without changing normal trace status", () => {
     const legacy = [
       {
@@ -239,6 +377,36 @@ describe("TaskFilterBar voice-call filter contract", () => {
     });
   });
 
+  it("hydrates Task transition and unknown statuses as in-progress", () => {
+    const legacy = [
+      {
+        property: "call_status",
+        propertyId: "call_status",
+        fieldCategory: "system",
+        apiColType: "SYSTEM_METRIC",
+        filterConfig: {
+          filterType: "text",
+          filterOp: "in",
+          filterValue: [
+            "initiated",
+            "processing",
+            "scheduled",
+            "future-provider-transition",
+          ],
+        },
+      },
+    ];
+
+    expect(convertOldToNew(legacy, { rowType: "voiceCalls" })).toEqual([
+      expect.objectContaining({
+        field: "call_status",
+        fieldCategory: "system",
+        apiColType: "SYSTEM_METRIC",
+        value: ["in-progress"],
+      }),
+    ]);
+  });
+
   it("normalizes provider failure and connection aliases deterministically", () => {
     const aliases = ["ERROR", "cancelled", "no_answer", "ok"];
     const rows = convertNewToOld(
@@ -259,6 +427,111 @@ describe("TaskFilterBar voice-call filter contract", () => {
       "dropped",
       "not-connected",
       "completed",
+    ]);
+  });
+
+  it("keeps an explicitly selected call.status span attribute raw", () => {
+    const panelRows = [
+      {
+        field: "call.status",
+        fieldName: "call.status",
+        fieldCategory: "attribute",
+        fieldType: "string",
+        apiColType: "SPAN_ATTRIBUTE",
+        operator: "in",
+        value: ["ended", "ringing"],
+      },
+    ];
+
+    const formRows = convertNewToOld(panelRows, { rowType: "voiceCalls" });
+    expect(formRows).toEqual([
+      expect.objectContaining({
+        property: "attributes",
+        propertyId: "call.status",
+        fieldCategory: "attribute",
+        apiColType: "SPAN_ATTRIBUTE",
+        filterConfig: expect.objectContaining({
+          filterValue: ["ended", "ringing"],
+        }),
+      }),
+    ]);
+    expect(buildApiFilterArray(formRows)).toEqual([
+      {
+        column_id: "call.status",
+        filter_config: {
+          filter_type: "text",
+          filter_op: "in",
+          filter_value: ["ended", "ringing"],
+          col_type: "SPAN_ATTRIBUTE",
+        },
+      },
+    ]);
+    expect(convertOldToNew(formRows, { rowType: "voiceCalls" })).toEqual([
+      expect.objectContaining({
+        field: "call.status",
+        fieldCategory: "attribute",
+        apiColType: "SPAN_ATTRIBUTE",
+        value: ["ended", "ringing"],
+      }),
+    ]);
+  });
+
+  it("keeps raw cost_cents and call_id distinct from same-id system fields", () => {
+    const panelRows = [
+      {
+        field: "cost_cents",
+        fieldName: "cost_cents",
+        fieldCategory: "attribute",
+        fieldType: "number",
+        apiColType: "SPAN_ATTRIBUTE",
+        operator: "equals",
+        value: 12.2,
+      },
+      {
+        field: "call_id",
+        fieldName: "call_id",
+        fieldCategory: "attribute",
+        fieldType: "string",
+        apiColType: "SPAN_ATTRIBUTE",
+        operator: "in",
+        value: ["raw-call-id"],
+      },
+    ];
+
+    const formRows = convertNewToOld(panelRows, { rowType: "voiceCalls" });
+    expect(buildApiFilterArray(formRows)).toEqual([
+      {
+        column_id: "cost_cents",
+        filter_config: {
+          filter_type: "number",
+          filter_op: "equals",
+          filter_value: 12.2,
+          col_type: "SPAN_ATTRIBUTE",
+        },
+      },
+      {
+        column_id: "call_id",
+        filter_config: {
+          filter_type: "text",
+          filter_op: "in",
+          filter_value: ["raw-call-id"],
+          col_type: "SPAN_ATTRIBUTE",
+        },
+      },
+    ]);
+    expect(convertOldToNew(formRows, { rowType: "voiceCalls" })).toEqual([
+      expect.objectContaining({
+        field: "cost_cents",
+        fieldCategory: "attribute",
+        apiColType: "SPAN_ATTRIBUTE",
+        value: [12.2],
+      }),
+      expect.objectContaining({
+        field: "call_id",
+        fieldCategory: "attribute",
+        apiColType: "SPAN_ATTRIBUTE",
+        value: ["raw-call-id"],
+      }),
     ]);
   });
 });

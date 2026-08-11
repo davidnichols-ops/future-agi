@@ -984,6 +984,7 @@ def compile_exact_graph_row_predicates(
         if (
             normalized_observe_type == "trace"
             and builder is not None
+            and normalized_col_type in {"SYSTEM_METRIC", "TRACE_END_USER"}
             and _is_root_only_system_metric(builder, column_id)
         ):
             predicate = (

@@ -381,9 +381,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     ) -> tuple[list[LatestFilterPredicate], list[dict[str, Any]]]:
         """Compile predicates with this list surface's filter semantics.
 
-        Voice lists inject a private filter subclass for response-normalized
-        aliases. Generic trace/span builders retain the canonical maps, so
-        their ``status`` and raw ``call.status`` contracts remain unchanged.
+        Public voice system metrics use one response-normalized contract across
+        voice lists and trace graphs. Raw provider values remain explicit
+        SPAN_ATTRIBUTE filters such as ``call.status``.
         """
 
         return partition_trace_filter_plans(
@@ -870,13 +870,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def _unindexed_positive_micro_seed_plan(self) -> LatestFilterPredicate | None:
         """Return one exact raw call-type seed safe for a five-minute probe.
 
-        ``call_type`` is derived from the JSON overflow and has no production
-        skip index.  Its positive equality/IN predicate is nevertheless a
-        complete *raw* superset for latest-state membership: every latest live
-        match has a physical live row with the same value.  Restrict this
-        optimization to that explicitly supported shape; negative/null JSON
-        predicates must keep the ordered candidate path because raw absence is
-        not a latest-state proof.
+        Provider-backed ``call_type`` is derived from the JSON overflow and has
+        no production skip index. Its positive equality/IN predicate is still
+        a complete *raw* superset for latest-state voice-root membership: every
+        latest live match has a physical live root row with the same value.
+        Restrict this optimization to that explicitly supported shape;
+        negative/null JSON predicates must keep the ordered candidate path
+        because raw absence is not a latest-state proof.
         """
 
         plans, residual_filters = self._partition_trace_filter_plans(
@@ -896,7 +896,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             if (
                 key == "call_type"
                 and operation in {"equals", "in"}
-                and plan.scope == "any"
+                and plan.scope == "root"
                 and "JSONExtract" in plan.seed_predicate
                 and not self._plan_uses_indexed_anchor(plan)
             ):
@@ -2309,7 +2309,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self.start_date, self.end_date = request_start, request_end
         self.params.update({"start_date": request_start, "end_date": request_end})
         plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
-        root_plans = [plan for plan in plans if plan.scope == "root"]
+        # call_type is a root-scoped semantic predicate, but its provider
+        # normalization parses unindexed JSON. Keep ordinary ordered seeds as
+        # cheap root-identity supersets; the dedicated five-minute micro-seed
+        # below may opt into the exact raw predicate on a bounded slice.
+        root_plans = [
+            plan
+            for plan in plans
+            if plan.scope == "root" and plan.source_metric != "call_type"
+        ]
         root_seed_plan_predicates = [
             (plan, plan.raw_witness_predicate or plan.seed_predicate)
             for plan in root_plans
@@ -2513,7 +2521,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         request_start, request_end = self.parse_time_range(self.filters)
         plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
-        root_plans = [plan for plan in plans if plan.scope == "root"]
+        root_plans = [
+            plan
+            for plan in plans
+            if plan.scope == "root" and plan.source_metric != "call_type"
+        ]
         any_span_plans = [plan for plan in plans if plan.scope == "any"]
         allowed_start, allowed_end = request_start, request_end
         if _deduplicate_traces and any_span_plans:

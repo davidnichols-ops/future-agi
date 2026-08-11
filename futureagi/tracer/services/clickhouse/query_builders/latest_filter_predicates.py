@@ -6,7 +6,7 @@ import math
 import unicodedata
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from tracer.services.clickhouse.query_builders.filters import (
@@ -141,20 +141,6 @@ _TRACE_ANY_SPAN_COLUMNS = {
     }
 }
 _INTERNAL_ROOT_METRIC_TYPE = "INTERNAL_ROOT_METRIC"
-_CALL_TYPE_RAW_VALUE = (
-    "coalesce("
-    "nullIf(JSONExtractString(span_attributes_raw, 'raw_log', 'type'), ''), "
-    "nullIf(JSONExtractString(JSONExtractString(span_attributes_raw, 'raw_log'), "
-    "'type'), ''), "
-    "nullIf(JSONExtractString(span_attr_str['raw_log'], 'type'), '')"
-    ")"
-)
-_CALL_TYPE_VALUE = (
-    "multiIf("
-    f"{_CALL_TYPE_RAW_VALUE} = 'inboundPhoneCall', 'inbound', "
-    f"{_CALL_TYPE_RAW_VALUE} = 'outboundPhoneCall', 'outbound', "
-    "null)"
-)
 
 
 class UnsupportedFilterShapeError(ValueError):
@@ -179,6 +165,7 @@ class LatestFilterPredicate:
     # value predicate before a row can become a graph point.
     raw_key_witness_predicate: str | None = None
     raw_witness_rank: int | None = None
+    source_metric: str | None = None
 
 
 def _parts(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -1315,6 +1302,46 @@ def _system_metric_plan(
             "end-user string metric needs residual lookup"
         )
 
+    filter_type = str(
+        config.get("filter_type") or config.get("filterType") or ""
+    ).lower()
+    if key in filter_builder_cls.VOICE_NORMALIZED_SYSTEM_METRIC_EXPRS:
+        value_type = "number" if key == "cost_cents" else "text"
+        if filter_type != value_type:
+            raise UnsupportedFilterShapeError(
+                f"normalized voice metric requires {value_type}"
+            )
+        return replace(
+            _expression_plan(
+                item,
+                index=index,
+                expression=filter_builder_cls.VOICE_NORMALIZED_SYSTEM_METRIC_EXPRS[key],
+                value_type=value_type,
+                nullable=True,
+                scope="root" if trace_mode else "span",
+            ),
+            source_metric=key,
+        )
+
+    if key in filter_builder_cls.VOICE_PUBLIC_ROOT_SYSTEM_METRIC_EXPRS:
+        if filter_type != "number":
+            raise UnsupportedFilterShapeError(
+                "public voice root metric requires number"
+            )
+        return replace(
+            _expression_plan(
+                item,
+                index=index,
+                expression=filter_builder_cls.VOICE_PUBLIC_ROOT_SYSTEM_METRIC_EXPRS[
+                    key
+                ],
+                value_type="number",
+                nullable=True,
+                scope="root" if trace_mode else "span",
+            ),
+            source_metric=key,
+        )
+
     if key in filter_builder_cls.VOICE_SYSTEM_METRIC_STR_MAP:
         mapped = dict(item)
         mapped["column_id"] = filter_builder_cls.VOICE_SYSTEM_METRIC_STR_MAP[key]
@@ -1324,9 +1351,6 @@ def _system_metric_plan(
             scope="any" if trace_mode else "span",
         )
 
-    filter_type = str(
-        config.get("filter_type") or config.get("filterType") or ""
-    ).lower()
     if key in filter_builder_cls.VOICE_SYSTEM_METRIC_EXPRS:
         return _expression_plan(
             item,
@@ -1388,38 +1412,6 @@ def _system_metric_plan(
     )
 
 
-def _call_type_plan(item: dict[str, Any], *, index: int) -> LatestFilterPredicate:
-    _, config = _parts(item)
-    alias = f"latest_json_value_{index}"
-    predicate, params = _comparison(
-        alias=alias,
-        exists_alias=None,
-        config=config,
-        coerce=str,
-        value_type="text",
-        index=index,
-    )
-    seed_predicate, seed_params = _comparison(
-        alias=_CALL_TYPE_VALUE,
-        exists_alias=None,
-        config=config,
-        coerce=str,
-        value_type="text",
-        index=index,
-    )
-    if seed_params != params:
-        raise AssertionError("latest and seed predicates must share bound values")
-    return LatestFilterPredicate(
-        aggregates=(
-            f"argMax(tuple({_CALL_TYPE_VALUE}), _peerdb_version).1 AS {alias}",
-        ),
-        predicate=predicate,
-        seed_predicate=seed_predicate,
-        params=params,
-        scope="any",
-    )
-
-
 def compile_trace_filter_plans(
     filters: list[dict[str, Any]],
     *,
@@ -1432,9 +1424,7 @@ def compile_trace_filter_plans(
             continue
         col_type = str(config.get("col_type") or config.get("colType") or "").upper()
         index = len(plans)
-        if key == "call_type":
-            plans.append(_call_type_plan(item, index=index))
-        elif (
+        if (
             col_type == _INTERNAL_ROOT_METRIC_TYPE
             and key == "observation_type"
             and item.get("_eval_task_trace_root") is True
@@ -1473,6 +1463,18 @@ def compile_trace_filter_plans(
                     scope="any",
                 )
             )
+        elif key in {
+            *filter_builder_cls.VOICE_NORMALIZED_SYSTEM_METRIC_EXPRS,
+            *filter_builder_cls.VOICE_PUBLIC_ROOT_SYSTEM_METRIC_EXPRS,
+        } and col_type in {"", "NORMAL"}:
+            plans.append(
+                _system_metric_plan(
+                    item,
+                    index=index,
+                    trace_mode=True,
+                    filter_builder_cls=filter_builder_cls,
+                )
+            )
         elif col_type == "SPAN_ATTRIBUTE":
             # Trace attribute filters retain their documented any-span
             # semantics: separate child spans may satisfy separate filters.
@@ -1501,9 +1503,7 @@ def compile_span_filter_plans(
             continue
         col_type = str(config.get("col_type") or config.get("colType") or "").upper()
         index = len(plans)
-        if key == "call_type":
-            plans.append(_call_type_plan(item, index=index))
-        elif key in _SPAN_COLUMNS:
+        if key in _SPAN_COLUMNS:
             column, value_type, nullable = _SPAN_COLUMNS[key]
             plans.append(
                 _column_plan(
@@ -1515,6 +1515,11 @@ def compile_span_filter_plans(
                     scope="span",
                 )
             )
+        elif key in {
+            *ClickHouseFilterBuilder.VOICE_NORMALIZED_SYSTEM_METRIC_EXPRS,
+            *ClickHouseFilterBuilder.VOICE_PUBLIC_ROOT_SYSTEM_METRIC_EXPRS,
+        } and col_type in {"", "NORMAL"}:
+            plans.append(_system_metric_plan(item, index=index, trace_mode=False))
         elif col_type == "SPAN_ATTRIBUTE":
             plans.append(_attribute_plan(item, index=index, scope="span"))
         elif col_type in {"SYSTEM_METRIC", "TRACE_END_USER"}:
@@ -1613,7 +1618,11 @@ def targets_trace_filter_domain(filters: list[dict[str, Any]]) -> bool:
             continue
         col_type = str(config.get("col_type") or config.get("colType") or "").upper()
         if (
-            key == "call_type"
+            key
+            in {
+                *ClickHouseFilterBuilder.VOICE_NORMALIZED_SYSTEM_METRIC_EXPRS,
+                *ClickHouseFilterBuilder.VOICE_PUBLIC_ROOT_SYSTEM_METRIC_EXPRS,
+            }
             or key in _TRACE_ROOT_COLUMNS
             or key in _TRACE_ANY_SPAN_COLUMNS
             or col_type
@@ -1642,7 +1651,11 @@ def targets_span_filter_domain(filters: list[dict[str, Any]]) -> bool:
             continue
         col_type = str(config.get("col_type") or config.get("colType") or "").upper()
         if (
-            key == "call_type"
+            key
+            in {
+                *ClickHouseFilterBuilder.VOICE_NORMALIZED_SYSTEM_METRIC_EXPRS,
+                *ClickHouseFilterBuilder.VOICE_PUBLIC_ROOT_SYSTEM_METRIC_EXPRS,
+            }
             or key in _SPAN_COLUMNS
             or col_type
             in {

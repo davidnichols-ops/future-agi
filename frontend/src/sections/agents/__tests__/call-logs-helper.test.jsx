@@ -313,6 +313,22 @@ describe("getCallLogsColumnDefs", () => {
       ]),
     );
   });
+
+  it("uses the canonical grid label for all 15 filterable voice fields", () => {
+    const columnsByField = new Map(
+      getCallLogsColumnDefs([], false, null, "project").map((column) => [
+        column.field,
+        column,
+      ]),
+    );
+
+    expect(VOICE_CALL_FILTER_FIELDS).toHaveLength(15);
+    VOICE_CALL_FILTER_FIELDS.forEach((field) => {
+      expect(columnsByField.get(field.responseKey)?.headerName).toBe(
+        field.columnLabel || field.label,
+      );
+    });
+  });
 });
 
 import {
@@ -321,3 +337,4 @@ import {
   useCallLogs,
 } from "../helper";
 import { createListCursorPagination } from "src/sections/projects/LLMTracing/listCursorPagination";
+import { VOICE_CALL_FILTER_FIELDS } from "src/sections/projects/LLMTracing/voiceCallFilterFields";

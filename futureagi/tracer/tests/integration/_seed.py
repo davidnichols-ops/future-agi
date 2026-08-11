@@ -43,19 +43,16 @@ CHOICE_OPTIONS = ["good", "bad", "neutral"]
 #   pct2 -> round(v/(v+1)*100, 2)    (agent-talk-percentage style)
 #   pct0 -> round(v/(v+1)*100)       (talk_ratio filter: integer-rounded)
 #
-# Two known display-vs-filter mismatches are currently NOT covered here:
-#   - wpm: filter round()s to int; displayed value is raw.
-#   - call_type: filter reads raw_log.type (not stored) -> always 'outbound'.
-# The auto-matrix pins the filter's own rounding/raw-value semantics (so it
-# passes), leaving the display divergence untested.
-# TODO: add an explicit known-bug family to pin these display-vs-filter gaps.
+# The list and filter both apply the precision documented here. In particular,
+# WPM values are integer-rounded at list assembly and call_type accepts the
+# already-normalized attribute used by collector/seed rows when raw_log is
+# absent; provider-backed rows derive the same value from their raw payload.
 
 # (col_id, seed_key, formula, precision)
 VOICE_NUM_SPEC: list[tuple] = [
     # curated + FE aliases (handled) — read the real stored key
     ("talk_ratio", "call.talk_ratio", lambda i: round(0.2 + i * 0.12, 4), "pct0"),
-    # wpm carry a fractional .4 (rounds down): the auto-matrix uses the filter's
-    # int precision so it passes (display-vs-filter gap not covered — see above).
+    # WPM carry a fractional .4 (rounds down) to exercise list/filter rounding.
     ("bot_wpm", "call.bot_wpm", lambda i: round(120.0 + i * 4 + 0.4, 4), "int"),
     ("user_wpm", "call.user_wpm", lambda i: round(110.0 + i * 5 + 0.4, 4), "int"),
     ("duration", "call.duration", lambda i: float(20 + i), "raw"),
@@ -118,8 +115,8 @@ VOICE_STR_SPEC: list[tuple] = [
         lambda i: "customer-ended-call" if i % 2 == 0 else "exceeded-max-duration",
     ),
     # call.status is stored raw ('ended'); the voice-list matrix filters the
-    # normalized public value ('completed'). call_type is seeded below but
-    # SKIPPED by the matrix (its filter reads raw_log.type, not this key).
+    # normalized public value ('completed'). With no provider raw_log,
+    # call_type is an already-normalized collector attribute.
     ("call_status", "call.status", lambda i: "ended"),
     ("call_type", "call_type", lambda i: "inbound" if i % 2 == 0 else "outbound"),
     # fallback string metrics — seeded under the FE col_id key.

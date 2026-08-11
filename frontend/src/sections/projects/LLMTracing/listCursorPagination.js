@@ -664,14 +664,51 @@ export const collectExactListRows = async ({
   while (response) {
     appendRows(rowsFromResponse(response));
     metadata = metadataFromResponse(response) || {};
-    if (rows.length >= targetRowCount || metadata.has_more !== true) {
+    const hasHasMore = hasOwn(metadata, "has_more");
+    const hasNextCursor = hasOwn(metadata, "next_cursor");
+    if (hasHasMore !== hasNextCursor) {
+      throw createListCursorProtocolError(
+        "List response returned incomplete cursor metadata",
+      );
+    }
+    const hasCursorContract = hasHasMore && hasNextCursor;
+    const hasMore = metadata.has_more === true;
+    let nextCursor = null;
+    if (hasCursorContract) {
+      if (metadata.has_more !== true && metadata.has_more !== false) {
+        throw createListCursorProtocolError(
+          "List response returned invalid cursor metadata",
+        );
+      }
+      if (hasMore) {
+        nextCursor = metadata.next_cursor;
+        if (typeof nextCursor !== "string" || nextCursor.length === 0) {
+          throw createListCursorProtocolError(
+            "List response omitted its continuation cursor",
+          );
+        }
+      } else if (metadata.next_cursor != null) {
+        throw createListCursorProtocolError(
+          "List response returned invalid cursor metadata",
+        );
+      }
+    }
+    if (rows.length >= targetRowCount || !hasMore) {
+      if (hasMore && followed.has(nextCursor)) {
+        throw createListCursorProtocolError(
+          "List API returned a repeated continuation cursor",
+        );
+      }
       return {
         response,
         rows: rows.slice(0, targetRowCount),
         metadata,
         pending: false,
         stale: false,
-        nextCursor: null,
+        // A full visible preview is not necessarily terminal. Preserve the
+        // unconsumed signed checkpoint so callers can lazily request another
+        // exact row without replaying the current transport page.
+        nextCursor,
       };
     }
     if (!isCurrent()) {
@@ -683,12 +720,6 @@ export const collectExactListRows = async ({
         stale: true,
         nextCursor: metadata.next_cursor,
       };
-    }
-    const nextCursor = metadata.next_cursor;
-    if (typeof nextCursor !== "string" || nextCursor.length === 0) {
-      throw createListCursorProtocolError(
-        "List response omitted its continuation cursor",
-      );
     }
     if (followed.has(nextCursor)) {
       throw createListCursorProtocolError(

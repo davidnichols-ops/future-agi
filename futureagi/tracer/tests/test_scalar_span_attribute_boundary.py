@@ -278,11 +278,10 @@ def test_final_status_v2_match_classifies_latest_typed_map_state_only() -> None:
     assert params["candidate_trace_ids"] == ("trace-a",)
 
 
-def test_bespoke_call_type_json_path_remains_separate() -> None:
+def test_raw_call_type_span_attribute_remains_separate() -> None:
     item = _attribute_filter(key="call_type", filter_value="inbound")
     plan = compile_trace_filter_plans([item])[0]
 
-    assert "JSONExtractString(span_attributes_raw, 'raw_log', 'type')" in (
-        plan.seed_predicate
-    )
-    assert "latest_filter_key_0" not in plan.params
+    assert "span_attr_str[%(latest_filter_key_0)s]" in plan.seed_predicate
+    assert "raw_log" not in plan.seed_predicate
+    assert plan.params["latest_filter_key_0"] == "call_type"

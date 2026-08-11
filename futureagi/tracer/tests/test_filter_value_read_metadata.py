@@ -88,6 +88,29 @@ def test_system_filter_value_cap_produces_a_labelled_sample():
             "12.2",
             ("'call_cost', 'combined_cost'", "'cost_breakdown.total'", "* 100"),
         ),
+        (
+            "call_id",
+            "provider-call-123",
+            (
+                "'raw_log', 'id'",
+                "'raw_log', 'conversation_id'",
+                "'metadata', 'call_execution_id'",
+            ),
+        ),
+        (
+            "call_type",
+            "inbound",
+            (
+                "'raw_log', 'type'",
+                "'raw_log', 'direction'",
+                "attrs_string['call_type']",
+            ),
+        ),
+        (
+            "ended_reason",
+            "customer-ended-call",
+            ("attrs_string['ended_reason']",),
+        ),
     ],
 )
 def test_voice_system_suggestions_use_normalized_list_expressions(

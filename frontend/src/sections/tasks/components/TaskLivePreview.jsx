@@ -146,18 +146,26 @@ export function buildApiFilterArray(oldFormatFilters, startDate, endDate) {
   return userFilters;
 }
 
-// Trace/span/session/voice previews opt into signed bounded continuation. Every row is
-// a genuine classified match; bounded transport pages are accumulated until
-// the 50-row preview is full or the frozen window is exhausted.
+const TASK_PREVIEW_CURSOR_ROW_TYPES = new Set([
+  "voiceCalls",
+  "traces",
+  "spans",
+  "sessions",
+]);
+
+const isTaskPreviewCursorRowType = (rowType) =>
+  TASK_PREVIEW_CURSOR_ROW_TYPES.has(rowType);
+
+// Trace/span/session/voice previews opt into signed bounded continuation and
+// navigate one row at a time. Filling an eager 50-row preview could force many
+// serial bounded scans before the first usable row rendered.
 // eslint-disable-next-line react-refresh/only-export-components
 export function buildTaskPreviewListParams({ rowType, projectId, apiFilters }) {
-  const cursorCapable = ["voiceCalls", "traces", "spans", "sessions"].includes(
-    rowType,
-  );
+  const cursorCapable = isTaskPreviewCursorRowType(rowType);
   return {
     project_id: projectId,
     ...(rowType === "voiceCalls" ? { page: 1 } : { page_number: 0 }),
-    page_size: 50,
+    page_size: cursorCapable ? 1 : 50,
     filters: JSON.stringify(apiFilters),
     ...(cursorCapable ? { cursor_mode: true } : {}),
   };
@@ -279,6 +287,8 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
   //   { [idx]: { status: "running" | "success" | "error", result?, error? } }
   const [testResults, setTestResults] = useState({});
   const [isTesting, setIsTesting] = useState(false);
+  const pendingNextRowIndexRef = useRef(null);
+  const failedListContinuationRef = useRef(null);
   const queryClient = useQueryClient();
 
   const formFilters = useWatch({ control, name: "filters" });
@@ -286,6 +296,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
   const endDate = useWatch({ control, name: "endDate" });
   const evalsDetails = useWatch({ control, name: "evalsDetails" });
   const rowType = useWatch({ control, name: "rowType" }) || "spans";
+  const isCursorPreview = isTaskPreviewCursorRowType(rowType);
 
   const apiFilters = useMemo(
     () => buildApiFilterArray(formFilters, startDate, endDate),
@@ -318,7 +329,9 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
       });
       previousPreviewScopeKeyRef.current = previewScopeKey;
       setListContinuation(null);
+      failedListContinuationRef.current = null;
     }
+    pendingNextRowIndexRef.current = null;
     setCurrentRowIndex(0);
   }, [previewScopeKey, queryClient]);
 
@@ -341,21 +354,33 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     queryFn: async ({ signal }) => {
       if (!projectId) return { rows: [], total: 0, columns: [] };
 
+      // A lazy continuation can traverse several empty bounded chunks before
+      // its transport fails. Retry from the last unconsumed signed checkpoint
+      // retained by that attempt instead of replaying the already-proven
+      // prefix from the cursor stored in React state.
+      const failedListContinuation =
+        failedListContinuationRef.current?.scopeKey === previewScopeKey
+          ? failedListContinuationRef.current
+          : null;
+      const attemptListContinuation =
+        failedListContinuation || activeListContinuation;
+      const attemptCursor = attemptListContinuation?.cursor || null;
+
       // Cursors are opaque and query-bound. Keep every cursor already
       // requested for this exact project/filter scope so a repeated or cyclic
       // backend chain fails closed instead of spinning forever. The pending
       // continuation itself is deliberately not in this set until this
       // request consumes it.
       const requestedCursors = new Set(
-        activeListContinuation?.requestedCursors || [],
+        attemptListContinuation?.requestedCursors || [],
       );
-      if (resumeCursor) {
-        if (requestedCursors.has(resumeCursor)) {
+      if (attemptCursor) {
+        if (requestedCursors.has(attemptCursor)) {
           throw createListCursorProtocolError(
             "List API returned a repeated continuation cursor",
           );
         }
-        requestedCursors.add(resumeCursor);
+        requestedCursors.add(attemptCursor);
       }
 
       const recordContinuation = (metadata) => {
@@ -372,7 +397,11 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         requestedCursors.add(nextCursor);
       };
 
-      const continuationResult = (nextCursor, accumulatedRows = []) => {
+      const continuationResult = (
+        nextCursor,
+        accumulatedRows = [],
+        continuationMetadata = {},
+      ) => {
         if (!nextCursor) return null;
         // The shared per-attempt follower checks cycles inside one bounded
         // attempt. This second guard covers a cycle that lands exactly on the
@@ -386,17 +415,52 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           cursor: nextCursor,
           requestedCursors: [...requestedCursors],
           rows: accumulatedRows,
+          ...continuationMetadata,
         };
       };
 
-      const requestList = (url, params, { voice = false, parser } = {}) =>
-        requestListWithLegacyCursorFallback({
-          request: (nextParams) =>
-            axios.get(url, { params: nextParams, signal }),
-          params,
-          pageParam: voice ? "page" : "page_number",
-          firstPage: voice ? 1 : 0,
-        }).then((response) => parseAxiosResult(response, parser));
+      const requestList = async (
+        url,
+        params,
+        { voice = false, parser } = {},
+      ) => {
+        try {
+          const response = await requestListWithLegacyCursorFallback({
+            request: (nextParams) =>
+              axios.get(url, { params: nextParams, signal }),
+            params,
+            pageParam: voice ? "page" : "page_number",
+            firstPage: voice ? 1 : 0,
+          });
+          return parseAxiosResult(response, parser);
+        } catch (error) {
+          const failedCursor = params?.cursor;
+          if (
+            !signal.aborted &&
+            typeof failedCursor === "string" &&
+            failedCursor.length > 0 &&
+            !isListCursorProtocolError(error)
+          ) {
+            failedListContinuationRef.current = {
+              scopeKey: previewScopeKey,
+              ...attemptListContinuation,
+              cursor: failedCursor,
+              requestedCursors: [...requestedCursors].filter(
+                (cursor) => cursor !== failedCursor,
+              ),
+              rows: attemptListContinuation?.rows || [],
+            };
+          }
+          throw error;
+        }
+      };
+
+      const completeListAttempt = (result) => {
+        if (failedListContinuationRef.current?.scopeKey === previewScopeKey) {
+          failedListContinuationRef.current = null;
+        }
+        return result;
+      };
 
       if (rowType === "voiceCalls") {
         const requestParams = buildTaskPreviewListParams({
@@ -406,15 +470,17 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         });
         const resp = await requestList(
           endpoints.project.getCallLogs,
-          resumeCursor
-            ? listContinuationParams(requestParams, resumeCursor)
+          attemptCursor
+            ? listContinuationParams(requestParams, attemptCursor)
             : requestParams,
           { voice: true, parser: parseVoiceCallListResponse },
         );
         const exactRows = await collectExactListRows({
           initialResponse: resp,
-          initialRows: activeListContinuation?.rows || [],
-          targetRowCount: requestParams.page_size,
+          initialRows: attemptListContinuation?.rows || [],
+          targetRowCount:
+            (attemptListContinuation?.rows?.length || 0) +
+            requestParams.page_size,
           rowsFromResponse: (response) => response.data.results,
           metadataFromResponse: (response) => response.data,
           nextResponse: (cursor) =>
@@ -429,14 +495,28 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         });
         const result = exactRows.response.data;
         const rowsOut = exactRows.rows;
-        return {
+        // Bounded cursor chunks may expose only a page-local/lower-bound
+        // count. Never let lazy navigation shrink a total already shown for
+        // this immutable preview scope, and retain the conservative qualifier.
+        const total = Math.max(
+          result.count,
+          rowsOut.length,
+          attemptListContinuation?.total || 0,
+        );
+        const totalIsLowerBound = Boolean(
+          result.count_is_lower_bound ||
+            attemptListContinuation?.totalIsLowerBound,
+        );
+        return completeListAttempt({
           rows: rowsOut,
-          total: result.count,
+          total,
+          totalIsLowerBound,
           columns: result.config,
-          continuation: exactRows.pending
-            ? continuationResult(exactRows.nextCursor, rowsOut)
-            : null,
-        };
+          continuation: continuationResult(exactRows.nextCursor, rowsOut, {
+            total,
+            totalIsLowerBound,
+          }),
+        });
       }
 
       let url;
@@ -466,15 +546,17 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
       });
       const resp = await requestList(
         url,
-        resumeCursor
-          ? listContinuationParams(requestParams, resumeCursor)
+        attemptCursor
+          ? listContinuationParams(requestParams, attemptCursor)
           : requestParams,
         { parser: responseParser },
       );
       const exactRows = await collectExactListRows({
         initialResponse: resp,
-        initialRows: activeListContinuation?.rows || [],
-        targetRowCount: requestParams.page_size,
+        initialRows: attemptListContinuation?.rows || [],
+        targetRowCount:
+          (attemptListContinuation?.rows?.length || 0) +
+          requestParams.page_size,
         rowsFromResponse: (response) => response.data.table,
         metadataFromResponse: (response) => response.data.metadata,
         nextResponse: (cursor) =>
@@ -487,18 +569,37 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
       });
       const result = exactRows.response.data;
       const rowsOut = exactRows.rows;
-      return {
+      // A bounded continuation may report only its page-local count. Preserve
+      // the best total already observed for this immutable preview scope.
+      const total = Math.max(
+        result.metadata.total_rows || 0,
+        rowsOut.length,
+        attemptListContinuation?.total || 0,
+      );
+      const totalIsLowerBound = Boolean(
+        result.metadata.total_rows_is_lower_bound ||
+          attemptListContinuation?.totalIsLowerBound,
+      );
+      return completeListAttempt({
         rows: rowsOut,
-        total: result.metadata.total_rows,
+        total,
+        totalIsLowerBound,
         columns: result.config,
-        continuation: exactRows.pending
-          ? continuationResult(exactRows.nextCursor, rowsOut)
-          : null,
-      };
+        continuation: continuationResult(exactRows.nextCursor, rowsOut, {
+          total,
+          totalIsLowerBound,
+        }),
+      });
     },
     enabled: !!projectId,
     refetchOnWindowFocus: false,
     staleTime: 10000,
+    // A continuation is the same immutable preview scope. Keep its current row
+    // visible while the next exact match is resolved.
+    placeholderData:
+      isCursorPreview && resumeCursor
+        ? (previousData) => previousData
+        : undefined,
     // Live Preview renders its own generic failure state; suppress backend
     // query text (including ClickHouse exception details) globally.
     meta: { errorHandled: true },
@@ -520,7 +621,43 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     [];
   const columns = listData?.columns || [];
   const pendingListContinuation = listData?.continuation || null;
+  const matchingTotal = listData?.total ?? rows.length;
+  const matchingTotalIsLowerBound = listData?.totalIsLowerBound === true;
   const currentRow = rows[currentRowIndex] || null;
+
+  const handleNextRow = useCallback(() => {
+    if (currentRowIndex < rows.length - 1) {
+      setCurrentRowIndex((index) => index + 1);
+      return;
+    }
+    if (!isCursorPreview || !pendingListContinuation || listFetching) return;
+
+    pendingNextRowIndexRef.current = rows.length;
+    setListContinuation({
+      scopeKey: previewScopeKey,
+      ...pendingListContinuation,
+    });
+  }, [
+    currentRowIndex,
+    isCursorPreview,
+    listFetching,
+    pendingListContinuation,
+    previewScopeKey,
+    rows.length,
+  ]);
+
+  useEffect(() => {
+    const nextIndex = pendingNextRowIndexRef.current;
+    if (nextIndex === null) return;
+    if (rows.length > nextIndex) {
+      pendingNextRowIndexRef.current = null;
+      setCurrentRowIndex(nextIndex);
+      return;
+    }
+    if (listError || (!listFetching && !pendingListContinuation)) {
+      pendingNextRowIndexRef.current = null;
+    }
+  }, [listError, listFetching, pendingListContinuation, rows.length]);
 
   // ── Fetch full detail for the currently selected row ──
   const {
@@ -882,7 +1019,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
               </Button>
             )}
           </Box>
-        ) : pendingListContinuation ? (
+        ) : pendingListContinuation && rows.length === 0 ? (
           <Box
             sx={{
               display: "flex",
@@ -942,22 +1079,39 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
               >
                 Row {Math.min(currentRowIndex + 1, rows.length)} of{" "}
                 {rows.length}
+                {(matchingTotalIsLowerBound || matchingTotal > rows.length) && (
+                  <Typography
+                    component="span"
+                    sx={{
+                      fontSize: "11px",
+                      color: "text.disabled",
+                      ml: 0.5,
+                    }}
+                  >
+                    ({matchingTotalIsLowerBound ? "≥" : ""}
+                    {matchingTotal} matching total)
+                  </Typography>
+                )}
               </Typography>
               <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
                 <IconButton
+                  aria-label="Previous row"
                   size="small"
-                  disabled={currentRowIndex === 0}
+                  disabled={listFetching || currentRowIndex === 0}
                   onClick={() => setCurrentRowIndex((i) => Math.max(0, i - 1))}
                   sx={{ width: 24, height: 24 }}
                 >
                   <Iconify icon="mdi:chevron-left" width={16} />
                 </IconButton>
                 <IconButton
+                  aria-label="Next row"
                   size="small"
-                  disabled={currentRowIndex >= rows.length - 1}
-                  onClick={() =>
-                    setCurrentRowIndex((i) => Math.min(rows.length - 1, i + 1))
+                  disabled={
+                    listFetching ||
+                    (currentRowIndex >= rows.length - 1 &&
+                      (!isCursorPreview || !pendingListContinuation))
                   }
+                  onClick={handleNextRow}
                   sx={{ width: 24, height: 24 }}
                 >
                   <Iconify icon="mdi:chevron-right" width={16} />

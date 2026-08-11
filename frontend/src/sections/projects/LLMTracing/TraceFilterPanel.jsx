@@ -167,11 +167,68 @@ export const toStaticFilterProperty = (field, isSpansView = false) => {
     ...(field.choices ? { choices: field.choices } : {}),
     ...(field.responseKey ? { responseKey: field.responseKey } : {}),
     ...(field.searchAliases ? { searchAliases: field.searchAliases } : {}),
+    ...(field.dynamicAliases ? { dynamicAliases: field.dynamicAliases } : {}),
     ...(field.legacyWireValues
       ? { legacyWireValues: field.legacyWireValues }
       : {}),
+    ...(field.allowCustomValue !== undefined
+      ? { allowCustomValue: field.allowCustomValue }
+      : {}),
   };
 };
+
+// Static fields are authoritative for their own ids. Voice fields also own a
+// small set of legacy/system aliases published by the dashboard catalog. Only
+// suppress those aliases in the System category: a raw span attribute with the
+// same spelling remains a distinct, selectable field under Attributes.
+export function mergeTraceFilterProperties({
+  tab,
+  isSpansView = false,
+  dynamicProperties = [],
+  filterFields = [],
+}) {
+  const staticProps = getTraceFilterFields(tab).map((field) =>
+    toStaticFilterProperty(field, isSpansView),
+  );
+  const canonicalIds = new Set(staticProps.map((property) => property.id));
+  const coveredSystemAliases = new Set(
+    staticProps.flatMap((property) => [
+      property.responseKey,
+      ...(property.legacyWireValues || []),
+      ...(property.dynamicAliases || []),
+    ]),
+  );
+  const dynamicExtras = dynamicProperties.filter((property) => {
+    const isSystemProperty =
+      property.category === "system" || property.apiColType === "SYSTEM_METRIC";
+    return !(
+      isSystemProperty &&
+      (canonicalIds.has(property.id) || coveredSystemAliases.has(property.id))
+    );
+  });
+  const dynamicSystemIds = dynamicExtras
+    .filter(
+      (property) =>
+        property.category === "system" ||
+        property.apiColType === "SYSTEM_METRIC",
+    )
+    .map((property) => property.id);
+  const allIds = new Set([
+    ...canonicalIds,
+    ...coveredSystemAliases,
+    ...dynamicSystemIds,
+  ]);
+  const fieldExtras = filterFields
+    .filter((field) => !allIds.has(field.id || field.value))
+    .map((field) => ({
+      id: field.id || field.value,
+      name: field.name || field.label,
+      category: "system",
+      apiColType: "SYSTEM_METRIC",
+      type: field.type || "string",
+    }));
+  return [...staticProps, ...dynamicExtras, ...fieldExtras];
+}
 
 // ---------------------------------------------------------------------------
 // Category config for dashboard-style property picker
@@ -643,13 +700,6 @@ const getUnambiguousCanonicalSystemMatches = (properties, rawQuery) => {
     : [];
 };
 
-const hasExactSystemRawId = (properties, rawQuery) =>
-  (properties || []).filter(
-    (property) =>
-      property?.category === "system" &&
-      propertyMatchesRawId(property, rawQuery),
-  ).length === 1;
-
 export function filterPropertiesForPicker({
   properties,
   category = "all",
@@ -714,7 +764,12 @@ export function buildManualAttributeProperty({
   ) {
     return null;
   }
-  if ((properties || []).some((property) => property.id === exactName)) {
+  if (
+    (properties || []).some(
+      (property) =>
+        property.category === "attribute" && property.id === exactName,
+    )
+  ) {
     return null;
   }
   return {
@@ -733,6 +788,52 @@ const resolveFieldCategory = (explicitCategory, prop, fallback = "system") => {
   if (prop) return prop.category;
   return fallback;
 };
+
+// A backend field id is only unique inside its column type/category. This
+// lookup keeps a raw attribute such as `cost_cents` bound to its Attribute
+// metadata even when a canonical System field has the same id.
+const PROPERTY_CATEGORY_TO_API_COL_TYPE = {
+  system: "SYSTEM_METRIC",
+  attribute: "SPAN_ATTRIBUTE",
+  eval: "EVAL_METRIC",
+  annotation: "ANNOTATION",
+};
+
+export function findTraceFilterProperty(properties, filter) {
+  let matches = (properties || []).filter(
+    (property) => property.id === filter?.field,
+  );
+  if (filter?.apiColType) {
+    matches = matches.filter(
+      (property) =>
+        (property.apiColType ||
+          PROPERTY_CATEGORY_TO_API_COL_TYPE[property.category]) ===
+        filter.apiColType,
+    );
+  }
+  if (filter?.fieldCategory) {
+    matches = matches.filter(
+      (property) => property.category === filter.fieldCategory,
+    );
+  }
+  return matches[0];
+}
+
+const queryPropertyIdentity = (property) =>
+  `__field_identity__${JSON.stringify([
+    property.apiColType || "",
+    property.category || "",
+    property.id,
+  ])}`;
+
+export function buildQueryPropertyEntries(properties) {
+  return {
+    entries: (properties || []).map((property) => [
+      queryPropertyIdentity(property),
+      property,
+    ]),
+  };
+}
 
 const ANNOTATOR_FILTER_PROPERTY = {
   id: "annotator",
@@ -898,9 +999,15 @@ export function mergeRetainedAttributeProperties(
   const nonAttributes = catalog.filter(
     (property) => property.category !== "attribute",
   );
-  const reservedIds = new Set(nonAttributes.map((property) => property.id));
-  const retainedAttributes = (retainedAttributeProperties || []).filter(
-    (property) => !reservedIds.has(property.id),
+  // Field id alone is not an identity: a raw span attribute may legitimately
+  // have the same key as a system metric (for example `cost_cents`). Keep one
+  // retained Attribute entry per raw id without reserving System ids.
+  const retainedAttributes = Array.from(
+    new Map(
+      (retainedAttributeProperties || [])
+        .filter((property) => property.category === "attribute")
+        .map((property) => [property.id, property]),
+    ).values(),
   );
   const retainedIds = new Set(
     retainedAttributes.map((property) => property.id),
@@ -1042,22 +1149,11 @@ function PropertyPicker({
   }, [propertiesWithExactAttribute]);
   const visibleProperties = filtered.slice(0, visiblePropertyLimit);
   const hiddenCount = Math.max(filtered.length - visiblePropertyLimit, 0);
-  const propertySearchHasExactSystemRawId = useMemo(
-    () =>
-      hasExactSystemRawId(
-        propertiesWithExactAttribute,
-        String(search || "").trim(),
-      ),
-    [propertiesWithExactAttribute, search],
-  );
-  // Only a backend-certified raw attribute identity or an exact system raw-id
-  // is terminal. Display labels and fuzzy matches are useful for ranking, but
-  // must leave continuation reachable: an older raw attribute may itself be
-  // named `Call ID`, even while the current page shows system `call_id`.
+  // Only a backend-certified raw attribute identity is terminal. A matching
+  // system raw id cannot stop discovery because a raw attribute may
+  // legitimately use the same spelling.
   const canLoadNextAttributePage =
-    hasNextAttributePage &&
-    !exactAttributeSearchMatched &&
-    !propertySearchHasExactSystemRawId;
+    hasNextAttributePage && !exactAttributeSearchMatched;
   const exactAttributeDiscoveryTerminal =
     exactAttributeCursorRetryExhausted ||
     exactAttributeBrowseStatus === "exhausted" ||
@@ -1334,6 +1430,7 @@ function PropertyPicker({
                 <Box
                   key={`${prop.category}:${prop.id}:${idx}`}
                   data-filter-property-option={prop.id}
+                  data-filter-property-category={prop.category}
                   data-filter-property-label={prop.name}
                   onClick={() => {
                     onSelect(prop);
@@ -1666,11 +1763,13 @@ function ValuePicker({
     : isSessionField
       ? sessionOptions
       : dashboardOptions;
+  const isCanonicalVoiceStatus =
+    propertyId === "call_status" && property?.apiColType === "SYSTEM_METRIC";
   // Keep the picker on the same canonical vocabulary as the rendered voice
   // rows even while an older backend is rolling out. Provider values such as
   // `ended` and `done` must appear once as `completed`, never as raw aliases.
   const options = useMemo(() => {
-    if (propertyId !== "call_status") return rawOptions;
+    if (!isCanonicalVoiceStatus) return rawOptions;
     const seen = new Set();
     return rawOptions.flatMap((option) => {
       const canonical = normalizeVoiceCallStatus(getPickerOptionValue(option));
@@ -1681,7 +1780,7 @@ function ValuePicker({
       if (typeof option === "string") return [canonical];
       return [{ ...option, value: canonical, label: canonical }];
     });
-  }, [propertyId, rawOptions]);
+  }, [isCanonicalVoiceStatus, rawOptions]);
   const isLoading = hasStaticChoices
     ? false
     : isSessionField
@@ -1739,10 +1838,10 @@ function ValuePicker({
 
   const selectedValues = useMemo(() => {
     const normalized = normalizePickerValues(value);
-    return propertyId === "call_status"
+    return isCanonicalVoiceStatus
       ? normalizeVoiceCallStatus(normalized)
       : normalized;
-  }, [propertyId, value]);
+  }, [isCanonicalVoiceStatus, value]);
   const selectedValueTypes = useMemo(
     () =>
       selectedValues.map((_, index) =>
@@ -2235,7 +2334,7 @@ function FilterRow({
   attributeSource,
 }) {
   const [pickerAnchor, setPickerAnchor] = useState(null);
-  const selectedProp = properties.find((p) => p.id === filter.field);
+  const selectedProp = findTraceFilterProperty(properties, filter);
   const normalizedType = normalizeFieldType(filter.fieldType);
   const isNumber = normalizedType === "number";
   const isDate = normalizedType === "date";
@@ -2618,7 +2717,10 @@ function FilterRow({
         valueTypes={filter.valueTypes}
         source={source}
         property={
-          properties.find((p) => p.id === filter.field) || {
+          selectedProp || {
+            id: filter.field,
+            category: filter.fieldCategory,
+            apiColType: filter.apiColType,
             type: filter.fieldType,
             attributeTypes: filter.attributeTypes,
             attributeTypesExact: filter.attributeTypesExact,
@@ -2789,32 +2891,12 @@ const TraceFilterPanel = ({
         ? propertiesOverride.filter(propertyFilter)
         : propertiesOverride;
     }
-    // Start with static trace fields (trace_name, status, model, etc.) —
-    // prepend trace_id / span_id when rendered inside the LLM Tracing
-    // trace or span tab. In spans view, relabel "Trace Name" to "Span Name".
-    const staticProps = getTraceFilterFields(tab).map((f) =>
-      toStaticFilterProperty(f, isSpansView),
-    );
-    const knownIds = new Set(
-      staticProps.flatMap((property) => [
-        property.id,
-        property.responseKey,
-        ...(property.legacyWireValues || []),
-      ]),
-    );
-    // Add dynamic properties not already covered by static fields
-    const dynamicExtras = dynamicProperties.filter((p) => !knownIds.has(p.id));
-    // Add any extra filterFields not already covered
-    const allIds = new Set([...knownIds, ...dynamicExtras.map((p) => p.id)]);
-    const fieldExtras = (filterFields || [])
-      .filter((f) => !allIds.has(f.id))
-      .map((f) => ({
-        id: f.id || f.value,
-        name: f.name || f.label,
-        category: "system",
-        type: f.type || "string",
-      }));
-    const merged = [...staticProps, ...dynamicExtras, ...fieldExtras];
+    const merged = mergeTraceFilterProperties({
+      tab,
+      isSpansView,
+      dynamicProperties,
+      filterFields,
+    });
     return propertyFilter ? merged.filter(propertyFilter) : merged;
   }, [
     dynamicProperties,
@@ -2824,10 +2906,6 @@ const TraceFilterPanel = ({
     tab,
     isSpansView,
   ]);
-  const propertyById = useMemo(
-    () => Object.fromEntries(properties.map((p) => [p.id, p])),
-    [properties],
-  );
   const propsLoading = skipDynamicProperties ? false : dynamicPropsLoading;
   const effectiveCategories = categoriesOverride ?? CATEGORIES;
   const effectiveDefaultRow = defaultRowOverride || DEFAULT_ROW;
@@ -2957,10 +3035,17 @@ const TraceFilterPanel = ({
     selectedQueryAttributeProperties,
   ]);
 
-  // Convert dashboard properties to QueryInput format (same IDs as dashboard API)
+  const queryPropertyRegistry = useMemo(
+    () => buildQueryPropertyEntries(queryProperties),
+    [queryProperties],
+  );
+  const { entries: queryPropertyEntries } = queryPropertyRegistry;
+
+  // QueryInput needs a unique UI identity for same-id fields. The converter
+  // below maps that identity back to the raw backend id before applying.
   const queryFilterFields = useMemo(() => {
-    return queryProperties.map((p) => ({
-      value: p.id,
+    return queryPropertyEntries.map(([identity, p]) => ({
+      value: identity,
       label: p.name,
       type: p.type || "string",
       choices: p.choices,
@@ -2971,13 +3056,20 @@ const TraceFilterPanel = ({
       attributeTypes: p.attributeTypes,
       attributeTypesExact: p.attributeTypesExact,
     }));
-  }, [queryProperties]);
+  }, [queryPropertyEntries]);
   const queryFieldMap = useMemo(
     () => Object.fromEntries(queryFilterFields.map((f) => [f.value, f])),
     [queryFilterFields],
   );
   const queryPropertyById = useMemo(
-    () => Object.fromEntries(queryProperties.map((p) => [p.id, p])),
+    () => Object.fromEntries(queryPropertyEntries),
+    [queryPropertyEntries],
+  );
+  const queryIdentityForFilter = useCallback(
+    (filter) => {
+      const property = findTraceFilterProperty(queryProperties, filter);
+      return property ? queryPropertyIdentity(property) : filter.field;
+    },
     [queryProperties],
   );
   const loadNextQueryAttributePage = useSingleFlightPageRequest({
@@ -3026,7 +3118,7 @@ const TraceFilterPanel = ({
     hasNextPage: hasNextQueryValuesPage,
     isFetchingNextPage: isFetchingNextQueryValuesPage,
   } = useDashboardFilterValues({
-    metricName: queryField || "",
+    metricName: queryFieldProp?.id || queryField || "",
     metricType: queryMetricType,
     projectIds: observeId ? [observeId] : [],
     source,
@@ -3065,7 +3157,7 @@ const TraceFilterPanel = ({
       if (currentFilters?.length) {
         // Enrich rows with fieldCategory and fieldType from properties lookup
         const enriched = currentFilters.map((f) => {
-          const prop = propertyById[f.field];
+          const prop = findTraceFilterProperty(properties, f);
           const fieldType = f.fieldType || prop?.type || "string";
           // ID-only fields (trace_id / span_id) bypass the string-op
           // rewrite — ID_ONLY_OPS = [{ value: "is" }] so anything other
@@ -3144,7 +3236,7 @@ const TraceFilterPanel = ({
               ? t.value
               : [t.value];
         return {
-          field: t.field,
+          field: prop?.id || t.field,
           fieldName: prop?.name || queryFieldDef?.label,
           fieldCategory: resolveFieldCategory(undefined, prop || queryFieldDef),
           fieldType,
@@ -3170,13 +3262,16 @@ const TraceFilterPanel = ({
 
   const queryGetOperators = useCallback(
     (type, field) => {
-      const ops = getOperatorsForFilter({ field, fieldType: type });
+      const ops = getOperatorsForFilter({
+        field: queryPropertyById[field]?.id || field,
+        fieldType: type,
+      });
       const allowed = operatorFilter ? ops.filter(operatorFilter) : ops;
       return allowed.map((op) =>
         NO_VALUE_OPS.has(op.value) ? { ...op, noValue: true } : op,
       );
     },
-    [operatorFilter],
+    [operatorFilter, queryPropertyById],
   );
 
   const handleChange = useCallback((idx, updated) => {
@@ -3268,7 +3363,12 @@ const TraceFilterPanel = ({
     });
     if (aiFilters.length > 0) {
       const aiRows = aiFilters.map((f) => {
-        const prop = properties.find((p) => p.id === f.field);
+        // Attribute fields are intentionally excluded from aiFilterSchema;
+        // keep same-id raw attributes from hijacking an AI-selected system id.
+        const prop = properties.find(
+          (property) =>
+            property.id === f.field && property.category !== "attribute",
+        );
         const fieldType = prop?.type || "string";
         return {
           field: f.field,
@@ -3523,7 +3623,7 @@ const TraceFilterPanel = ({
                         ? r.value
                         : r.value ?? "";
                   return {
-                    field: r.field,
+                    field: queryIdentityForFilter(r),
                     operator:
                       BASIC_TO_QUERY_OP[normalizedRow.operator] ||
                       normalizedRow.operator,

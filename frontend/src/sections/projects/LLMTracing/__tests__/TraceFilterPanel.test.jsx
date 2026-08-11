@@ -1,11 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "src/utils/test-utils";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { buildApiFilterFromPanelRow } from "src/api/contracts/filter-contract";
 import TraceFilterPanel, {
   buildManualAttributeProperty,
+  buildQueryPropertyEntries,
   buildTraceFilterProperties,
   filterPropertiesForPicker,
+  findTraceFilterProperty,
   getTraceFilterFields,
+  mergeTraceFilterProperties,
   mergeRetainedAttributeProperties,
   normalizeFilterRowOperator,
   shouldUseRetainedAttributePages,
@@ -482,7 +486,7 @@ describe("voice-call property search aliases", () => {
     ]);
   });
 
-  it("keeps the canonical Call ID visible and stops unrelated attribute continuation", () => {
+  it("keeps raw call_id discovery reachable beside the canonical system id", () => {
     const fetchNextPage = vi.fn();
     exactAttributePropertiesMock.mockReturnValue({
       data: [
@@ -520,10 +524,11 @@ describe("voice-call property search aliases", () => {
         '[data-filter-property-option="conversation.transcript.0.tool_calls.0.tool_call.id"]',
       ),
     ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Load more attributes" }),
-    ).not.toBeInTheDocument();
-    expect(fetchNextPage).not.toHaveBeenCalled();
+    const loadMore = screen.getByRole("button", {
+      name: "Load more attributes",
+    });
+    fireEvent.click(loadMore);
+    expect(fetchNextPage).toHaveBeenCalledOnce();
     document.body.removeChild(anchorEl);
   });
 
@@ -787,6 +792,357 @@ describe("voice-call property search aliases", () => {
 
     document.body.removeChild(anchorEl);
   });
+
+  it("keeps an uncatalogued raw call_status attribute raw in Basic and the API", async () => {
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [
+        { value: "ended", label: "ended" },
+        { value: "processing", label: "processing" },
+      ],
+    });
+    const onApply = vi.fn();
+    const rawStatusFilter = {
+      field: "call_status",
+      fieldName: "call_status",
+      fieldCategory: "attribute",
+      fieldType: "string",
+      apiColType: "SPAN_ATTRIBUTE",
+      operator: "in",
+      value: ["ended"],
+    };
+    const { anchorEl } = renderPanel({
+      properties,
+      currentFilters: [rawStatusFilter],
+      onApply,
+      projectId: "project-1",
+    });
+
+    // Only the canonical SYSTEM_METRIC is in the catalog. The explicit raw
+    // identity must not borrow its closed choices or lifecycle normalization.
+    expect(
+      findTraceFilterProperty(properties, rawStatusFilter),
+    ).toBeUndefined();
+    fireEvent.click(
+      document.querySelector('[data-filter-value-trigger="call_status"]'),
+    );
+
+    expect(dashboardFilterValuesMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        metricName: "call_status",
+        metricType: "custom_attribute",
+        enabled: true,
+      }),
+    );
+    expect(
+      document.querySelector('[data-filter-value-option="ended"]'),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-filter-value-option="processing"]'),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-filter-value-option="completed"]'),
+    ).not.toBeInTheDocument();
+    expect(
+      document.querySelector('[data-filter-value-option="in-progress"]'),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      document.querySelector('[data-filter-value-option="processing"]'),
+    );
+    await waitFor(() => expect(onApply).toHaveBeenCalled());
+    const applied = onApply.mock.calls.at(-1)[0][0];
+    expect(applied).toMatchObject({
+      field: "call_status",
+      fieldCategory: "attribute",
+      apiColType: "SPAN_ATTRIBUTE",
+      value: ["ended", "processing"],
+    });
+    expect(buildApiFilterFromPanelRow(applied)).toMatchObject({
+      column_id: "call_status",
+      filter_config: {
+        filter_type: "text",
+        filter_op: "in",
+        filter_value: ["ended", "processing"],
+        col_type: "SPAN_ATTRIBUTE",
+      },
+    });
+
+    document.body.removeChild(anchorEl);
+  });
+});
+
+describe("voice-call property parity", () => {
+  it("does not bind an explicit identity to a lone mismatched same-id property", () => {
+    const systemOnly = [
+      {
+        id: "call_status",
+        name: "Status",
+        category: "system",
+        type: "string",
+      },
+    ];
+    const rawFilter = {
+      field: "call_status",
+      fieldCategory: "attribute",
+      apiColType: "SPAN_ATTRIBUTE",
+    };
+
+    expect(findTraceFilterProperty(systemOnly, rawFilter)).toBeUndefined();
+    expect(
+      findTraceFilterProperty(systemOnly, {
+        ...rawFilter,
+        fieldCategory: "system",
+        apiColType: "SYSTEM_METRIC",
+      }),
+    ).toEqual(systemOnly[0]);
+  });
+
+  it("stamps specialized system filterFields with their wire identity", () => {
+    expect(
+      mergeTraceFilterProperties({
+        filterFields: [
+          { id: "specialized_status", name: "Specialized Status" },
+        ],
+      }),
+    ).toContainEqual(
+      expect.objectContaining({
+        id: "specialized_status",
+        category: "system",
+        apiColType: "SYSTEM_METRIC",
+      }),
+    );
+  });
+
+  it("deduplicates dashboard system aliases while retaining raw attributes", () => {
+    const merged = mergeTraceFilterProperties({
+      tab: "voiceCalls",
+      dynamicProperties: [
+        { id: "status", category: "system", type: "string" },
+        { id: "agent_latency", category: "system", type: "number" },
+        { id: "tokens", category: "system", type: "number" },
+        { id: "total_tokens", category: "system", type: "number" },
+        { id: "total_cost", category: "system", type: "number" },
+        { id: "user_interruptions", category: "system", type: "number" },
+        { id: "ai_interruptions", category: "system", type: "number" },
+        {
+          id: "call.status",
+          name: "call.status",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+        {
+          id: "tokens",
+          name: "tokens",
+          category: "attribute",
+          type: "number",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+    });
+
+    const idsByCategory = merged.map(({ id, category }) => `${category}:${id}`);
+    expect(idsByCategory).not.toContain("system:status");
+    expect(idsByCategory).not.toContain("system:agent_latency");
+    expect(idsByCategory).not.toContain("system:tokens");
+    expect(idsByCategory).not.toContain("system:total_tokens");
+    expect(idsByCategory).not.toContain("system:total_cost");
+    expect(idsByCategory).not.toContain("system:user_interruptions");
+    expect(idsByCategory).not.toContain("system:ai_interruptions");
+    expect(idsByCategory).toContain("attribute:call.status");
+    expect(idsByCategory).toContain("attribute:tokens");
+    expect(
+      idsByCategory.filter((id) => id === "system:call_status"),
+    ).toHaveLength(1);
+  });
+
+  it("marks lifecycle status as a closed canonical vocabulary", () => {
+    const status = mergeTraceFilterProperties({ tab: "voiceCalls" }).find(
+      (property) => property.id === "call_status",
+    );
+
+    expect(status).toMatchObject({
+      choices: [
+        "completed",
+        "in-progress",
+        "failed",
+        "dropped",
+        "not-connected",
+      ],
+      allowCustomValue: false,
+    });
+  });
+
+  it("keeps same-id system metrics and raw attributes category-qualified", () => {
+    const merged = mergeTraceFilterProperties({
+      tab: "voiceCalls",
+      dynamicProperties: [
+        {
+          id: "cost_cents",
+          name: "cost_cents",
+          category: "attribute",
+          type: "number",
+          apiColType: "SPAN_ATTRIBUTE",
+          attributeTypes: ["number"],
+          attributeTypesExact: true,
+        },
+        {
+          id: "call_id",
+          name: "call_id",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+    });
+
+    for (const field of ["cost_cents", "call_id"]) {
+      expect(
+        merged
+          .filter((property) => property.id === field)
+          .map((property) => [property.category, property.apiColType]),
+      ).toEqual([
+        ["system", "SYSTEM_METRIC"],
+        ["attribute", "SPAN_ATTRIBUTE"],
+      ]);
+    }
+
+    const costEntries = buildQueryPropertyEntries(
+      merged.filter((property) => property.id === "cost_cents"),
+    ).entries;
+    expect(new Set(costEntries.map(([identity]) => identity)).size).toBe(2);
+    expect(
+      [...new Map(costEntries).values()].map((property) => property.category),
+    ).toEqual(["system", "attribute"]);
+
+    const systemRow = {
+      field: "cost_cents",
+      fieldCategory: "system",
+      fieldType: "number",
+      apiColType: "SYSTEM_METRIC",
+      operator: "equals",
+      value: 12.2,
+    };
+    const attributeRow = {
+      ...systemRow,
+      fieldCategory: "attribute",
+      apiColType: "SPAN_ATTRIBUTE",
+    };
+    expect(findTraceFilterProperty(merged, systemRow)).toMatchObject({
+      category: "system",
+      apiColType: "SYSTEM_METRIC",
+    });
+    expect(findTraceFilterProperty(merged, attributeRow)).toMatchObject({
+      category: "attribute",
+      apiColType: "SPAN_ATTRIBUTE",
+    });
+    expect([
+      buildApiFilterFromPanelRow(systemRow),
+      buildApiFilterFromPanelRow(attributeRow),
+    ]).toEqual([
+      expect.objectContaining({
+        column_id: "cost_cents",
+        filter_config: expect.objectContaining({ col_type: "SYSTEM_METRIC" }),
+      }),
+      expect.objectContaining({
+        column_id: "cost_cents",
+        filter_config: expect.objectContaining({ col_type: "SPAN_ATTRIBUTE" }),
+      }),
+    ]);
+  });
+
+  it("uses raw attribute metadata for a same-id call_id value lookup", () => {
+    dashboardFilterValuesMock.mockClear();
+    const propertiesWithRawCallId = mergeTraceFilterProperties({
+      tab: "voiceCalls",
+      dynamicProperties: [
+        {
+          id: "call_id",
+          name: "call_id",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          attributeTypes: ["string"],
+          attributeTypesExact: true,
+        },
+      ],
+    });
+    const { anchorEl } = renderPanel({
+      properties: propertiesWithRawCallId,
+      projectId: "project-1",
+      currentFilters: [
+        {
+          field: "call_id",
+          fieldName: "call_id",
+          fieldCategory: "attribute",
+          fieldType: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          operator: "in",
+          value: ["raw-call-id"],
+        },
+      ],
+    });
+
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metricName: "call_id",
+        metricType: "custom_attribute",
+        attributeType: "string",
+      }),
+    );
+    document.body.removeChild(anchorEl);
+  });
+
+  it("selects raw cost_cents independently from canonical system cost", async () => {
+    const propertiesWithRawCost = mergeTraceFilterProperties({
+      tab: "voiceCalls",
+      dynamicProperties: [
+        {
+          id: "cost_cents",
+          name: "cost_cents",
+          category: "attribute",
+          type: "number",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+    });
+    const onApply = vi.fn();
+    const { anchorEl } = renderPanel({
+      properties: propertiesWithRawCost,
+      onApply,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "cost_cents" },
+    });
+    expect(
+      document.querySelector(
+        '[data-filter-property-option="cost_cents"][data-filter-property-category="system"]',
+      ),
+    ).toBeInTheDocument();
+    const rawOption = document.querySelector(
+      '[data-filter-property-option="cost_cents"][data-filter-property-category="attribute"]',
+    );
+    expect(rawOption).toBeInTheDocument();
+    fireEvent.click(rawOption);
+    fireEvent.change(screen.getByPlaceholderText("Value"), {
+      target: { value: "12.2" },
+    });
+
+    await waitFor(() =>
+      expect(onApply).toHaveBeenLastCalledWith([
+        expect.objectContaining({
+          field: "cost_cents",
+          fieldCategory: "attribute",
+          apiColType: "SPAN_ATTRIBUTE",
+          value: "12.2",
+        }),
+      ]),
+    );
+    document.body.removeChild(anchorEl);
+  });
 });
 
 describe("exact manual attribute fallback", () => {
@@ -833,6 +1189,19 @@ describe("exact manual attribute fallback", () => {
         { canonical: false },
       ).map((property) => property.id),
     ).toEqual(["status", "first_page_key", "catalog_sample_key"]);
+  });
+
+  it("retains raw attributes whose id matches a system metric", () => {
+    expect(
+      mergeRetainedAttributeProperties(
+        [{ id: "cost_cents", category: "system" }],
+        [{ id: "cost_cents", category: "attribute" }],
+        { canonical: true },
+      ).map((property) => [property.category, property.id]),
+    ).toEqual([
+      ["system", "cost_cents"],
+      ["attribute", "cost_cents"],
+    ]);
   });
 
   it("keeps sampled catalog attributes through an empty cursor continuation", () => {
@@ -901,7 +1270,7 @@ describe("exact manual attribute fallback", () => {
     ).toBeNull();
   });
 
-  it("does not shadow an exact system property such as voice cost_cents", () => {
+  it("allows an exact raw attribute beside system voice cost_cents", () => {
     expect(
       buildManualAttributeProperty({
         search: "cost_cents",
@@ -914,7 +1283,15 @@ describe("exact manual attribute fallback", () => {
           },
         ],
       }),
-    ).toBeNull();
+    ).toEqual({
+      id: "cost_cents",
+      name: "cost_cents",
+      category: "attribute",
+      rawCategory: "custom_attribute",
+      type: "string",
+      apiColType: "SPAN_ATTRIBUTE",
+      isManualExactAttribute: true,
+    });
   });
 
   it("does not inject attributes into a system-only or specialized picker", () => {

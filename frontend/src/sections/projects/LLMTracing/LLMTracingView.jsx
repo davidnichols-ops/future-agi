@@ -182,6 +182,7 @@ import { buildAddEvalsDraft } from "./buildAddEvalsDraft";
 import SelectAllBanner from "./SelectAllBanner";
 import { getSelectionCountState } from "./listTotalMetadata";
 import { spanSourceIdsFromPhysicalRowIds } from "./spanPhysicalIdentity";
+import { normalizeVoiceCallSavedFilters } from "./voiceCallFilterFields";
 import useProjectFilterField from "../UsersView/useProjectFilterField";
 import FilterChips from "./FilterChips";
 import { useDashboardFilterValues } from "src/hooks/useDashboards";
@@ -1047,6 +1048,15 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   const projectSource = isUserMode
     ? PROJECT_SOURCE.OBSERVE
     : projectDetail?.source;
+  const hydrateProjectFilterList = useCallback(
+    (filters, createId) => {
+      const hydrated = hydrateStoredFilterList(filters, createId);
+      return projectSource === PROJECT_SOURCE.SIMULATOR
+        ? normalizeVoiceCallSavedFilters(hydrated)
+        : hydrated;
+    },
+    [projectSource],
+  );
   const traceListProjectReady = isTraceListProjectReady({
     projectId: observeId,
     projectSource,
@@ -2150,7 +2160,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
 
     // Hydrate persisted filters and upgrade the legacy pre-contract key names
     // before they hit the strict API serializer.
-    const nextFilters = hydrateStoredFilterList(
+    const nextFilters = hydrateProjectFilterList(
       activeViewConfig.filters,
       getRandomId,
     );
@@ -2162,11 +2172,11 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
 
     // Apply extraFilters unconditionally (independent of compare mode).
     setExtraFilters(
-      hydrateStoredFilterList(activeViewConfig.extra_filters, getRandomId),
+      hydrateProjectFilterList(activeViewConfig.extra_filters, getRandomId),
     );
 
     // Compare state — always replace, regardless of current showCompare state.
-    const nextCompareFilters = hydrateStoredFilterList(
+    const nextCompareFilters = hydrateProjectFilterList(
       activeViewConfig.compare_filters,
       getRandomId,
     );
@@ -2182,14 +2192,14 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       }
     }
     setCompareExtraFilters(
-      hydrateStoredFilterList(
+      hydrateProjectFilterList(
         activeViewConfig.compare_extra_filters,
         getRandomId,
       ),
     );
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeViewConfig]);
+  }, [activeViewConfig, hydrateProjectFilterList]);
 
   // Drains pendingColumnStateRef once the lazy-loaded grid mounts.
   useEffect(() => {
@@ -2425,7 +2435,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       if (!raw) return;
       const saved = JSON.parse(raw);
       if (saved.filters?.length > 0) {
-        const filtersWithIds = hydrateStoredFilterList(
+        const filtersWithIds = hydrateProjectFilterList(
           saved.filters,
           getRandomId,
         );
@@ -2436,7 +2446,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
         }
       }
       if (saved.extra_filters?.length > 0) {
-        const extraFiltersWithIds = hydrateStoredFilterList(
+        const extraFiltersWithIds = hydrateProjectFilterList(
           saved.extra_filters,
           getRandomId,
         );
@@ -2447,7 +2457,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       }
       if (saved.showCompare) {
         if (saved.compare_filters?.length > 0) {
-          const compareFiltersWithIds = hydrateStoredFilterList(
+          const compareFiltersWithIds = hydrateProjectFilterList(
             saved.compare_filters,
             getRandomId,
           );
@@ -2466,7 +2476,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
         }
         if (saved.compare_extra_filters?.length > 0) {
           setCompareExtraFiltersRaw(
-            hydrateStoredFilterList(saved.compare_extra_filters, getRandomId),
+            hydrateProjectFilterList(saved.compare_extra_filters, getRandomId),
           );
         }
       }
@@ -2474,7 +2484,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       /* ignore corrupted localStorage */
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filtersStorageKey]);
+  }, [filtersStorageKey, hydrateProjectFilterList]);
 
   // Helper: get current custom columns
   const getCustomColumns = useCallback(() => {
@@ -2786,11 +2796,11 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
     if (isHydratingView) return false;
 
     const baselineDisplay = activeViewConfig.display || {};
-    const baselineExtraFilters = hydrateStoredFilterList(
+    const baselineExtraFilters = hydrateProjectFilterList(
       activeViewConfig.extra_filters,
     );
     const baselineDateOption = baselineDisplay.dateFilter?.dateOption ?? null;
-    const baselineColumnFilters = hydrateStoredFilterList(
+    const baselineColumnFilters = hydrateProjectFilterList(
       activeViewConfig.filters,
     );
 
@@ -2881,6 +2891,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
     return false;
   }, [
     activeViewConfig,
+    hydrateProjectFilterList,
     extraFilters,
     selectedTab,
     primaryTraceDateFilter,

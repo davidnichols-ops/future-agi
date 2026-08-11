@@ -11,6 +11,10 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from tracer.services.clickhouse.query_builders.voice_filter_expressions import (
+    VOICE_NORMALIZED_ROOT_SYSTEM_METRIC_EXPRS,
+    voice_conversation_root_expression,
+)
 from tracer.utils.constants import (
     LIST_OPS,
     NO_VALUE_OPS,
@@ -26,6 +30,12 @@ _LEGACY_OP_ALIAS = {"is": "equals", "is_not": "not_equals"}
 _LITERAL_TEXT_MATCH_OPS = frozenset(
     {"contains", "not_contains", "starts_with", "ends_with"}
 )
+
+
+def _voice_root_metric_expressions(
+    expressions: dict[str, str], keys: tuple[str, ...]
+) -> dict[str, str]:
+    return {key: voice_conversation_root_expression(expressions[key]) for key in keys}
 
 
 def normalize_filter_op(op: str | None) -> str | None:
@@ -228,7 +238,7 @@ class ClickHouseFilterBuilder:
         # percentage = ratio / (ratio + 1) * 100
         "agent_talk_percentage": (
             "if(mapContains(span_attr_num, 'call.talk_ratio') "
-            "AND span_attr_num['call.talk_ratio'] > 0, "
+            "AND span_attr_num['call.talk_ratio'] >= 0, "
             "round(span_attr_num['call.talk_ratio'] / "
             "(span_attr_num['call.talk_ratio'] + 1) * 100, 2), null)"
         ),
@@ -265,7 +275,7 @@ class ClickHouseFilterBuilder:
         # percentage so equals filters the value the user sees.
         "talk_ratio": (
             "if(mapContains(span_attr_num, 'call.talk_ratio') "
-            "AND span_attr_num['call.talk_ratio'] > 0, "
+            "AND span_attr_num['call.talk_ratio'] >= 0, "
             "round(span_attr_num['call.talk_ratio'] / "
             "(span_attr_num['call.talk_ratio'] + 1) * 100), null)"
         ),
@@ -323,28 +333,44 @@ class ClickHouseFilterBuilder:
         ),
     }
 
+    # The public voice registry renders each value from the canonical
+    # conversation root. These IDs are voice-specific (the global token alias
+    # below already has root semantics through SYSTEM_METRIC_MAP), so direct
+    # list/graph compilers can safely carry the same row-domain guard.
+    VOICE_PUBLIC_ROOT_SYSTEM_METRIC_EXPRS: dict[str, str] = (
+        _voice_root_metric_expressions(
+            VOICE_SYSTEM_METRIC_EXPRS,
+            (
+                "duration",
+                "avg_agent_latency_ms",
+                "turn_count",
+                "talk_ratio",
+                "user_interruption_count",
+                "ai_interruption_count",
+                "user_wpm",
+                "bot_wpm",
+                "agent_talk_percentage",
+            ),
+        )
+    )
+
     # Voice system metrics that map to string span attributes
     VOICE_SYSTEM_METRIC_STR_MAP: dict[str, str] = {
         "ended_reason": "ended_reason",
         "call_status": "call.status",
     }
 
-    # Voice system metrics using expressions on span_attributes_raw JSON
-    VOICE_SYSTEM_METRIC_STR_EXPRS: dict[str, str] = {
-        "call_type": (
-            "multiIf("
-            "coalesce("
-            "nullIf(JSONExtractString(span_attributes_raw, 'raw_log', 'type'), ''), "
-            "nullIf(JSONExtractString(JSONExtractString(span_attributes_raw, 'raw_log'), 'type'), ''), "
-            "nullIf(JSONExtractString(span_attr_str['raw_log'], 'type'), '')"
-            ") = 'inboundPhoneCall', 'inbound', "
-            "coalesce("
-            "nullIf(JSONExtractString(span_attributes_raw, 'raw_log', 'type'), ''), "
-            "nullIf(JSONExtractString(JSONExtractString(span_attributes_raw, 'raw_log'), 'type'), ''), "
-            "nullIf(JSONExtractString(span_attr_str['raw_log'], 'type'), '')"
-            ") = 'outboundPhoneCall', 'outbound', null)"
-        ),
-    }
+    # Provider-aware public voice strings live in the normalized map below.
+    # Keep this legacy extension point for subclasses without routing any
+    # canonical voice field through a less-specific expression.
+    VOICE_SYSTEM_METRIC_STR_EXPRS: dict[str, str] = {}
+
+    # Explicit public voice aliases always resolve to the same normalized
+    # values returned by the voice-call list. Keeping this separate from the
+    # legacy implicit maps prevents call_id/cost_cents SPAN_ATTRIBUTE filters
+    # from silently opting into provider normalization; raw status is exposed
+    # by its actual provider attribute key, ``call.status``.
+    VOICE_NORMALIZED_SYSTEM_METRIC_EXPRS = VOICE_NORMALIZED_ROOT_SYSTEM_METRIC_EXPRS
 
     # These are string fields on the curated EndUser dimension (v2 `end_users`),
     # not columns on spans. Route them centrally here so trace/span/session/voice
@@ -1069,8 +1095,28 @@ class ClickHouseFilterBuilder:
         if col_id in self._ENDUSER_STRING_COLUMNS:
             return self.SYSTEM_METRIC
 
+        # Canonical normalized voice aliases are promoted only when callers
+        # omitted a column type. An explicit SPAN_ATTRIBUTE request must keep
+        # reading the raw provider/customer attribute with the same key.
+        if (
+            col_id in self.VOICE_NORMALIZED_SYSTEM_METRIC_EXPRS
+            and col_type == self.NORMAL
+        ):
+            return self.SYSTEM_METRIC
+
+        if (
+            col_id in self.VOICE_PUBLIC_ROOT_SYSTEM_METRIC_EXPRS
+            and col_type == self.NORMAL
+        ):
+            return self.SYSTEM_METRIC
+
         # Denormalised columns may arrive as SPAN_ATTRIBUTE; route via SYSTEM_METRIC to match root metrics.
         if col_id in self.SYSTEM_METRIC_MAP and col_type != self.SYSTEM_METRIC:
+            if (
+                col_id == "gen_ai.usage.total_tokens"
+                and col_type == self.SPAN_ATTRIBUTE
+            ):
+                return col_type
             return self.SYSTEM_METRIC
 
         # Voice list metrics derive from span attrs/exprs; treat as system metrics even when col_type is omitted.
@@ -1078,7 +1124,7 @@ class ClickHouseFilterBuilder:
             col_id in self.VOICE_SYSTEM_METRIC_EXPRS
             or col_id in self.VOICE_SYSTEM_METRIC_STR_MAP
             or col_id in self.VOICE_SYSTEM_METRIC_STR_EXPRS
-        ) and col_type != self.SYSTEM_METRIC:
+        ) and col_type == self.NORMAL:
             return self.SYSTEM_METRIC
 
         return col_type
@@ -1186,7 +1232,18 @@ class ClickHouseFilterBuilder:
                 self._ENDUSER_STRING_COLUMNS[col_id], filter_op, filter_value
             )
 
-        if col_id in self.VOICE_SYSTEM_METRIC_EXPRS:
+        if col_id in self.VOICE_NORMALIZED_SYSTEM_METRIC_EXPRS:
+            expr = self.VOICE_NORMALIZED_SYSTEM_METRIC_EXPRS[col_id]
+            inner = self._build_expr_condition(
+                expr,
+                filter_op,
+                filter_value,
+                case_insensitive=filter_type == FilterType.TEXT.value,
+            )
+        elif col_id in self.VOICE_PUBLIC_ROOT_SYSTEM_METRIC_EXPRS:
+            expr = self.VOICE_PUBLIC_ROOT_SYSTEM_METRIC_EXPRS[col_id]
+            inner = self._build_expr_condition(expr, filter_op, filter_value)
+        elif col_id in self.VOICE_SYSTEM_METRIC_EXPRS:
             expr = self.VOICE_SYSTEM_METRIC_EXPRS[col_id]
             inner = self._build_expr_condition(
                 expr,
