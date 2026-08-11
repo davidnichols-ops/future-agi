@@ -15,6 +15,21 @@ function runQuickFilter(col, value) {
   return produced?.[0];
 }
 
+// The number-popover branches hand their filter to openQuickFilter instead of
+// applying it, so capture that payload rather than setFilters'.
+function runPopoverQuickFilter(col, value) {
+  let payload;
+  const noop = () => {};
+  applyQuickFilters(
+    noop,
+    (p) => {
+      payload = p;
+    },
+    noop,
+  )({ col, value, filterAnchor: {} });
+  return payload?.filter;
+}
+
 describe("applyQuickFilters", () => {
   it("attaches col_type SYSTEM_METRIC for a system column (without it the list 400s)", () => {
     const f = runQuickFilter({ id: "provider", name: "Provider" }, "anthropic");
@@ -48,5 +63,60 @@ describe("applyQuickFilters", () => {
     );
     expect(f.column_id).toBe("ann-1");
     expect(f.filter_config.col_type).toBe("ANNOTATION");
+  });
+  it("maps a Pass/Fail eval cell onto the passed/failed token the backend expects", () => {
+    const col = {
+      id: "eval-1",
+      name: "task completion",
+      groupBy: "Evaluation Metrics",
+      outputType: "Pass/Fail",
+    };
+
+    const passed = runQuickFilter(col, 100);
+    expect(passed.column_id).toBe("eval-1");
+    expect(passed.display_name).toBe("task completion");
+    expect(passed.filter_config.col_type).toBe("EVAL_METRIC");
+    expect(passed.filter_config.filter_type).toBe("text");
+    expect(passed.filter_config.filter_value).toBe("Passed");
+
+    expect(runQuickFilter(col, 0).filter_config.filter_value).toBe("Failed");
+  });
+
+  it("emits nothing for an averaged Pass/Fail rate or an empty cell", () => {
+    const col = {
+      id: "eval-1",
+      name: "task completion",
+      groupBy: "Evaluation Metrics",
+      outputType: "Pass/Fail",
+    };
+    expect(runQuickFilter(col, 66.67)).toBeUndefined();
+    expect(runQuickFilter(col, "")).toBeUndefined();
+    expect(runQuickFilter(col, null)).toBeUndefined();
+  });
+
+  it("sends voice system metrics as a number with col_type SYSTEM_METRIC (the PG path skips anything else)", () => {
+    const f = runPopoverQuickFilter(
+      { id: "turn_count", name: "Turn count", groupBy: "System Metrics" },
+      5,
+    );
+    expect(f.column_id).toBe("turn_count");
+    expect(f.display_name).toBe("Turn count");
+    expect(f.filter_config.col_type).toBe("SYSTEM_METRIC");
+    expect(f.filter_config.filter_type).toBe("number");
+  });
+
+  it("attaches col_type EVAL_METRIC to score evals (without it the eval id is read as a column)", () => {
+    const f = runPopoverQuickFilter(
+      {
+        id: "eval-2",
+        name: "toxicity",
+        groupBy: "Evaluation Metrics",
+        outputType: "score",
+      },
+      80,
+    );
+    expect(f.column_id).toBe("eval-2");
+    expect(f.display_name).toBe("toxicity");
+    expect(f.filter_config.col_type).toBe("EVAL_METRIC");
   });
 });

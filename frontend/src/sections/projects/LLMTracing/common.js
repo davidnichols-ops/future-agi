@@ -232,6 +232,30 @@ export const applyQuickFilters =
       return;
     }
 
+    if (col.groupBy === "System Metrics") {
+      openQuickFilter({
+        filterAnchor,
+        value,
+        filter: {
+          column_id: col.id,
+          // FilterChips looks labels up at the top level; these are nested.
+          display_name: col.name,
+          filter_config: {
+            filter_type: "number",
+            filter_op: "equals",
+            filter_value: [value, ""],
+            col_type: "SYSTEM_METRIC",
+          },
+          _meta: {
+            parentProperty: "System Metrics",
+            "System Metrics": col.id,
+          },
+          id: getRandomId(),
+        },
+      });
+      return;
+    }
+
     if (!col.groupBy) {
       let filter_type = "text";
       if (DATE_FILTER_FIELDS.includes(col.name)) {
@@ -274,6 +298,32 @@ export const applyQuickFilters =
       }
     } else if (
       col?.groupBy === "Evaluation Metrics" &&
+      col?.sourceField !== "reason" &&
+      String(col?.outputType || "")
+        .toUpperCase()
+        .replace(/[/ ]/g, "_") === "PASS_FAIL"
+    ) {
+      // Pass/Fail is filtered by token, not score. Casing matches the value
+      // picker's choices; the backend lowercases before matching.
+      // Number("") and Number(null) are 0, which would apply a wrong "Failed".
+      if (value === "" || value === null || value === undefined) return;
+      const rate = Number(value);
+      if (rate !== 0 && rate !== 100) return;
+      filter = {
+        column_id: col.id,
+        filter_config: {
+          filter_type: "text",
+          filter_op: "equals",
+          filter_value: rate === 100 ? "Passed" : "Failed",
+        },
+        _meta: {
+          parentProperty: "Evaluation Metrics",
+          "Evaluation Metrics": col.id,
+        },
+        id: getRandomId(),
+      };
+    } else if (
+      col?.groupBy === "Evaluation Metrics" &&
       col?.sourceField !== "reason"
     ) {
       openQuickFilter({
@@ -281,10 +331,13 @@ export const applyQuickFilters =
         value,
         filter: {
           column_id: col.id,
+          // Eval ids are UUIDs, so the chip has no label without this.
+          display_name: col.name,
           filter_config: {
             filter_type: "number",
             filter_op: "equals",
             filter_value: [value, ""],
+            col_type: "EVAL_METRIC",
           },
           _meta: {
             parentProperty: "Evaluation Metrics",
@@ -357,6 +410,7 @@ export const applyQuickFilters =
                 filter_type: "number",
                 filter_op: "equals",
                 filter_value: [value, ""],
+                col_type: "ANNOTATION",
               },
             },
           });
@@ -369,9 +423,15 @@ export const applyQuickFilters =
       // Quick filters skip the toolbar normalization, so attach the col_type
       // the backend needs — without it the list 400s on a NORMAL col_type.
       let field = filter.column_id;
-      let fieldName;
+      // Eval ids are UUIDs, so the chip has no readable label without this.
+      let fieldName =
+        col?.groupBy === "Evaluation Metrics" ? col?.name : undefined;
       const apiColType =
-        col?.groupBy === "Annotation Metrics" ? "ANNOTATION" : "SYSTEM_METRIC";
+        col?.groupBy === "Annotation Metrics"
+          ? "ANNOTATION"
+          : col?.groupBy === "Evaluation Metrics"
+            ? "EVAL_METRIC"
+            : "SYSTEM_METRIC";
       let operator = filter.filter_config?.filter_op;
       let value = filter.filter_config?.filter_value;
 
