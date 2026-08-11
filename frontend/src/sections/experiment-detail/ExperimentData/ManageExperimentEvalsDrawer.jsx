@@ -45,6 +45,7 @@ const transformEvals = (evalList) =>
     ...(evalItem.compositeWeightOverrides
       ? { composite_weight_overrides: evalItem.compositeWeightOverrides }
       : {}),
+    pinned_version_id: evalItem.pinnedVersionId || evalItem.pinned_version_id || null,
   }));
 
 const ManageExperimentEvalsDrawer = ({
@@ -166,7 +167,7 @@ const ManageExperimentEvalsDrawer = ({
     stopSingleEval(evalId);
   };
 
-  const handleAddEvaluation = (evalConfig) => {
+  const handleAddEvaluation = async (evalConfig) => {
     // Translate column names to UUIDs
     const rawMapping = evalConfig.mapping || {};
     const translatedMapping = {};
@@ -180,19 +181,111 @@ const ManageExperimentEvalsDrawer = ({
 
     const templateConfig =
       evalConfig.config || evalConfig.evalTemplate?.config || {};
+    const isCompositeEval =
+      evalConfig.templateType === "composite" ||
+      evalConfig.evalTemplate?.template_type === "composite" ||
+      evalConfig.evalTemplate?.templateType === "composite";
+
+    const runConfig = {};
+    if (!isCompositeEval) {
+      if (evalConfig.model) runConfig.model = evalConfig.model;
+      if (evalConfig.agent_mode) runConfig.agent_mode = evalConfig.agent_mode;
+      if (evalConfig.check_internet !== undefined)
+        runConfig.check_internet = !!evalConfig.check_internet;
+      if (evalConfig.summary) runConfig.summary = evalConfig.summary;
+      if (evalConfig.knowledge_base_id)
+        runConfig.knowledge_base_id = evalConfig.knowledge_base_id;
+      if (evalConfig.knowledge_bases)
+        runConfig.knowledge_bases = evalConfig.knowledge_bases;
+      if (evalConfig.tools) runConfig.tools = evalConfig.tools;
+      if (evalConfig.pass_threshold !== undefined)
+        runConfig.pass_threshold = evalConfig.pass_threshold;
+      if (evalConfig.choice_scores && Object.keys(evalConfig.choice_scores).length)
+        runConfig.choice_scores = evalConfig.choice_scores;
+      if (evalConfig.multi_choice !== undefined)
+        runConfig.multi_choice = !!evalConfig.multi_choice;
+    }
+    if (evalConfig.data_injection)
+      runConfig.data_injection = evalConfig.data_injection;
+    if (evalConfig.error_localizer_enabled !== undefined)
+      runConfig.error_localizer_enabled = !!evalConfig.error_localizer_enabled;
 
     const builtEval = {
       templateId: evalConfig.templateId,
       evalTemplateName: evalConfig.name,
       model: evalConfig.model,
       mapping: translatedMapping,
-      config: { ...templateConfig, mapping: translatedMapping },
+      config: {
+        ...templateConfig,
+        mapping: translatedMapping,
+        ...(Object.keys(runConfig).length ? { run_config: runConfig } : {}),
+      },
       templateType: evalConfig.templateType,
-      ...(evalConfig.templateType === "composite" &&
-      evalConfig.compositeWeightOverrides
-        ? { compositeWeightOverrides: evalConfig.compositeWeightOverrides }
+      ...(isCompositeEval &&
+      (evalConfig.compositeWeightOverrides || evalConfig.composite_weight_overrides)
+        ? {
+            compositeWeightOverrides:
+              evalConfig.compositeWeightOverrides ??
+              evalConfig.composite_weight_overrides,
+          }
         : {}),
+      pinnedVersionId: evalConfig.versionId || null,
     };
+
+    // Create a version only when the user actually edited config fields.
+    if (evalConfig.isDirty && evalConfig.templateId) {
+      try {
+        if (isCompositeEval) {
+          const patchPayload = {};
+          if (evalConfig.composite_weight_overrides) {
+            const weights = {};
+            for (const [childId, w] of Object.entries(evalConfig.composite_weight_overrides)) {
+              if (w != null) weights[childId] = w;
+            }
+            if (Object.keys(weights).length) patchPayload.child_weights = weights;
+          }
+          await axios.patch(
+            endpoints.develop.eval.getCompositeDetail(evalConfig.templateId),
+            patchPayload,
+          );
+          const { data: versionsData } = await axios.get(
+            endpoints.develop.eval.getEvalVersions(evalConfig.templateId),
+          );
+          const latest = versionsData?.result?.versions?.[0];
+          if (latest?.id) builtEval.pinnedVersionId = latest.id;
+        } else {
+          const updatePayload = Object.fromEntries(
+            Object.entries({
+              instructions: evalConfig.instructions,
+              model: evalConfig.model,
+              pass_threshold: evalConfig.pass_threshold,
+              choice_scores: evalConfig.choice_scores,
+              multi_choice: evalConfig.multi_choice,
+              messages: evalConfig.messages,
+              mode: evalConfig.agent_mode,
+              check_internet: evalConfig.check_internet,
+              summary: evalConfig.summary,
+              tools: evalConfig.tools,
+              knowledge_bases: evalConfig.knowledge_bases,
+              data_injection: evalConfig.data_injection,
+              error_localizer_enabled: evalConfig.error_localizer_enabled,
+            }).filter(([, v]) => v !== undefined),
+          );
+          await axios.put(
+            endpoints.develop.eval.updateEvalTemplate(evalConfig.templateId),
+            updatePayload,
+          );
+          const { data: versionData } = await axios.post(
+            endpoints.develop.eval.createEvalVersion(evalConfig.templateId),
+            {},
+          );
+          if (versionData?.result?.id) builtEval.pinnedVersionId = versionData.result.id;
+        }
+        queryClient.invalidateQueries({ queryKey: ["evals", "versions", evalConfig.templateId] });
+      } catch {
+        // Fall back to the version the user selected in the picker
+      }
+    }
 
     if (editingEval) {
       // Edit mode: replace the existing eval in-place
@@ -258,6 +351,7 @@ const ManageExperimentEvalsDrawer = ({
       compositeWeightOverrides:
         evalItem.compositeWeightOverrides ||
         evalItem.composite_weight_overrides,
+      pinned_version_id: evalItem.pinnedVersionId || evalItem.pinned_version_id || null,
     });
     setOpenEvaluationDialog(true);
   };

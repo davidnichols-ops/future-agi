@@ -20540,7 +20540,8 @@ export const ModelHubExperimentsV2CreateBody = zod.object({
   "kb_id": zod.string().uuid().optional(),
   "composite_weight_overrides": zod.object({
 
-}).passthrough().optional()
+}).passthrough().optional(),
+  "pinned_version_id": zod.string().uuid().optional()
 }))
 })
 
@@ -20791,7 +20792,8 @@ export const ModelHubExperimentsV2UpdateBody = zod.object({
   "kb_id": zod.string().uuid().optional(),
   "composite_weight_overrides": zod.object({
 
-}).passthrough().optional()
+}).passthrough().optional(),
+  "pinned_version_id": zod.string().uuid().optional()
 })).optional()
 })
 

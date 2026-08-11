@@ -162,7 +162,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
 
   // ── Editable state (mirrors EvalDetailPage) ──
   const [selectedVersionId, setSelectedVersionId] = useState(
-    evalData?.pinned_version_id ?? null,
+    evalData?.pinned_version_id ?? evalData?.pinnedVersionId ?? null,
   );
   const [instructions, setInstructions] = useState("");
   const [code, setCode] = useState("");
@@ -480,6 +480,14 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
     }
     if (config.error_localizer_enabled != null) {
       setErrorLocalizerEnabled(!!config.error_localizer_enabled);
+    }
+
+    if (Array.isArray(config.children)) {
+      const weights = {};
+      config.children.forEach((c) => {
+        weights[c.child_id] = c.weight ?? 1;
+      });
+      setCompositeChildWeights(weights);
     }
 
     if (isEditMode) setEvalName(evalData?.name || fullEval?.name || "");
@@ -825,6 +833,13 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
             : ["variables_only"],
         );
         setUseInternet(config.check_internet ?? false);
+        if (Array.isArray(config.children)) {
+          const weights = {};
+          config.children.forEach((c) => {
+            weights[c.child_id] = c.weight ?? 1;
+          });
+          setCompositeChildWeights(weights);
+        }
         setIsDirty(false);
       }
     },
@@ -1069,6 +1084,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
         templateType,
         config: fullEval?.config || evalData?.config,
         versionId: selectedVersionId,
+        isDirty,
         data_injection: dataInjection,
         error_localizer_enabled: errorLocalizerActive,
         composite_weight_overrides: compositeChildWeights,
@@ -1089,6 +1105,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
       outputType,
       config: resolvedConfig,
       versionId: selectedVersionId,
+      isDirty,
       instructions,
       messages,
       pass_threshold: passThreshold,
@@ -1273,18 +1290,14 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
           {versions.length > 0 && (
             <Select
               size="small"
-              value={selectedVersionId || ""}
+              value={selectedVersionId || (versions.find((v) => v.is_default || v.isDefault)?.id ?? versions[0]?.id ?? "")}
               onChange={handleVersionChange}
-              displayEmpty
               sx={{ fontSize: "12px", minWidth: 130, height: 30 }}
             >
-              <MenuItem value="" sx={{ fontSize: "12px" }}>
-                Default version
-              </MenuItem>
               {versions.map((v) => (
                 <MenuItem key={v.id} value={v.id} sx={{ fontSize: "12px" }}>
-                  V{v.version_number}
-                  {v.is_default ? " (default)" : ""}
+                  V{v.version_number ?? v.versionNumber}
+                  {v.is_default || v.isDefault ? " (default)" : ""}
                 </MenuItem>
               ))}
             </Select>

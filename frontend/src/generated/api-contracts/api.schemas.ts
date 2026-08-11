@@ -10931,6 +10931,7 @@ export interface EvalMetricEntryApi {
   error_localizer?: boolean;
   kb_id?: string;
   composite_weight_overrides?: EvalMetricEntryApiCompositeWeightOverrides;
+  pinned_version_id?: string;
 }
 
 export interface ExperimentCreateV2Api {

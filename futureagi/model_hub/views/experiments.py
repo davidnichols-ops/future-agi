@@ -4583,6 +4583,7 @@ def _create_eval_metrics_inline(
             # Per-binding weight overrides for composite evals. Ignored
             # for single-template metrics. See Phase 7 wiring plan.
             composite_weight_overrides=entry.get("composite_weight_overrides"),
+            pinned_version_id=entry.get("pinned_version_id"),
         )
         created.append(metric)
     return created
@@ -5102,6 +5103,8 @@ def _has_eval_changed(metric, entry, translated_mapping):
         return True
     if metric.name != entry.get("name", ""):
         return True
+    if str(metric.pinned_version_id or "") != str(entry.get("pinned_version_id") or ""):
+        return True
     return False
 
 
@@ -5152,6 +5155,7 @@ def _diff_and_update_evals(
                 metric.model = entry.get("model", "")
                 metric.error_localizer = entry.get("error_localizer", False)
                 metric.kb_id = entry.get("kb_id")
+                metric.pinned_version_id = entry.get("pinned_version_id")
                 metric.save()
                 rerun_ids.append(entry_id)
         else:

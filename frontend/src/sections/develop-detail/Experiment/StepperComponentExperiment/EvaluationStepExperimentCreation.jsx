@@ -14,7 +14,7 @@ import PropTypes from "prop-types";
 import SvgColor from "src/components/svg-color";
 import { FormSearchSelectFieldControl } from "src/components/FromSearchSelectField";
 import { useFieldArray, useWatch } from "react-hook-form";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams } from "react-router";
 import { useSearchParams } from "react-router-dom";
 import axios, { endpoints } from "src/utils/axios";
@@ -34,6 +34,7 @@ const EvaluationStepExperimentCreation = ({
   const [searchParam] = useSearchParams();
   const datasetId = datasetParam || searchParam.get("datasetId") || "";
   const theme = useTheme();
+  const queryClient = useQueryClient();
   const userChangedColumnRef = useRef(false);
   const experimentVirtualColumns = [
     { field: "output", headerName: "Output", dataType: "text" },
@@ -84,7 +85,7 @@ const EvaluationStepExperimentCreation = ({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userEvalList, replaceEvals]);
-  const handleAddEvaluation = (evalConfig) => {
+  const handleAddEvaluation = async (evalConfig) => {
     // Build mapping: DatasetTestMode returns { variable: "column_name" }.
     // The backend expects { variable: "column_uuid" }.
     // Translate using updatedEvalColumns.
@@ -102,9 +103,40 @@ const EvaluationStepExperimentCreation = ({
     // how to execute the eval (eval_type_id, rule_prompt, output, etc.)
     const templateConfig =
       evalConfig.config || evalConfig.evalTemplate?.config || {};
+    const isCompositeEval =
+      evalConfig.templateType === "composite" ||
+      evalConfig.evalTemplate?.template_type === "composite" ||
+      evalConfig.evalTemplate?.templateType === "composite";
+
+    // Build run_config — mirrors EvaluationDrawer L600-L635.
+    const runConfig = {};
+    if (!isCompositeEval) {
+      if (evalConfig.model) runConfig.model = evalConfig.model;
+      if (evalConfig.agent_mode) runConfig.agent_mode = evalConfig.agent_mode;
+      if (evalConfig.check_internet !== undefined)
+        runConfig.check_internet = !!evalConfig.check_internet;
+      if (evalConfig.summary) runConfig.summary = evalConfig.summary;
+      if (evalConfig.knowledge_base_id)
+        runConfig.knowledge_base_id = evalConfig.knowledge_base_id;
+      if (evalConfig.knowledge_bases)
+        runConfig.knowledge_bases = evalConfig.knowledge_bases;
+      if (evalConfig.tools) runConfig.tools = evalConfig.tools;
+      if (evalConfig.pass_threshold !== undefined)
+        runConfig.pass_threshold = evalConfig.pass_threshold;
+      if (evalConfig.choice_scores && Object.keys(evalConfig.choice_scores).length)
+        runConfig.choice_scores = evalConfig.choice_scores;
+      if (evalConfig.multi_choice !== undefined)
+        runConfig.multi_choice = !!evalConfig.multi_choice;
+    }
+    if (evalConfig.data_injection)
+      runConfig.data_injection = evalConfig.data_injection;
+    if (evalConfig.error_localizer_enabled !== undefined)
+      runConfig.error_localizer_enabled = !!evalConfig.error_localizer_enabled;
+
     const fullConfig = {
       ...templateConfig,
       mapping: translatedMapping,
+      ...(Object.keys(runConfig).length ? { run_config: runConfig } : {}),
     };
 
     const evalEntry = {
@@ -120,11 +152,71 @@ const EvaluationStepExperimentCreation = ({
         evalConfig.evalTemplate?.requiredKeys ||
         templateConfig.requiredKeys ||
         [],
-      ...(evalConfig.templateType === "composite" &&
-      evalConfig.compositeWeightOverrides
-        ? { compositeWeightOverrides: evalConfig.compositeWeightOverrides }
+      ...(isCompositeEval &&
+      (evalConfig.compositeWeightOverrides || evalConfig.composite_weight_overrides)
+        ? {
+            compositeWeightOverrides:
+              evalConfig.compositeWeightOverrides ??
+              evalConfig.composite_weight_overrides,
+          }
         : {}),
+      pinnedVersionId: evalConfig.versionId || null,
     };
+
+    // Create a version only when the user actually edited config fields.
+    // A pure version-dropdown switch (isDirty=false) just stores the selected ID.
+    if (evalConfig.isDirty && evalConfig.templateId) {
+      try {
+        if (isCompositeEval) {
+          const patchPayload = {};
+          if (evalConfig.composite_weight_overrides) {
+            const weights = {};
+            for (const [childId, w] of Object.entries(evalConfig.composite_weight_overrides)) {
+              if (w != null) weights[childId] = w;
+            }
+            if (Object.keys(weights).length) patchPayload.child_weights = weights;
+          }
+          await axios.patch(
+            endpoints.develop.eval.getCompositeDetail(evalConfig.templateId),
+            patchPayload,
+          );
+          const { data: versionsData } = await axios.get(
+            endpoints.develop.eval.getEvalVersions(evalConfig.templateId),
+          );
+          const latest = versionsData?.result?.versions?.[0];
+          if (latest?.id) evalEntry.pinnedVersionId = latest.id;
+        } else {
+          const updatePayload = Object.fromEntries(
+            Object.entries({
+              instructions: evalConfig.instructions,
+              model: evalConfig.model,
+              pass_threshold: evalConfig.pass_threshold,
+              choice_scores: evalConfig.choice_scores,
+              multi_choice: evalConfig.multi_choice,
+              messages: evalConfig.messages,
+              mode: evalConfig.agent_mode,
+              check_internet: evalConfig.check_internet,
+              summary: evalConfig.summary,
+              tools: evalConfig.tools,
+              knowledge_bases: evalConfig.knowledge_bases,
+              data_injection: evalConfig.data_injection,
+              error_localizer_enabled: evalConfig.error_localizer_enabled,
+            }).filter(([, v]) => v !== undefined),
+          );
+          await axios.put(
+            endpoints.develop.eval.updateEvalTemplate(evalConfig.templateId),
+            updatePayload,
+          );
+          const { data: versionData } = await axios.post(
+            endpoints.develop.eval.createEvalVersion(evalConfig.templateId),
+            {},
+          );
+          if (versionData?.result?.id) evalEntry.pinnedVersionId = versionData.result.id;
+        }
+        queryClient.invalidateQueries({ queryKey: ["evals", "versions", evalConfig.templateId] });
+      } catch (err) {
+      }
+    }
 
     if (editingEval) {
       // Edit mode: replace the existing field in place, keep the same name.
@@ -179,6 +271,7 @@ const EvaluationStepExperimentCreation = ({
       compositeWeightOverrides:
         evalItem.compositeWeightOverrides ||
         evalItem.composite_weight_overrides,
+      pinned_version_id: evalItem.pinnedVersionId || evalItem.pinned_version_id || null,
     });
     setOpenEvaluationDialog(true);
   };
