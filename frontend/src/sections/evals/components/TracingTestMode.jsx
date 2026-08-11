@@ -25,6 +25,7 @@ import React, {
 import { useQuery } from "@tanstack/react-query";
 import DraggableColResizer from "src/components/draggable-col-resizer";
 import Iconify from "src/components/iconify";
+import { useMapToVariable } from "./useMapToVariable";
 import axios, { endpoints } from "src/utils/axios";
 import { PROJECT_SOURCE } from "src/utils/constants";
 import { canonicalEntries } from "src/utils/utils";
@@ -378,6 +379,14 @@ const TracingTestMode = React.forwardRef(
         ? { ...initialMapping }
         : {},
     );
+
+    // ── Map-from-table: assign a column's path straight into a variable ──
+    // Shared across every mapping surface — see useMapToVariable.
+    const { renderRowMapAction, mapMenu, rowHoverSx } = useMapToVariable({
+      variables,
+      mapping,
+      setMapping,
+    });
 
     // Template ID ref (updated via imperative handle for first-test flow)
     const templateIdRef = useRef(templateId);
@@ -880,14 +889,15 @@ const TracingTestMode = React.forwardRef(
       });
     }, [variables, fieldNames]);
 
-    // Mapping is always required; a sample row only when not using data injection.
+    // With data injection the trace/session context supplies the values, so
+    // mapping is optional; otherwise require all variables mapped + a sample row.
     useEffect(() => {
       if (!onReadyChange) return;
       const allMapped =
         variables.length === 0 ||
         variables.every((v) => mapping[v] && String(mapping[v]).length > 0);
       const hasRow = !!currentRow;
-      const ready = hasDataInjection ? allMapped : allMapped && hasRow;
+      const ready = hasDataInjection || (allMapped && hasRow);
       onReadyChange(ready, mapping);
     }, [variables, mapping, currentRow, hasDataInjection, onReadyChange]);
 
@@ -1465,6 +1475,8 @@ const TracingTestMode = React.forwardRef(
                         borderColor: "divider",
                         "&:last-child": { borderBottom: "none" },
                         "&:hover": { backgroundColor: "action.hover" },
+                        // Reveal the map/copy action only on row hover.
+                        ...rowHoverSx,
                       }}
                     >
                       <CustomTooltip
@@ -1572,6 +1584,7 @@ const TracingTestMode = React.forwardRef(
                           </Tooltip>
                         )}
                       </Box>
+                      {renderRowMapAction(key)}
                     </Box>
                   );
                 })}
@@ -1820,6 +1833,9 @@ const TracingTestMode = React.forwardRef(
               </Box>
             );
           })()}
+
+        {/* Map-from-table menu — shared across mapping surfaces */}
+        {mapMenu}
 
         {/* Result */}
         {result && (
