@@ -1929,12 +1929,16 @@ class TestExperimentEvalVersionPinning:
             dataset=dataset,
             template=eval_template,
             config={"mapping": {}},
+            model="turing_large",
+            error_localizer=False,
             user=user,
         )
         entry = {
             "template_id": str(eval_template.id),
             "name": "test",
             "config": {"mapping": {}},
+            "model": "turing_large",
+            "error_localizer": False,
         }
         assert _has_eval_changed(metric, entry, {}) is False
 
