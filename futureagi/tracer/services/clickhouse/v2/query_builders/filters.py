@@ -400,27 +400,55 @@ class ClickHouseFilterBuilderV2(ClickHouseFilterBuilder):
         """Expand a curated user to every old/new ID stored on spans.
 
         ``end_users`` remains keyed by the deterministic group's survivor old
-        ID while spans can straddle the old-ID/new-ID cutover.  Expand only the
-        matching dimension rows through the small remap table; the surrounding
-        membership query can then keep its indexed ``end_user_id`` predicate.
+        ID while spans can straddle the old-ID/new-ID cutover.  The old shape
+        built a tenant-global window over ``end_user_id_remap`` before applying
+        the user predicate.  On a large remap table that materialized hundreds
+        of MiB even for the one-user CrossProjectUserDetailPage request.
+
+        Resolve the filtered dimension IDs first, discover only the remap
+        groups touched by those IDs, and expand only those groups.  The direct
+        dimension arm preserves net-new users that do not have a remap row.
+        No result is sampled or truncated, and the surrounding membership read
+        keeps its indexed ``end_user_id`` predicate.
         """
 
         project_scope = self._project_scope_predicate("eu")
-        return (
-            "SELECT expanded_end_user_id FROM ("
-            "SELECT arrayJoin(arrayFilter(end_user_key -> "
-            "end_user_key != toUUID('00000000-0000-0000-0000-000000000000'), "
-            "arrayConcat([eu.end_user_id], groupUniqArray(remap.old_id), "
-            "groupUniqArray(remap.new_id)))) AS expanded_end_user_id "
-            "FROM end_users AS eu FINAL "
-            "LEFT JOIN ("
-            "SELECT old_id, new_id, "
-            "argMin(old_id, toString(old_id)) OVER (PARTITION BY new_id) "
-            "AS survivor_id FROM end_user_id_remap FINAL"
-            ") AS remap ON eu.end_user_id = remap.survivor_id "
-            f"WHERE {project_scope} AND ({inner}) AND eu.is_deleted = 0 "
-            "GROUP BY eu.end_user_id)"
-        )
+        return f"""
+            WITH
+            matching_end_user_ids AS (
+                SELECT DISTINCT eu.end_user_id
+                FROM end_users AS eu FINAL
+                WHERE {project_scope}
+                  AND ({inner})
+                  AND eu.is_deleted = 0
+            ),
+            matching_end_user_group_ids AS (
+                SELECT DISTINCT remap_match.new_id
+                FROM end_user_id_remap AS remap_match FINAL
+                WHERE remap_match.old_id IN (
+                    SELECT end_user_id FROM matching_end_user_ids
+                )
+                   OR remap_match.new_id IN (
+                    SELECT end_user_id FROM matching_end_user_ids
+                )
+            ),
+            expanded_matching_end_user_ids AS (
+                SELECT arrayJoin(arrayDistinct(arrayConcat(
+                    groupArray(remap.old_id),
+                    [remap.new_id]
+                ))) AS expanded_end_user_id
+                FROM end_user_id_remap AS remap FINAL
+                WHERE remap.new_id IN (
+                    SELECT new_id FROM matching_end_user_group_ids
+                )
+                GROUP BY remap.new_id
+            )
+            SELECT end_user_id AS expanded_end_user_id
+            FROM matching_end_user_ids
+            UNION DISTINCT
+            SELECT expanded_end_user_id
+            FROM expanded_matching_end_user_ids
+        """
 
     @staticmethod
     def _rewrite_filter_fragment(sql: str) -> str:

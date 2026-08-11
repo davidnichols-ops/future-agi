@@ -61,6 +61,9 @@ def test_user_aggregate_graph_replays_latest_physical_span_versions():
     # Both the aggregate and trace-membership filter read the replayed CTE.
     assert sql.count("FROM latest_spans") >= 2
     assert "FROM latest_spans WHERE" in " ".join(sql.split())
+    assert "candidate_end_user_ids AS" in sql
+    assert "eu_survivor_map AS" in sql
+    assert "OVER (PARTITION BY new_id)" not in sql
     assert params["project_id"] == PROJECT_ID
     assert params["start_date"] < params["end_date"]
 
@@ -77,8 +80,8 @@ def test_project_user_detail_graph_prunes_and_buckets_on_start_time():
     sql, params = builder.build()
 
     _assert_latest_replay_precedes_live_filter(sql)
-    assert "candidate_span_identities AS" not in sql
-    assert sql.count("FROM spans") == 1
+    assert "candidate_span_identities AS" in sql
+    assert sql.count("FROM spans") == 2
     assert "FROM latest_spans AS rs" in sql
     assert "toDate(start_time) BETWEEN" in sql
     assert "AND start_time >= %(start_date)s" in sql
@@ -86,10 +89,14 @@ def test_project_user_detail_graph_prunes_and_buckets_on_start_time():
     assert "created_at >= %(start_date)s" not in sql
     assert "rs.created_at" not in sql
     assert "toStartOfDay(start_time) AS time_bucket" in sql
-    assert "FROM end_users FINAL" not in sql
-    assert "argMax(is_deleted, version) AS latest_is_deleted" in sql
+    assert "FROM end_users FINAL" in sql
+    assert "expanded_target_end_user_ids AS" in sql
+    assert "candidate_trace_session_ids AS" in sql
+    assert "ts_survivor_map AS" in sql
+    assert "OVER (PARTITION BY new_id)" not in sql
     assert "FROM spans AS rs" not in sql
     assert re.search(r"\bFINAL\b", sql)  # bounded remap tables only
     assert params["project_id"] == PROJECT_ID
     assert params["org_id"] == ORGANIZATION_ID
     assert params["end_user_id"] == END_USER_ID
+    assert params["target_end_user_ids"] == (END_USER_ID,)

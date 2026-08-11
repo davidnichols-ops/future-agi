@@ -33,8 +33,8 @@ from tracer.services.exact_aggregation_cache import (
     read_or_schedule_exact_snapshot,
 )
 
-SESSION_GRAPH_WALL_DEADLINE_MS = 4_400
-SESSION_GRAPH_QUERY_TIMEOUT_MS = 1_200
+SESSION_GRAPH_WALL_DEADLINE_MS = 30_000
+SESSION_GRAPH_QUERY_TIMEOUT_MS = 30_000
 SESSION_GRAPH_RESULT_BYTES = 32 * 1024 * 1024
 SESSION_GRAPH_HYDRATION_BATCH_SIZE = 512
 SESSION_GRAPH_MAX_HYDRATION_QUERIES = (
@@ -65,9 +65,8 @@ _SESSION_IDENTITY_ONLY_METRICS = frozenset(
 _SESSION_GRAPH_READ_CAPS = {
     "max_threads": 1,
     "max_block_size": 8192,
-    "max_rows_to_read": 10_000_000,
     "max_bytes_to_read": 512 * 1024 * 1024,
-    "max_memory_usage": 256 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_result_rows": 10_001,
     "max_result_bytes": SESSION_GRAPH_RESULT_BYTES,
 }
@@ -78,6 +77,11 @@ def _bounded_read_settings(settings: dict[str, Any] | None) -> dict[str, Any]:
 
     bounded = dict(_SESSION_GRAPH_READ_CAPS)
     for key, value in (settings or {}).items():
+        if key == "max_rows_to_read":
+            # Large but valid historical windows must be allowed to finish;
+            # bytes, memory, result size, query count and the shared wall clock
+            # remain authoritative bounds.
+            continue
         if key in _SESSION_GRAPH_READ_CAPS:
             bounded[key] = min(int(value), int(_SESSION_GRAPH_READ_CAPS[key]))
         else:
@@ -560,7 +564,12 @@ def fetch_session_graph_ch(
 ) -> dict[str, Any]:
     """Dispatch complete exact session aggregates to direct-write CH25."""
 
-    del wall_deadline_ms
+    if wall_deadline_ms <= 0:
+        raise ValueError("session graph wall deadline must be positive")
+    deadline = ReadDeadline.start(
+        min(int(wall_deadline_ms), SESSION_GRAPH_WALL_DEADLINE_MS)
+    )
+    bounded_analytics = _DeadlineBoundAnalytics(analytics, deadline)
     metric_type = str(req_data_config.get("type") or "")
     metric_id = str(req_data_config.get("id") or "session_count")
     filters = list(filters or [])
@@ -595,7 +604,7 @@ def fetch_session_graph_ch(
     session_filters = _session_scoped_filters(filters)
     if metric_type == "EVAL":
         return fetch_eval_graph_ch(
-            analytics=analytics,
+            analytics=bounded_analytics,
             project_id=project_id,
             filters=session_filters,
             interval=interval,
@@ -608,7 +617,7 @@ def fetch_session_graph_ch(
         )
     if metric_type == "ANNOTATION":
         return fetch_annotation_graph_ch(
-            analytics=analytics,
+            analytics=bounded_analytics,
             project_id=project_id,
             filters=session_filters,
             interval=interval,

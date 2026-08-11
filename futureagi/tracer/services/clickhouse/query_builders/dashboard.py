@@ -32,9 +32,8 @@ from tracer.services.clickhouse.trace_project_scope import (
 )
 from tracer.services.clickhouse.v2.id_remap_sql import (
     NIL_UUID,
-    remap_left_join,
+    bounded_survivor_map_subquery,
     resolved_id_expr,
-    survivor_map_subquery,
 )
 
 logger = logging.getLogger(__name__)
@@ -392,6 +391,32 @@ _SESSION_DIMENSION_NAMES = frozenset({"session_count", "session"})
 _MATERIALIZED_DASHBOARD_COLS: tuple[str, ...] = ()
 
 
+def _touched_survivor_map_subquery(*, remap_table: str, candidate_ids_sql: str) -> str:
+    """Build a survivor map only for groups touched by request-scoped ids."""
+
+    return f"""
+        SELECT
+            any_id,
+            argMin(survivor_id, toString(survivor_id)) AS survivor_id
+        FROM (
+            SELECT
+                arrayJoin(
+                    arrayDistinct(arrayConcat(groupArray(old_id), [new_id]))
+                ) AS any_id,
+                argMin(old_id, toString(old_id)) AS survivor_id
+            FROM {remap_table} FINAL
+            WHERE new_id IN (
+                SELECT DISTINCT new_id
+                FROM {remap_table} FINAL
+                WHERE old_id IN ({candidate_ids_sql})
+                   OR new_id IN ({candidate_ids_sql})
+            )
+            GROUP BY new_id
+        )
+        GROUP BY any_id
+    """
+
+
 def _resolved_spans_source(
     alias: str | None = None,
     *,
@@ -411,17 +436,62 @@ def _resolved_spans_source(
     for spans collapses pre/post-cutover ids without fan-out.
     """
     out_alias = alias or "spans"
+    remap_ctes: list[str] = []
     eu_join = ""
     resolved_eu = "sp.end_user_id"
     if resolve_end_user_id:
-        eu_join = remap_left_join("sp.end_user_id", "end_user_id_remap", "eu_remap")
+        candidate_eu_sql = (
+            "SELECT DISTINCT end_user_id FROM dashboard_candidate_end_user_ids"
+        )
+        eu_map = _touched_survivor_map_subquery(
+            remap_table="end_user_id_remap",
+            candidate_ids_sql=candidate_eu_sql,
+        )
+        remap_ctes.extend(
+            (
+                "dashboard_candidate_end_user_ids AS ("
+                "SELECT DISTINCT end_user_id FROM spans "
+                "PREWHERE project_id IN %(project_ids)s "
+                "AND start_time >= %(start_date)s "
+                "AND start_time < %(end_date)s "
+                "WHERE isNotNull(end_user_id) "
+                f"AND end_user_id != toUUID('{NIL_UUID}')"
+                ")",
+                f"eu_survivor_map AS ({eu_map})",
+            )
+        )
+        eu_join = (
+            "LEFT JOIN eu_survivor_map AS eu_remap ON sp.end_user_id = eu_remap.any_id"
+        )
         resolved_eu = resolved_id_expr("sp.end_user_id", "eu_remap")
 
     ts_join = ""
     resolved_ts = "sp.trace_session_id"
     if resolve_trace_session_id:
-        ts_join = remap_left_join(
-            "sp.trace_session_id", "trace_session_id_remap", "ts_remap"
+        candidate_ts_sql = (
+            "SELECT DISTINCT trace_session_id "
+            "FROM dashboard_candidate_trace_session_ids"
+        )
+        ts_map = _touched_survivor_map_subquery(
+            remap_table="trace_session_id_remap",
+            candidate_ids_sql=candidate_ts_sql,
+        )
+        remap_ctes.extend(
+            (
+                "dashboard_candidate_trace_session_ids AS ("
+                "SELECT DISTINCT trace_session_id FROM spans "
+                "PREWHERE project_id IN %(project_ids)s "
+                "AND start_time >= %(start_date)s "
+                "AND start_time < %(end_date)s "
+                "WHERE isNotNull(trace_session_id) "
+                f"AND trace_session_id != toUUID('{NIL_UUID}')"
+                ")",
+                f"ts_survivor_map AS ({ts_map})",
+            )
+        )
+        ts_join = (
+            "LEFT JOIN ts_survivor_map AS ts_remap "
+            "ON sp.trace_session_id = ts_remap.any_id"
         )
         resolved_ts = resolved_id_expr("sp.trace_session_id", "ts_remap")
 
@@ -436,7 +506,6 @@ def _resolved_spans_source(
 
     dimension_join = ""
     if include_end_user_dimension:
-        curated_map = survivor_map_subquery("end_user_id_remap")
         resolved_curated_eu = resolved_id_expr("eu.end_user_id", "eu_dimension_remap")
         exact_or_latest = f"tuple(eu.end_user_id = {resolved_curated_eu}, eu.version)"
         dimension_join = (
@@ -447,7 +516,7 @@ def _resolved_spans_source(
             f"argMax(eu.user_id, {exact_or_latest}) AS user_id, "
             f"argMax(tuple(eu.user_id_type), {exact_or_latest}).1 AS user_id_type "
             "FROM end_users AS eu FINAL "
-            f"LEFT JOIN ({curated_map}) AS eu_dimension_remap "
+            "LEFT JOIN eu_survivor_map AS eu_dimension_remap "
             "ON eu.end_user_id = eu_dimension_remap.any_id "
             "WHERE eu.project_id IN %(project_ids)s "
             "AND eu.is_deleted = 0 "
@@ -487,8 +556,9 @@ def _resolved_spans_source(
         f", {', '.join(projected_columns)}" if projected_columns else ""
     )
     spans_source = "spans AS sp FINAL" if latest_state else "spans AS sp"
+    with_clause = f"WITH {', '.join(remap_ctes)} " if remap_ctes else ""
     return (
-        "(SELECT sp.project_id AS project_id, "
+        f"({with_clause}SELECT sp.project_id AS project_id, "
         f"sp.* EXCEPT ({', '.join(excluded_columns)})"
         f"{additional_projection} "
         f"FROM {spans_source} {eu_join} {ts_join} {dimension_join}"
@@ -787,7 +857,16 @@ class DashboardQueryBuilder:
         if not match_conditions:
             return ""
 
-        dimension_remap = survivor_map_subquery("end_user_id_remap")
+        dimension_candidate_ids = """
+            SELECT filtered_dimension_candidate.end_user_id
+            FROM end_users AS filtered_dimension_candidate FINAL
+            WHERE filtered_dimension_candidate.project_id IN %(project_ids)s
+              AND filtered_dimension_candidate.is_deleted = 0
+        """
+        dimension_remap = _touched_survivor_map_subquery(
+            remap_table="end_user_id_remap",
+            candidate_ids_sql=dimension_candidate_ids,
+        )
         resolved_dimension_id = resolved_id_expr(
             "filtered_eu.end_user_id", "filtered_eu_remap"
         )
@@ -808,7 +887,6 @@ class DashboardQueryBuilder:
             GROUP BY project_id, resolved_end_user_id
             HAVING {" AND ".join(match_conditions)}
         """
-        physical_map = survivor_map_subquery("end_user_id_remap")
         physical_id = (
             "if(user_filter_physical_map.any_id IS NULL "
             f"OR user_filter_physical_map.any_id = toUUID('{NIL_UUID}'), "
@@ -819,7 +897,7 @@ class DashboardQueryBuilder:
                 matched_user.project_id AS project_id,
                 {physical_id} AS physical_end_user_id
             FROM ({filtered_dimension}) AS matched_user
-            LEFT JOIN ({physical_map}) AS user_filter_physical_map
+            LEFT JOIN ({dimension_remap}) AS user_filter_physical_map
               ON user_filter_physical_map.survivor_id =
                  matched_user.resolved_end_user_id
         )"""
@@ -850,13 +928,17 @@ class DashboardQueryBuilder:
             fallback_param_keys.append(fallback_key)
         fallback_tuple = tuple(sorted(fallback_uuid_values))
         params["direct_user_fallback_uuids"] = fallback_tuple
+        fallback_map = bounded_survivor_map_subquery(
+            "end_user_id_remap",
+            candidate_param="direct_user_fallback_uuids",
+        )
         literal_branches = " UNION ALL ".join(
             f"SELECT toUUID(%({parameter_key})s) AS physical_end_user_id"
             for parameter_key in fallback_param_keys
         )
         fallback_membership = f"""sp.end_user_id IN (
             SELECT any_id AS physical_end_user_id
-            FROM ({physical_map}) AS fallback_user_physical_map
+            FROM ({fallback_map}) AS fallback_user_physical_map
             WHERE survivor_id IN %(direct_user_fallback_uuids)s
             UNION DISTINCT
             {literal_branches}
@@ -927,7 +1009,10 @@ class DashboardQueryBuilder:
             params[parameter_key] = candidate_value
             literal_param_keys.append(parameter_key)
 
-        physical_map = survivor_map_subquery("trace_session_id_remap")
+        physical_map = bounded_survivor_map_subquery(
+            "trace_session_id_remap",
+            candidate_param="direct_session_filter_uuids",
+        )
         literal_branches = " UNION ALL ".join(
             f"SELECT toUUID(%({parameter_key})s) AS physical_trace_session_id"
             for parameter_key in literal_param_keys

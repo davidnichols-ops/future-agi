@@ -65,10 +65,13 @@ _SKIP_ATTR_PREFIXES = (
     "output.value",
 )
 
-USER_LIST_WALL_DEADLINE_MS = 12_000
-USER_LIST_PRESENCE_TIMEOUT_MS = 1_500
-USER_LIST_QUERY_TIMEOUT_MS = 8_000
-USER_LIST_ENRICHMENT_TIMEOUT_MS = 5_000
+# Production telemetry reads share the infrastructure's hard 30-second ceiling.
+# Each phase receives only the request's remaining time, so sequential work
+# cannot extend the endpoint beyond that wall.
+USER_LIST_WALL_DEADLINE_MS = 30_000
+USER_LIST_PRESENCE_TIMEOUT_MS = 30_000
+USER_LIST_QUERY_TIMEOUT_MS = 30_000
+USER_LIST_ENRICHMENT_TIMEOUT_MS = 30_000
 USER_EXPORT_WALL_DEADLINE_MS = 30_000
 USER_LIST_CANDIDATE_BATCH_SIZE = 25
 USER_LIST_MAX_CANDIDATE_BATCHES = 8
@@ -76,10 +79,9 @@ USER_LIST_MAX_CANDIDATE_BATCHES = 8
 _USER_LIST_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
-    "max_rows_to_read": 10_000_000,
     "read_overflow_mode": "throw",
     "max_bytes_to_read": 512 * 1024 * 1024,
-    "max_memory_usage": 256 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "timeout_overflow_mode": "throw",
 }
 _USER_LIST_RESULT_BYTES = 32 * 1024 * 1024
@@ -164,6 +166,7 @@ def _users_attr_enrichment_query(
     attribute_keys: tuple[str, ...] | list[str] | None = None,
     start_date: datetime | None = None,
     end_date: datetime | None = None,
+    candidate_end_user_id_map: dict[str, str] | None = None,
 ):
     """Project only requested keys for a finite Observe-Users page.
 
@@ -174,6 +177,7 @@ def _users_attr_enrichment_query(
     """
     from tracer.services.clickhouse.v2.id_remap_sql import (
         bounded_survivor_map_subquery,
+        literal_survivor_map_subquery,
         resolved_id_expr,
     )
 
@@ -192,9 +196,22 @@ def _users_attr_enrichment_query(
         params["attr_pids"] = tuple(str(value) for value in project_ids)
         project_clause = "AND spans.project_id IN %(attr_pids)s"
 
-    eu_map = bounded_survivor_map_subquery(
-        "end_user_id_remap", candidate_param="eu_ids"
-    )
+    finite_map = {
+        str(any_id): str(survivor_id)
+        for any_id, survivor_id in (candidate_end_user_id_map or {}).items()
+        if any_id and survivor_id
+    }
+    if finite_map:
+        params["candidate_remap_any_ids"] = list(finite_map)
+        params["candidate_remap_survivor_ids"] = list(finite_map.values())
+        eu_map = literal_survivor_map_subquery(
+            any_ids_param="candidate_remap_any_ids",
+            survivor_ids_param="candidate_remap_survivor_ids",
+        )
+    else:
+        eu_map = bounded_survivor_map_subquery(
+            "end_user_id_remap", candidate_param="eu_ids"
+        )
     resolved = resolved_id_expr("latest_end_user_id", "eu_remap")
     if (start_date is None) != (end_date is None):
         raise ValueError("attribute enrichment window must be provided together")
@@ -455,6 +472,7 @@ class UsersListManager:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         candidate_scan_ids: list[str] | None = None,
+        candidate_end_user_id_map: dict[str, str] | None = None,
     ) -> dict[str, dict[str, object]]:
         """Return page-user attributes under the request-owned wall deadline."""
 
@@ -513,6 +531,7 @@ class UsersListManager:
                 attribute_keys=keys,
                 start_date=bucket_start,
                 end_date=bucket_end,
+                candidate_end_user_id_map=candidate_end_user_id_map,
             )
             attr_params["eu_ids"] = tuple(str(e) for e in end_user_ids)
             attr_params["eu_scan_ids"] = tuple(
@@ -635,6 +654,7 @@ class UsersListManager:
         start_date: datetime | None,
         end_date: datetime | None,
         candidate_scan_ids: list[str] | None = None,
+        candidate_end_user_id_map: dict[str, str] | None = None,
     ) -> None:
         """Run only explicitly requested finite enrichments."""
 
@@ -651,6 +671,7 @@ class UsersListManager:
                 start_date=start_date,
                 end_date=end_date,
                 candidate_scan_ids=candidate_scan_ids,
+                candidate_end_user_id_map=candidate_end_user_id_map,
             )
             self._apply_span_attributes(rows, attributes)
         if self.needs_evals:
@@ -747,6 +768,7 @@ class UsersListManager:
         *,
         candidate_ids: list[str],
         candidate_scan_ids: list[str] | None = None,
+        candidate_end_user_id_map: dict[str, str] | None = None,
         frozen_filters: list[dict],
         window_start: datetime,
         window_end: datetime,
@@ -767,6 +789,7 @@ class UsersListManager:
             offset=0,
             candidate_end_user_ids=candidate_ids,
             candidate_scan_end_user_ids=candidate_scan_ids or candidate_ids,
+            candidate_end_user_id_map=candidate_end_user_id_map,
             empty_scope=self.empty_scope,
         )
         query, params = builder.build_candidate_page_query()
@@ -786,6 +809,7 @@ class UsersListManager:
             start_date=window_start,
             end_date=window_end,
             candidate_scan_ids=candidate_scan_ids,
+            candidate_end_user_id_map=candidate_end_user_id_map,
         )
         return rows
 
@@ -1004,9 +1028,19 @@ class UsersListManager:
                         )
                     )
                 )
+                candidate_end_user_id_map = {
+                    str(scan_id): str(row["end_user_id"])
+                    for row in batch
+                    if row.get("_is_survivor_candidate", True)
+                    for scan_id in row.get(
+                        "_candidate_scan_end_user_ids",
+                        (str(row["end_user_id"]),),
+                    )
+                }
                 exact_rows = self._read_exact_candidate_rows(
                     candidate_ids=candidate_ids,
                     candidate_scan_ids=candidate_scan_ids,
+                    candidate_end_user_id_map=candidate_end_user_id_map,
                     frozen_filters=frozen_filters,
                     window_start=window_start,
                     window_end=window_end,

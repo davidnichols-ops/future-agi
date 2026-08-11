@@ -24,7 +24,9 @@ import re
 from datetime import datetime
 
 from tracer.services.clickhouse.query_builders.dashboard import (
+    AGGREGATIONS,
     DashboardQueryBuilder,
+    _sanitize_attr_key,
 )
 from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 from tracer.services.clickhouse.v2.query_builders.filters import (
@@ -106,6 +108,95 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
 
     def parse_time_range(self) -> tuple[datetime, datetime]:
         return self._resolved_time_range
+
+    def _build_custom_attr_query(
+        self,
+        metric: dict,
+        aggregation: str,
+        bucket_fn: str,
+        per_metric_filters: list[dict],
+        params: dict,
+    ) -> tuple[str, dict]:
+        """Stream the common numeric custom-metric shape without ``FINAL``.
+
+        ``FINAL`` over a wide window materializes every physical span version
+        before the Map key can be reduced.  For a metric with no filters or
+        breakdowns, collapse versions in table sort-key order instead and
+        carry only the requested numeric value.  Mutable predicates remain
+        outside ``argMax`` so a later tombstone or key removal wins exactly.
+        More complex shapes keep the general builder path.
+        """
+
+        if (
+            metric.get("attribute_type", "number") != "number"
+            or self.breakdowns
+            or self.global_filters
+            or per_metric_filters
+        ):
+            return super()._build_custom_attr_query(
+                metric,
+                aggregation,
+                bucket_fn,
+                per_metric_filters,
+                params,
+            )
+
+        attr_key = _sanitize_attr_key(metric.get("attribute_key", ""))
+        params = dict(params)
+        params["custom_metric_attr_key"] = attr_key
+        aggregate = AGGREGATIONS.get(aggregation, "avg({col})").format(
+            col="metric_value"
+        )
+        sql = f"""
+            WITH latest_custom_metric_spans AS (
+                SELECT
+                    project_id,
+                    observation_type,
+                    service_name,
+                    toStartOfHour(start_time) AS identity_hour,
+                    trace_id,
+                    id,
+                    argMax(
+                        tuple(
+                            is_deleted,
+                            start_time,
+                            mapContains(
+                                attrs_number,
+                                %(custom_metric_attr_key)s
+                            ),
+                            attrs_number[%(custom_metric_attr_key)s]
+                        ),
+                        _version
+                    ) AS latest_metric_state
+                FROM spans
+                PREWHERE project_id IN %(project_ids)s
+                  AND start_time >= %(start_date)s
+                  AND start_time < %(end_date)s
+                GROUP BY
+                    project_id,
+                    observation_type,
+                    service_name,
+                    identity_hour,
+                    trace_id,
+                    id
+            ), live_custom_metric_spans AS (
+                SELECT
+                    tupleElement(latest_metric_state, 2) AS start_time,
+                    tupleElement(latest_metric_state, 4) AS metric_value
+                FROM latest_custom_metric_spans
+                WHERE tupleElement(latest_metric_state, 1) = 0
+                  AND tupleElement(latest_metric_state, 3) = 1
+                  AND tupleElement(latest_metric_state, 2) >= %(start_date)s
+                  AND tupleElement(latest_metric_state, 2) < %(end_date)s
+            )
+            SELECT
+                {bucket_fn}(start_time) AS time_bucket,
+                {aggregate} AS value
+            FROM live_custom_metric_spans
+            GROUP BY time_bucket
+            ORDER BY time_bucket
+        """
+        return sql, params
 
     def build_metric_query(self, metric: dict) -> tuple[str, dict]:
         sql, params = super().build_metric_query(metric)

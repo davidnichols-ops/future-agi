@@ -6,6 +6,7 @@ from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.v2.id_remap_sql import (
     bounded_survivor_map_subquery,
+    literal_survivor_map_subquery,
     resolved_id_expr,
     survivor_map_subquery,
 )
@@ -13,6 +14,38 @@ from tracer.services.clickhouse.v2.id_remap_sql import (
 
 class UnsupportedBoundedUserListQuery(ValueError):
     """Raised when an exact user page cannot use the bounded query path."""
+
+
+def _touched_survivor_map_subquery(
+    *, remap_table: str, candidate_cte: str, candidate_column: str
+) -> str:
+    """Resolve only consolidation groups reached by a finite candidate CTE."""
+
+    return f"""
+        SELECT
+            any_id,
+            argMin(survivor_id, toString(survivor_id)) AS survivor_id
+        FROM (
+            SELECT
+                arrayJoin(
+                    arrayDistinct(arrayConcat(groupArray(old_id), [new_id]))
+                ) AS any_id,
+                argMin(old_id, toString(old_id)) AS survivor_id
+            FROM {remap_table} FINAL
+            WHERE new_id IN (
+                SELECT DISTINCT new_id
+                FROM {remap_table} FINAL
+                WHERE old_id IN (
+                    SELECT {candidate_column} FROM {candidate_cte}
+                )
+                   OR new_id IN (
+                    SELECT {candidate_column} FROM {candidate_cte}
+                )
+            )
+            GROUP BY new_id
+        )
+        GROUP BY any_id
+    """
 
 
 class UserListQueryBuilder(BaseQueryBuilder):
@@ -110,6 +143,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
         end_user_id: str | None = None,
         candidate_end_user_ids: list[str] | tuple[str, ...] | None = None,
         candidate_scan_end_user_ids: list[str] | tuple[str, ...] | None = None,
+        candidate_end_user_id_map: dict[str, str] | None = None,
         include_null_workspace: bool = False,
         empty_scope: bool = False,
     ) -> None:
@@ -142,12 +176,61 @@ class UserListQueryBuilder(BaseQueryBuilder):
             str(value)
             for value in (candidate_scan_end_user_ids or self.candidate_end_user_ids)
         )
+        supplied_map = {
+            str(any_id): str(survivor_id)
+            for any_id, survivor_id in (candidate_end_user_id_map or {}).items()
+            if any_id and survivor_id
+        }
+        if self.candidate_end_user_ids and not supplied_map:
+            supplied_map = {
+                candidate_id: candidate_id
+                for candidate_id in self.candidate_scan_end_user_ids
+            }
+        if supplied_map:
+            missing_aliases = (
+                set(self.candidate_scan_end_user_ids) - supplied_map.keys()
+            )
+            invalid_survivors = set(supplied_map.values()) - set(
+                self.candidate_end_user_ids
+            )
+            if missing_aliases or invalid_survivors:
+                raise ValueError("candidate end-user remap is inconsistent")
+        self.candidate_end_user_id_map = tuple(supplied_map.items())
         self.include_null_workspace = include_null_workspace
         # When the caller resolved an EMPTY workspace-project set, the read must
         # return nothing — NOT fall through to an org-wide scan. (BaseQueryBuilder
         # treats `project_ids=[]` as falsy and would otherwise drop project
         # scoping entirely, re-introducing a cross-workspace leak.)
         self.empty_scope = empty_scope
+
+    def _finite_end_user_map(
+        self,
+        *,
+        candidate_param: str,
+    ) -> tuple[str, dict[str, list[str]]]:
+        """Return a literal page map when the cursor already resolved one."""
+
+        if not self.candidate_end_user_id_map:
+            return (
+                bounded_survivor_map_subquery(
+                    "end_user_id_remap", candidate_param=candidate_param
+                ),
+                {},
+            )
+        any_ids, survivor_ids = zip(
+            *self.candidate_end_user_id_map,
+            strict=True,
+        )
+        return (
+            literal_survivor_map_subquery(
+                any_ids_param="candidate_remap_any_ids",
+                survivor_ids_param="candidate_remap_survivor_ids",
+            ),
+            {
+                "candidate_remap_any_ids": list(any_ids),
+                "candidate_remap_survivor_ids": list(survivor_ids),
+            },
+        )
 
     def build_dimension_candidate_query(
         self,
@@ -401,13 +484,13 @@ class UserListQueryBuilder(BaseQueryBuilder):
             pagination = ""
             total_count_select = "0 AS total_count"
 
-        eu_map = (
-            bounded_survivor_map_subquery(
-                "end_user_id_remap", candidate_param="candidate_end_user_ids"
+        if self.candidate_end_user_ids:
+            eu_map, finite_map_params = self._finite_end_user_map(
+                candidate_param="candidate_end_user_ids"
             )
-            if self.candidate_end_user_ids
-            else survivor_map_subquery("end_user_id_remap")
-        )
+            self.params.update(finite_map_params)
+        else:
+            eu_map = survivor_map_subquery("end_user_id_remap")
         resolved_curated_eu = resolved_id_expr("eu.end_user_id", "eu_remap")
         resolved_latest_eu = resolved_id_expr("latest_end_user_id", "span_eu_remap")
         if self.candidate_end_user_ids:
@@ -616,7 +699,14 @@ class UserListQueryBuilder(BaseQueryBuilder):
         else:
             params["project_id"] = self.project_id
 
-        eu_map = survivor_map_subquery("end_user_id_remap")
+        # Page hydration runs only after a finite user page is selected. Building
+        # the global remap window here made this read exceed the 256 MiB
+        # production ceiling on large remap tables. Expand only the consolidation
+        # groups touched by the page ids.
+        eu_map, finite_map_params = self._finite_end_user_map(
+            candidate_param="candidate_end_user_ids"
+        )
+        params.update(finite_map_params)
         ts_map = survivor_map_subquery("trace_session_id_remap")
         resolved_latest_eu = resolved_id_expr("latest_end_user_id", "span_eu_remap")
         resolved_latest_session = resolved_id_expr(
@@ -781,9 +871,10 @@ class UserListQueryBuilder(BaseQueryBuilder):
         else:
             base_params["project_id"] = self.project_id
 
-        eu_map = bounded_survivor_map_subquery(
-            "end_user_id_remap", candidate_param="candidate_end_user_ids"
+        eu_map, finite_map_params = self._finite_end_user_map(
+            candidate_param="candidate_end_user_ids"
         )
+        base_params.update(finite_map_params)
         resolved_eu = resolved_id_expr("latest_end_user_id", "span_eu_remap")
 
         def common_prefix(state_selects: list[str], *, include_sessions: bool) -> str:
@@ -1045,10 +1136,16 @@ class UserListQueryBuilder(BaseQueryBuilder):
             pagination = ""
             total_count_select = "0 AS total_count"
 
-        eu_map = bounded_survivor_map_subquery(
-            "end_user_id_remap", candidate_param="eval_eu_ids"
+        eu_map = _touched_survivor_map_subquery(
+            remap_table="end_user_id_remap",
+            candidate_cte="filtered_end_users_raw",
+            candidate_column="end_user_id",
         )
-        ts_map = survivor_map_subquery("trace_session_id_remap")
+        ts_map = _touched_survivor_map_subquery(
+            remap_table="trace_session_id_remap",
+            candidate_cte="candidate_trace_session_ids",
+            candidate_column="trace_session_id",
+        )
         resolved_curated_eu = resolved_id_expr("eu.end_user_id", "eu_remap")
         resolved_usage_eu = resolved_id_expr(
             "latest_usage_end_user_id", "usage_eu_remap"
@@ -1060,8 +1157,6 @@ class UserListQueryBuilder(BaseQueryBuilder):
 
         query = f"""
         WITH
-        eu_survivor_map AS ({eu_map}),
-        ts_survivor_map AS ({ts_map}),
         filtered_end_users_raw AS (
             SELECT
                 eu.project_id,
@@ -1080,6 +1175,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
               {search_filter}
               {end_user_filter}
         ),
+        eu_survivor_map AS ({eu_map}),
         filtered_end_users AS (
             SELECT
                 {resolved_curated_eu} AS end_user_id,
@@ -1227,9 +1323,17 @@ class UserListQueryBuilder(BaseQueryBuilder):
               AND (project_id, trace_id, id, start_time) IN (
                   SELECT project_id, trace_id, id, start_time
                   FROM candidate_span_identities
-              )
+            )
             GROUP BY project_id, trace_id, id, start_time
         ),
+        candidate_trace_session_ids AS (
+            SELECT DISTINCT latest_trace_session_id AS trace_session_id
+            FROM latest_candidate_spans
+            WHERE isNotNull(latest_trace_session_id)
+              AND latest_trace_session_id !=
+                  toUUID('00000000-0000-0000-0000-000000000000')
+        ),
+        ts_survivor_map AS ({ts_map}),
         resolved_candidate_spans AS (
             SELECT
                 {resolved_latest_eu} AS end_user_id,
@@ -1386,7 +1490,13 @@ class UserListQueryBuilder(BaseQueryBuilder):
             project_filter = "AND spans.project_id = %(project_id)s"
         else:
             project_filter = ""
-        eu_map = survivor_map_subquery("end_user_id_remap")
+        # Eval hydration also owns a finite page id set. Keep remap aggregation
+        # proportional to that set instead of materializing the tenant-global
+        # survivor window before applying the id predicate.
+        eu_map, finite_map_params = self._finite_end_user_map(
+            candidate_param="eval_eu_ids"
+        )
+        params.update(finite_map_params)
         resolved_eu = resolved_id_expr("latest_end_user_id", "eval_eu_remap")
         query = f"""
         WITH

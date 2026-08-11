@@ -164,22 +164,13 @@ ERROR_RESPONSES = {
     500: ApiErrorResponseSerializer,
 }
 
-# The outer infrastructure ceiling is 30 s.  Keep one exact request below it
-# while admitting the serializer's maximum 500-row page without increasing CH
-# concurrency: five 100-trace content chunks + five attribute chunks + one
-# packed eval replay + one annotation span-map replay + the two-phase optional
-# user replay consume at most fourteen 900 ms worker slots.  At two workers the
-# modeled enrichment ceiling is seven waves (6.3 s); after the bounded 8 s
-# candidate phase that is 14.3 s.  The extra 1.7 s covers response assembly and
-# scheduler jitter.  Healthy reads still return immediately.
-TRACE_LIST_WALL_DEADLINE_MS = 16_000
-# The candidate reader remains a single bounded pass. Production qualification
-# showed a complete heavy-tenant proof just beyond the former 2.5 s ceiling, so
-# allow it up to 8 s while retaining the separately modeled enrichment budget.
-# This is only a ceiling: healthy reads return immediately and issue no
-# additional query.
-TRACE_LIST_CANDIDATE_DEADLINE_MS = 8_000
-TRACE_LIST_ENRICHMENT_TIMEOUT_MS = 900
+# All trace-list reads share the outer infrastructure's 30-second ceiling.
+# Every candidate and enrichment statement receives only the request's
+# remaining time; concurrent finite page hydration therefore cannot extend the
+# endpoint beyond that wall deadline.
+TRACE_LIST_WALL_DEADLINE_MS = 30_000
+TRACE_LIST_CANDIDATE_DEADLINE_MS = 30_000
+TRACE_LIST_ENRICHMENT_TIMEOUT_MS = 30_000
 # Page-local content/attribute hydration is exact but can still make ClickHouse
 # read a wide part when a caller requests the serializer's 500-row maximum.
 # High-volume qualification showed 100 identities remain below the locked
@@ -201,7 +192,7 @@ TRACE_LIST_ANNOTATION_SCORE_SPAN_LIMIT = 50_000
 TRACE_LIST_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
-    "max_memory_usage": 256 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_bytes_to_read": 512 * 1024 * 1024,
     "max_result_rows": 5_001,
     "read_overflow_mode": "throw",
@@ -212,7 +203,7 @@ _VOICE_CONTENT_MAX_QUERY_ATTEMPTS = 64
 TRACE_NAVIGATION_CANDIDATE_LIMIT = 4_095
 TRACE_NAVIGATION_SCAN_PAGE_SIZE = 200
 TRACE_NAVIGATION_MAX_QUERIES = 128
-TRACE_NAVIGATION_WALL_DEADLINE_MS = 20_000
+TRACE_NAVIGATION_WALL_DEADLINE_MS = 30_000
 _CLICKHOUSE_ERROR_CODE_RE = re.compile(r"\bcode:\s*(\d+)\b", re.IGNORECASE)
 _OPTIONAL_USER_ENRICHMENT_ERROR_CODES = frozenset({497})
 
@@ -5716,7 +5707,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         timeout_ms=eval_timeout_ms,
                         settings={
                             "max_threads": 1,
-                            "max_memory_usage": 256 * 1024 * 1024,
+                            "max_memory_usage": 36 * 1024 * 1024 * 1024,
                             "max_bytes_to_read": 512 * 1024 * 1024,
                             "read_overflow_mode": "throw",
                             "max_result_rows": 5001,

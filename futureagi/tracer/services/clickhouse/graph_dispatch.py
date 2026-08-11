@@ -31,9 +31,9 @@ from tracer.services.exact_aggregation_cache import (
     read_or_schedule_exact_snapshot,
 )
 
-GRAPH_WALL_DEADLINE_MS = 4_400
-GRAPH_QUERY_TIMEOUT_MS = 1_200
-GRAPH_DECORATION_TIMEOUT_MS = 900
+GRAPH_WALL_DEADLINE_MS = 30_000
+GRAPH_QUERY_TIMEOUT_MS = 30_000
+GRAPH_DECORATION_TIMEOUT_MS = 30_000
 GRAPH_EVENT_LIMIT = 2_000
 # Part of the cache identity, not a database schema version. Incrementing this
 # prevents a rolling deploy from serving a 30-day cached payload produced by
@@ -54,7 +54,7 @@ GRAPH_SPAN_METRIC_BATCH_SIZE = 1_024
 _GRAPH_BASE_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
-    "max_memory_usage": 256 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_bytes_to_read": 512 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "result_overflow_mode": "throw",

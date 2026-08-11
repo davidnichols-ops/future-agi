@@ -163,6 +163,78 @@ def test_finite_candidate_ids_narrow_identity_before_latest_replay():
     assert "argMax(tuple(end_user_id), _version)" in replay
 
 
+def test_cursor_candidate_replay_injects_page_remap_without_table_scan():
+    survivor_ids = [str(uuid.UUID(int=index + 1)) for index in range(25)]
+    alias_ids = [str(uuid.UUID(int=index + 101)) for index in range(25)]
+    candidate_map = {
+        any_id: survivor_id
+        for survivor_id, alias_id in zip(survivor_ids, alias_ids, strict=True)
+        for any_id in (survivor_id, alias_id)
+    }
+    builder = UserListQueryBuilder(
+        organization_id=str(uuid.uuid4()),
+        project_ids=[str(uuid.uuid4())],
+        filters=[],
+        limit=25,
+        offset=0,
+        candidate_end_user_ids=survivor_ids,
+        candidate_scan_end_user_ids=list(candidate_map),
+        candidate_end_user_id_map=candidate_map,
+    )
+
+    sql, params = builder.build_candidate_page_query()
+
+    assert "end_user_id_remap" not in sql
+    assert (
+        "arrayZip(%(candidate_remap_any_ids)s, %(candidate_remap_survivor_ids)s)" in sql
+    )
+    assert params["candidate_remap_any_ids"] == list(candidate_map)
+    assert params["candidate_remap_survivor_ids"] == list(candidate_map.values())
+    assert params["candidate_scan_end_user_ids"] == tuple(candidate_map)
+
+
+def test_cursor_enrichments_reuse_literal_page_remap():
+    project_id = str(uuid.uuid4())
+    config_id = str(uuid.uuid4())
+    survivor_ids = [str(uuid.UUID(int=index + 1)) for index in range(25)]
+    alias_ids = [str(uuid.UUID(int=index + 101)) for index in range(25)]
+    candidate_map = {
+        any_id: survivor_id
+        for survivor_id, alias_id in zip(survivor_ids, alias_ids, strict=True)
+        for any_id in (survivor_id, alias_id)
+    }
+    builder = UserListQueryBuilder(
+        organization_id=str(uuid.uuid4()),
+        project_ids=[project_id],
+        candidate_end_user_ids=survivor_ids,
+        candidate_scan_end_user_ids=list(candidate_map),
+        candidate_end_user_id_map=candidate_map,
+    )
+
+    metric_queries = builder.build_requested_page_metric_queries(
+        survivor_ids, {"num_active_days"}
+    )
+    eval_sql, eval_params = builder.build_eval_query(
+        survivor_ids,
+        allowed_eval_config_ids_by_project={project_id: [config_id]},
+    )
+    attr_sql, attr_params = _users_attr_enrichment_query(
+        project_ids=[project_id],
+        attribute_keys=["final_status"],
+        candidate_end_user_id_map=candidate_map,
+    )
+
+    assert len(metric_queries) == 1
+    metric_sql, metric_params, _ = metric_queries[0]
+    for sql in (metric_sql, eval_sql, attr_sql):
+        assert "end_user_id_remap" not in sql
+        assert "candidate_remap_any_ids" in sql
+        assert "candidate_remap_survivor_ids" in sql
+    for params in (metric_params, eval_params, attr_params):
+        assert params["candidate_remap_any_ids"] == list(candidate_map)
+        assert params["candidate_remap_survivor_ids"] == list(candidate_map.values())
+
+
 def test_unbounded_numbered_page_uses_final_before_mutable_filters():
     builder = UserListQueryBuilder(
         organization_id=str(uuid.uuid4()),
@@ -262,6 +334,40 @@ def test_cursor_page_publishes_only_fully_hydrated_matching_rows():
         candidates[-1]["first_seen"],
         candidates[-1]["end_user_id"],
     )
+
+
+def test_cursor_threads_classified_alias_map_into_exact_replay():
+    now = datetime(2026, 8, 5, 12, tzinfo=UTC)
+    candidates = [_candidate(index, now=now) for index in range(2)]
+    alias_id = str(uuid.uuid4())
+    candidates[0]["_is_survivor_candidate"] = True
+    candidates[0]["_candidate_scan_end_user_ids"] = (
+        candidates[0]["end_user_id"],
+        alias_id,
+    )
+    candidates[1]["_is_survivor_candidate"] = True
+    candidates[1]["_candidate_scan_end_user_ids"] = (candidates[1]["end_user_id"],)
+    manager = _manager()
+
+    with (
+        patch.object(
+            manager,
+            "_read_dimension_candidates",
+            return_value=candidates,
+        ),
+        patch.object(
+            manager,
+            "_read_exact_candidate_rows",
+            return_value=[],
+        ) as exact_read,
+    ):
+        manager.list_cursor_payload(page_size=25)
+
+    assert exact_read.call_args.kwargs["candidate_end_user_id_map"] == {
+        candidates[0]["end_user_id"]: candidates[0]["end_user_id"],
+        alias_id: candidates[0]["end_user_id"],
+        candidates[1]["end_user_id"]: candidates[1]["end_user_id"],
+    }
 
 
 def test_cursor_checkpoint_survives_later_deadline_without_inventing_match():

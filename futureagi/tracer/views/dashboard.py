@@ -80,6 +80,8 @@ from tracer.services.clickhouse.query_builders.simulation_dashboard import (
 )
 from tracer.services.clickhouse.query_service import AnalyticsQueryService
 from tracer.services.clickhouse.read_budget import (
+    ReadDeadline,
+    ReadDeadlineExceeded,
     is_clickhouse_api_read_unavailable_error,
     is_clickhouse_query_error,
     is_read_budget_error,
@@ -201,16 +203,15 @@ def _materialize_dashboard_query_scope(
     return scoped
 
 
-# Exact trace dashboards may hydrate wide attribute Maps. Keep every query
-# finite at the ClickHouse boundary so an exact read either completes or is
-# returned as unavailable without monopolising the shared cluster. Two metric
-# queries are allowed in flight below, making the aggregate request ceiling
-# predictable as well.
+# Exact dashboards may hydrate wide attribute Maps. Do not impose a row-count
+# ceiling: wide but selective production reads can legitimately scan many
+# compact rows. Bound the work by wall time, bytes, memory, result size, and
+# concurrency instead so a read either completes or fails closed without
+# monopolising the shared cluster.
 _DASHBOARD_TRACE_READ_SETTINGS = {
     "max_threads": 2,
-    "max_rows_to_read": 30_000_000,
     "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
-    "max_memory_usage": 512 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "max_result_rows": 250_000,
     "max_result_bytes": 64 * 1024 * 1024,
@@ -218,6 +219,7 @@ _DASHBOARD_TRACE_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
 }
 _DASHBOARD_TRACE_MAX_CONCURRENT_METRICS = 2
+_DASHBOARD_EXACT_QUERY_TIMEOUT_MS = 30_000
 
 
 def _fetch_exact_dashboard_rows(
@@ -228,7 +230,15 @@ def _fetch_exact_dashboard_rows(
     timeout_ms,
     settings,
 ):
-    """Run one exact, current-state dashboard metric for the full window."""
+    """Run one exact full-window statement without rewriting query semantics.
+
+    ``start_date`` and ``end_date`` can scope window-global latest-state,
+    deduplication, evaluation, and filter relations in addition to the final
+    output buckets. Replaying the SQL with narrower values is therefore not an
+    equivalent partition. The executor sends the builder's SQL and parameters
+    through unchanged and relies on finite ClickHouse read/result settings plus
+    the worker timeout to fail closed.
+    """
 
     result = analytics.execute_ch_query(
         sql,
@@ -2798,6 +2808,14 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 )
             )
 
+        # One worker invocation owns one wall budget. Every metric statement,
+        # including later executor waves and later data sources, receives only
+        # the time still left on this same deadline. This prevents N metrics or
+        # trace/dataset/simulation sequencing from multiplying the 30-second
+        # production ceiling while preserving each metric's indivisible
+        # full-window SQL.
+        read_deadline = ReadDeadline.start(_DASHBOARD_EXACT_QUERY_TIMEOUT_MS)
+
         # Freeze one concrete wall-clock window before any builder prepares its
         # metric SQL. Preset windows must not drift by microseconds across
         # concurrent source queries or later response formatting.
@@ -2821,8 +2839,6 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         dataset_prepared = ()
         simulation_builder = None
         simulation_prepared = ()
-        query_timeout = 300_000
-
         if trace_metrics:
             trace_config = {
                 **query_config,
@@ -2904,7 +2920,9 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     analytics=trace_analytics,
                     sql=sql,
                     params=params,
-                    timeout_ms=query_timeout,
+                    timeout_ms=read_deadline.remaining_ms(
+                        _DASHBOARD_EXACT_QUERY_TIMEOUT_MS
+                    ),
                     settings=read_settings,
                 )
 
@@ -2927,7 +2945,9 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     analytics=legacy_analytics,
                     sql=sql,
                     params=params,
-                    timeout_ms=query_timeout,
+                    timeout_ms=read_deadline.remaining_ms(
+                        _DASHBOARD_EXACT_QUERY_TIMEOUT_MS
+                    ),
                     settings=read_settings,
                 )
 
@@ -2951,7 +2971,9 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     analytics=legacy_analytics,
                     sql=sql,
                     params=params,
-                    timeout_ms=query_timeout,
+                    timeout_ms=read_deadline.remaining_ms(
+                        _DASHBOARD_EXACT_QUERY_TIMEOUT_MS
+                    ),
                     settings=read_settings,
                 )
 
@@ -2976,6 +2998,16 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             raise DashboardExactReadError(
                 "one or more dashboard metrics did not complete exactly"
             )
+
+        # A statement can finish just inside its server timeout while result
+        # collection/coordination crosses the worker wall. Never format or
+        # publish that late result as a completed exact snapshot.
+        try:
+            read_deadline.remaining_ms(floor_ms=1)
+        except ReadDeadlineExceeded as exc:
+            raise DashboardExactReadError(
+                "dashboard exact read deadline exceeded"
+            ) from exc
 
         # Format using DatasetQueryBuilder (compatible format_results)
         formatter_config = {**query_config, "workspace_id": str(workspace.id)}
@@ -3002,6 +3034,16 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "query_sampled": False,
             }
         )
+        # Formatting and ORM-backed display-name hydration are part of this
+        # refresh too. A payload returned after the wall expires would still
+        # be published atomically by the exact-aggregation activity, so fence
+        # it here immediately before handing it to that publisher.
+        try:
+            read_deadline.remaining_ms(floor_ms=1)
+        except ReadDeadlineExceeded as exc:
+            raise DashboardExactReadError(
+                "dashboard exact read deadline exceeded"
+            ) from exc
         if _exact_worker:
             return self._gm.success_response(formatted)
         published = publish_exact_snapshot(

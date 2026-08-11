@@ -33,6 +33,7 @@ from tracer.services.clickhouse.query_builders.session_filters import (
     build_session_id_filter_clause,
 )
 from tracer.services.clickhouse.v2.id_remap_sql import (
+    bounded_survivor_map_subquery,
     remap_left_join,
     resolved_id_expr,
     survivor_map_subquery,
@@ -42,6 +43,7 @@ _SESSION_FILTER_ANCHOR_SENTINEL = 64
 _SESSION_FILTER_ANCHOR_TIMEOUT_MS = 900
 _SESSION_FILTER_ANCHOR_STRATA = 4
 _SESSION_FILTER_ANCHOR_MAX_BYTES = 192 * 1024 * 1024
+_USER_DETAIL_FILTER_TIMEOUT_MS = 30_000
 
 
 class SessionListQueryBuilder(BaseQueryBuilder):
@@ -631,12 +633,26 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             # Sampling is defined on the remap-resolved public session ID.  A
             # raw-alias witness must not change that internal hash population.
             return False
+        # A sole positive end-user filter is already an indexed, remap-bounded
+        # membership seed. Do not put the generic 900 ms speculative anchor in
+        # front of the exact CrossProjectUserDetailPage query.
+        if self._positive_exact_end_user_detail_filter():
+            return False
         try:
             plans, residual = self._bounded_span_filter_parts()
             self._validate_bounded_relational_filters(residual)
         except (TypeError, ValueError):
             return False
         return self._bounded_root_witness_plan(plans) is not None
+
+    def recommended_filter_query_timeout_ms(self) -> int | None:
+        """Use the request's remaining wall time for public session filters.
+
+        Finite candidate, query-count, byte, memory, thread and result controls
+        remain authoritative. Optional anchor probes retain their shorter caps.
+        """
+
+        return _USER_DETAIL_FILTER_TIMEOUT_MS
 
     def recommended_filter_anchor_probe_limit(self) -> int | None:
         if not self.supports_filter_anchor_probe():
@@ -795,6 +811,11 @@ class SessionListQueryBuilder(BaseQueryBuilder):
 
         if self.sort_params or not self.supports_candidate_first_page():
             return False
+        return self._positive_exact_end_user_detail_filter()
+
+    def _positive_exact_end_user_detail_filter(self) -> bool:
+        """Recognize only the structural user-detail membership predicate."""
+
         active_filters = [
             item
             for item in self.filters
@@ -1097,9 +1118,51 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             self._SESSION_ID_FILTER_COLS
         )
         seed_session_ids = candidate_session_ids or positive_session_ids
-        ts_map_ctes = (
-            f"ts_survivor_map AS ({survivor_map_subquery('trace_session_id_remap')})"
+        # The ordinary candidate page has no finite Python session-id set yet,
+        # but it does have a finite request scope: physical root rows in the
+        # selected project(s) and time window. Use those raw IDs as an exact
+        # remap superset, then expand only the consolidation groups they touch.
+        # Historical/tombstoned root versions can add harmless map rows; latest
+        # physical replay below remains authoritative for page membership.
+        ts_map_ctes = f"""
+        candidate_root_raw_session_ids AS (
+            SELECT DISTINCT trace_session_id AS raw_session_id
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}{span_time_scope}
+            WHERE (parent_span_id IS NULL OR parent_span_id = '')
+              AND isNotNull(trace_session_id)
+              AND trace_session_id != toUUID('{NIL_UUID}')
+        ),
+        candidate_root_session_group_ids AS (
+            SELECT DISTINCT remap_match.new_id
+            FROM trace_session_id_remap AS remap_match FINAL
+            WHERE remap_match.old_id IN (
+                SELECT raw_session_id FROM candidate_root_raw_session_ids
+            )
+               OR remap_match.new_id IN (
+                SELECT raw_session_id FROM candidate_root_raw_session_ids
+            )
+        ),
+        ts_survivor_map AS (
+            SELECT
+                any_id,
+                argMin(survivor_id, toString(survivor_id)) AS survivor_id
+            FROM (
+                SELECT
+                    arrayJoin(arrayDistinct(arrayConcat(
+                        groupArray(remap.old_id),
+                        [remap.new_id]
+                    ))) AS any_id,
+                    argMin(remap.old_id, toString(remap.old_id)) AS survivor_id
+                FROM trace_session_id_remap AS remap FINAL
+                WHERE remap.new_id IN (
+                    SELECT new_id FROM candidate_root_session_group_ids
+                )
+                GROUP BY remap.new_id
+            )
+            GROUP BY any_id
         )
+        """
         candidate_session_cte = ""
         root_session_seed = ""
         if seed_session_ids:
@@ -1225,6 +1288,16 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         if self.user_id:
             user_ids.append(str(self.user_id))
         user_ids = list(dict.fromkeys(user_ids))
+        user_filter_ops = {
+            (item.get("filter_config") or item.get("filterConfig") or {}).get(
+                "filter_op"
+            )
+            or (item.get("filter_config") or item.get("filterConfig") or {}).get(
+                "filterOp"
+            )
+            for item in user_filter_items
+        }
+        positive_user_seed = bool(user_ids) and user_filter_ops <= {"equals", "in"}
         user_null_op = self._user_null_filter_op()
         resolved_user_clause = (
             "" if user_null_op else self._build_resolved_user_clause(params)
@@ -1235,7 +1308,14 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         user_root_ids_cte = ""
         eu_map_cte = ""
         if resolved_user_clause or user_null_op:
-            eu_map = survivor_map_subquery("end_user_id_remap")
+            if positive_user_seed:
+                params["candidate_filter_user_ids"] = tuple(user_ids)
+                eu_map = bounded_survivor_map_subquery(
+                    "end_user_id_remap",
+                    candidate_param="candidate_filter_user_ids",
+                )
+            else:
+                eu_map = survivor_map_subquery("end_user_id_remap")
             resolved_user_session = resolved_id_expr(
                 "latest_trace_session_id", "user_ts_remap"
             )
@@ -1247,16 +1327,6 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             # IDs, so it scopes by those IDs instead; this also makes NOT IN and
             # null-presence semantics exact without scanning every user span in
             # the project.
-            user_filter_ops = {
-                (item.get("filter_config") or item.get("filterConfig") or {}).get(
-                    "filter_op"
-                )
-                or (item.get("filter_config") or item.get("filterConfig") or {}).get(
-                    "filterOp"
-                )
-                for item in user_filter_items
-            }
-            positive_user_seed = user_filter_ops <= {"equals", "in"}
             if candidate_session_ids:
                 user_seed_clause = """
               AND (
@@ -1273,9 +1343,6 @@ class SessionListQueryBuilder(BaseQueryBuilder):
               )
                 """
             elif positive_user_seed:
-                # A positive filter with an empty value list must match nothing,
-                # never widen into an unscoped scan.
-                params["candidate_filter_user_ids"] = tuple(user_ids or [NIL_UUID])
                 user_seed_clause = """
               AND (
                   end_user_id IN %(candidate_filter_user_ids)s
@@ -1316,7 +1383,97 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 # remains project/time/root-column only and replays latest
                 # physical state before forming session membership.
                 user_seed_clause = ""
-            user_ctes = f""",
+            if positive_user_seed and not seed_session_ids:
+                # A user-detail request has no finite session IDs yet. First
+                # replay only spans for the finite requested user aliases, then
+                # expand only the session-remap groups touched by those exact
+                # live spans. This avoids materializing either tenant-global
+                # remap while preserving many-old-to-one-new semantics.
+                resolved_raw_session = resolved_id_expr(
+                    "matching_user_raw_sessions.raw_session_id", "user_ts_remap"
+                )
+                resolved_matching_user_clause = resolved_user_clause.replace(
+                    "end_user_id", f"({resolved_user})"
+                )
+                ts_map_ctes = f"""
+        eu_survivor_map AS ({eu_map}),
+        candidate_user_span_identities AS (
+            SELECT DISTINCT project_id, trace_id, id, start_time
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}{span_time_scope}
+              {user_seed_clause}
+        ),
+        latest_user_spans AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(trace_session_id), _peerdb_version).1 AS latest_trace_session_id,
+                argMax(tuple(end_user_id), _peerdb_version).1 AS latest_end_user_id,
+                argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}{span_time_scope}
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM candidate_user_span_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        matching_user_raw_sessions AS (
+            SELECT latest_trace_session_id AS raw_session_id
+            FROM latest_user_spans
+            LEFT JOIN eu_survivor_map AS user_eu_remap
+                ON latest_end_user_id = user_eu_remap.any_id
+            WHERE latest_is_deleted = 0
+              AND isNotNull(latest_trace_session_id)
+              AND latest_trace_session_id != toUUID('{NIL_UUID}')
+              AND isNotNull(latest_end_user_id)
+              AND latest_end_user_id != toUUID('{NIL_UUID}')
+              AND {resolved_matching_user_clause}
+            GROUP BY raw_session_id
+        ),
+        candidate_user_session_group_ids AS (
+            SELECT DISTINCT remap_match.new_id
+            FROM trace_session_id_remap AS remap_match FINAL
+            WHERE remap_match.old_id IN (
+                SELECT raw_session_id FROM matching_user_raw_sessions
+            )
+               OR remap_match.new_id IN (
+                SELECT raw_session_id FROM matching_user_raw_sessions
+            )
+        ),
+        ts_survivor_map AS (
+            SELECT
+                any_id,
+                argMin(survivor_id, toString(survivor_id)) AS survivor_id
+            FROM (
+                SELECT
+                    arrayJoin(arrayDistinct(arrayConcat(
+                        groupArray(remap.old_id),
+                        [remap.new_id]
+                    ))) AS any_id,
+                    argMin(remap.old_id, toString(remap.old_id)) AS survivor_id
+                FROM trace_session_id_remap AS remap FINAL
+                WHERE remap.new_id IN (
+                    SELECT new_id FROM candidate_user_session_group_ids
+                )
+                GROUP BY remap.new_id
+            )
+            GROUP BY any_id
+        ),
+        matching_user_sessions AS (
+            SELECT {resolved_raw_session} AS session_id
+            FROM matching_user_raw_sessions
+            LEFT JOIN ts_survivor_map AS user_ts_remap
+                ON matching_user_raw_sessions.raw_session_id = user_ts_remap.any_id
+            GROUP BY session_id
+        )
+        {user_root_ids_cte}"""
+                eu_map_cte = ""
+                user_ctes = ""
+            else:
+                user_ctes = f""",
         candidate_user_span_identities AS (
             SELECT DISTINCT project_id, trace_id, id, start_time
             FROM {self.TABLE}
@@ -1832,11 +1989,13 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             "end_date": end_date,
             "candidate_session_ids": ids,
         }
-        ts_map = survivor_map_subquery("trace_session_id_remap")
+        # Hydration owns a finite page (<=200 IDs). Reuse the candidate-scoped
+        # remap so a page read cannot materialize the tenant-global bridge.
+        ts_map_ctes = self._candidate_survivor_map_ctes(params, ids)
         resolved_session = resolved_id_expr("latest_trace_session_id", "ts_remap")
         query = f"""
         WITH
-        ts_survivor_map AS ({ts_map}),
+        {ts_map_ctes},
         candidate_root_identities AS (
             SELECT DISTINCT
                 project_id,
@@ -2349,15 +2508,18 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         span_attributes_raw, and typed Map columns (span_attr_str,
         span_attr_num) as fallback when the raw JSON blob is empty.
         """
-        if not session_ids:
+        ids = tuple(dict.fromkeys(str(value) for value in session_ids if value))
+        if not ids:
             return "", {}
+        if len(ids) > 200:
+            raise ValueError("session attribute page exceeds bounded limit")
 
         # Preserve the raw session-ID prefilter while adding the list request's
         # finite partition window; this legacy method does not replay versions.
         attr_start_date, attr_end_date = self.parse_time_range(self.filters)
         params = {
             **self.params,
-            "attr_session_ids": tuple(session_ids),
+            "attr_session_ids": ids,
             "attr_start_date": attr_start_date,
             "attr_end_date": attr_end_date,
         }
@@ -2387,18 +2549,19 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         # stay BARE (CH binds them to `s` — the remap join has no such columns),
         # and only `trace_session_id` is read prefixed as `s.trace_session_id`
         # (not a rewrite-special token) to feed the resolve expression.
-        ts_join = remap_left_join(
-            "s.trace_session_id", "trace_session_id_remap", "ts_remap"
-        )
+        ts_map_ctes = self._candidate_survivor_map_ctes(params, ids)
         resolved_ts = resolved_id_expr("s.trace_session_id", "ts_remap")
         query = f"""
+        WITH
+        {ts_map_ctes}
         SELECT
             {resolved_ts} AS session_id,
             span_attributes_raw,
             span_attr_str,
             span_attr_num
         FROM {self.TABLE} AS s
-        {ts_join}
+        LEFT JOIN ts_survivor_map AS ts_remap
+            ON s.trace_session_id = ts_remap.any_id
         WHERE {self.project_filter_sql()}
           AND is_deleted = 0
           AND toDate(s.start_time) BETWEEN
@@ -2407,7 +2570,14 @@ class SessionListQueryBuilder(BaseQueryBuilder):
           AND s.start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
           AND s.start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'){attr_exclusion_fragment}
           AND (parent_span_id IS NULL OR parent_span_id = '')
-          AND s.trace_session_id IN %(attr_session_ids)s
+          AND (
+              s.trace_session_id IN %(attr_session_ids)s
+              OR s.trace_session_id IN (
+                  SELECT any_id
+                  FROM ts_survivor_map
+                  WHERE survivor_id IN %(attr_session_ids)s
+              )
+          )
           AND (
             (span_attributes_raw != '{{}}' AND span_attributes_raw != '')
             OR length(mapKeys(span_attr_str)) > 0

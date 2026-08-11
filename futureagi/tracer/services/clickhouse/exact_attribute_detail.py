@@ -24,7 +24,7 @@ from tracer.services.clickhouse.attribute_reads import (
 
 EXACT_ATTRIBUTE_DETAIL_HORIZON_DAYS = 365
 EXACT_ATTRIBUTE_DETAIL_TOP_VALUES = 100
-EXACT_ATTRIBUTE_DETAIL_QUERY_TIMEOUT_MS = 3_300_000
+EXACT_ATTRIBUTE_DETAIL_QUERY_TIMEOUT_MS = 30_000
 _MIB = 1024 * 1024
 EXACT_ATTRIBUTE_DETAIL_READ_SETTINGS: dict[str, Any] = {
     "max_threads": 1,
@@ -36,9 +36,8 @@ EXACT_ATTRIBUTE_DETAIL_READ_SETTINGS: dict[str, Any] = {
     "max_bytes_before_external_sort": 32 * _MIB,
     "optimize_use_projections": 0,
     "allow_experimental_projection_optimization": 0,
-    "max_rows_to_read": 0,
-    "max_bytes_to_read": 0,
-    "max_memory_usage": 1536 * _MIB,
+    "max_bytes_to_read": 36 * 1024 * _MIB,
+    "max_memory_usage": 36 * 1024 * _MIB,
     "read_overflow_mode": "throw",
     "max_result_rows": 1_001,
     "max_result_bytes": 64 * _MIB,

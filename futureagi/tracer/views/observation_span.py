@@ -3,7 +3,7 @@ import hashlib
 import json
 import uuid
 from collections import defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from typing import Any
 
@@ -94,6 +94,7 @@ from tracer.serializers.observation_span import (
 )
 from tracer.serializers.trace import TraceSerializer
 from tracer.services.clickhouse.attribute_reads import (
+    ATTRIBUTE_READ_EXPLICIT_SEGMENT,
     AttributeReadMetadata,
     AttributeReadSelector,
     IncompleteLatestStateReplay,
@@ -166,13 +167,13 @@ from tracer.utils.sql_queries import SQL_query_handler
 
 logger = structlog.get_logger(__name__)
 
-SPAN_LIST_WALL_DEADLINE_MS = 5_000
-SPAN_LIST_CANDIDATE_DEADLINE_MS = 4_100
-SPAN_LIST_ENRICHMENT_TIMEOUT_MS = 900
+SPAN_LIST_WALL_DEADLINE_MS = 30_000
+SPAN_LIST_CANDIDATE_DEADLINE_MS = 30_000
+SPAN_LIST_ENRICHMENT_TIMEOUT_MS = 30_000
 SPAN_LIST_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
-    "max_memory_usage": 256 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_bytes_to_read": 512 * 1024 * 1024,
     "max_result_rows": 5_001,
     "read_overflow_mode": "throw",
@@ -209,7 +210,7 @@ def _span_filtered_page_depth_exceeded(
 SPAN_NAVIGATION_CANDIDATE_LIMIT = 4_095
 SPAN_NAVIGATION_SCAN_PAGE_SIZE = 200
 SPAN_NAVIGATION_MAX_QUERIES = 128
-SPAN_NAVIGATION_WALL_DEADLINE_MS = 20_000
+SPAN_NAVIGATION_WALL_DEADLINE_MS = 30_000
 
 
 class SpanNavigationReadUnavailable(RuntimeError):
@@ -3363,6 +3364,36 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         selector: AttributeReadSelector,
         exact_key: str | None,
     ) -> tuple[list[str], AttributeReadMetadata]:
+        if exact_key is None:
+            # Generic pickers need a useful bounded inventory, not a seven-day
+            # first statement that can exceed the selector's 500k-row ceiling
+            # on dense voice projects. The selector already defines six hours
+            # as its production-safe dense segment. Prefer that frozen recent
+            # sample; only sparse/empty projects pay for the existing adaptive
+            # one-year search below.
+            window_end = selector.query_window_end
+            recent_read = selector.discover_keys(
+                [project_id],
+                window_start=window_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+                window_end=window_end,
+            )
+            recent_metadata = recent_read.metadata
+            recent_read_is_publishable = recent_metadata.query_complete or (
+                recent_metadata.query_status == "sampled"
+                and recent_metadata.query_error_code == "sample_limit"
+            )
+            if recent_read.rows and recent_read_is_publishable:
+                # Even an exact six-hour result is only a sample of the
+                # endpoint's historical inventory. Keep that coverage honest
+                # instead of presenting it as a complete all-time key list.
+                sampled_metadata = replace(
+                    recent_metadata,
+                    query_complete=False,
+                    query_status="sampled",
+                    query_error_code="sample_limit",
+                )
+                return [row.key for row in recent_read.rows], sampled_metadata
+
         read = selector.discover_keys([project_id], exact_key=exact_key)
         return [row.key for row in read.rows], read.metadata
 

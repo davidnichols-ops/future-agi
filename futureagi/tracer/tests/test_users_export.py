@@ -310,11 +310,11 @@ class TestUsersExportStreaming:
         assert execute_mock.call_count == 2
         for call in execute_mock.call_args_list:
             assert 0 < call.kwargs["timeout_ms"] <= USER_LIST_QUERY_TIMEOUT_MS
-            assert call.kwargs["timeout_ms"] < USER_LIST_WALL_DEADLINE_MS
+            assert call.kwargs["timeout_ms"] <= USER_LIST_WALL_DEADLINE_MS
             settings = call.kwargs["settings"]
-            assert settings["max_rows_to_read"] == 10_000_000
+            assert "max_rows_to_read" not in settings
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
-            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
             assert settings["max_result_rows"] > 0
             assert settings["max_result_bytes"] == 32 * 1024 * 1024
             assert settings["result_overflow_mode"] == "throw"

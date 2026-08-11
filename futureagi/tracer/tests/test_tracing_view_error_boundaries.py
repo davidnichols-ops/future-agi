@@ -923,6 +923,15 @@ def test_session_eval_logs_uses_authoritative_table_on_direct_service(
     assert "FROM tracer_eval_logger_v2 AS eval_scan" not in query
     assert "latest_eval._peerdb_is_deleted = 0" in query
     assert "latest_eval.deleted = 0 OR latest_eval.deleted IS NULL" in query
+    call = analytics.execute_ch_query.call_args
+    assert 0 < call.kwargs["timeout_ms"] <= 30_000
+    read_settings = call.kwargs["settings"]
+    assert "max_rows_to_read" not in read_settings
+    assert read_settings["max_result_rows"] == 1
+    assert read_settings["max_result_bytes"] == 8 * 1024 * 1024
+    assert read_settings["max_bytes_to_read"] == 256 * 1024 * 1024
+    assert read_settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+    assert read_settings["max_threads"] == 2
 
 
 @pytest.mark.unit

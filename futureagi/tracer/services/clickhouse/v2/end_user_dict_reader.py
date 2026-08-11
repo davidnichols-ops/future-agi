@@ -42,7 +42,7 @@ import structlog
 
 from tracer.services.clickhouse.v2 import get_v2_config
 from tracer.services.clickhouse.v2.id_remap_sql import (
-    remap_left_join,
+    bounded_survivor_map_subquery,
     resolved_id_expr,
 )
 
@@ -102,7 +102,11 @@ def _get_client():
                     username=cfg["user"],
                     password=cfg["password"] or "",
                     database=cfg["database"],
-                    send_receive_timeout=15,
+                    # User-detail membership owns a 30-second request budget.
+                    # Keep the HTTP socket envelope aligned with that ceiling;
+                    # the individual query also receives the smaller remaining
+                    # server-side max_execution_time below.
+                    send_receive_timeout=30,
                 )
     return _client
 
@@ -137,7 +141,10 @@ def resolve_user_ids(end_user_ids: Iterable[object]) -> dict[str, str | None]:
 
     client = _get_client()
     resolved = resolved_id_expr("ids.eid")
-    remap_join = remap_left_join("ids.eid", "end_user_id_remap")
+    bounded_map = bounded_survivor_map_subquery(
+        "end_user_id_remap", candidate_param="ids"
+    )
+    remap_join = f"LEFT JOIN ({bounded_map}) AS id_remap ON ids.eid = id_remap.any_id"
     try:
         # arrayJoin over the literal id list resolves the whole batch in ONE
         # round-trip. dictGetOrNull keeps the missing-key → NULL semantics.
@@ -208,7 +215,10 @@ def resolve_end_user_fields(
 
     client = _get_client()
     resolved = resolved_id_expr("ids.eid")
-    remap_join = remap_left_join("ids.eid", "end_user_id_remap")
+    bounded_map = bounded_survivor_map_subquery(
+        "end_user_id_remap", candidate_param="ids"
+    )
+    remap_join = f"LEFT JOIN ({bounded_map}) AS id_remap ON ids.eid = id_remap.any_id"
     try:
         # arrayJoin over the literal id list resolves the whole batch in ONE
         # round-trip. dictGetOrNull keeps the missing-key → NULL semantics for
@@ -324,8 +334,25 @@ def resolve_end_user_ids_by_user_id(
         )
     if user_id is None or str(user_id) == "":
         return []
+    if timeout_ms is not None and timeout_ms <= 0:
+        raise ValueError("timeout_ms must be positive")
 
     client = _get_client()
+    if timeout_ms is not None:
+        # The readonly=1 native adapter must omit every query setting, including
+        # max_execution_time. Returning an empty ID set after silently dropping
+        # the caller's hard deadline would make the user detail page lie. Fail
+        # as a typed budget error so the API reports a retryable unavailable
+        # read instead.
+        from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+        from tracer.services.clickhouse.server_readonly import (
+            ServerEnforcedReadOnlyNativeClient,
+        )
+
+        if isinstance(client, ServerEnforcedReadOnlyNativeClient):
+            raise ReadDeadlineExceeded(
+                "server-locked end-user lookup cannot enforce request deadline"
+            )
     conds = ["user_id = %(uid)s", "is_deleted = 0"]
     params: dict[str, object] = {"uid": str(user_id)}
     if project_id is not None:
@@ -343,8 +370,6 @@ def resolve_end_user_ids_by_user_id(
         query_kwargs = {"parameters": params}
         query_settings = dict(settings or {})
         if timeout_ms is not None:
-            if timeout_ms <= 0:
-                raise ValueError("timeout_ms must be positive")
             query_settings["max_execution_time"] = timeout_ms / 1000
         if query_settings:
             query_kwargs["settings"] = query_settings

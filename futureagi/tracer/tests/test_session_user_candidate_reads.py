@@ -106,6 +106,36 @@ def test_user_default_page_replays_latest_state_before_pagination():
 
 
 @pytest.mark.unit
+def test_user_detail_metrics_uses_only_target_and_touched_remap_groups():
+    end_user_id = str(uuid.uuid4())
+    builder = UserListQueryBuilderV2(
+        organization_id=str(uuid.uuid4()),
+        project_id=str(uuid.uuid4()),
+        end_user_id=end_user_id,
+        filters=[],
+    )
+
+    sql, params = builder.build()
+    compact_sql = " ".join(sql.split())
+
+    assert params["end_user_id"] == end_user_id
+    assert "eval_eu_ids" not in params
+    assert "%(eval_eu_ids)s" not in sql
+    assert compact_sql.index("filtered_end_users_raw AS") < compact_sql.index(
+        "eu_survivor_map AS"
+    )
+    assert "candidate_trace_session_ids AS" in compact_sql
+    assert "WHERE old_id IN ( SELECT end_user_id FROM filtered_end_users_raw )" in (
+        compact_sql
+    )
+    assert (
+        "WHERE old_id IN ( SELECT trace_session_id "
+        "FROM candidate_trace_session_ids )" in compact_sql
+    )
+    assert "OVER (PARTITION BY new_id)" not in compact_sql
+
+
+@pytest.mark.unit
 def test_user_raw_metric_sort_fails_closed_instead_of_running_legacy_scan():
     builder = UserListQueryBuilderV2(
         organization_id=str(uuid.uuid4()),
@@ -138,16 +168,28 @@ def test_session_candidate_page_is_physical_latest_and_page_metrics_are_scoped()
     assert "argMax(is_deleted, _version) AS latest_is_deleted" in page_sql
     assert "count() OVER() AS total_count" in page_sql
     assert "ORDER BY session_start DESC, session_id DESC" in page_sql
+    assert "candidate_root_raw_session_ids AS" in page_sql
+    assert "candidate_root_session_group_ids AS" in page_sql
+    assert "FROM trace_session_id_remap AS remap_match FINAL" in page_sql
+    assert "SELECT raw_session_id FROM candidate_root_raw_session_ids" in page_sql
+    assert "WHERE remap.new_id IN (" in page_sql
+    assert "OVER (PARTITION BY new_id)" not in page_sql
     assert page_params["limit"] == 26
     assert page_params["offset"] == 75
     assert metrics_params["candidate_session_ids"] == (session_id,)
+    assert metrics_params["candidate_filter_session_id_array"] == [session_id]
     assert "candidate_root_identities AS" in metrics_sql
     assert "(project_id, trace_id, id, start_time) IN" in metrics_sql
     assert "trace_session_id_remap" in metrics_sql
+    assert "PREWHERE old_id IN (" in metrics_sql
+    assert "WHERE new_id IN (" in metrics_sql
+    assert "OVER (PARTITION BY new_id)" not in metrics_sql
 
     count_sql, _ = builder.build_candidate_count_query()
     assert "SELECT count() AS total" in count_sql
     assert "sum(cost)" not in count_sql
+    assert "candidate_root_raw_session_ids AS" in count_sql
+    assert "OVER (PARTITION BY new_id)" not in count_sql
 
 
 @pytest.mark.unit
@@ -948,7 +990,6 @@ def test_session_annotation_leaves_combine_with_namespaced_params():
 @override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
 def test_session_eval_value_filter_uses_candidate_trace_cte(monkeypatch):
     from model_hub.models.evals_metric import EvalTemplate
-
     from tracer.models.custom_eval_config import CustomEvalConfig
 
     class _Values(list):
@@ -1268,7 +1309,33 @@ def test_session_identity_filters_stay_on_bounded_candidate_path():
 
 
 @pytest.mark.unit
-def test_positive_end_user_filter_uses_candidate_scoped_membership():
+def test_public_trace_and_session_filters_share_the_30_second_statement_ceiling():
+    project_id = str(uuid.uuid4())
+    status_filter = {
+        "column_id": "status",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "text",
+            "filter_op": "in",
+            "filter_value": ["UNSET"],
+        },
+    }
+
+    trace_builder = TraceListQueryBuilderV2(
+        project_id=project_id,
+        filters=[status_filter],
+    )
+    session_builder = SessionListQueryBuilderV2(
+        project_id=project_id,
+        filters=[status_filter],
+    )
+
+    assert trace_builder.recommended_filter_query_timeout_ms() == 30_000
+    assert session_builder.recommended_filter_query_timeout_ms() == 30_000
+
+
+@pytest.mark.unit
+def test_cross_project_user_detail_session_query_bounds_both_remaps():
     end_user_id = str(uuid.uuid4())
     builder = SessionListQueryBuilderV2(
         project_id=str(uuid.uuid4()),
@@ -1287,8 +1354,17 @@ def test_positive_end_user_filter_uses_candidate_scoped_membership():
     sql, params = builder.build_candidate_page_query()
 
     assert builder.supports_candidate_first_page() is True
+    assert builder.recommended_filter_query_timeout_ms() == 30_000
+    assert builder.supports_filter_anchor_probe() is False
     assert params["candidate_filter_user_ids"] == (end_user_id,)
     assert params["eu_remap_1"] == (end_user_id,)
+    assert "OVER (PARTITION BY new_id)" not in sql
+    assert "matching_user_raw_sessions AS" in sql
+    assert "candidate_user_session_group_ids AS" in sql
+    assert "WHERE remap.new_id IN (" in sql
+    assert "SELECT new_id FROM candidate_user_session_group_ids" in sql
+    assert "old_id IN %(candidate_filter_user_ids)s" in sql
+    assert "new_id IN %(candidate_filter_user_ids)s" in sql
     assert "candidate_user_span_identities AS" in sql
     assert "latest_user_spans AS" in sql
     assert "matching_user_sessions AS" in sql
@@ -1304,6 +1380,109 @@ def test_positive_end_user_filter_uses_candidate_scoped_membership():
     assert "matching_user_root_ids AS" in sql
     assert "groupUniqArray(user_session_aliases.any_id)" in sql
     assert "LEFT JOIN ts_survivor_map AS user_session_aliases" in sql
+
+
+@pytest.mark.unit
+def test_cross_project_user_detail_trace_query_bounds_dimension_remap():
+    now = datetime(2026, 8, 11, 12, 0)
+    project_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    filters = [
+        *_window(now),
+        {
+            "column_id": "user_id",
+            "filter_config": {
+                "col_type": "TRACE_END_USER",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "cross-project-user",
+            },
+        },
+    ]
+    builder = TraceListQueryBuilderV2(
+        project_ids=project_ids,
+        page_size=25,
+        filters=filters,
+    )
+
+    seed_sql, seed_params = builder.build_filter_ordered_seed_page(
+        slice_start=now - timedelta(days=1),
+        slice_end=now + timedelta(days=1),
+        limit=26,
+    )
+    match_sql, match_params = builder.build_filter_match_query_from_seed_rows(
+        [
+            {
+                "project_id": project_ids[0],
+                "trace_id": "trace-a",
+                "root_span_id": "root-a",
+                "start_time": now,
+            }
+        ]
+    )
+
+    assert builder.recommended_filter_query_timeout_ms() == 30_000
+    assert builder.supports_filter_anchor_probe() is False
+    for sql in (seed_sql, match_sql):
+        assert "matching_end_user_ids AS" in sql
+        assert "matching_end_user_group_ids AS" in sql
+        assert "WHERE remap.new_id IN (" in sql
+        assert "SELECT new_id FROM matching_end_user_group_ids" in sql
+        assert "OVER (PARTITION BY new_id)" not in sql
+    assert tuple(project_ids) in seed_params.values()
+    assert tuple(project_ids) in match_params.values()
+
+
+@pytest.mark.unit
+def test_user_detail_selector_uses_deadline_without_row_read_cap():
+    now = datetime(2026, 8, 11, 12, 0)
+
+    class _UserDetailBuilder:
+        @staticmethod
+        def recommended_filter_query_timeout_ms():
+            return 30_000
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return now - timedelta(minutes=5), now
+
+        @staticmethod
+        def build_filter_seed_page(**_kwargs):
+            return "user detail seed", {}
+
+        @staticmethod
+        def build_filter_match_query(_candidate_ids):
+            return "user detail classify", {}
+
+    class _Recorder:
+        supports_per_query_read_settings = True
+
+        def __init__(self):
+            self.calls = []
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            self.calls.append((query, params, timeout_ms, settings))
+            return SimpleNamespace(data=[])
+
+    recorder = _Recorder()
+    page = read_bounded_filter_page(
+        builder=_UserDetailBuilder(),
+        analytics=recorder,
+        filters=[],
+        key_field="trace_id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=30_000,
+    )
+
+    assert page.complete is True
+    assert len(recorder.calls) == 1
+    _, _, timeout_ms, settings = recorder.calls[0]
+    assert 3_000 < timeout_ms <= 30_000
+    assert "max_rows_to_read" not in settings
+    assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+    assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+    assert 0 < settings["max_result_rows"] <= 512
+    assert settings["max_threads"] == 1
 
 
 @pytest.mark.unit
@@ -1438,20 +1617,23 @@ def test_session_page_enrichments_replay_tombstones_and_resolve_remaps():
     )
     session_id = str(uuid.uuid4())
 
-    metrics_sql, _ = builder.build_page_metrics_query([session_id])
+    metrics_sql, metrics_params = builder.build_page_metrics_query([session_id])
     content_sql, content_params = builder.build_content_query([session_id])
-    attrs_sql, _ = builder.build_span_attributes_query([session_id])
+    attrs_sql, attrs_params = builder.build_span_attributes_query([session_id])
 
-    assert content_params["candidate_filter_session_id_array"] == [session_id]
+    for params in (metrics_params, content_params, attrs_params):
+        assert params["candidate_filter_session_id_array"] == [session_id]
     # One primary-key old-ID probe plus one authoritative reverse new-ID pass.
     # The scalar tuple-array wrapper executes those source arms once even though
     # content hydration consumes the tiny map in multiple CTE stages.
-    assert content_sql.count("FROM trace_session_id_remap FINAL") == 2
-    assert "WHERE new_id IN (" in content_sql
-    assert "candidate_target_new_ids AS" in content_sql
-    assert "PREWHERE old_id IN (" in content_sql
-    assert "AS candidate_session_pairs" in content_sql
-    assert "SELECT arrayJoin(candidate_session_pairs) AS pair" in content_sql
+    for sql in (metrics_sql, content_sql, attrs_sql):
+        assert sql.count("FROM trace_session_id_remap FINAL") == 2
+        assert "WHERE new_id IN (" in sql
+        assert "candidate_target_new_ids AS" in sql
+        assert "PREWHERE old_id IN (" in sql
+        assert "AS candidate_session_pairs" in sql
+        assert "SELECT arrayJoin(candidate_session_pairs) AS pair" in sql
+        assert "OVER (PARTITION BY new_id)" not in sql
     assert "trace_session_id IN %(content_session_ids)s" in content_sql
     assert "if(ts_remap.survivor_id IS NULL OR ts_remap.survivor_id = " in content_sql
 

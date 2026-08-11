@@ -23,7 +23,7 @@ PROJECT_B = "20000000-0000-0000-0000-000000000002"
 
 
 @pytest.mark.unit
-def test_user_enrichment_phase_one_reads_each_source_once() -> None:
+def test_user_enrichment_phase_one_bounds_remap_to_page_user_ids() -> None:
     builder = TraceListQueryBuilderV2(
         project_id=PROJECT_A,
         page_number=0,
@@ -36,13 +36,20 @@ def test_user_enrichment_phase_one_reads_each_source_once() -> None:
 
     assert params["user_trace_ids"] == ("trace-a", "trace-b", "trace-c")
     assert query.count("FROM spans AS sp") == 1
-    assert query.count("FROM end_user_id_remap FINAL") == 1
+    assert query.count("end_user_id_remap") == 2
+    assert "AS page_trace_user_rows" in query
+    assert "page_end_user_group_ids AS" in query
+    assert "WHERE new_id IN (SELECT new_id FROM page_end_user_group_ids)" in query
     assert "remap_lookup AS (" in query
     assert "ARRAY JOIN all_physical_end_user_ids AS any_id" in query
     assert "GROUP BY any_id" in query
     assert "LEFT ANY JOIN remap_lookup AS remap" in query
-    assert "groupArray(tuple" not in query
+    assert (
+        query.count("groupArray(tuple(project_id, trace_id, selected_end_user_id))")
+        == 1
+    )
     assert "arrayFirst(" not in query
+    assert "OVER (PARTITION BY new_id)" not in query
     assert "end_users" not in query
     assert "end_users_dict" not in query
     assert "dictGet" not in query
@@ -498,7 +505,7 @@ def test_user_enrichment_executes_with_latest_remap_tombstone_and_tenant_scope()
         assert phase_one_plan.count(f"ReadFromMergeTree ({database}.spans)") == 1
         assert (
             phase_one_plan.count(f"ReadFromMergeTree ({database}.end_user_id_remap)")
-            == 1
+            == 2
         )
         assert f"ReadFromMergeTree ({database}.end_users)" not in phase_one_plan
 

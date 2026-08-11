@@ -9,6 +9,7 @@ logger = structlog.get_logger(__name__)
 STARTUP_SAFE_MANAGEMENT_COMMANDS = frozenset(
     {
         "check",
+        "collectstatic",
         "generate_swagger",
         "grpcrunaioserver",
         "runserver",
@@ -16,20 +17,57 @@ STARTUP_SAFE_MANAGEMENT_COMMANDS = frozenset(
     }
 )
 
+# Cloud application processes are never schema/bootstrap runners. A one-shot
+# operator job may run one of these explicit management commands, but even that
+# job does not re-enable the AppConfig boot hooks below.
+CLOUD_ENV_TYPES = frozenset({"prod", "production", "staging"})
+CLOUD_DEPLOYMENTS = frozenset({"US", "EU", "DEV"})
+OPERATOR_STARTUP_MUTATION_COMMANDS = frozenset(
+    {
+        "ch25_apply_schema",
+        "ch25_remove_pg",
+        "createcachetable",
+        "drop_legacy_observation_span",
+        "migrate",
+        "register_temporal_schedules",
+        "seed_system_evals",
+    }
+)
+OPERATOR_STARTUP_MUTATION_MODE = "operator"
+OPERATOR_STARTUP_SERVICE_TYPE = "bootstrap"
+
+
+def cloud_startup_environment() -> bool:
+    """Return whether startup is running in a hosted/cloud environment.
+
+    This intentionally treats a configured ``CLOUD_DEPLOYMENT`` as cloud even
+    before the deployment secret has been validated. False positives only
+    disable implicit mutations; false negatives could execute DDL.
+    """
+
+    env_type = os.getenv("ENV_TYPE", "").strip().lower()
+    cloud_deployment = os.getenv("CLOUD_DEPLOYMENT", "").strip().upper()
+    return env_type in CLOUD_ENV_TYPES or cloud_deployment in CLOUD_DEPLOYMENTS
+
 
 def startup_db_mutations_disabled() -> bool:
-    """Return whether this process explicitly requested mutation-free startup."""
+    """Return whether implicit AppConfig database mutations are disabled.
+
+    Hosted/cloud startup is always mutation-free. Database bootstrap there is
+    an explicit one-shot management-command workflow, never a side effect of
+    importing Django in a web, worker, shell, or diagnostic process.
+    """
 
     value = os.getenv("NO_STARTUP_DB_MUTATIONS")
-    if value is None:
-        return False
-    if value not in {"true", "false"}:
+    if value is not None and value not in {"true", "false"}:
         raise RuntimeError("NO_STARTUP_DB_MUTATIONS must be exactly 'true' or 'false'")
+    if cloud_startup_environment():
+        return True
     return value == "true"
 
 
-def guarded_management_command(argv: list[str]) -> str | None:
-    """Return a Django command forbidden during mutation-free startup."""
+def _management_command(argv: list[str]) -> str | None:
+    """Extract a Django management command from a process argv."""
 
     if not argv:
         return None
@@ -38,25 +76,59 @@ def guarded_management_command(argv: list[str]) -> str | None:
     executable = os.path.basename(executable_path)
     path_parts = tuple(part for part in executable_path.split("/") if part)
     is_django_module_main = path_parts[-2:] == ("django", "__main__.py")
-    command: str | None = None
     if executable == "manage.py" and len(argv) >= 2:
-        command = argv[1]
-    elif executable in {"django-admin", "django-admin.py"} and len(argv) >= 2:
-        command = argv[1]
-    elif is_django_module_main and len(argv) >= 2:
+        return argv[1]
+    if executable in {"django-admin", "django-admin.py"} and len(argv) >= 2:
+        return argv[1]
+    if is_django_module_main and len(argv) >= 2:
         # CPython rewrites ``python -m django`` to django/__main__.py before
         # Django initializes the application registry.
-        command = argv[1]
-    elif (
+        return argv[1]
+    if (
         executable.startswith("python")
         and len(argv) >= 4
         and argv[1:3] == ["-m", "django"]
     ):
-        command = argv[3]
+        return argv[3]
+    return None
 
+
+def operator_startup_mutation_authorized(argv: list[str]) -> bool:
+    """Authorize one allowlisted command in a dedicated operator job.
+
+    The two explicit environment values keep ordinary backend/worker pods and
+    ad-hoc ``manage.py shell`` sessions out of the mutation path. The entrypoint
+    also enforces this contract before executing any bootstrap command.
+    """
+
+    mode = os.getenv("STARTUP_DB_MUTATION_MODE", "disabled")
+    if mode not in {"disabled", OPERATOR_STARTUP_MUTATION_MODE}:
+        raise RuntimeError(
+            "STARTUP_DB_MUTATION_MODE must be exactly 'disabled' or 'operator'"
+        )
+    return (
+        mode == OPERATOR_STARTUP_MUTATION_MODE
+        and os.getenv("SERVICE_TYPE") == OPERATOR_STARTUP_SERVICE_TYPE
+        and _management_command(argv) in OPERATOR_STARTUP_MUTATION_COMMANDS
+    )
+
+
+def guarded_management_command(argv: list[str]) -> str | None:
+    """Return a Django command forbidden during mutation-free startup."""
+
+    command = _management_command(argv)
     if command is None or command in STARTUP_SAFE_MANAGEMENT_COMMANDS:
         return None
     return command
+
+
+def assert_implicit_startup_mutations_allowed() -> None:
+    """Fail before any implicit seed/schema helper can acquire a DB client."""
+
+    if startup_db_mutations_disabled():
+        raise RuntimeError(
+            "Implicit database schema/data mutations are disabled for this startup"
+        )
 
 
 def _seed_prompt_labels_after_migrate(sender, **kwargs):
@@ -94,11 +166,20 @@ class ModelHubConfig(AppConfig):
 
         if startup_db_mutations_disabled():
             if command := guarded_management_command(sys.argv):
-                raise RuntimeError(
-                    f"{command} is disabled while NO_STARTUP_DB_MUTATIONS=true"
-                )
+                if not operator_startup_mutation_authorized(sys.argv):
+                    raise RuntimeError(
+                        f"{command} is disabled during mutation-free startup; "
+                        "use a one-shot SERVICE_TYPE=bootstrap process with "
+                        "STARTUP_DB_MUTATION_MODE=operator"
+                    )
+                if command == "migrate":
+                    post_migrate.connect(
+                        _seed_prompt_labels_after_migrate,
+                        sender=self,
+                        dispatch_uid="model_hub_seed_default_prompt_labels",
+                    )
             logger.info(
-                "Mutation-free startup requested; skipping seed and schema setup"
+                "Mutation-free startup; skipping implicit seed and schema setup"
             )
             return
 
@@ -140,6 +221,8 @@ class ModelHubConfig(AppConfig):
     def _ensure_analytics_schema(self):
         """Ensure all ClickHouse analytics tables, MVs, and dicts exist.
         Idempotent — uses CREATE IF NOT EXISTS for everything."""
+        assert_implicit_startup_mutations_allowed()
+
         from tracer.services.clickhouse.client import get_clickhouse_client
         from tracer.services.clickhouse.schema import (
             POST_DDL_ALTERS,
@@ -327,6 +410,8 @@ class ModelHubConfig(AppConfig):
                 logger.warning(f"CH cache warm failed for {label}: {e}")
 
     def check_and_create_clickhouse_tables(self):
+        assert_implicit_startup_mutations_allowed()
+
         from agentic_eval.core.embeddings.embedding_manager import FEEDBACK_TABLE_NAME
 
         # vector dbs

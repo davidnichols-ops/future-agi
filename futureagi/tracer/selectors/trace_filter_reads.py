@@ -37,6 +37,7 @@ _MAX_OPTIONAL_ANCHOR_STRATA = 4
 # bytes, memory, and single-thread settings remain the authoritative envelope.
 _QUERY_TIMEOUT_MS = 1_500
 _MAX_OPT_IN_QUERY_TIMEOUT_MS = 3_000
+_MAX_BUILDER_RECOMMENDED_QUERY_TIMEOUT_MS = 30_000
 # Do not launch a resumable cursor statement with less than its full bounded
 # statement envelope. A short-token final batch can time out even though an
 # exact signed checkpoint already exists. Returning that checkpoint is
@@ -62,7 +63,7 @@ MAX_NUMBERED_PAGE_WORK_ROWS = 5_000
 _READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
-    "max_memory_usage": 256 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_bytes_to_read": 512 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "max_result_rows": _MAX_CANDIDATES,
@@ -365,9 +366,31 @@ def read_bounded_filter_page(
 
     if page_number < 0 or page_size <= 0 or deadline_ms <= 0:
         raise ValueError("page_number, page_size and deadline_ms must be positive")
+    query_timeout_recommendation = getattr(
+        builder, "recommended_filter_query_timeout_ms", None
+    )
+    raw_recommended_query_timeout_ms = (
+        query_timeout_recommendation()
+        if callable(query_timeout_recommendation)
+        else None
+    )
+    recommended_query_timeout_ms = (
+        int(raw_recommended_query_timeout_ms)
+        if raw_recommended_query_timeout_ms is not None
+        else None
+    )
+    if recommended_query_timeout_ms is not None and not (
+        25 <= recommended_query_timeout_ms <= _MAX_BUILDER_RECOMMENDED_QUERY_TIMEOUT_MS
+    ):
+        raise ValueError("recommended query timeout exceeds the bounded read contract")
     if query_timeout_ms is None:
-        query_timeout_ms = _QUERY_TIMEOUT_MS
-    if not 25 <= query_timeout_ms <= _MAX_OPT_IN_QUERY_TIMEOUT_MS:
+        query_timeout_ms = recommended_query_timeout_ms or _QUERY_TIMEOUT_MS
+    max_query_timeout_ms = (
+        _MAX_BUILDER_RECOMMENDED_QUERY_TIMEOUT_MS
+        if recommended_query_timeout_ms is not None
+        else _MAX_OPT_IN_QUERY_TIMEOUT_MS
+    )
+    if not 25 <= query_timeout_ms <= max_query_timeout_ms:
         raise ValueError("query_timeout_ms exceeds the bounded read contract")
     query_contract_limit = (
         _WORKFLOW_MAX_QUERIES if workflow_exact else _ABSOLUTE_MAX_QUERIES
@@ -733,6 +756,29 @@ def read_bounded_filter_page(
     ):
         raise ValueError("graph key witness probe is unavailable")
     ordered_seed_builder = getattr(builder, "build_filter_ordered_seed_page", None)
+    candidate_seed_builder = getattr(builder, "build_filter_candidate_seed_page", None)
+    candidate_seed_support = getattr(
+        builder, "supports_filter_candidate_seed_page", None
+    )
+    candidate_seed_order_proof = getattr(
+        builder, "filter_candidate_seed_proves_result_order", None
+    )
+    candidate_seed_can_run = bool(
+        not workflow_exact
+        and not anchor_probe_only
+        and not defer_classification
+        and not graph_key_witness_probe
+        and callable(candidate_seed_builder)
+        and callable(candidate_seed_support)
+        and candidate_seed_support()
+    )
+    candidate_seed_proves_result_order = bool(
+        candidate_seed_order_proof() if callable(candidate_seed_order_proof) else False
+    )
+    if candidate_seed_can_run and not candidate_seed_proves_result_order:
+        raise ValueError("candidate-first seed must prove result order")
+    if candidate_seed_can_run:
+        seed_proves_result_order = True
     recommended_anchor_limit: int | None = None
     recommended_anchor_timeout_ms: int | None = None
     recommended_anchor_strata = 1
@@ -2065,10 +2111,14 @@ def read_bounded_filter_page(
         # start with ordered roots. After exhaustion or saturation, canonical
         # root batches plus global finite classification provide the exact
         # result-order proof without materialising a tenant-wide trace-id Set.
-        seed_page_builder = builder.build_filter_seed_page
+        seed_page_builder = (
+            candidate_seed_builder
+            if candidate_seed_can_run
+            else builder.build_filter_seed_page
+        )
         if not use_seed_loop:
             pass
-        elif cursor_key is not None:
+        elif cursor_key is not None and not candidate_seed_can_run:
             # Continuations must start from the signed *result* tuple. Trace
             # any-span seeds are ordered by the matching physical child, not
             # by the public root trace, so use the root-ordered fallback when

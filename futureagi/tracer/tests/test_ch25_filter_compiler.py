@@ -284,8 +284,13 @@ class TestEndUserDimensionSource:
         )
         assert "trace_id IN (" in sql
         assert "FROM end_users AS eu FINAL" in sql
-        assert "FROM end_user_id_remap FINAL" in sql
+        assert "FROM end_user_id_remap AS remap_match FINAL" in sql
         assert "eu.is_deleted = 0" in sql
+        assert "matching_end_user_ids AS" in sql
+        assert "matching_end_user_group_ids AS" in sql
+        assert "WHERE remap.new_id IN (" in sql
+        assert "SELECT new_id FROM matching_end_user_group_ids" in sql
+        assert "OVER (PARTITION BY new_id)" not in sql
         # The dropped legacy table must NOT appear on the v2 path.
         assert "tracer_enduser" not in sql
         assert "_peerdb_is_deleted" not in sql
@@ -296,7 +301,7 @@ class TestEndUserDimensionSource:
             self._filter("user_id_type", "equals", "external")
         )
         assert "FROM end_users AS eu FINAL" in sql
-        assert "FROM end_user_id_remap FINAL" in sql
+        assert "FROM end_user_id_remap AS remap_match FINAL" in sql
         assert "tracer_enduser" not in sql
 
     def test_v2_negation_emits_not_in_against_end_users(self):
@@ -306,7 +311,7 @@ class TestEndUserDimensionSource:
         )
         assert "trace_id NOT IN (" in sql
         assert "FROM end_users AS eu FINAL" in sql
-        assert "FROM end_user_id_remap FINAL" in sql
+        assert "FROM end_user_id_remap AS remap_match FINAL" in sql
         assert "tracer_enduser" not in sql
 
     # ─── No-value path (is_null) — a different branch that skips the dim ──────

@@ -355,6 +355,153 @@ def test_session_end_user_enrichment_drops_clickhouse_null_before_uuid_lookup():
 
 
 @pytest.mark.unit
+def test_session_page_canonicalization_never_builds_global_remap_window():
+    from tracer.views.trace_session import _resolve_session_ids_to_canonical
+
+    session_ids = [str(uuid.uuid4()) for _ in range(30)]
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.return_value = SimpleNamespace(data=[])
+
+    resolved = _resolve_session_ids_to_canonical(analytics, session_ids)
+
+    assert resolved == {session_id: session_id for session_id in session_ids}
+    sql, params = analytics.execute_ch_query.call_args.args[:2]
+    assert "FROM trace_session_id_remap FINAL" in sql
+    assert "old_id IN %(ids)s OR new_id IN %(ids)s" in sql
+    assert "OVER (PARTITION BY new_id)" not in sql
+    assert set(params["ids"]) == set(session_ids)
+
+
+@pytest.mark.unit
+def test_session_end_user_span_query_remap_is_page_bounded():
+    from tracer.views.trace_session import TraceSessionView
+
+    session_ids = [str(uuid.uuid4()) for _ in range(30)]
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.return_value = SimpleNamespace(data=[])
+
+    with (
+        mock.patch(
+            "tracer.views.trace_session._resolve_session_ids_to_canonical",
+            return_value={session_id: session_id for session_id in session_ids},
+        ),
+        mock.patch(
+            "tracer.services.clickhouse.v2.end_user_dict_reader.resolve_end_user_fields"
+        ) as resolve_end_user_fields,
+    ):
+        result = TraceSessionView._fetch_end_user_info(session_ids, analytics)
+
+    assert result == {}
+    resolve_end_user_fields.assert_not_called()
+    sql, params = analytics.execute_ch_query.call_args.args[:2]
+    assert "FROM trace_session_id_remap FINAL" in sql
+    assert "old_id IN %(session_ids)s OR new_id IN %(session_ids)s" in sql
+    assert "OVER (PARTITION BY new_id)" not in sql
+    assert set(params["session_ids"]) == set(session_ids)
+
+
+@pytest.mark.unit
+def test_session_end_user_dictionary_lookup_remap_is_candidate_bounded():
+    from tracer.services.clickhouse.v2.end_user_dict_reader import (
+        resolve_end_user_fields,
+    )
+
+    end_user_ids = [str(uuid.uuid4()) for _ in range(30)]
+    client = mock.MagicMock()
+    client.query.return_value = SimpleNamespace(result_rows=[])
+
+    with mock.patch(
+        "tracer.services.clickhouse.v2.end_user_dict_reader._get_client",
+        return_value=client,
+    ):
+        assert resolve_end_user_fields(end_user_ids) == {}
+
+    sql = client.query.call_args.args[0]
+    params = client.query.call_args.kwargs["parameters"]
+    assert "FROM end_user_id_remap FINAL" in sql
+    assert "old_id IN %(ids)s OR new_id IN %(ids)s" in sql
+    assert "OVER (PARTITION BY new_id)" not in sql
+    assert set(params["ids"]) == set(end_user_ids)
+
+
+@pytest.mark.unit
+def test_user_detail_reverse_lookup_keeps_transport_and_query_under_30_seconds(
+    monkeypatch,
+):
+    import sys
+
+    from tracer.services.clickhouse.v2 import end_user_dict_reader as reader
+
+    client = mock.MagicMock()
+    client.query.return_value = SimpleNamespace(result_rows=[])
+    client_factory = mock.MagicMock(return_value=client)
+    monkeypatch.setattr(reader, "_client", None)
+    monkeypatch.setattr(
+        reader,
+        "get_v2_config",
+        lambda: {
+            "host": "clickhouse.invalid",
+            "http_port": 8123,
+            "tcp_port": 9000,
+            "user": "readonly",
+            "password": "",
+            "database": "futureagi",
+            "server_enforced_readonly": False,
+        },
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "clickhouse_connect",
+        SimpleNamespace(get_client=client_factory),
+    )
+
+    try:
+        assert (
+            reader.resolve_end_user_ids_by_user_id(
+                "customer-1",
+                organization_id=str(uuid.uuid4()),
+                timeout_ms=29_500,
+                settings={
+                    "max_threads": 2,
+                    "max_bytes_to_read": 256 * 1024 * 1024,
+                    "max_memory_usage": 36 * 1024 * 1024 * 1024,
+                    "max_result_rows": 10_000,
+                },
+            )
+            == []
+        )
+    finally:
+        reader._reset_client()
+
+    assert client_factory.call_args.kwargs["send_receive_timeout"] == 30
+    query_settings = client.query.call_args.kwargs["settings"]
+    assert query_settings["max_execution_time"] == 29.5
+    assert "max_rows_to_read" not in query_settings
+    assert query_settings["max_threads"] == 2
+    assert query_settings["max_result_rows"] == 10_000
+
+
+@pytest.mark.unit
+def test_user_detail_reverse_lookup_rejects_unbounded_locked_transport(monkeypatch):
+    from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+    from tracer.services.clickhouse.server_readonly import (
+        ServerEnforcedReadOnlyNativeClient,
+    )
+    from tracer.services.clickhouse.v2 import end_user_dict_reader as reader
+
+    locked_client = object.__new__(ServerEnforcedReadOnlyNativeClient)
+    monkeypatch.setattr(reader, "_get_client", lambda: locked_client)
+
+    with pytest.raises(ReadDeadlineExceeded, match="cannot enforce request deadline"):
+        reader.resolve_end_user_ids_by_user_id(
+            "customer-1",
+            organization_id=str(uuid.uuid4()),
+            timeout_ms=30_000,
+            settings={"max_threads": 2},
+        )
+
+
+@pytest.mark.unit
 def test_session_export_context_reaches_clickhouse_list_path():
     from tracer.views.trace_session import TraceSessionView
 
@@ -617,6 +764,87 @@ def test_candidate_first_session_list_keeps_exact_metadata():
     bounded_read.assert_not_called()
     builder.build_candidate_page_query.assert_called_once_with()
     builder.build_candidate_count_query.assert_called_once_with()
+
+
+@pytest.mark.unit
+def test_session_list_keeps_exact_page_when_end_user_label_enrichment_exhausts_budget():
+    from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    project_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    start_time = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
+    builder = mock.MagicMock()
+    builder.supports_candidate_first_page.return_value = True
+    builder.build_candidate_page_query.return_value = ("candidate page", {})
+    builder.build_page_metrics_query.return_value = ("page metrics", {})
+    builder.build_content_query.return_value = ("page content", {})
+    builder.build_span_attributes_query.return_value = ("page attributes", {})
+    builder.format_sessions.side_effect = lambda rows, columns: [
+        dict(zip(columns, row, strict=True)) for row in rows
+    ]
+    analytics = mock.MagicMock()
+
+    def _execute(query, _params, **_kwargs):
+        if query == "candidate page":
+            return SimpleNamespace(data=[{"session_id": session_id, "total_count": 1}])
+        if query == "page metrics":
+            return SimpleNamespace(
+                data=[
+                    {
+                        "session_id": session_id,
+                        "session_start": start_time,
+                        "session_end": start_time,
+                        "duration": 0,
+                        "total_cost": 0,
+                        "total_tokens": 0,
+                        "traces_count": 1,
+                    }
+                ]
+            )
+        if query == "page content":
+            return SimpleNamespace(data=[])
+        if query == "page attributes":
+            return SimpleNamespace(data=[])
+        raise AssertionError(f"unexpected ClickHouse query: {query}")
+
+    analytics.execute_ch_query.side_effect = _execute
+    view._fetch_session_names = mock.MagicMock(return_value={})
+    view._fetch_end_user_info = mock.MagicMock(
+        side_effect=ReadDeadlineExceeded("end-user label budget exhausted")
+    )
+
+    with (
+        mock.patch(
+            "tracer.views.trace_session.SessionListQueryBuilderV2",
+            return_value=builder,
+        ),
+        mock.patch(
+            "tracer.views.trace_session.AnnotationsLabels.objects.filter",
+            return_value=[],
+        ),
+    ):
+        status, payload = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=project_id,
+            project=None,
+            analytics=analytics,
+            validated_data={
+                "filters": [],
+                "sort_params": [],
+                "page_number": 0,
+                "page_size": 25,
+            },
+        )
+
+    assert status == "ok"
+    assert payload["metadata"] == {"total_rows": 1}
+    assert payload["table"][0]["session_id"] == session_id
+    assert payload["table"][0]["user_id"] is None
+    assert payload["table"][0]["user_id_type"] is None
+    assert payload["table"][0]["user_id_hash"] is None
 
 
 @pytest.mark.unit

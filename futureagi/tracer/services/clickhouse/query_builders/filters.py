@@ -1088,6 +1088,15 @@ class ClickHouseFilterBuilder:
 
     def _normalize_col_type_for_dispatch(self, col_id: str, col_type: str) -> str:
         """Promote a default ``NORMAL`` col_id to its real handler so it doesn't fall through or raise."""
+        if col_type == self.SPAN_ATTRIBUTE and col_id in {
+            *self._ENDUSER_STRING_COLUMNS,
+            "end_user_id",
+        }:
+            # Structural end-user aliases are promoted only when the caller
+            # omitted a type or selected their structural category. An
+            # explicit raw attribute with the same key remains a Map lookup.
+            return col_type
+
         # TRACE_END_USER resolves via the SYSTEM_METRIC end-user path.
         if col_type == self.TRACE_END_USER:
             return self.SYSTEM_METRIC

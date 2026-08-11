@@ -319,8 +319,10 @@ def test_exact_detail_parses_full_distribution_and_weighted_numeric_stats():
     query, params, kwargs = executor.calls[0]
     assert query == EXACT_ATTRIBUTE_DETAIL_SQL
     assert params["attribute_key"] == "latency.score"
-    assert kwargs["settings"]["max_rows_to_read"] == 0
-    assert kwargs["settings"]["max_bytes_to_read"] == 0
+    assert "max_rows_to_read" not in kwargs["settings"]
+    assert kwargs["settings"]["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
+    assert kwargs["settings"]["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+    assert kwargs["timeout_ms"] == 30_000
 
 
 def test_exact_detail_empty_result_is_complete_and_not_sampled():

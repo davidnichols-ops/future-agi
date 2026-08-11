@@ -746,7 +746,11 @@ def test_org_user_trace_seed_is_remap_aware_scoped_and_cursor_ordered() -> None:
     assert "(parent_span_id IS NULL OR parent_span_id = '')" in seed_sql
     assert "trace_id IN (SELECT trace_id FROM spans WHERE end_user_id IN (" in seed_sql
     assert "FROM end_users AS eu FINAL" in seed_sql
-    assert "FROM end_user_id_remap FINAL" in seed_sql
+    assert "matching_end_user_ids AS" in seed_sql
+    assert "matching_end_user_group_ids AS" in seed_sql
+    assert "FROM end_user_id_remap AS remap_match FINAL" in seed_sql
+    assert "WHERE remap.new_id IN (" in seed_sql
+    assert "OVER (PARTITION BY new_id)" not in seed_sql
     assert seed_sql.count("project_id IN %(project_ids)s") >= 3
     assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in seed_sql
     assert "start_time < %(end_date)s + INTERVAL 1 DAY" in seed_sql
@@ -760,9 +764,131 @@ def test_org_user_trace_seed_is_remap_aware_scoped_and_cursor_ordered() -> None:
     # The seed is only a physical superset. The existing finite latest-state
     # classifier remains authoritative and retains the residual user predicate.
     assert "FROM end_users AS eu FINAL" in match_sql
-    assert "FROM end_user_id_remap FINAL" in match_sql
+    assert "matching_end_user_ids AS" in match_sql
+    assert "matching_end_user_group_ids AS" in match_sql
+    assert "FROM end_user_id_remap AS remap_match FINAL" in match_sql
+    assert "WHERE remap.new_id IN (" in match_sql
+    assert "OVER (PARTITION BY new_id)" not in match_sql
     assert "candidate_trace_ids" in match_sql
     assert match_params["org_residual_0_col_1"] == "guest-e3dce503"
+
+
+@pytest.mark.parametrize("col_type", ["SYSTEM_METRIC", "TRACE_END_USER"])
+def test_external_user_trace_candidate_seed_is_user_first_and_root_ordered(
+    col_type: str,
+) -> None:
+    start = END - timedelta(days=180)
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(start, END),
+            {
+                "column_id": "user_id",
+                "filter_config": {
+                    "col_type": col_type,
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "45293328",
+                },
+            },
+        ],
+    )
+
+    sql, params = builder.build_filter_candidate_seed_page(
+        slice_start=start,
+        slice_end=END,
+        limit=26,
+    )
+    compact_sql = " ".join(sql.split())
+
+    assert builder.supports_filter_candidate_seed_page() is True
+    assert "matching_user_trace_identities AS" in compact_sql
+    assert "FROM end_users AS eu FINAL" in compact_sql
+    assert "FROM end_user_id_remap AS remap_match FINAL" in compact_sql
+    assert "PREWHERE project_id = %(project_id)s" in compact_sql
+    assert "AND (end_user_id IN (" in compact_sql
+    assert (
+        "AND (project_id, trace_id) IN ( SELECT project_id, trace_id "
+        "FROM matching_user_trace_identities )"
+    ) in compact_sql
+    assert "ORDER BY start_time DESC, trace_id DESC" in compact_sql
+    assert "LIMIT 1 BY trace_id LIMIT %(filter_seed_limit)s" in compact_sql
+    assert params["col_1"] == "45293328"
+    assert params["filter_seed_limit"] == 26
+    assert "user_candidate_start_us" not in params
+    assert "user_candidate_end_us" not in params
+
+
+def test_structural_end_user_id_candidate_seed_uses_direct_uuid_predicate() -> None:
+    end_user_id = "50f8845d-e410-5ceb-9bb5-a0d5e7ca6773"
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(END - timedelta(days=30), END),
+            {
+                "column_id": "end_user_id",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": end_user_id,
+                },
+            },
+        ],
+    )
+
+    sql, params = builder.build_filter_candidate_seed_page(
+        slice_start=END - timedelta(days=30),
+        slice_end=END,
+        limit=26,
+    )
+    candidate_sql = sql.split("SELECT trace_id, id AS root_span_id", 1)[0]
+
+    assert builder.supports_filter_candidate_seed_page() is True
+    assert builder.filter_seed_proves_result_order() is False
+    assert builder.filter_candidate_seed_proves_result_order() is True
+    assert "matching_user_trace_identities AS" in candidate_sql
+    assert "toString(end_user_id) = %(col_1)s" in candidate_sql
+    assert "FROM end_users" not in candidate_sql
+    assert params["col_1"] == end_user_id
+
+
+@pytest.mark.parametrize("column_id", ["end_user_id", "user", "user_id"])
+def test_raw_user_named_span_attribute_does_not_use_candidate_seed(
+    column_id: str,
+) -> None:
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(END - timedelta(days=30), END),
+            {
+                "column_id": column_id,
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "raw-provider-value",
+                },
+            },
+        ],
+    )
+
+    assert builder.supports_filter_candidate_seed_page() is False
+    raw_sql, _ = builder.build_filter_seed_page(
+        slice_start=END - timedelta(days=30),
+        slice_end=END,
+        limit=26,
+    )
+    assert "mapKeys(attrs_string)" in raw_sql
+    assert "attrs_string[" in raw_sql
+    assert "end_users" not in raw_sql
+    assert "end_user_id_remap" not in raw_sql
+    with pytest.raises(ValueError, match="trace user candidate seed is unavailable"):
+        builder.build_filter_candidate_seed_page(
+            slice_start=END - timedelta(days=30),
+            slice_end=END,
+            limit=26,
+        )
 
 
 def test_negated_user_trace_filter_does_not_use_positive_root_seed() -> None:
@@ -779,6 +905,7 @@ def test_negated_user_trace_filter_does_not_use_positive_root_seed() -> None:
     )
     match_sql, _ = builder.build_filter_match_query(["trace-a"])
 
+    assert builder.supports_filter_candidate_seed_page() is False
     assert "end_users" not in seed_sql
     assert "end_user_id_remap" not in seed_sql
     assert builder.recommended_filter_initial_slice_width() is None
@@ -3638,6 +3765,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget(
         TRACE_LIST_CANDIDATE_DEADLINE_MS,
         TRACE_LIST_ENRICHMENT_CHUNK_SIZE,
         TRACE_LIST_ENRICHMENT_MAX_WORKERS,
+        TRACE_LIST_ENRICHMENT_TIMEOUT_MS,
         TRACE_LIST_READ_SETTINGS,
         TRACE_LIST_WALL_DEADLINE_MS,
         TraceView,
@@ -3753,7 +3881,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget(
     assert (
         bounded_read.call_args.kwargs["deadline_ms"] <= TRACE_LIST_CANDIDATE_DEADLINE_MS
     )
-    assert TRACE_LIST_CANDIDATE_DEADLINE_MS < TRACE_LIST_WALL_DEADLINE_MS < 30_000
+    assert TRACE_LIST_CANDIDATE_DEADLINE_MS == TRACE_LIST_WALL_DEADLINE_MS == 30_000
     assert TRACE_LIST_ENRICHMENT_MAX_WORKERS == 2
     assert len(analytics.calls) == 2 * expected_chunks + 1
     content_chunks = [
@@ -3784,7 +3912,10 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget(
     assert [trace_id for chunk in attribute_chunks for trace_id in chunk] == [
         f"trace-{index}" for index in range(row_count)
     ]
-    assert all(0 < timeout_ms <= 900 for _, timeout_ms, _ in analytics.calls)
+    assert all(
+        0 < timeout_ms <= TRACE_LIST_ENRICHMENT_TIMEOUT_MS
+        for _, timeout_ms, _ in analytics.calls
+    )
     assert all(
         settings == TRACE_LIST_READ_SETTINGS for _, _, settings in analytics.calls
     )
@@ -3794,7 +3925,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget(
     CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"},
 )
 def test_page_500_slow_candidate_admits_every_exact_enrichment_wave():
-    """The 16 s ceiling admits the modeled 14.3 s max-page exact replay.
+    """The 30 s ceiling admits the modeled 14.3 s max-page exact replay.
 
     The virtual two-worker scheduler is deterministic: the candidate consumes
     8 s, each CH statement consumes its full 900 ms cap, and the optional user
@@ -4012,7 +4143,7 @@ def test_page_500_slow_candidate_admits_every_exact_enrichment_wave():
 
     assert status_name == "ok"
     assert len(payload["table"]) == 500
-    assert TRACE_LIST_WALL_DEADLINE_MS == 16_000
+    assert TRACE_LIST_WALL_DEADLINE_MS == 30_000
     assert deadline.now_ms == 14_300
     assert VirtualPool.instances[0].submit_count == 13
     assert all(
@@ -5097,10 +5228,8 @@ def test_span_list_nonempty_page_content_shares_wall_budget() -> None:
         bounded_read.call_args.kwargs["deadline_ms"] <= SPAN_LIST_CANDIDATE_DEADLINE_MS
     )
     assert bounded_read.call_args.kwargs.get("retry_wide_read_budget", False) is False
-    assert (
-        SPAN_LIST_CANDIDATE_DEADLINE_MS + SPAN_LIST_ENRICHMENT_TIMEOUT_MS
-        <= SPAN_LIST_WALL_DEADLINE_MS
-    )
+    assert SPAN_LIST_CANDIDATE_DEADLINE_MS <= SPAN_LIST_WALL_DEADLINE_MS
+    assert SPAN_LIST_ENRICHMENT_TIMEOUT_MS <= SPAN_LIST_WALL_DEADLINE_MS
     assert len(analytics.calls) == 1
     assert 0 < analytics.calls[0][1] <= SPAN_LIST_ENRICHMENT_TIMEOUT_MS
     assert analytics.calls[0][2] == SPAN_LIST_READ_SETTINGS
@@ -5463,6 +5592,43 @@ class _IdentityHydrationFakeBuilder(_FakeBuilder):
         return row["id"], row["root_span_id"], start_time
 
 
+@dataclass
+class _CandidateFirstIdentityHydrationFakeBuilder(_IdentityHydrationFakeBuilder):
+    @staticmethod
+    def supports_filter_candidate_seed_page() -> bool:
+        return True
+
+    @staticmethod
+    def filter_candidate_seed_proves_result_order() -> bool:
+        return True
+
+    def build_filter_candidate_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+        before_start_time: datetime | None = None,
+        before_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        return "candidate_seed", {
+            "slice_start": slice_start,
+            "slice_end": slice_end,
+            "limit": limit,
+            "before_start_time": before_start_time,
+            "before_id": before_id,
+        }
+
+    def build_filter_seed_page(self, **_kwargs):
+        raise AssertionError("generic chronological seed must not run")
+
+    def recommended_filter_initial_slice_width(self) -> timedelta:
+        return self.end - self.start
+
+    def recommended_filter_max_slice_width(self) -> timedelta:
+        return self.end - self.start
+
+
 class _IdentityHydrationFakeExecutor(_FakeExecutor):
     def __init__(
         self,
@@ -5479,9 +5645,11 @@ class _IdentityHydrationFakeExecutor(_FakeExecutor):
         self.clock = clock
         self.durations_ms = dict(durations_ms or {})
         self.timeouts: list[tuple[str, int]] = []
+        self.settings_by_query: list[tuple[str, dict[str, Any]]] = []
 
     def execute_ch_query(self, query, params, *, timeout_ms, settings):
         self.timeouts.append((query, timeout_ms))
+        self.settings_by_query.append((query, dict(settings)))
         if query in {"match_identity", "hydrate"}:
             self.calls.append((query, params))
             wanted = set(params["candidate_ids"])
@@ -5518,6 +5686,67 @@ class _IdentityHydrationFakeExecutor(_FakeExecutor):
             if duration_ms >= timeout_ms:
                 raise ReadDeadlineExceeded(f"{query} timeout")
         return result
+
+
+def test_candidate_first_seed_keeps_exact_classifier_and_page_hydration() -> None:
+    row = {
+        "id": "trace-user",
+        "root_span_id": "root-user",
+        "start_time": END - timedelta(days=180),
+        "name": "user trace",
+    }
+    builder = _CandidateFirstIdentityHydrationFakeBuilder(
+        rows=[row],
+        start=END - timedelta(days=365),
+        end=END,
+        key_field="id",
+        recommended_batch_size=80,
+        recommended_seed_batch_size=200,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(END - timedelta(days=365), END)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=30_000,
+        max_candidates=512,
+        max_seed_attempts=128,
+        max_query_count=128,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert page.rows == [row]
+    assert page.has_more is False
+    assert [query for query, _ in executor.calls] == [
+        "candidate_seed",
+        "match_identity",
+        "hydrate",
+    ]
+    seed_params = executor.calls[0][1]
+    assert seed_params["slice_start"] == END - timedelta(days=365)
+    assert seed_params["slice_end"] == END
+    assert seed_params["limit"] == 26
+    assert [attempt.kind for attempt in page.attempts] == [
+        "seed",
+        "classify",
+        "hydrate",
+    ]
+    assert all(
+        "max_rows_to_read" not in settings for _, settings in executor.settings_by_query
+    )
+    assert all(
+        settings["max_bytes_to_read"] == 512 * 1024 * 1024
+        and settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+        and settings["max_threads"] == 1
+        and 0 < settings["max_result_rows"] <= 10_000
+        for _, settings in executor.settings_by_query
+    )
 
 
 @dataclass
@@ -6986,8 +7215,18 @@ def test_org_user_trace_endpoint_proves_six_month_empty_page_in_one_seed() -> No
     assert analytics.execute_ch_query.call_count == 1
     seed_sql = analytics.execute_ch_query.call_args.args[0]
     seed_params = analytics.execute_ch_query.call_args.args[1]
+    compact_seed_sql = " ".join(seed_sql.split())
+    assert "matching_user_trace_identities AS" in compact_seed_sql
+    assert (
+        "AND (project_id, trace_id) IN ( SELECT project_id, trace_id "
+        "FROM matching_user_trace_identities )"
+    ) in compact_seed_sql
     assert "FROM end_users AS eu FINAL" in seed_sql
-    assert "FROM end_user_id_remap FINAL" in seed_sql
+    assert "matching_end_user_ids AS" in seed_sql
+    assert "matching_end_user_group_ids AS" in seed_sql
+    assert "FROM end_user_id_remap AS remap_match FINAL" in seed_sql
+    assert "WHERE remap.new_id IN (" in seed_sql
+    assert "OVER (PARTITION BY new_id)" not in seed_sql
     assert "end_user_id IN (" in seed_sql
     assert "created_at" not in seed_sql
     assert seed_params["filter_slice_start"] == start

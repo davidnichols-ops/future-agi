@@ -11,9 +11,11 @@ Covers:
 """
 
 import hashlib
+import inspect
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from threading import Lock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlencode
@@ -80,7 +82,9 @@ from tracer.services.clickhouse.v2.query_builders.dashboard import (
 from tracer.services.exact_aggregation_cache import snapshot_cache_key
 from tracer.utils.graphs_optimized import EvalGraphReadError
 from tracer.views.dashboard import (
+    _DASHBOARD_EXACT_QUERY_TIMEOUT_MS,
     _DASHBOARD_TRACE_READ_SETTINGS,
+    DashboardExactReadError,
     DashboardReadQuerySerializer,
     DashboardViewSet,
     DashboardWidgetViewSet,
@@ -156,6 +160,29 @@ class _DashboardFullWindowAnalytics:
         )
 
 
+class _ProductionShapedDashboardAnalytics:
+    """Model the observed 114.4M-row exact dashboard scan."""
+
+    rows_to_read = 114_400_000
+
+    def __init__(self):
+        self.calls = []
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.calls.append((query, params, timeout_ms, settings))
+        assert "max_rows_to_read" not in settings
+        return SimpleNamespace(
+            data=[
+                {
+                    "time_bucket": params["start_date"],
+                    "value": 1,
+                    "eval_attempts": 1,
+                }
+            ],
+            columns=["time_bucket", "value", "eval_attempts"],
+        )
+
+
 def _recording_dashboard_builder(configs):
     class RecordingDashboardBuilder:
         def __init__(self, config):
@@ -208,7 +235,7 @@ def _dashboard_full_window_params(*, days):
 
 
 @pytest.mark.unit
-def test_dashboard_exact_rows_use_one_full_12m_current_state_statement():
+def test_dashboard_exact_rows_use_one_full_window_statement_unchanged():
     analytics = _DashboardFullWindowAnalytics()
     settings = dict(_DASHBOARD_TRACE_READ_SETTINGS)
     params = _dashboard_full_window_params(days=365)
@@ -217,7 +244,7 @@ def test_dashboard_exact_rows_use_one_full_12m_current_state_statement():
         analytics=analytics,
         sql="SELECT exact dashboard metric",
         params=params,
-        timeout_ms=300_000,
+        timeout_ms=_DASHBOARD_EXACT_QUERY_TIMEOUT_MS,
         settings=settings,
     )
 
@@ -226,50 +253,101 @@ def test_dashboard_exact_rows_use_one_full_12m_current_state_statement():
     query, observed_params, timeout_ms, observed_settings = analytics.calls[0]
     assert query == "SELECT exact dashboard metric"
     assert observed_params == params
-    assert timeout_ms == 300_000
+    assert timeout_ms == _DASHBOARD_EXACT_QUERY_TIMEOUT_MS
     assert observed_settings == settings
     assert "additional_table_filters" not in observed_settings
     assert "snapshot_version_ceiling" not in observed_params
 
 
 @pytest.mark.unit
-def test_dashboard_full_window_budget_failure_is_not_split():
-    analytics = _DashboardFullWindowAnalytics(
-        failure=ServerException("private read budget detail", code=159)
+def test_dashboard_30d_114m_row_read_has_no_application_row_ceiling():
+    analytics = _ProductionShapedDashboardAnalytics()
+    params = _dashboard_full_window_params(days=30)
+    sql = (
+        "WITH window_global_latest_evals AS ("
+        "SELECT * FROM usage_apicalllog "
+        "WHERE created_at >= %(start_date)s AND created_at < %(end_date)s"
+        ") SELECT time_bucket, avg(score) FROM window_global_latest_evals"
     )
 
-    with pytest.raises(ServerException):
-        _fetch_exact_dashboard_rows(
-            analytics=analytics,
-            sql="SELECT exact dashboard metric",
-            params=_dashboard_full_window_params(days=365),
-            timeout_ms=300_000,
-            settings=_DASHBOARD_TRACE_READ_SETTINGS,
-        )
+    rows = _fetch_exact_dashboard_rows(
+        analytics=analytics,
+        sql=sql,
+        params=params,
+        timeout_ms=_DASHBOARD_EXACT_QUERY_TIMEOUT_MS,
+        settings=_DASHBOARD_TRACE_READ_SETTINGS,
+    )
 
+    assert rows == [
+        {
+            "time_bucket": params["start_date"],
+            "value": 1,
+            "eval_attempts": 1,
+        }
+    ]
     assert len(analytics.calls) == 1
-    assert analytics.calls[0][2] == 300_000
+    observed_sql, observed_params, observed_timeout, observed_settings = (
+        analytics.calls[0]
+    )
+    # Identity assertions make query/parameter cloning-and-rewriting fail this
+    # test even when a rewritten mapping happens to compare equal.
+    assert observed_sql is sql
+    assert observed_params is params
+    assert observed_settings is _DASHBOARD_TRACE_READ_SETTINGS
+    assert observed_timeout == 30_000
+    assert "max_rows_to_read" not in observed_settings
+    assert params == _dashboard_full_window_params(days=30)
 
 
 @pytest.mark.unit
-def test_dashboard_full_window_failure_returns_no_partial_rows_to_publisher():
+def test_dashboard_full_window_budget_failure_is_not_retried_or_partitioned():
     analytics = _DashboardFullWindowAnalytics(
         failure=ServerException("private read budget detail", code=159)
     )
     published = []
+    params = _dashboard_full_window_params(days=30)
 
     with pytest.raises(ServerException):
         rows = _fetch_exact_dashboard_rows(
             analytics=analytics,
             sql="SELECT exact dashboard metric",
-            params=_dashboard_full_window_params(days=30),
-            timeout_ms=300_000,
+            params=params,
+            timeout_ms=_DASHBOARD_EXACT_QUERY_TIMEOUT_MS,
             settings=_DASHBOARD_TRACE_READ_SETTINGS,
         )
         published.extend(rows)
 
     assert published == []
     assert len(analytics.calls) == 1
+    assert analytics.calls[0][1] == params
+    assert analytics.calls[0][2] == _DASHBOARD_EXACT_QUERY_TIMEOUT_MS
+
+
+@pytest.mark.unit
+def test_dashboard_full_window_read_keeps_all_independent_finite_limits():
+    read_settings = _DASHBOARD_TRACE_READ_SETTINGS
+
+    assert read_settings == {
+        "max_threads": 2,
+        "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
+        "max_memory_usage": 36 * 1024 * 1024 * 1024,
+        "read_overflow_mode": "throw",
+        "max_result_rows": 250_000,
+        "max_result_bytes": 64 * 1024 * 1024,
+        "result_overflow_mode": "throw",
+        "timeout_overflow_mode": "throw",
+    }
+
+
+@pytest.mark.unit
+def test_dashboard_worker_has_one_deadline_for_every_exact_source():
+    source = inspect.getsource(DashboardWidgetViewSet._execute_ch_query_config)
+
+    assert _DASHBOARD_EXACT_QUERY_TIMEOUT_MS == 30_000
+    assert source.count("ReadDeadline.start(") == 1
+    assert source.count("timeout_ms=read_deadline.remaining_ms(") == 3
+    assert source.count("read_deadline.remaining_ms(floor_ms=1)") == 2
+    assert "query_timeout =" not in source
 
 
 @pytest.mark.unit
@@ -358,6 +436,26 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
             }
 
     analytics = _DashboardFullWindowAnalytics()
+    deadline_lock = Lock()
+
+    class TrackingDeadline:
+        def __init__(self):
+            self.next_timeout_ms = _DASHBOARD_EXACT_QUERY_TIMEOUT_MS
+            self.statement_timeouts = []
+            self.publication_fences = 0
+
+        def remaining_ms(self, cap_ms=None, *, floor_ms=25):
+            with deadline_lock:
+                if cap_ms is None:
+                    assert floor_ms == 1
+                    self.publication_fences += 1
+                    return 1_000
+                timeout_ms = min(cap_ms, self.next_timeout_ms)
+                self.next_timeout_ms -= 1_000
+                self.statement_timeouts.append(timeout_ms)
+                return timeout_ms
+
+    deadline = TrackingDeadline()
     project_queryset = MagicMock()
     project_queryset.filter.return_value = project_queryset
     project_queryset.count.return_value = 1
@@ -385,6 +483,10 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
             "tracer.views.dashboard.V2AnalyticsQueryService",
             return_value=analytics,
         ),
+        patch(
+            "tracer.views.dashboard.ReadDeadline.start",
+            return_value=deadline,
+        ) as deadline_start,
     ):
         response = DashboardWidgetViewSet()._execute_ch_query_config(
             query_config,
@@ -397,6 +499,20 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
         )
 
     assert len(analytics.calls) == 4
+    deadline_start.assert_called_once_with(_DASHBOARD_EXACT_QUERY_TIMEOUT_MS)
+    assert sorted(deadline.statement_timeouts, reverse=True) == [
+        30_000,
+        29_000,
+        28_000,
+        27_000,
+    ]
+    assert deadline.publication_fences == 2
+    assert sorted([call[2] for call in analytics.calls], reverse=True) == [
+        30_000,
+        29_000,
+        28_000,
+        27_000,
+    ]
     assert {call[0] for call in analytics.calls} == {
         "SELECT latency FROM spans FINAL",
         "SELECT traffic FROM spans FINAL",
@@ -430,6 +546,108 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
     assert "query_snapshot_version_ceiling" not in result
     assert "query_snapshot_capture_count" not in result
     assert "query_snapshot_relation_count" not in result
+
+
+@pytest.mark.unit
+def test_dashboard_worker_does_not_return_payload_after_formatting_crosses_deadline():
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    end = datetime(2026, 8, 1, tzinfo=UTC)
+    project_id = "00000000-0000-0000-0000-000000000010"
+    workspace = SimpleNamespace(
+        id="00000000-0000-0000-0000-000000000020",
+        organization_id="00000000-0000-0000-0000-000000000030",
+    )
+    query_config = {
+        "project_ids": [project_id],
+        "granularity": "day",
+        "time_range": {
+            "custom_start": start.isoformat(),
+            "custom_end": end.isoformat(),
+        },
+        "metrics": [
+            {
+                "id": "latency",
+                "name": "latency",
+                "type": "system_metric",
+                "aggregation": "avg",
+                "source": "traces",
+            }
+        ],
+        "filters": [],
+        "breakdowns": [],
+    }
+    builder_configs = []
+    BaseBuilder = _recording_dashboard_builder(builder_configs)
+    formatting = {"complete": False}
+
+    class FormattingBuilder(BaseBuilder):
+        def format_results(self, metric_results, **kwargs):
+            formatted = super().format_results(metric_results, **kwargs)
+            formatting["complete"] = True
+            return formatted
+
+    class ExpiresAfterFormattingDeadline:
+        def __init__(self):
+            self.fences = 0
+
+        def remaining_ms(self, cap_ms=None, *, floor_ms=25):
+            if cap_ms is not None:
+                return min(cap_ms, _DASHBOARD_EXACT_QUERY_TIMEOUT_MS)
+            assert floor_ms == 1
+            self.fences += 1
+            if self.fences == 1:
+                return 1
+            raise ReadDeadlineExceeded("deadline")
+
+    analytics = _DashboardFullWindowAnalytics()
+    project_queryset = MagicMock()
+    project_queryset.filter.return_value = project_queryset
+    project_queryset.count.return_value = 1
+    project_queryset.values_list.return_value = []
+    publish = MagicMock()
+
+    with (
+        patch(
+            "tracer.views.dashboard._materialize_dashboard_query_scope",
+            side_effect=lambda config, *_args, **_kwargs: config,
+        ),
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard._project_queryset_for_dashboard_scope",
+            return_value=project_queryset,
+        ),
+        patch(
+            "tracer.views.dashboard.Project.objects.filter",
+            return_value=project_queryset,
+        ),
+        patch("tracer.views.dashboard.DashboardQueryBuilderV2", FormattingBuilder),
+        patch(
+            "tracer.views.dashboard.V2AnalyticsQueryService",
+            return_value=analytics,
+        ),
+        patch(
+            "tracer.views.dashboard.ReadDeadline.start",
+            return_value=ExpiresAfterFormattingDeadline(),
+        ),
+        patch("tracer.views.dashboard.publish_exact_snapshot", publish),
+    ):
+        with pytest.raises(
+            DashboardExactReadError,
+            match="dashboard exact read deadline exceeded",
+        ):
+            DashboardWidgetViewSet()._execute_ch_query_config(
+                query_config,
+                workspace,
+                _exact_worker=True,
+                cache_identity_override={
+                    "workspace_id": workspace.id,
+                    "query_config": query_config,
+                },
+            )
+
+    assert formatting["complete"] is True
+    assert len(analytics.calls) == 1
+    publish.assert_not_called()
 
 
 @pytest.mark.django_db
@@ -3652,10 +3870,15 @@ class TestDashboardQueryBuilder:
             (unknown_sql, unknown_params, unknown_info),
             (filtered_sql, filtered_params, filtered_info),
         ):
-            assert "FROM spans FINAL" in sql
             assert "_raw_attr_candidate_limit" not in sql
             assert not any(key.startswith("_raw_attr_slice_") for key in params)
             assert "query_status" not in info
+        assert "latest_custom_metric_spans AS" in unknown_sql
+        assert "FROM spans FINAL" not in unknown_sql
+        assert "argMax(" in unknown_sql
+        assert "tupleElement(latest_metric_state, 1) = 0" in unknown_sql
+        assert "tupleElement(latest_metric_state, 3) = 1" in unknown_sql
+        assert "FROM spans FINAL" in filtered_sql
         assert "attrs_number" in unknown_sql
         assert "legacy_numeric_attribute" in unknown_params.values()
         assert "attrs_string" in filtered_sql
@@ -7126,7 +7349,14 @@ class TestDashboardQuerySerializer:
         sql, params = DashboardQueryBuilderV2(
             serializer.validated_data
         ).build_metric_query(metric)
-        assert "avg(attrs_number[%(custom_metric_attr_key)s])" in sql
+        assert "avg(metric_value)" in sql
+        assert "latest_custom_metric_spans AS" in sql
+        assert "FROM spans FINAL" not in sql
+        assert "mapContains(" in sql
+        assert "attrs_number[%(custom_metric_attr_key)s]" in sql
+        assert "tupleElement(latest_metric_state, 1) = 0" in sql
+        assert "tupleElement(latest_metric_state, 3) = 1" in sql
+        assert "GROUP BY\n                    project_id," in sql
         assert params["custom_metric_attr_key"] == "call.total_turns"
 
     @pytest.mark.parametrize("aggregation", ["min", "max"])
@@ -7156,7 +7386,9 @@ class TestDashboardQuerySerializer:
         sql, params = DashboardQueryBuilderV2(
             serializer.validated_data
         ).build_metric_query(metric)
-        assert f"{aggregation}(attrs_number[%(custom_metric_attr_key)s])" in sql
+        assert f"{aggregation}(metric_value)" in sql
+        assert "latest_custom_metric_spans AS" in sql
+        assert "FROM spans FINAL" not in sql
         assert params["custom_metric_attr_key"] == "call.total_turns"
 
     def test_text_custom_metric_count_keeps_string_default_when_type_is_omitted(self):
@@ -8303,9 +8535,12 @@ class TestDashboardV2RewriteRouting:
         sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
         compact_sql = " ".join(sql.split())
 
-        # One survivor-map lookup resolves span ids; the second resolves rows in
-        # the curated dimension before they are collapsed to one label/type.
-        assert compact_sql.count("end_user_id_remap FINAL") >= 4
+        # The one request-scoped survivor map is reused for both span ids and
+        # curated dimension rows; it never materializes a tenant-global window.
+        assert compact_sql.count("end_user_id_remap FINAL") == 2
+        assert "dashboard_candidate_end_user_ids AS" in compact_sql
+        assert "FROM spans PREWHERE project_id IN %(project_ids)s" in compact_sql
+        assert "OVER (PARTITION BY new_id)" not in compact_sql
         assert "AS eu_remap ON sp.end_user_id = eu_remap.any_id" in compact_sql
         assert (
             "AS eu_dimension_remap ON eu.end_user_id = eu_dimension_remap.any_id"
@@ -8381,6 +8616,10 @@ class TestDashboardV2RewriteRouting:
         )
         assert "matched_user.project_id AS project_id" in compact_sql
         assert "AS user_filter_physical_map" in compact_sql
+        assert "filtered_dimension_candidate.project_id IN %(project_ids)s" in (
+            compact_sql
+        )
+        assert "OVER (PARTITION BY new_id)" not in compact_sql
         assert "PREWHERE sp.project_id IN %(project_ids)s" in compact_sql
         assert "sp.start_time >= %(start_date)s" in compact_sql
         assert "sp.start_time < %(end_date)s" in compact_sql
@@ -8410,6 +8649,9 @@ class TestDashboardV2RewriteRouting:
         assert "trace_session_id_remap" in sql
         assert "end_user_id_remap" not in sql
         assert "AS session_filter_physical_map" in sql
+        assert "old_id IN %(direct_session_filter_uuids)s" in sql
+        assert "new_id IN %(direct_session_filter_uuids)s" in sql
+        assert "OVER (PARTITION BY new_id)" not in sql
         assert "sp.trace_session_id IN (" in sql
         assert "PREWHERE sp.project_id IN %(project_ids)s" in sql
         assert len(params["direct_session_filter_uuids"]) == 1
@@ -8444,6 +8686,7 @@ class TestDashboardV2RewriteRouting:
         assert "end_user_id_remap" in sql
         assert "session_filter_physical_map" in sql
         assert "user_filter_physical_map" in sql
+        assert "OVER (PARTITION BY new_id)" not in sql
 
     def test_invalid_positive_session_filter_short_circuits_physical_scan(self):
         config = _single_metric_config(
@@ -8675,6 +8918,8 @@ class TestDashboardV2RewriteRouting:
         assert "OR sp.end_user_id IN (" in compact_sql
         assert "AS fallback_user_physical_map" in compact_sql
         assert "WHERE survivor_id IN %(direct_user_fallback_uuids)s" in compact_sql
+        assert "old_id IN %(direct_user_fallback_uuids)s" in compact_sql
+        assert "OVER (PARTITION BY new_id)" not in compact_sql
         assert params["direct_user_fallback_uuids"] == (fallback_user_id,)
         assert params["direct_user_fallback_uuid_0"] == fallback_user_id
 

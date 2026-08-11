@@ -129,6 +129,7 @@ _LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ = 192 * 1024 * 1024
 # every root batch while preserving chronological fallback for heavy Map/JSON.
 _LONG_WINDOW_CANDIDATE_WITNESS_STRATA = 1
 _LONG_WINDOW_ORDERED_ROOT_INITIAL_SLICE = timedelta(hours=1)
+_USER_DETAIL_FILTER_TIMEOUT_MS = 30_000
 _UNINDEXED_POSITIVE_MICRO_SEED_WIDTH = timedelta(minutes=5)
 _UNINDEXED_POSITIVE_MICRO_SEED_STRATA = 4
 _CANONICAL_TRACE_ID_SEED_PREDICATE = re.compile(
@@ -446,9 +447,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def _positive_exact_end_user_seed_filter(self) -> dict[str, Any] | None:
         """Return the sole exact user alias filter eligible for root seeding.
 
-        User-detail trace pages add one ``user``/``user_id`` equality while
-        retaining a separate time predicate.  Other relational shapes stay on
-        the candidate classifier path: negation, substring matching, and
+        User-detail trace pages add one structural ``user``/``user_id`` or
+        ``end_user_id`` equality while retaining a separate time predicate.
+        An explicitly raw ``SPAN_ATTRIBUTE`` with the same key must keep its
+        ordinary attribute semantics. Other relational shapes stay on the
+        candidate classifier path: negation, substring matching, and
         combinations can be common enough that they are not safe selective
         seeds.
         """
@@ -458,10 +461,18 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return None
         item = active_filters[0]
         key = item.get("column_id") or item.get("columnId")
-        if key not in {"user", "user_id"}:
+        if key not in {"end_user_id", "user", "user_id"}:
             return None
         config = item.get("filter_config") or item.get("filterConfig") or {}
         if not isinstance(config, dict):
+            return None
+        col_type = str(config.get("col_type") or config.get("colType") or "").upper()
+        if col_type not in {"", "NORMAL", "SYSTEM_METRIC", "TRACE_END_USER"}:
+            return None
+        filter_type = str(
+            config.get("filter_type") or config.get("filterType") or ""
+        ).lower()
+        if filter_type not in {"", "text"}:
             return None
         operation = normalize_filter_op(
             config.get("filter_op") or config.get("filterOp")
@@ -481,6 +492,79 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return None
         return item
 
+    def _positive_exact_end_user_span_seed(self) -> tuple[str, dict[str, Any]]:
+        """Compile the direct span predicate for candidate-first user seeding.
+
+        ``user``/``user_id`` values are external identifiers, so resolve them
+        through the existing curated end-user/remap expansion before probing
+        the indexed span UUID. ``end_user_id`` is already a physical structural
+        UUID and can use the normal direct-column compiler. The returned
+        predicate is a necessary candidate condition only; the existing finite
+        latest-state classifier remains authoritative for publication.
+        """
+
+        filter_item = self._positive_exact_end_user_seed_filter()
+        if filter_item is None:
+            return "", {}
+        key = filter_item.get("column_id") or filter_item.get("columnId")
+        config = (
+            filter_item.get("filter_config") or filter_item.get("filterConfig") or {}
+        )
+        operation = normalize_filter_op(
+            config.get("filter_op") or config.get("filterOp")
+        )
+        value = config.get("filter_value", config.get("filterValue"))
+        filter_builder = self._FILTER_BUILDER_CLS(
+            table=self.TABLE,
+            query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_SPAN,
+            project_id=self.project_id,
+            project_ids=self.project_ids,
+            score_date_scope=False,
+            span_date_scope=True,
+            strict_enduser_project_correlation=True,
+        )
+        if key in {"user", "user_id"}:
+            external_column = filter_builder._ENDUSER_STRING_COLUMNS[key]
+            inner = filter_builder._build_column_condition(
+                external_column,
+                "text",
+                operation,
+                value,
+            )
+            if not inner:
+                return "", {}
+            predicate = (
+                "end_user_id IN ("
+                f"{filter_builder._enduser_dimension_id_subquery(inner)}"
+                ")"
+            )
+        else:
+            predicate = filter_builder._build_column_condition(
+                "end_user_id",
+                "text",
+                operation,
+                value,
+            )
+        return predicate or "", dict(filter_builder._params)
+
+    def supports_filter_candidate_seed_page(self) -> bool:
+        """Use candidate-first roots only for the public user-detail shape."""
+
+        return bool(
+            not self._bounded_internal_scan
+            and not self._bounded_identity_only
+            and not self._bounded_bulk_scan
+            and not self._bounded_population_proof
+            and not self.sort_params
+            and self._positive_exact_end_user_seed_filter() is not None
+        )
+
+    @staticmethod
+    def filter_candidate_seed_proves_result_order() -> bool:
+        """Candidate-first membership is followed by ordered root selection."""
+
+        return True
+
     def _positive_exact_end_user_seed(self) -> tuple[str, dict[str, Any]]:
         """Compile an indexed, project/time-scoped trace-membership superset."""
 
@@ -498,6 +582,24 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         )
         predicate, params = filter_builder.translate([filter_item])
         return predicate or "", params
+
+    def recommended_filter_query_timeout_ms(self) -> int | None:
+        """Use the request deadline for every public filtered trace page.
+
+        The endpoint owns one 30-second wall, while finite candidate, query-count,
+        byte, memory, thread and result controls still bound each physical read.
+        Optional anchor/proof builders retain their independently shorter timeout
+        recommendations. Internal bulk/workflow readers keep their existing
+        statement contract.
+        """
+
+        if (
+            not self._bounded_internal_scan
+            and not self._bounded_bulk_scan
+            and not self._bounded_population_proof
+        ):
+            return _USER_DETAIL_FILTER_TIMEOUT_MS
+        return None
 
     def _structured_attribute_filter_count(self) -> int:
         """Count canonical array/object leaves evaluated from JSON overflow."""
@@ -1189,6 +1291,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def supports_filter_anchor_probe(self) -> bool:
         """Whether a direct any-span leaf can classify sparse vs common."""
 
+        # The positive user-detail shape already has an exact, indexed,
+        # remap-bounded membership seed.  A speculative any-span anchor adds a
+        # shorter statement timeout in front of that authoritative path and can
+        # make a healthy large-remap request fail before the seed is attempted.
+        if self._positive_exact_end_user_seed_filter() is not None:
+            return False
         return bool(self._filter_anchor_plans())
 
     @staticmethod
@@ -2289,6 +2397,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         before_start_time: datetime | None = None,
         before_id: Any = None,
         direction: str = "older",
+        _positive_user_candidate_first: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Return a root-ordered superset after a common anchor sentinel.
 
@@ -2303,6 +2412,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             raise ValueError("limit must be greater than zero")
         if (before_start_time is None) != (before_id is None):
             raise ValueError("trace keyset values must be provided together")
+        if (
+            _positive_user_candidate_first
+            and not self.supports_filter_candidate_seed_page()
+        ):
+            raise ValueError("trace user candidate seed is unavailable")
         request_start, request_end = self.parse_time_range(self.filters)
         if not request_start <= slice_start < slice_end <= request_end:
             raise ValueError("trace seed slice must stay inside the request window")
@@ -2352,11 +2466,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     if f"%({key})s" in seed_predicate
                 }
             )
-        end_user_seed_predicate, end_user_seed_params = (
-            self._positive_exact_end_user_seed()
-        )
+        if _positive_user_candidate_first:
+            end_user_seed_predicate, end_user_seed_params = (
+                self._positive_exact_end_user_span_seed()
+            )
+        else:
+            end_user_seed_predicate, end_user_seed_params = (
+                self._positive_exact_end_user_seed()
+            )
         params.update(end_user_seed_params)
-        if end_user_seed_predicate:
+        if end_user_seed_predicate and not _positive_user_candidate_first:
             root_seed_predicates.append(end_user_seed_predicate)
         root_predicate = " AND ".join(root_seed_predicates)
         predicate_fragment = f"AND {root_predicate}" if root_predicate else ""
@@ -2445,13 +2564,34 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         identity_limit_by = (
             "project_id, trace_id" if self.project_ids is not None else "trace_id"
         )
+        candidate_cte = ""
+        candidate_membership_fragment = ""
+        if _positive_user_candidate_first:
+            if not end_user_seed_predicate:
+                raise ValueError("trace user candidate predicate is unavailable")
+            candidate_cte = f"""
+        WITH matching_user_trace_identities AS (
+            SELECT DISTINCT project_id, trace_id
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND ({end_user_seed_predicate})
+        )
+            """
+            candidate_membership_fragment = """
+          AND (project_id, trace_id) IN (
+              SELECT project_id, trace_id
+              FROM matching_user_trace_identities
+          )
+            """
         query = f"""
+        {candidate_cte}
         SELECT {identity_select}, id AS root_span_id, start_time
         FROM {self.TABLE}
         PREWHERE {self.project_filter_sql()}
           AND is_deleted = 0
           {project_version_fragment}
           {trace_id_prewhere_fragment}
+          {candidate_membership_fragment}
           AND (parent_span_id IS NULL OR parent_span_id = '')
           AND start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)
           AND start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)
@@ -2464,6 +2604,27 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         LIMIT %(filter_seed_limit)s
         """
         return query, params
+
+    def build_filter_candidate_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+        before_start_time: datetime | None = None,
+        before_id: Any = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Seed ordered roots from a sole positive structural user first."""
+
+        return TraceListQueryBuilder.build_filter_ordered_seed_page(
+            self,
+            slice_start=slice_start,
+            slice_end=slice_end,
+            limit=limit,
+            before_start_time=before_start_time,
+            before_id=before_id,
+            _positive_user_candidate_first=True,
+        )
 
     def build_filter_navigation_seed_page(
         self,

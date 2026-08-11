@@ -43,11 +43,15 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS,
     ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+    ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS,
     ATTRIBUTE_READ_MAX_PROJECTS,
     ATTRIBUTE_READ_MAX_QUERY_COUNT,
+    ATTRIBUTE_READ_METADATA_TIMEOUT_MS,
+    ATTRIBUTE_READ_QUERY_TIMEOUT_MS,
     ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT,
     ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
+    ATTRIBUTE_READ_WALL_TIMEOUT_MS,
     ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_GUARD_MARGIN_MS,
@@ -90,6 +94,21 @@ from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 NOW = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
 PROJECT_A = "c4de3065-12b5-488c-a814-aa1c8e3f856f"
 PROJECT_B = "790063cd-bc6a-4ad0-866b-35f11b5bc29b"
+
+
+def test_production_attribute_reads_use_one_30s_authoritative_deadline():
+    assert ATTRIBUTE_READ_WALL_TIMEOUT_MS == 30_000
+    assert ATTRIBUTE_READ_QUERY_TIMEOUT_MS == ATTRIBUTE_READ_WALL_TIMEOUT_MS
+    assert ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS == ATTRIBUTE_READ_WALL_TIMEOUT_MS
+    assert ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS == ATTRIBUTE_READ_WALL_TIMEOUT_MS
+    # These probes are optional accelerators. Their failures publish no cursor
+    # progress, and their shorter caps preserve time for the exact fallback.
+    assert (
+        ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS < ATTRIBUTE_READ_WALL_TIMEOUT_MS
+    )
+    assert ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS < ATTRIBUTE_READ_WALL_TIMEOUT_MS
+    assert ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS < ATTRIBUTE_READ_WALL_TIMEOUT_MS
+    assert ATTRIBUTE_READ_METADATA_TIMEOUT_MS < ATTRIBUTE_READ_WALL_TIMEOUT_MS
 
 
 @dataclass(frozen=True)
@@ -568,21 +587,24 @@ def test_empty_key_inventory_walks_five_bounded_ch25_segments():
         assert "OBSERVATION_TYPE ASC" in upper_sql
         assert "SERVICE_NAME ASC" in upper_sql
         assert "TOSTARTOFHOUR(ATTRIBUTE_SOURCE.START_TIME) ASC" in upper_sql
-        assert call.timeout_ms <= 1_500
+        assert 0 < call.timeout_ms <= ATTRIBUTE_READ_QUERY_TIMEOUT_MS
         assert call.settings["max_threads"] == 1
         assert call.settings["optimize_use_projections"] == 0
         assert call.settings["allow_experimental_projection_optimization"] == 0
         assert call.settings["use_skip_indexes"] == 0
         assert call.settings["optimize_read_in_order"] == 1
         assert call.settings["max_block_size"] == 8_192
-        assert call.settings["max_memory_usage"] <= 512 * 1024 * 1024
+        assert call.settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         assert call.settings["max_bytes_to_read"] <= 512 * 1024 * 1024
-        assert call.settings["max_rows_to_read"] == 500_000
+        assert "max_rows_to_read" not in call.settings
         assert call.settings["max_result_rows"] == ATTRIBUTE_READ_CANDIDATE_LIMIT + 1
         assert call.settings["timeout_overflow_mode"] == "throw"
     assert all("attributes_extra" not in call.sql for call in typed_calls)
     assert all("attrs_string" not in call.sql for call in json_calls)
-    assert all(call.timeout_ms <= 750 for call in json_calls)
+    assert all(
+        0 < call.timeout_ms <= ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS
+        for call in json_calls
+    )
 
 
 def test_streaming_candidate_avoids_datetime_bucket_type_coercion():
@@ -1774,7 +1796,7 @@ def test_detail_read_uses_latest_versions_and_does_not_resurrect_tombstones():
     assert "argMax(" in replay.sql
     assert "_version" in replay.sql
     assert " FINAL " not in f" {replay.sql.upper()} "
-    assert replay.settings["max_rows_to_read"] == 500_000
+    assert "max_rows_to_read" not in replay.settings
     assert replay.settings["max_bytes_to_read"] == 512 * 1024 * 1024
 
 
@@ -1862,7 +1884,7 @@ def test_exact_structured_json_key_is_not_reported_as_complete_empty():
         ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1
     )
     assert json_seed.settings["max_bytes_to_read"] == 64 * 1024 * 1024
-    assert json_seed.settings["max_rows_to_read"] == 100_000
+    assert "max_rows_to_read" not in json_seed.settings
 
 
 def test_explicit_fourteen_day_exact_json_key_uses_one_bounded_identity_sample():
@@ -1928,7 +1950,7 @@ def test_explicit_fourteen_day_exact_json_key_uses_one_bounded_identity_sample()
         ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1
     )
     assert json_calls[0].settings["max_bytes_to_read"] == 64 * 1024 * 1024
-    assert json_calls[0].settings["max_rows_to_read"] == 100_000
+    assert "max_rows_to_read" not in json_calls[0].settings
     assert len(hydration_calls[0].params["candidate_ids_0"]) <= (
         ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT
     )
@@ -1955,7 +1977,7 @@ def test_exact_json_key_read_budget_becomes_an_explicit_sample():
     json_call = executor.calls[-1]
     assert "attributes_extra" not in json_call.sql
     assert "JSONHas(" not in json_call.sql
-    assert json_call.timeout_ms <= 750
+    assert 0 < json_call.timeout_ms <= ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS
     assert json_call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
 
 
@@ -1976,7 +1998,7 @@ def test_exact_typed_key_read_budget_is_not_published_as_a_sample():
 
     assert len(executor.calls) == 1
     assert "mapKeys(attrs_string)" in executor.calls[0].sql
-    assert executor.calls[0].timeout_ms == ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS
+    assert 0 < executor.calls[0].timeout_ms <= ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS
 
 
 def test_exact_typed_key_timeout_keeps_query_safety_caps() -> None:
@@ -1999,19 +2021,19 @@ def test_exact_typed_key_timeout_keeps_query_safety_caps() -> None:
     assert read.rows == (AttributeKeyRow("final_status", "string", 1),)
     assert len(executor.calls) == 2
     assert all(
-        call.timeout_ms == ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS
+        0 < call.timeout_ms <= ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS
         for call in executor.calls
     )
     assert all(call.settings["max_threads"] == 1 for call in executor.calls)
     assert all(
-        call.settings["max_memory_usage"] <= 512 * 1024 * 1024
+        call.settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         for call in executor.calls
     )
     assert all(
         call.settings["max_bytes_to_read"] <= 512 * 1024 * 1024
         for call in executor.calls
     )
-    assert all(call.settings["max_rows_to_read"] == 500_000 for call in executor.calls)
+    assert all("max_rows_to_read" not in call.settings for call in executor.calls)
 
 
 def test_structured_json_value_picker_is_explicitly_degraded():
@@ -3311,7 +3333,7 @@ def test_filter_value_cursor_resource_telemetry_sizes_below_adjacent_byte_cliff(
         == proof_calls[1].params["segment_end_us"]
     )
     assert proof_calls[0].settings["max_bytes_to_read"] == 1_024 * 1024 * 1024
-    assert proof_calls[0].settings["max_rows_to_read"] == 500_000
+    assert "max_rows_to_read" not in proof_calls[0].settings
     assert read.rows == ()
     assert read.browse_status == "exhausted"
     assert read.has_more is False
@@ -5080,8 +5102,8 @@ def test_filter_value_cursor_typed_distinct_sentinel_is_an_exact_fallback():
     assert "distinct_overflow_mode" not in distinct_call.settings
     assert distinct_call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
     assert distinct_call.settings["max_threads"] == 1
-    assert distinct_call.settings["max_memory_usage"] == 256 * 1024 * 1024
-    assert distinct_call.settings["max_rows_to_read"] == 500_000
+    assert distinct_call.settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+    assert "max_rows_to_read" not in distinct_call.settings
     assert distinct_call.settings["max_bytes_to_read"] == 1024 * 1024 * 1024
     assert distinct_call.settings["max_result_rows"] == 2
     assert distinct_call.settings["max_result_bytes"] == 16 * 1024 * 1024
@@ -6728,7 +6750,7 @@ def test_explicit_window_json_value_runs_after_all_typed_bands_are_empty():
     assert all("attribute_search" not in call.params for call in candidate_calls)
     first_json_call = candidate_calls[-1]
     assert first_json_call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
-    assert first_json_call.settings["max_rows_to_read"] == 100_000
+    assert "max_rows_to_read" not in first_json_call.settings
     assert first_json_call.settings["max_block_size"] == 2_048
     json_hydration = next(
         call
@@ -7089,7 +7111,7 @@ def test_json_budget_failure_keeps_verified_typed_key_inventory_usable(code: int
     json_call = next(
         call for call in executor.calls if "attributes_extra NOT IN" in call.sql
     )
-    assert json_call.timeout_ms <= 750
+    assert 0 < json_call.timeout_ms <= ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS
     typed_call = next(
         call for call in executor.calls if "length(attrs_string.keys)" in call.sql
     )
@@ -7183,10 +7205,13 @@ def test_absent_heavy_json_key_uses_only_bounded_identity_seeds():
         call for call in candidate_calls if "candidate_version" not in call.sql
     ]
     assert len(json_calls) == len(windows)
-    assert all(call.timeout_ms <= 750 for call in json_calls)
+    assert all(
+        0 < call.timeout_ms <= ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS
+        for call in json_calls
+    )
     assert all(
         call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
-        and call.settings["max_rows_to_read"] == 100_000
+        and "max_rows_to_read" not in call.settings
         and call.settings["max_block_size"] == 2_048
         for call in json_calls
     )
@@ -8054,8 +8079,9 @@ def test_span_attribute_key_cursor_collapses_empty_historical_suffix(monkeypatch
     assert len(widths) < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
 
 
+@pytest.mark.parametrize("failure_stage", ["candidate", "replay"])
 def test_span_attribute_key_cursor_retries_expanded_batch_without_moving_checkpoint(
-    monkeypatch,
+    monkeypatch, failure_stage
 ):
     duplicate_key = "already_seen"
     unique_key = "reachable_after_expanded_retry"
@@ -8100,13 +8126,14 @@ def test_span_attribute_key_cursor_retries_expanded_batch_without_moving_checkpo
         typed_only=True,
         json_attribute_mode="structured",
     )
-    calls: list[tuple[int, tuple[str, str, str, datetime] | None]] = []
+    calls: list[tuple[int, tuple[str, str, str, datetime] | None, int | None]] = []
+    replay_calls: list[tuple[int, int | None]] = []
 
     def candidates(_projects, segment, **kwargs):
         limit = kwargs["candidate_limit"]
         before_identity = kwargs.get("before_identity")
-        calls.append((limit, before_identity))
-        if limit > 64:
+        calls.append((limit, before_identity, kwargs.get("query_timeout_ms")))
+        if limit > 64 and failure_stage == "candidate":
             raise ReadDeadlineExceeded("expanded replay exceeded its short budget")
         matches = [
             identity
@@ -8120,13 +8147,19 @@ def test_span_attribute_key_cursor_retries_expanded_batch_without_moving_checkpo
         return tuple(matches[:limit]), len(matches) > limit, {}
 
     monkeypatch.setattr(selector, "_candidate_ids", candidates)
-    monkeypatch.setattr(
-        selector,
-        "_verify_latest",
-        lambda *_args, **kwargs: [
-            rows[identity] for identity in kwargs.get("candidate_ids", ())
-        ],
-    )
+
+    def verify(*_args, **kwargs):
+        candidate_ids = kwargs.get("candidate_ids", ())
+        timeout_ms = kwargs.get("query_timeout_ms")
+        replay_calls.append((len(candidate_ids), timeout_ms))
+        if (
+            failure_stage == "replay"
+            and timeout_ms == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+        ):
+            raise ReadDeadlineExceeded("expanded replay exceeded its short budget")
+        return [rows[identity] for identity in candidate_ids]
+
+    monkeypatch.setattr(selector, "_verify_latest", verify)
 
     page = selector.read_key_cursor_page(
         [PROJECT_A],
@@ -8138,10 +8171,12 @@ def test_span_attribute_key_cursor_retries_expanded_batch_without_moving_checkpo
 
     assert [row.key for row in page.rows] == [unique_key]
     assert calls[:3] == [
-        (64, None),
-        (128, identities[63]),
-        (64, identities[63]),
+        (64, None, None),
+        (128, identities[63], ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS),
+        (64, identities[63], None),
     ]
+    if failure_stage == "replay":
+        assert replay_calls[1][1] == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
 
 
 def test_span_attribute_key_cursor_exact_search_continues_until_verified_match(
@@ -9026,6 +9061,57 @@ def test_attribute_cursor_continues_retained_bound_operation_budget():
     assert page.has_more is False
     assert page.metadata.query_count == len(executor.calls)
     assert page.metadata.query_count >= 2
+
+
+def test_attribute_retained_bound_budget_falls_back_without_starving_cursor(
+    monkeypatch,
+):
+    class ManualClock:
+        value = 100.0
+
+        def __call__(self):
+            return self.value
+
+    clock = ManualClock()
+
+    class Capacity:
+        def __init__(self):
+            self.timeouts: list[float] = []
+
+        def acquire(self, *, timeout):
+            self.timeouts.append(timeout)
+            if len(self.timeouts) == 1:
+                clock.value += timeout
+                return False
+            return True
+
+        def release(self):
+            return None
+
+    capacity = Capacity()
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.attribute_reads._ATTRIBUTE_READ_CAPACITY",
+        capacity,
+    )
+    executor = RecordingExecutor()
+    selector = AttributeReadSelector(executor, now=NOW, clock=clock)
+
+    retained_start = selector.retained_window_start([PROJECT_A], window_end=NOW)
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=retained_start,
+        window_end=NOW,
+        continue_operation=True,
+    )
+
+    assert retained_start == datetime(1970, 1, 1, tzinfo=UTC)
+    assert capacity.timeouts[0] == ATTRIBUTE_READ_METADATA_TIMEOUT_MS / 1000
+    assert capacity.timeouts[1] > capacity.timeouts[0]
+    assert any("segment_start" in call.params for call in executor.calls)
+    assert all(0 < call.timeout_ms <= 30_000 for call in executor.calls)
+    assert clock.value < 101.0
+    assert page.metadata.query_count == len(executor.calls)
 
 
 @pytest.mark.parametrize(
@@ -10535,6 +10621,118 @@ def test_eval_picker_uses_selector_for_keys_and_cardinality_without_pg_fallback(
         "typed_only": True,
         "json_attribute_mode": "all",
         "exact_key": "rare.customer.key",
+    }
+
+
+def test_eval_picker_generic_inventory_prefers_one_recent_dense_segment(monkeypatch):
+    """A dense active project must not begin with the legacy seven-day scan."""
+
+    from tracer.views.observation_span import ObservationSpanView
+
+    calls: list[dict[str, Any]] = []
+
+    def discover_keys(self, project_ids, exact_key=None, **kwargs):
+        calls.append(
+            {
+                "project_ids": project_ids,
+                "exact_key": exact_key,
+                **kwargs,
+            }
+        )
+        window_start = kwargs["window_start"]
+        window_end = kwargs["window_end"]
+        return AttributeKeyRead(
+            (AttributeKeyRow("final_status", "string", 1),),
+            AttributeReadMetadata(
+                query_complete=True,
+                query_status="complete",
+                query_error_code=None,
+                query_window_start=window_start,
+                query_window_end=window_end,
+                query_count=2,
+            ),
+        )
+
+    monkeypatch.setattr(AttributeReadSelector, "discover_keys", discover_keys)
+    monkeypatch.setattr(
+        ObservationSpanView,
+        "_attribute_project_for_request",
+        staticmethod(lambda _request, _project_id: True),
+    )
+    request = _authenticated_get(
+        "/tracer/observation-span/get_eval_attributes_list/",
+        {"filters": json.dumps({"project_id": PROJECT_A})},
+    )
+
+    response = ObservationSpanView.as_view({"get": "get_eval_attributes_list"})(request)
+
+    assert response.status_code == 200
+    assert response.data["result"] == ["final_status"]
+    assert response.data["query_complete"] is False
+    assert response.data["query_status"] == "sampled"
+    assert response.data["query_error_code"] == "sample_limit"
+    assert len(calls) == 1
+    assert calls[0]["project_ids"] == [PROJECT_A]
+    assert calls[0]["exact_key"] is None
+    assert (
+        calls[0]["window_end"] - calls[0]["window_start"]
+        == ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    )
+
+
+def test_eval_picker_empty_recent_segment_preserves_historical_fallback(monkeypatch):
+    """Sparse projects still search the existing adaptive historical bands."""
+
+    from tracer.views.observation_span import ObservationSpanView
+
+    calls: list[dict[str, Any]] = []
+
+    def discover_keys(self, project_ids, exact_key=None, **kwargs):
+        calls.append(
+            {
+                "project_ids": project_ids,
+                "exact_key": exact_key,
+                **kwargs,
+            }
+        )
+        if kwargs:
+            return AttributeKeyRead(
+                (),
+                AttributeReadMetadata(
+                    query_complete=True,
+                    query_status="complete",
+                    query_error_code=None,
+                    query_window_start=kwargs["window_start"],
+                    query_window_end=kwargs["window_end"],
+                    query_count=2,
+                ),
+            )
+        return AttributeKeyRead(
+            (AttributeKeyRow("historical_status", "string", 1),),
+            _metadata(),
+        )
+
+    monkeypatch.setattr(AttributeReadSelector, "discover_keys", discover_keys)
+    monkeypatch.setattr(
+        ObservationSpanView,
+        "_attribute_project_for_request",
+        staticmethod(lambda _request, _project_id: True),
+    )
+    request = _authenticated_get(
+        "/tracer/observation-span/get_eval_attributes_list/",
+        {"filters": json.dumps({"project_id": PROJECT_A})},
+    )
+
+    response = ObservationSpanView.as_view({"get": "get_eval_attributes_list"})(request)
+
+    assert response.status_code == 200
+    assert response.data["result"] == ["historical_status"]
+    assert response.data["query_complete"] is True
+    assert len(calls) == 2
+    assert calls[0]["window_end"] - calls[0]["window_start"] == timedelta(hours=6)
+    assert calls[1] == {
+        "project_ids": [PROJECT_A],
+        "exact_key": None,
     }
 
 

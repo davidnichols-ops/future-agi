@@ -512,6 +512,39 @@ class TestTraceSessionExportAPI:
 class TestTraceSessionGraphAPI:
     """Tests for POST /tracer/trace-session/get_session_graph_data/ endpoint."""
 
+    def test_session_graph_uses_30_second_wall_without_row_read_cap(self):
+        from tracer.services.clickhouse.read_budget import ReadDeadline
+        from tracer.services.clickhouse.session_graph import (
+            SESSION_GRAPH_QUERY_TIMEOUT_MS,
+            SESSION_GRAPH_WALL_DEADLINE_MS,
+            _DeadlineBoundAnalytics,
+        )
+
+        delegate = mock.Mock()
+        delegate.execute_ch_query.return_value = mock.Mock(data=[])
+        analytics = _DeadlineBoundAnalytics(
+            delegate,
+            ReadDeadline.start(SESSION_GRAPH_WALL_DEADLINE_MS),
+        )
+
+        analytics.execute_ch_query(
+            "SELECT 1",
+            timeout_ms=60_000,
+            settings={"max_rows_to_read": 1, "max_threads": 8},
+        )
+
+        call = delegate.execute_ch_query.call_args
+        assert SESSION_GRAPH_WALL_DEADLINE_MS == 30_000
+        assert SESSION_GRAPH_QUERY_TIMEOUT_MS == 30_000
+        assert 0 < call.kwargs["timeout_ms"] <= 30_000
+        settings = call.kwargs["settings"]
+        assert "max_rows_to_read" not in settings
+        assert settings["max_threads"] == 1
+        assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+        assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+        assert settings["max_result_rows"] == 10_001
+        assert settings["max_result_bytes"] == 32 * 1024 * 1024
+
     def test_session_filter_uses_clickhouse_graph(self, auth_client, observe_project):
         session_id = "003b76f1-2b4a-4af5-b0dc-224d687374d4"
         graph = {
@@ -1418,10 +1451,11 @@ class TestTraceSessionWorkspaceScopeAPI:
         assert "positionCaseInsensitiveUTF8(val, %(filter_value_search)s)" in query
         assert params["filter_value_search"] == "Needle"
         assert params["result_limit"] == 51
-        assert call.kwargs["timeout_ms"] == 4_000
+        assert call.kwargs["timeout_ms"] == 30_000
         settings = call.kwargs["settings"]
-        assert settings["max_rows_to_read"] == 2_000_000
+        assert "max_rows_to_read" not in settings
         assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+        assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         assert settings["timeout_overflow_mode"] == "throw"
         assert settings["read_overflow_mode"] == "throw"
 
@@ -1587,9 +1621,15 @@ class TestTraceSessionWorkspaceScopeAPI:
         payload = str(get_result(response))
         assert "secret-internal-query" not in payload
         assert "DB::Exception" not in payload
-        settings = analytics.execute_ch_query.call_args.kwargs["settings"]
-        assert settings["max_rows_to_read"] == 500_000
+        call = analytics.execute_ch_query.call_args
+        assert call.kwargs["timeout_ms"] == 30_000
+        settings = call.kwargs["settings"]
+        assert "max_rows_to_read" not in settings
         assert settings["max_bytes_to_read"] == 256 * 1024 * 1024
+        assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+        assert settings["max_result_rows"] == 50
+        assert settings["max_result_bytes"] == 32 * 1024 * 1024
+        assert settings["max_threads"] == 2
         assert settings["timeout_overflow_mode"] == "throw"
 
     @pytest.mark.parametrize(
@@ -1670,11 +1710,12 @@ class TestTraceSessionWorkspaceScopeAPI:
             assert "sum(total_tokens) AS total_tokens" in sql
             assert "HAVING total_tokens >" in sql
         for call in analytics.execute_ch_query.call_args_list:
+            assert SESSION_LIST_QUERY_TIMEOUT_MS == 30_000
             assert 0 < call.kwargs["timeout_ms"] <= SESSION_LIST_QUERY_TIMEOUT_MS
             settings = call.kwargs["settings"]
-            assert settings["max_rows_to_read"] == 10_000_000
+            assert "max_rows_to_read" not in settings
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
-            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
             assert settings["max_result_rows"] > 0
             assert settings["max_result_bytes"] == 32 * 1024 * 1024
             assert settings["result_overflow_mode"] == "throw"
@@ -1804,6 +1845,14 @@ class TestTraceSessionWorkspaceScopeAPI:
         assert get_result(response)["values"] == [
             {"value": session_id, "label": "session-alpha"}
         ]
+        call = analytics.execute_ch_query.call_args
+        assert call.kwargs["timeout_ms"] == 30_000
+        settings = call.kwargs["settings"]
+        assert "max_rows_to_read" not in settings
+        assert settings["max_result_rows"] == 50
+        assert settings["max_bytes_to_read"] == 256 * 1024 * 1024
+        assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+        assert settings["max_threads"] == 2
 
     def test_session_filter_values_dedupe_straddlers_through_remap(
         self, auth_client, observe_project

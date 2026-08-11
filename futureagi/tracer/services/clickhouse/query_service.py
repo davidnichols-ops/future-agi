@@ -40,10 +40,9 @@ class SpanTraceMapIntegrityError(ReadDeadlineExceeded):
 
 _PAGE_EVAL_READ_SETTINGS = {
     "max_threads": 2,
-    "max_rows_to_read": 2_000_000,
     "read_overflow_mode": "throw",
     "max_bytes_to_read": 256 * 1024 * 1024,
-    "max_memory_usage": 128 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "timeout_overflow_mode": "throw",
 }
 

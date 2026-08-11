@@ -367,6 +367,7 @@ class TestSpanAttributeKeysPartitionPruning:
     def test_preserves_hard_query_limits(self, monkeypatch):
         from tracer.services.clickhouse.attribute_reads import (
             ATTRIBUTE_READ_CANDIDATE_LIMIT,
+            ATTRIBUTE_READ_QUERY_TIMEOUT_MS,
         )
 
         sql, params, timeout_ms, settings = self._capture_calls(
@@ -374,10 +375,10 @@ class TestSpanAttributeKeysPartitionPruning:
         )[0]
         assert "LIMIT %(candidate_limit)s" in sql
         assert params["candidate_limit"] == ATTRIBUTE_READ_CANDIDATE_LIMIT + 1
-        assert timeout_ms <= 1_500
+        assert 0 < timeout_ms <= ATTRIBUTE_READ_QUERY_TIMEOUT_MS
         assert settings["max_threads"] == 1
         assert settings["max_bytes_to_read"] <= 512 * 1024 * 1024
-        assert settings["max_rows_to_read"] == 500_000
+        assert "max_rows_to_read" not in settings
         assert settings["optimize_use_projections"] == 0
         assert settings["allow_experimental_projection_optimization"] == 0
         assert settings["use_skip_indexes"] == 0

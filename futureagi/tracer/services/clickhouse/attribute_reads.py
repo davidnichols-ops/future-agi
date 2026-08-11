@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import structlog
+
 from tracer.services.clickhouse.attribute_cursor_state import (
     ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
 )
@@ -52,27 +53,29 @@ JsonScalar = str | int | float | bool
 AttributeValue = str | int | float | bool | tuple[JsonScalar, ...]
 
 ATTRIBUTE_READ_HORIZON_DAYS = (7, 14, 30, 180, 365)
-# Generic browse/value discovery keeps a short per-statement budget. Exact
-# typed-key lookup gets a little more room because it must build three existing
-# Map-key bloom conditions before the bounded identity seed can begin; the US
-# incident query was cut off at the old 1.5 s client boundary. The independent
-# six-second operation wall and every thread/row/byte/memory ceiling remain
-# unchanged. JSON overflow retains its separate 750 ms cap below.
-ATTRIBUTE_READ_WALL_TIMEOUT_MS = 6_000
-ATTRIBUTE_READ_QUERY_TIMEOUT_MS = 1_500
-ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS = 3_000
+# Attribute inventory and value reads use the same hard 30-second production
+# ceiling as the surrounding API. Each statement receives only the operation's
+# remaining time; finite query-count, candidate, byte, memory, and result caps
+# continue to bound the work independently of source-row volume.
+ATTRIBUTE_READ_WALL_TIMEOUT_MS = 30_000
+ATTRIBUTE_READ_QUERY_TIMEOUT_MS = 30_000
+ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS = 30_000
 # Keep one operation below the production low-load harness ceiling (32) even
 # when a typed value page needs candidate, version-certificate, and hydration
 # queries. Candidate-page caps bound discovery breadth; this separate ceiling
 # bounds the actual ClickHouse attempts those pages can expand into.
 ATTRIBUTE_READ_MAX_QUERY_COUNT = 30
-# JSON overflow has no key skip index. Keep its independent lane short so a
-# rare/absent JSON key cannot consume the whole picker deadline after typed Map
-# rows have already been verified.
-ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS = 750
+# JSON overflow has no key skip index, but it still follows the one shared
+# operation deadline rather than imposing a smaller data-dependent cutoff.
+ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS = 30_000
+# The active-part lower bound is only a pagination accelerator: Unix epoch is
+# the conservative lossless fallback. Keep this metadata probe short so it
+# cannot consume the authoritative cursor read's shared 30-second wall.
+ATTRIBUTE_READ_METADATA_TIMEOUT_MS = 750
+ATTRIBUTE_READ_FALLBACK_RETAINED_START = datetime(1970, 1, 1, tzinfo=UTC)
 # Production A/B on the largest US project showed that one-day and 12-hour
-# attribute seeds exceed the 500k-row picker envelope on historical dense
-# windows, while six-hour seeds return the exact requested key/value in a
+# attribute seeds exceed the picker byte envelope on historical dense windows,
+# while six-hour seeds return the exact requested key/value in a
 # bounded sample. Keep this below the storage-density failure threshold; the
 # whole-operation query/deadline caps still bound long-window discovery.
 ATTRIBUTE_READ_EXPLICIT_SEGMENT = timedelta(hours=6)
@@ -95,7 +98,7 @@ ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT = 6
 # First probes cover all adaptive bands before these pages run round-robin, so a
 # dense recent week cannot hide an older value. A first sample that already has
 # usable values remains a visibly degraded sample instead of paying for a full
-# global sort. The six-second wall deadline remains the tighter production cap.
+# global sort. The 30-second wall deadline remains the tighter production cap.
 ATTRIBUTE_READ_VALUE_CANDIDATE_PAGE_LIMIT = 6
 ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT = 15
 ATTRIBUTE_READ_MAX_KEYS = 1_000
@@ -114,7 +117,7 @@ ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE = 50
 # de-duplication prefix can grow beyond this optimization ceiling; in that case
 # an overflowing proof simply falls back to the ordinary exact physical walk at
 # the unchanged frontier. DISTINCT state remains bounded by the independent
-# read-row, read-byte, memory, statement, and wall limits below rather than
+# read-byte, memory, statement, and wall limits below rather than
 # max_rows_in_distinct, which races the SQL LIMIT.
 ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS = (
     ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE + 1
@@ -136,7 +139,7 @@ ATTRIBUTE_VALUE_CURSOR_DUPLICATE_ONLY_MAX_CANDIDATE_PAGES = (
 # candidate in that half-open physical slice.  Grow only after such a proof so
 # sparse retained history does not require one public cursor round-trip per
 # day.  The 60-day ceiling still exhausts a frozen 365-day window in a small,
-# finite number of statements, while the selector's independent six-second /
+# finite number of statements, while the selector's independent 30-second /
 # 30-query ceilings remain the hard request bound.
 ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT = timedelta(days=60)
 # A widened physical candidate slice is an optional accelerator.  If
@@ -149,7 +152,7 @@ ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS = 750
 # falling back to a physical latest-state walk. Search pages advance only when
 # that superset has no relevant value; continuations may also prove every
 # relevant value is already in their exact digest vocabulary. Start below the
-# one-hour density that can exceed the project-wide 500k-row envelope, then grow
+# one-hour density that can exceed the finite byte envelope, then grow
 # successful proofs under the bounded speculative policy below.
 # Start at the production-qualified floor: a failed five-minute probe can consume the
 # request's whole read-volume allowance before the selector gets a chance to
@@ -180,7 +183,7 @@ ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS = 500
 # between freeze the width. Missing progress telemetry preserves the legacy
 # time-only policy for compatible external executors.
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION = 0.25
-# Dense projects can cross the ordinary row/byte envelope even inside the
+# Dense projects can cross the ordinary byte envelope even inside the
 # production-qualified six-hour seed.  A failed statement proves nothing, so
 # retry its identical newest-first frontier in this smaller exact slice before
 # exposing an unavailable picker response.
@@ -229,9 +232,9 @@ ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT = timedelta(days=60)
 # A missing candidate proves the whole queried slice has no selectable key, so
 # the next adjacent slice may widen.  Dense attribute-free intervals can still
 # exceed the read envelope. On a typed budget failure, jump directly to a
-# five-minute slice instead of spending the six-second request wall on several
+# five-minute slice instead of spending the request wall on several
 # doomed halvings. No cursor progress is published until that retry succeeds.
-# Every successful statement therefore stays inside the same row/byte/time
+# Every successful statement therefore stays inside the same byte/time
 # ceilings while sparse retained history remains reachable in practical pages.
 # Sixty days is the largest ordinary empty slice.  After a successful empty
 # proof, older slices may grow beyond it under a short speculative statement
@@ -259,9 +262,8 @@ ATTRIBUTE_READ_SETTINGS: dict[str, Any] = {
     # A small block lets LIMIT BY stop dense candidate scans promptly instead
     # of pulling the default ~65k-row block after the 513th identity.
     "max_block_size": 8_192,
-    "max_memory_usage": 256 * _MIB,
+    "max_memory_usage": 36 * 1024 * _MIB,
     "max_bytes_to_read": 512 * _MIB,
-    "max_rows_to_read": 500_000,
     "read_overflow_mode": "throw",
     "max_result_rows": ATTRIBUTE_READ_CANDIDATE_LIMIT + 1,
     "max_result_bytes": 16 * _MIB,
@@ -276,7 +278,6 @@ ATTRIBUTE_READ_SETTINGS: dict[str, Any] = {
 _JSON_VALUE_CANDIDATE_SETTINGS: dict[str, Any] = {
     "max_block_size": 2_048,
     "max_bytes_to_read": 64 * _MIB,
-    "max_rows_to_read": 100_000,
 }
 
 # A single indexed Map granule on the largest production tenant exceeds the
@@ -290,12 +291,11 @@ _ATTRIBUTE_VALUE_PROOF_MAP_SETTINGS: dict[str, Any] = {
 
 # The ordered fallback stops at a 65-row sentinel, but ClickHouse may have to
 # admit one whole physical granule before LIMIT can fire.  Coletia has a
-# 542,110-row granule, just above the generic 500k guard.  This candidate-only
-# ceiling lets that finite keyset seed complete; latest-version replay remains
-# bounded to the returned identities and the memory/byte limits are unchanged.
+# very large granule before LIMIT can stop. This candidate-only byte allowance
+# lets that finite keyset seed complete; latest-version replay remains bounded
+# to the returned identities and the memory/byte limits are unchanged.
 _ATTRIBUTE_VALUE_CANDIDATE_MAP_SETTINGS: dict[str, Any] = {
     "max_bytes_to_read": 1_024 * _MIB,
-    "max_rows_to_read": 1_000_000,
 }
 
 _TYPE_PRIORITY: dict[AttributeType, int] = {
@@ -1135,14 +1135,16 @@ _LATEST_CARDINALITY_SQL = """
 class AttributeReadSelector:
     """Thin typed selector shared by every production attribute picker.
 
-    Each public operation gets one six-second wall budget shared by all of its
+    Each public operation gets one 30-second wall budget shared by all of its
     adaptive candidate and latest-state replay queries. Default-horizon reads
     keep the existing finite band/page caps; caller-supplied windows are split
     into adjacent six-hour probes under the same whole-operation deadline. Common
     dense typed reads stop after one candidate/replay pair and explicitly
     report a sample. Reusing a
     selector for a second public operation starts a fresh operation budget;
-    per-query caps remain 1.5 s.
+    authoritative statements receive the remaining operation wall. Optional
+    speculative accelerators retain shorter fail-open budgets so they cannot
+    consume the exact fallback's deadline.
     """
 
     def __init__(
@@ -1209,7 +1211,9 @@ class AttributeReadSelector:
         latest/live attributes and costs no span-row scan. It lets cursors prove
         exhaustion at the real table-retention boundary instead of emitting
         empty continuations back to 1970. ``None`` means the spans table has no
-        active part before the frozen window.
+        active part before the frozen window. A read-budget failure returns
+        Unix epoch, the conservative lossless bound, so this optional metadata
+        optimization cannot make the authoritative cursor unavailable.
         """
 
         self._begin_operation()
@@ -1217,14 +1221,20 @@ class AttributeReadSelector:
         if not projects:
             return None
         end = _utc(window_end)
-        rows = self._execute(
-            _GLOBAL_RETAINED_START_SQL,
-            {
-                "window_end_us": _unix_microseconds(end),
-            },
-            max_result_rows=1,
-            query_timeout_ms=ATTRIBUTE_READ_QUERY_TIMEOUT_MS,
-        )
+        try:
+            rows = self._execute(
+                _GLOBAL_RETAINED_START_SQL,
+                {
+                    "window_end_us": _unix_microseconds(end),
+                },
+                max_result_rows=1,
+                query_timeout_ms=ATTRIBUTE_READ_METADATA_TIMEOUT_MS,
+            )
+        except Exception as exc:
+            if not is_read_budget_error(exc):
+                raise
+            logger.warning("attribute_retained_window_metadata_budget_exceeded")
+            return ATTRIBUTE_READ_FALLBACK_RETAINED_START
         if len(rows) != 1:
             raise IncompleteLatestStateReplay(
                 "Attribute retained-window query returned an invalid result"
@@ -1288,8 +1298,20 @@ class AttributeReadSelector:
         remaining_ms = int((self._deadline - self._clock()) * 1000)
         if remaining_ms < 25:
             raise ReadDeadlineExceeded("Attribute read deadline exceeded")
+        timeout_cap_ms = (
+            ATTRIBUTE_READ_QUERY_TIMEOUT_MS
+            if query_timeout_ms is None
+            else min(
+                max(int(query_timeout_ms), 1),
+                ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS,
+            )
+        )
+        # Admission is part of the read, not free time before it. In
+        # particular, a fail-open speculative probe must not wait for the
+        # semaphore longer than its own short cap and consume the exact
+        # fallback's whole operation wall.
         acquired = _ATTRIBUTE_READ_CAPACITY.acquire(
-            timeout=max(self._deadline - self._clock(), 0)
+            timeout=max(min(remaining_ms, timeout_cap_ms), 0) / 1000
         )
         if not acquired:
             raise ReadDeadlineExceeded("Attribute read capacity is busy")
@@ -1302,14 +1324,6 @@ class AttributeReadSelector:
                     "Attribute read query limit exceeded"
                 )
             self._query_count += 1
-            timeout_cap_ms = (
-                ATTRIBUTE_READ_QUERY_TIMEOUT_MS
-                if query_timeout_ms is None
-                else min(
-                    max(int(query_timeout_ms), 1),
-                    ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS,
-                )
-            )
             self._last_query_time_ms = None
             self._last_query_read_rows = None
             self._last_query_read_bytes = None
@@ -3498,7 +3512,7 @@ class AttributeReadSelector:
         )
         # Once ClickHouse rejects a widened empty slice, remember that ceiling
         # for the rest of this request.  Re-doubling immediately after the
-        # successful narrower retry would repeatedly spend the six-second wall
+        # successful narrower retry would repeatedly spend the request wall
         # budget on the same known-failing shape while walking sparse history.
         max_empty_segment_width = current_segment_end - start
         exact_probe_segment_end: datetime | None = None
@@ -3749,7 +3763,7 @@ class AttributeReadSelector:
                         ordered=False,
                         before_identity=None,
                         candidate_limit=ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT,
-                        query_timeout_ms=ATTRIBUTE_READ_QUERY_TIMEOUT_MS,
+                        query_timeout_ms=ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
                     )
                     candidate_pages += 1
                     exact_rows = self._verify_latest(
@@ -3757,7 +3771,7 @@ class AttributeReadSelector:
                         project_ids=projects,
                         candidate_ids=exact_candidate_ids,
                         attribute_key=exact_key,
-                        query_timeout_ms=ATTRIBUTE_READ_QUERY_TIMEOUT_MS,
+                        query_timeout_ms=ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
                     )
                     exact_rows_by_identity = {
                         self._physical_identity(row): row for row in exact_rows
@@ -3797,13 +3811,16 @@ class AttributeReadSelector:
                     candidate_limit=candidate_limit,
                     query_timeout_ms=(
                         ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
-                        if cursor_before is None
-                        and (
-                            current_segment_end - current_segment_start
-                            > ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT
-                            or exact_key is not None
-                            and current_segment_end - current_segment_start
-                            > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                        if candidate_limit > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                        or (
+                            cursor_before is None
+                            and (
+                                current_segment_end - current_segment_start
+                                > ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT
+                                or exact_key is not None
+                                and current_segment_end - current_segment_start
+                                > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                            )
                         )
                         else None
                     ),
@@ -3900,7 +3917,7 @@ class AttributeReadSelector:
                     candidate_ids=candidate_ids,
                     attribute_key=exact_key,
                     query_timeout_ms=(
-                        ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS
+                        ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
                         if candidate_limit > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
                         else None
                     ),
@@ -4664,7 +4681,6 @@ class AttributeReadSelector:
                         query_timeout_ms=proof_timeout_ms,
                     )
                     proof_query_time_ms = self._last_query_time_ms
-                    proof_read_rows = self._last_query_read_rows
                     proof_read_bytes = self._last_query_read_bytes
                 except Exception as exc:
                     if not is_read_budget_error(exc):
@@ -4757,12 +4773,12 @@ class AttributeReadSelector:
                     # A searched proof with no relevant raw value is an exact
                     # empty slice. Keep walking adjacent safe slices; handing
                     # this frontier to the geometrically widened physical path
-                    # would reintroduce the known Coletia row/byte failures.
+                    # would reintroduce the known Coletia byte failures.
                     empty_segment_width = proven_width
                     last_successful_segment_width = proven_width
                 # A completed proof advances this exact half-open slice before
                 # deciding how to read the next adjacent one. Native progress
-                # is the only proactive signal of row/byte pressure: preserve
+                # is the only proactive signal of byte pressure: preserve
                 # four-times headroom for unknown adjacent density, shrinking
                 # a width already at one quarter of a cap and freezing
                 # intermediate widths. Cheap, low-volume slices still grow
@@ -4770,7 +4786,6 @@ class AttributeReadSelector:
                 failed_distinct_ceiling = None
                 resource_utilizations = []
                 for consumed, cap in (
-                    (proof_read_rows, ATTRIBUTE_READ_SETTINGS["max_rows_to_read"]),
                     (
                         proof_read_bytes,
                         _ATTRIBUTE_VALUE_PROOF_MAP_SETTINGS["max_bytes_to_read"],

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import structlog
 from django.db import models, transaction
@@ -52,6 +52,7 @@ from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     UnsupportedFilterShapeError,
 )
 from tracer.services.clickhouse.read_budget import (
+    ReadDeadline,
     is_clickhouse_api_read_unavailable_error,
 )
 from tracer.services.clickhouse.v2.query_builders.user_list import (
@@ -79,6 +80,50 @@ from tracer.utils.graphs_optimized import (
 from tracer.utils.helper import get_default_project_version_config, get_sort_query
 
 logger = structlog.get_logger(__name__)
+
+# The Observe landing page is on the critical navigation path. Its activity
+# cells must preserve exact latest-root semantics and root event time. The
+# insert-only count rollup cannot retract tombstones or guarantee historical
+# coverage, while ``traces.created_at`` is arrival time and mis-buckets late
+# telemetry. The deployed replacement identity contains the start-hour and the
+# table is partitioned by event day, so one physical identity cannot cross a
+# midnight boundary. Read three adjacent 30-day chunks under one wall deadline
+# and collapse the complete replacement key explicitly. This keeps peak state
+# below the monolithic 90-day ``FINAL`` merge while preserving exact tombstones
+# and producer event time. No source-row ceiling is allowed.
+_PROJECT_ACTIVITY_TIMEOUT_MS = 30_000
+_PROJECT_ACTIVITY_CHUNK_DAYS = 30
+_PROJECT_ACTIVITY_READ_SETTINGS = {
+    "max_threads": 1,
+    "max_block_size": 8_192,
+    "read_overflow_mode": "throw",
+    "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
+    "max_bytes_before_external_group_by": 64 * 1024 * 1024,
+    "optimize_aggregation_in_order": 1,
+    "max_result_rows": 1_000,
+    "result_overflow_mode": "throw",
+    "timeout_overflow_mode": "throw",
+}
+
+# The legacy per-user metrics panel is still a production Observe read even
+# though the project-level user graph has moved to exact snapshots. Keep this
+# one statement under the same public contract: source-row volume is not an
+# error condition, while bytes, memory, result size, threads, and wall time are
+# finite and fail closed.
+_PROJECT_USER_GRAPH_TIMEOUT_MS = 30_000
+_PROJECT_USER_GRAPH_READ_SETTINGS = {
+    "max_threads": 1,
+    "max_block_size": 8_192,
+    "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
+    "max_bytes_before_external_group_by": 64 * 1024 * 1024,
+    "max_result_rows": 10_000,
+    "max_result_bytes": 32 * 1024 * 1024,
+    "read_overflow_mode": "throw",
+    "result_overflow_mode": "throw",
+    "timeout_overflow_mode": "throw",
+}
 
 
 class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
@@ -508,88 +553,170 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             daily_volume_map = {}
             last_active_map = {}
             project_ids = [str(p["id"]) for p in projects_data]
+            activity_query_complete = not project_ids
+            activity_error_code = None
             if project_ids:
                 try:
                     service = V2AnalyticsQueryService()
-                    thirty_days_ago = (datetime.now() - timedelta(days=30)).strftime(
-                        "%Y-%m-%d"
-                    )
-                    ninety_days_ago = (datetime.now() - timedelta(days=90)).strftime(
-                        "%Y-%m-%d"
-                    )
-                    activity_query = """
-                        WITH latest_roots AS (
-                            SELECT
-                                project_id,
-                                trace_id,
-                                id,
-                                start_time,
-                                argMax(tuple(parent_span_id), _version).1
-                                    AS latest_parent_span_id,
-                                argMax(is_deleted, _version) AS latest_is_deleted
-                            FROM spans
-                            PREWHERE project_id IN %(pids)s
-                              AND start_time >= %(since_90d)s
-                            GROUP BY project_id, trace_id, id, start_time
-                        ), daily AS (
-                            SELECT
-                                project_id,
-                                toDate(start_time) AS day,
-                                count() AS day_volume,
-                                max(start_time) AS day_last_active
-                            FROM latest_roots
-                            WHERE latest_is_deleted = 0
-                              AND latest_parent_span_id = ''
-                            GROUP BY project_id, day
-                        )
-                        SELECT
-                            toString(project_id) AS project_id,
-                            sumIf(day_volume, day >= toDate(%(since_30d)s)) AS volume,
-                            max(day_last_active) AS last_active,
-                            groupArrayIf(
-                                tuple(toString(day), day_volume),
-                                day >= toDate(%(since_30d)s)
-                            ) AS daily_volume
-                        FROM daily
-                        GROUP BY project_id
-                    """
-                    activity_result = service.execute_ch_query(
-                        activity_query,
-                        {
-                            "pids": project_ids,
-                            "since_30d": thirty_days_ago,
-                            "since_90d": ninety_days_ago,
-                        },
-                        timeout_ms=5000,
-                    )
-                    daily_map_raw = {}
-                    last_active_map = {}
-                    for row in activity_result.data:
-                        pid = str(row["project_id"])
-                        volume_map[pid] = int(row.get("volume") or 0)
-                        daily_map_raw[pid] = {
-                            str(day): int(volume)
-                            for day, volume in (row.get("daily_volume") or [])
-                        }
-                        last_active = row.get("last_active")
-                        last_active_map[pid] = (
-                            last_active.isoformat() if last_active else None
-                        )
-
-                    # Fill in missing days with zero for the fixed sparkline
-                    # response contract.
-                    for pid in project_ids:
-                        daily_volume_map[pid] = [
-                            daily_map_raw.get(pid, {}).get(
-                                (datetime.now() - timedelta(days=29 - offset)).strftime(
-                                    "%Y-%m-%d"
-                                ),
-                                0,
-                            )
-                            for offset in range(30)
-                        ]
                 except Exception as e:
-                    logger.warning(f"CH volume query failed, falling back to 0: {e}")
+                    activity_error_code = "project_activity_unavailable"
+                    logger.warning(f"CH project activity client unavailable: {e}")
+                else:
+                    try:
+                        # A readonly=1 / locked ClickHouse profile strips every
+                        # query-local row, byte, memory, and execution-time cap.
+                        # This high-volume optional read is safe only when the
+                        # server accepts the finite settings below; otherwise
+                        # fail closed without issuing it.
+                        if not service.supports_per_query_read_settings:
+                            raise RuntimeError(
+                                "exact project activity read requires enforced "
+                                "per-query limits"
+                            )
+                        activity_today = timezone.now().date()
+                        volume_window_start = activity_today - timedelta(days=29)
+                        activity_window_start = activity_today - timedelta(days=89)
+                        activity_window_end = activity_today + timedelta(days=1)
+                        activity_deadline = ReadDeadline.start(
+                            _PROJECT_ACTIVITY_TIMEOUT_MS
+                        )
+                        activity_query = """
+                                WITH latest_physical_spans AS (
+                                    SELECT
+                                        project_id,
+                                        argMax(
+                                            tuple(
+                                                parent_span_id,
+                                                start_time,
+                                                is_deleted
+                                            ),
+                                            _version
+                                        ) AS latest_span_state
+                                    FROM spans
+                                    PREWHERE project_id IN %(pids)s
+                                      AND toDate(start_time) >=
+                                          toDate(%(activity_start)s)
+                                      AND toDate(start_time) <
+                                          toDate(%(activity_end)s)
+                                      AND start_time >= toDateTime64(
+                                          %(activity_start)s, 6, 'UTC'
+                                      )
+                                      AND start_time < toDateTime64(
+                                          %(activity_end)s, 6, 'UTC'
+                                      )
+                                    GROUP BY
+                                        project_id,
+                                        observation_type,
+                                        service_name,
+                                        toStartOfHour(start_time),
+                                        trace_id,
+                                        id
+                                ), live_daily AS (
+                                    SELECT
+                                        project_id,
+                                        toDate(latest_span_state.2) AS day,
+                                        count() AS day_volume,
+                                        max(latest_span_state.2) AS day_last_active
+                                    FROM latest_physical_spans
+                                    WHERE latest_span_state.3 = 0
+                                      AND latest_span_state.1 = ''
+                                      AND latest_span_state.2 >= toDateTime64(
+                                          %(activity_start)s, 6, 'UTC'
+                                      )
+                                      AND latest_span_state.2 < toDateTime64(
+                                          %(activity_end)s, 6, 'UTC'
+                                      )
+                                    GROUP BY project_id, day
+                                )
+                                SELECT
+                                    toString(project_id) AS project_id_text,
+                                    sumIf(
+                                        day_volume,
+                                        day >= toDate(%(volume_start)s)
+                                    ) AS volume,
+                                    max(day_last_active) AS last_active,
+                                    arraySort(
+                                        item -> item.1,
+                                        groupArrayIf(
+                                            tuple(toString(day), day_volume),
+                                            day >= toDate(%(volume_start)s)
+                                        )
+                                    ) AS daily_volume
+                                FROM live_daily
+                                GROUP BY project_id
+                            """
+
+                        # Parse every chunk into request-local pending maps and
+                        # publish all three activity fields only after the full
+                        # 90-day window succeeds. A later cap breach, timeout,
+                        # or malformed row discards every earlier chunk.
+                        pending_volume_map = dict.fromkeys(project_ids, 0)
+                        pending_daily_map_raw = {pid: {} for pid in project_ids}
+                        pending_last_active_values = dict.fromkeys(project_ids)
+                        chunk_start = activity_window_start
+                        while chunk_start < activity_window_end:
+                            chunk_end = min(
+                                chunk_start
+                                + timedelta(days=_PROJECT_ACTIVITY_CHUNK_DAYS),
+                                activity_window_end,
+                            )
+                            activity_result = service.execute_ch_query(
+                                activity_query,
+                                {
+                                    "pids": project_ids,
+                                    "activity_start": chunk_start.strftime("%Y-%m-%d"),
+                                    "activity_end": chunk_end.strftime("%Y-%m-%d"),
+                                    "volume_start": volume_window_start.strftime(
+                                        "%Y-%m-%d"
+                                    ),
+                                },
+                                timeout_ms=activity_deadline.remaining_ms(),
+                                settings=_PROJECT_ACTIVITY_READ_SETTINGS,
+                            )
+                            for row in activity_result.data:
+                                pid = str(row["project_id_text"])
+                                if pid not in pending_volume_map:
+                                    continue
+                                pending_volume_map[pid] += int(row.get("volume") or 0)
+                                for day, day_volume in row.get("daily_volume") or []:
+                                    pending_daily_map_raw[pid][str(day)] = int(
+                                        day_volume
+                                    )
+                                last_active = row.get("last_active")
+                                previous_last_active = pending_last_active_values[pid]
+                                if last_active and (
+                                    previous_last_active is None
+                                    or last_active > previous_last_active
+                                ):
+                                    pending_last_active_values[pid] = last_active
+                            chunk_start = chunk_end
+
+                        pending_daily_volume_map = {
+                            pid: [
+                                pending_daily_map_raw[pid].get(
+                                    (
+                                        volume_window_start + timedelta(days=offset)
+                                    ).strftime("%Y-%m-%d"),
+                                    0,
+                                )
+                                for offset in range(30)
+                            ]
+                            for pid in project_ids
+                        }
+                        pending_last_active_map = {
+                            pid: (last_active.isoformat() if last_active else None)
+                            for pid, last_active in pending_last_active_values.items()
+                        }
+                        volume_map = pending_volume_map
+                        daily_volume_map = pending_daily_volume_map
+                        last_active_map = pending_last_active_map
+                        activity_query_complete = True
+                    except Exception as e:
+                        volume_map = {}
+                        daily_volume_map = {}
+                        last_active_map = {}
+                        activity_error_code = "project_activity_unavailable"
+                        logger.warning(f"CH exact project activity query failed: {e}")
 
             # Run counts — count ProjectVersions per project
             run_count_map = {}
@@ -629,11 +756,25 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             result = [
                 {
                     "name": project["name"],
-                    "last_30_days_vol": volume_map.get(str(project["id"]), 0),
-                    "daily_volume": daily_volume_map.get(str(project["id"]), []),
+                    "last_30_days_vol": (
+                        volume_map.get(str(project["id"]), 0)
+                        if activity_query_complete
+                        else None
+                    ),
+                    "daily_volume": (
+                        daily_volume_map.get(str(project["id"]), [])
+                        if activity_query_complete
+                        else None
+                    ),
                     "created_at": project["created_at"],
                     "updated_at": project["updated_at"],
-                    "last_active": last_active_map.get(str(project["id"])),
+                    "last_active": (
+                        last_active_map.get(str(project["id"]))
+                        if activity_query_complete
+                        else None
+                    ),
+                    "activity_query_complete": activity_query_complete,
+                    "activity_error_code": activity_error_code,
                     "run_count": run_count_map.get(str(project["id"]), 0),
                     "issues": alert_count_map.get(str(project["id"]), 0),
                     "tags": project.get("tags") or [],
@@ -775,6 +916,14 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             _org = get_request_organization(request) or request.user.organization
             _org_id = str(_org.id)
             analytics = V2AnalyticsQueryService()
+            if not analytics.supports_per_query_read_settings:
+                logger.warning("project_user_metrics_requires_enforced_read_limits")
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "User metrics are temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            deadline = ReadDeadline.start(_PROJECT_USER_GRAPH_TIMEOUT_MS)
             builder = UserListQueryBuilderV2(
                 organization_id=_org_id,
                 workspace_id=str(request.workspace.id),
@@ -786,7 +935,12 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                 ),
             )
             query, params = builder.build()
-            result = analytics.execute_ch_query(query, params, timeout_ms=30000)
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=deadline.remaining_ms(),
+                settings=_PROJECT_USER_GRAPH_READ_SETTINGS,
+            )
             output = []
             for row in builder.format_rows(result.data)["table"]:
                 output.append(
@@ -1009,6 +1163,14 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                     body["filters"],
                 )
                 analytics = V2AnalyticsQueryService()
+                if not analytics.supports_per_query_read_settings:
+                    logger.warning("project_user_graph_requires_enforced_read_limits")
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "User graph data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
+                deadline = ReadDeadline.start(_PROJECT_USER_GRAPH_TIMEOUT_MS)
                 _org = get_request_organization(request) or request.user.organization
                 builder = UserDetailTimeSeriesQueryBuilderV2(
                     project_id=project_id,
@@ -1021,7 +1183,12 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                 start_date = builder.start_date
                 end_date = builder.end_date
                 assert start_date is not None and end_date is not None
-                result = analytics.execute_ch_query(query, params, timeout_ms=10000)
+                result = analytics.execute_ch_query(
+                    query,
+                    params,
+                    timeout_ms=deadline.remaining_ms(),
+                    settings=_PROJECT_USER_GRAPH_READ_SETTINGS,
+                )
                 rows = result.data or []
 
                 def _series(source_key, output_key):

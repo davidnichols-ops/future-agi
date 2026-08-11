@@ -28,6 +28,7 @@ from typing import Any
 
 import structlog
 from django.db import DatabaseError, connection, transaction
+
 from model_hub.models.choices import AnnotationTypeChoices
 from model_hub.models.score import Score
 from tracer.models.custom_eval_config import CustomEvalConfig
@@ -55,7 +56,6 @@ from tracer.services.clickhouse.query_builders.user_list import UserListQueryBui
 from tracer.services.clickhouse.read_budget import is_read_budget_error
 from tracer.services.clickhouse.v2.id_remap_sql import (
     resolved_id_expr,
-    survivor_map_subquery,
 )
 from tracer.services.clickhouse.v2.query_builders.agent_graph import (
     AgentGraphQueryBuilderV2,
@@ -77,19 +77,11 @@ from tracer.utils.helper import get_annotation_labels_for_project
 
 logger = structlog.get_logger(__name__)
 
-# Exact graphs run only in the deduplicated background refresh activity; the US
-# production deployment admits that activity through the single-slot
-# ``exact_aggregation`` queue, while deployments without that worker retain the
-# compatible ``tasks_xl`` route. The HTTP request schedules the work and polls
-# the last complete snapshot. The production qualification set contains valid exact queries with
-# p95 958s and
-# a 1032.479s ceiling, so the old five-minute ClickHouse deadline rejected
-# healthy work.  The largest production tenant already contains more than
-# 207M physical rows in a twelve-month window.  Give an exact refresh up to
-# 55 minutes while retaining an independent five-minute activity shutdown
-# margin; HTTP requests never wait for this work and keep serving the last
-# atomically published exact snapshot.
-EXACT_GRAPH_QUERY_TIMEOUT_MS = 3_300_000
+# Exact graphs run only in a deduplicated background refresh and publish
+# atomically, but their database reads still share the production hard
+# 30-second ceiling. Source-row volume is not capped; byte, memory, result,
+# partition, and admission limits remain the independent safety boundaries.
+EXACT_GRAPH_QUERY_TIMEOUT_MS = 30_000
 # This partition size belongs to the PostgreSQL-backed annotation membership
 # reader below. Most system graphs deliberately remain one ClickHouse statement
 # so CH25.3 cannot stitch independently changing ReplacingMergeTree snapshots.
@@ -108,9 +100,10 @@ EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE = 5_000
 # an exact broadness sentinel, not sampling or a public result ceiling.
 EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL = 1_001
 # Broad positive scalar Map filters use an authoritative latest-state scan over
-# disjoint whole-hour storage identities.  Two hours stays below the 15-second
-# statement ceiling on the densest observed production period; the corresponding
-# three-hour page exceeded it after the transport sentinel was raised to 50k.
+# disjoint whole-hour storage identities. Two hours stayed below 15 seconds on
+# the densest observed production period; the corresponding three-hour page
+# exceeded that qualification boundary after the transport sentinel was raised
+# to 50k. The production statement ceiling is now 30 seconds.
 # A failing slice is still split to whole-hour children without publishing its
 # partial rows.
 EXACT_GRAPH_TRACE_ANCHOR_PARTITION_WIDTH = timedelta(hours=2)
@@ -123,7 +116,7 @@ EXACT_GRAPH_TRACE_ANCHOR_MIN_PARTITION_WIDTH = timedelta(hours=1)
 EXACT_GRAPH_TRACE_ANCHOR_MAX_WORKERS = 2
 EXACT_GRAPH_TRACE_ANCHOR_PAGE_SIZE = 50_000
 EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL = EXACT_GRAPH_TRACE_ANCHOR_PAGE_SIZE + 1
-EXACT_GRAPH_TRACE_ANCHOR_QUERY_TIMEOUT_MS = 15_000
+EXACT_GRAPH_TRACE_ANCHOR_QUERY_TIMEOUT_MS = 30_000
 EXACT_GRAPH_TRACE_ANCHOR_MAX_BYTES_TO_READ = 20 * 1024 * 1024 * 1024
 # Scanning complete retained history is worthwhile only when the requested
 # root window is both substantial in absolute terms and covers a meaningful
@@ -152,7 +145,7 @@ EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE = 5_000
 # contribution at 0.95 seconds and 1.79 GB. Preserve explicit headroom, then
 # bisect a hotter tenant-specific batch instead of allowing one statement to
 # inherit the whole background-refresh deadline.
-EXACT_GRAPH_TRACE_CONTRIBUTION_QUERY_TIMEOUT_MS = 15_000
+EXACT_GRAPH_TRACE_CONTRIBUTION_QUERY_TIMEOUT_MS = 30_000
 EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ = 20 * 1024 * 1024 * 1024
 # Witness work runs only in the exact-snapshot background activity; public
 # graph polls never wait on an individual statement.  Production qualification
@@ -163,8 +156,8 @@ EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ = 20 * 1024 * 1024 * 1024
 # ceiling, while the former 10-second ceiling discarded the same work and
 # replayed both halves.  Match the independently bounded witness/contribution
 # statements; adaptive bisection remains fail-closed for any hotter batch.
-EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS = 15_000
-EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 15_000
+EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS = 30_000
+EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 30_000
 EXACT_GRAPH_TRACE_INITIAL_SLICE = timedelta(minutes=5)
 # A failed raw witness slice is retried at the same upper bound so no interval
 # is skipped. Thirty seconds bounds retry fan-out while still allowing a hot
@@ -193,10 +186,14 @@ EXACT_GRAPH_SPAN_MAX_PARTITION_WIDTH = timedelta(days=1)
 # current slice was cheap. All growth/retry widths remain integer multiples of
 # the one-hour storage-identity floor.
 EXACT_GRAPH_SPAN_GROW_BELOW_QUERY_MS = 250.0
-EXACT_GRAPH_SPAN_PARTITION_QUERY_TIMEOUT_MS = 15_000
+EXACT_GRAPH_SPAN_PARTITION_QUERY_TIMEOUT_MS = 30_000
 EXACT_GRAPH_MAX_RESULT_ROWS = 10_000
 EXACT_GRAPH_RESULT_ROW_SENTINEL = EXACT_GRAPH_MAX_RESULT_ROWS + 1
 EXACT_GRAPH_MAX_RESULT_BYTES = 32 * 1024 * 1024
+# The previous 64-GiB ceiling missed one qualified production read by less
+# than 1 MiB. Preserve finite read-volume admission with 50% measured headroom
+# instead of disabling the control entirely. Row volume remains uncapped.
+EXACT_GRAPH_MAX_BYTES_TO_READ = 96 * 1024 * 1024 * 1024
 EXACT_GRAPH_READ_SETTINGS = {
     "max_threads": 1,
     # Attribute maps are several KiB per row on the heaviest tenants.  Smaller
@@ -224,20 +221,17 @@ EXACT_GRAPH_READ_SETTINGS = {
     # immutable project/time predicates to PREWHERE.
     "optimize_move_to_prewhere_if_final": 0,
     "use_skip_indexes_if_final": 0,
-    # Row/byte volume is data, not an error condition.  Production evidence
-    # shows 207,479,677 physical rows in a valid twelve-month window and a
-    # seven-day attribute graph reading 68,719,963,633 bytes: the former was
-    # rejected by the old 100M-row cap and the latter crossed the old 64-GiB
-    # cap by 486,897 bytes.  ClickHouse defines zero as unlimited for these two
-    # settings.  Time, memory, default one-thread execution, refresh admission,
-    # bounded result size, and atomic publication remain the operational
-    # safeguards.
-    "max_rows_to_read": 0,
-    "max_bytes_to_read": 0,
+    # Source-row volume is data, not an error condition, so there is no
+    # max_rows_to_read setting. Production evidence includes 207,479,677
+    # physical rows in one valid twelve-month window. The finite byte ceiling
+    # above admits the measured 68,719,963,633-byte graph with explicit
+    # headroom while time, memory, thread, result, and refresh-admission limits
+    # remain independently enforced.
+    "max_bytes_to_read": EXACT_GRAPH_MAX_BYTES_TO_READ,
     # The same observed seven-day read peaked at 1,055,221,165 bytes.  Preserve
     # measured headroom while spilling compact aggregation/sort state early;
     # the production exact-aggregation worker has a separate 32-GiB pod limit.
-    "max_memory_usage": 1536 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "max_result_rows": EXACT_GRAPH_RESULT_ROW_SENTINEL,
     "max_result_bytes": EXACT_GRAPH_MAX_RESULT_BYTES,
@@ -258,7 +252,6 @@ EXACT_GRAPH_TRACE_CLASSIFIER_READ_SETTINGS = {
 }
 EXACT_GRAPH_SPAN_PARTITION_READ_SETTINGS = {
     **EXACT_GRAPH_READ_SETTINGS,
-    "max_rows_to_read": 2_000_000,
     # The densest observed production five-minute statement reads 2.66 GiB while
     # touching 720k rows. Preserve finite measured headroom without reverting
     # to an unbounded tenant-wide filtered scan.
@@ -353,15 +346,59 @@ def _metadata(
     query_count: int,
     rows_returned: int,
 ) -> dict[str, Any]:
+    elapsed_ms = max(monotonic() - started, 0.0) * 1000
+    if elapsed_ms >= EXACT_GRAPH_QUERY_TIMEOUT_MS:
+        raise ExactGraphReadError("exact graph refresh deadline exceeded")
     metadata = {
         "query_complete": True,
         "query_status": "complete",
         "query_sampled": False,
         "query_count": query_count,
         "query_rows_returned": rows_returned,
-        "query_elapsed_ms": round((monotonic() - started) * 1000, 3),
+        "query_elapsed_ms": round(elapsed_ms, 3),
     }
     return metadata
+
+
+def _remaining_exact_graph_timeout_ms(started: float) -> int:
+    """Return the time left on one authoritative exact-refresh wall.
+
+    Direct readers do builder, relation, database, formatting, and publication
+    work under one 30-second budget.  A later statement may consume only the
+    remaining portion; it never receives a fresh 30 seconds.
+    """
+
+    remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
+        max(monotonic() - started, 0.0) * 1000
+    )
+    if remaining_ms <= 0:
+        raise ExactGraphReadError("exact graph refresh deadline exceeded")
+    return remaining_ms
+
+
+def _execute_direct_exact_graph_query(
+    *,
+    analytics: Any,
+    query: str,
+    params: dict[str, Any],
+    started: float,
+    settings: dict[str, Any],
+) -> Any:
+    """Execute a direct publication read inside its refresh's remaining wall."""
+
+    return analytics.execute_ch_query(
+        query,
+        params,
+        timeout_ms=_remaining_exact_graph_timeout_ms(started),
+        settings=settings,
+    )
+
+
+def _finalize_exact_graph_payload(payload: Any, *, started: float) -> Any:
+    """Fence publication after all formatting and result construction."""
+
+    _remaining_exact_graph_timeout_ms(started)
+    return payload
 
 
 def _align_partition_boundary_timezone(
@@ -1560,14 +1597,17 @@ def read_exact_system_graph(
             end_date=end_date,
         )
         metrics = builder.format_result([], [])
-        return _system_metric_payload(
-            metrics,
-            metric_id,
-            _metadata(
-                started=started,
-                query_count=0,
-                rows_returned=0,
+        return _finalize_exact_graph_payload(
+            _system_metric_payload(
+                metrics,
+                metric_id,
+                _metadata(
+                    started=started,
+                    query_count=0,
+                    rows_returned=0,
+                ),
             ),
+            started=started,
         )
 
     annotation_label_ids = _annotation_label_ids_for_filters(project_id, filters)
@@ -1602,14 +1642,17 @@ def read_exact_system_graph(
             annotation_label_ids=annotation_label_ids,
             started=started,
         )
-        return _system_metric_payload(
-            metrics,
-            metric_id,
-            _metadata(
-                started=started,
-                query_count=query_count,
-                rows_returned=rows_returned,
+        return _finalize_exact_graph_payload(
+            _system_metric_payload(
+                metrics,
+                metric_id,
+                _metadata(
+                    started=started,
+                    query_count=query_count,
+                    rows_returned=rows_returned,
+                ),
             ),
+            started=started,
         )
     if normalized_observe_type == "span" and exact_filter_plan.predicates:
         metrics, query_count, rows_returned = _read_exact_filtered_span_graph(
@@ -1620,33 +1663,40 @@ def read_exact_system_graph(
             end_date=end_date,
             started=started,
         )
-        return _system_metric_payload(
-            metrics,
-            metric_id,
-            _metadata(
-                started=started,
-                query_count=query_count,
-                rows_returned=rows_returned,
+        return _finalize_exact_graph_payload(
+            _system_metric_payload(
+                metrics,
+                metric_id,
+                _metadata(
+                    started=started,
+                    query_count=query_count,
+                    rows_returned=rows_returned,
+                ),
             ),
+            started=started,
         )
     query, params = builder.build()
-    result = analytics.execute_ch_query(
-        query,
-        params,
-        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+    result = _execute_direct_exact_graph_query(
+        analytics=analytics,
+        query=query,
+        params=params,
+        started=started,
         settings=EXACT_GRAPH_READ_SETTINGS,
     )
     rows = list(result.data or [])
     columns = list(result.columns or [])
     metrics = builder.format_result(rows, columns)
-    return _system_metric_payload(
-        metrics,
-        metric_id,
-        _metadata(
-            started=started,
-            query_count=1,
-            rows_returned=len(rows),
+    return _finalize_exact_graph_payload(
+        _system_metric_payload(
+            metrics,
+            metric_id,
+            _metadata(
+                started=started,
+                query_count=1,
+                rows_returned=len(rows),
+            ),
         ),
+        started=started,
     )
 
 
@@ -1671,16 +1721,20 @@ def read_exact_agent_graph(
         annotation_label_ids=_annotation_label_ids_for_filters(project_id, filters),
     )
     if builder.empty_window:
-        return {
-            **builder.format_result([], []),
-            **_metadata(started=started, query_count=0, rows_returned=0),
-        }
+        return _finalize_exact_graph_payload(
+            {
+                **builder.format_result([], []),
+                **_metadata(started=started, query_count=0, rows_returned=0),
+            },
+            started=started,
+        )
 
     query, params = builder.build()
-    result = analytics.execute_ch_query(
-        query,
-        params,
-        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+    result = _execute_direct_exact_graph_query(
+        analytics=analytics,
+        query=query,
+        params=params,
+        started=started,
         settings={
             **EXACT_GRAPH_READ_SETTINGS,
             "max_threads": 1,
@@ -1696,10 +1750,13 @@ def read_exact_agent_graph(
     )
     rows = list(result.data or [])
     columns = list(result.columns or [])
-    return {
-        **builder.format_result(rows, columns),
-        **_metadata(started=started, query_count=1, rows_returned=len(rows)),
-    }
+    return _finalize_exact_graph_payload(
+        {
+            **builder.format_result(rows, columns),
+            **_metadata(started=started, query_count=1, rows_returned=len(rows)),
+        },
+        started=started,
+    )
 
 
 def read_exact_all_system_metrics(
@@ -1721,14 +1778,17 @@ def read_exact_all_system_metrics(
             start_date=start_date,
             end_date=end_date,
         )
-        return {
-            **builder.format_result([], []),
-            **_metadata(
-                started=started,
-                query_count=0,
-                rows_returned=0,
-            ),
-        }
+        return _finalize_exact_graph_payload(
+            {
+                **builder.format_result([], []),
+                **_metadata(
+                    started=started,
+                    query_count=0,
+                    rows_returned=0,
+                ),
+            },
+            started=started,
+        )
     builder = TimeSeriesQueryBuilder(
         project_id=str(project_id),
         filters=filters,
@@ -1740,22 +1800,26 @@ def read_exact_all_system_metrics(
         annotation_label_ids=_annotation_label_ids_for_filters(project_id, filters),
     )
     query, params = builder.build()
-    result = analytics.execute_ch_query(
-        query,
-        params,
-        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+    result = _execute_direct_exact_graph_query(
+        analytics=analytics,
+        query=query,
+        params=params,
+        started=started,
         settings=EXACT_GRAPH_READ_SETTINGS,
     )
     rows = list(result.data or [])
     columns = list(result.columns or [])
-    return {
-        **builder.format_result(rows, columns),
-        **_metadata(
-            started=started,
-            query_count=1,
-            rows_returned=len(rows),
-        ),
-    }
+    return _finalize_exact_graph_payload(
+        {
+            **builder.format_result(rows, columns),
+            **_metadata(
+                started=started,
+                query_count=1,
+                rows_returned=len(rows),
+            ),
+        },
+        started=started,
+    )
 
 
 def _row_value(row: Any, columns: list[str], key: str, default: Any = 0) -> Any:
@@ -1967,10 +2031,11 @@ def read_exact_eval_graph(
         )
     else:
         query, params = builder.build()
-        result = analytics.execute_ch_query(
-            query,
-            params,
-            timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+        result = _execute_direct_exact_graph_query(
+            analytics=analytics,
+            query=query,
+            params=params,
+            started=started,
             settings=EXACT_GRAPH_READ_SETTINGS,
         )
         rows = list(result.data or [])
@@ -1985,10 +2050,12 @@ def read_exact_eval_graph(
         )
     exact_series = [{**item, "metric_name": config_id, **metadata} for item in series]
     if all_series:
-        return exact_series
-    if exact_series:
-        return exact_series[0]
-    return {"metric_name": config_id, "data": [], **metadata}
+        payload: dict[str, Any] | list[dict[str, Any]] = exact_series
+    elif exact_series:
+        payload = exact_series[0]
+    else:
+        payload = {"metric_name": config_id, "data": [], **metadata}
+    return _finalize_exact_graph_payload(payload, started=started)
 
 
 def _annotation_numeric_value(payload: Any) -> float | None:
@@ -2165,13 +2232,40 @@ def read_exact_annotation_graph(
     aggregation_context: str = "trace",
 ) -> dict[str, Any]:
     started = monotonic()
+
+    def remaining_statement_timeout_ms() -> int:
+        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
+            max(monotonic() - started, 0.0) * 1000
+        )
+        if remaining_ms <= 0:
+            raise ExactGraphReadError("exact annotation graph deadline exceeded")
+        return remaining_ms
+
     aggregation_context = str(aggregation_context or "trace").strip().lower()
     if aggregation_context not in {"trace", "session", "user"}:
         raise ValueError("unsupported annotation graph aggregation context")
     if aggregation_context in {"session", "user"} and observe_type != "trace":
         raise ValueError("aggregate annotation graphs require trace observation mode")
     label_id = str(req_data_config.get("id") or "")
-    label = get_annotation_labels_for_project(project_id).get(id=label_id)
+    if connection.vendor == "postgresql":
+        # Label discovery consults both authoritative Score membership and
+        # label metadata. It is part of the same refresh, so give both ORM
+        # statements only the time still left on that refresh wall.
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                cursor.execute(
+                    "SET LOCAL statement_timeout = "
+                    f"'{remaining_statement_timeout_ms()}ms'"
+                )
+            label = get_annotation_labels_for_project(project_id).get(id=label_id)
+    else:
+        label = get_annotation_labels_for_project(project_id).get(id=label_id)
+    # A slow successful metadata read must not start Score partition work after
+    # the refresh wall has already expired.
+    remaining_statement_timeout_ms()
     output_type = req_data_config.get("output_type")
     if not output_type:
         annotation_type = str(label.type)
@@ -2186,16 +2280,19 @@ def read_exact_annotation_graph(
     selected = req_data_config.get("value")
     start_date, end_date, empty = _snapshot_window(filters)
     if empty:
-        return {
-            "metric_name": label_id,
-            "name": label.name,
-            "data": [],
-            **_metadata(
-                started=started,
-                query_count=0,
-                rows_returned=0,
-            ),
-        }
+        return _finalize_exact_graph_payload(
+            {
+                "metric_name": label_id,
+                "name": label.name,
+                "data": [],
+                **_metadata(
+                    started=started,
+                    query_count=0,
+                    rows_returned=0,
+                ),
+            },
+            started=started,
+        )
 
     settings: dict[str, Any] = {**EXACT_GRAPH_READ_SETTINGS}
     if aggregation_context == "session":
@@ -2260,17 +2357,12 @@ def read_exact_annotation_graph(
     query_count = 0
     rows_returned = 0
 
-    def remaining_statement_timeout_ms() -> int:
-        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
-            max(monotonic() - started, 0.0) * 1000
-        )
-        if remaining_ms <= 0:
-            raise ExactGraphReadError("exact annotation graph deadline exceeded")
-        return remaining_ms
-
     # PostgreSQL is authoritative for Score. Hold one repeatable-read snapshot
     # while CH checks only those finite annotated identities. Any membership
-    # batch failure aborts the refresh before publication.
+    # batch failure aborts the refresh before publication. Each partition's PG
+    # statement receives only the refresh's remaining wall time; a later
+    # partition can never reset the timeout back to a fresh 30 seconds.
+    remaining_statement_timeout_ms()
     with transaction.atomic():
         if connection.vendor == "postgresql":
             with connection.cursor() as cursor:
@@ -2280,6 +2372,13 @@ def read_exact_annotation_graph(
         for partition_start, partition_end in output_bucket_partitions(
             start_date, end_date, interval
         ):
+            partition_timeout_ms = remaining_statement_timeout_ms()
+            if connection.vendor == "postgresql":
+                with connection.cursor() as cursor:
+                    # Internal bounded integer, never request-derived SQL.
+                    cursor.execute(
+                        f"SET LOCAL statement_timeout = '{partition_timeout_ms}ms'"
+                    )
             queryset = (
                 Score.no_workspace_objects.filter(
                     tracer_project_id=project_id,
@@ -2381,6 +2480,10 @@ def read_exact_annotation_graph(
                     reduce_batch(pending)
                     pending = []
             reduce_batch(pending)
+            # PostgreSQL may return an empty partition, in which case no CH
+            # membership batch calls the deadline helper. Check after every PG
+            # iterator so a slow empty statement still fails the refresh.
+            remaining_statement_timeout_ms()
 
     points = []
     for timestamp in BaseQueryBuilder._generate_timestamp_range(
@@ -2397,16 +2500,22 @@ def read_exact_annotation_graph(
                 "primary_traffic": len(values),
             }
         )
-    return {
-        "metric_name": label_id,
-        "name": label.name,
-        "data": points,
-        **_metadata(
-            started=started,
-            query_count=query_count,
-            rows_returned=rows_returned,
-        ),
-    }
+    # Formatting is bounded by the result sentinel, but publication must still
+    # be inside the same authoritative wall budget.
+    remaining_statement_timeout_ms()
+    return _finalize_exact_graph_payload(
+        {
+            "metric_name": label_id,
+            "name": label.name,
+            "data": points,
+            **_metadata(
+                started=started,
+                query_count=query_count,
+                rows_returned=rows_returned,
+            ),
+        },
+        started=started,
+    )
 
 
 _SESSION_POST_AGGREGATE_FILTERS = {
@@ -2512,6 +2621,76 @@ class _SessionMembershipPlan:
     scalar_predicates: tuple[str, ...]
     relational_predicates: tuple[str, ...]
     params: dict[str, Any]
+
+
+def _finite_survivor_map_ctes(
+    *,
+    remap_table: str,
+    candidate_relation: str,
+    candidate_column: str,
+    prefix: str,
+    map_name: str,
+) -> str:
+    """Materialize only remap groups touched by one finite candidate relation.
+
+    Exact entity graphs discover physical IDs inside the frozen project/time
+    window.  Resolving those IDs must not construct a window over the complete
+    tenant remap table.  This shape probes old IDs, treats candidate new IDs as
+    possible group keys, expands only the touched groups, and materializes the
+    resulting tiny map once as a scalar tuple array.
+    """
+
+    identifiers = (
+        remap_table,
+        candidate_relation,
+        candidate_column,
+        prefix,
+        map_name,
+    )
+    if any(not value or not value.replace("_", "").isalnum() for value in identifiers):
+        raise ValueError("finite remap identifier is invalid")
+    candidate_ids_name = f"{prefix}_candidate_ids"
+    target_relation = f"{prefix}_target_new_ids"
+    pair_name = f"{prefix}_pairs"
+    return f"""
+    (
+        SELECT groupUniqArray(assumeNotNull({candidate_column}))
+        FROM {candidate_relation}
+    ) AS {candidate_ids_name},
+    {target_relation} AS (
+        SELECT DISTINCT new_id
+        FROM {remap_table} FINAL
+        PREWHERE old_id IN {candidate_ids_name}
+        UNION DISTINCT
+        SELECT arrayJoin({candidate_ids_name}) AS new_id
+    ),
+    (
+        SELECT groupArray(tuple(any_id, survivor_id))
+        FROM (
+            SELECT
+                any_id,
+                argMin(survivor_id, toString(survivor_id)) AS survivor_id
+            FROM (
+                SELECT
+                    arrayJoin(arrayDistinct(arrayConcat(
+                        groupArray(old_id),
+                        [new_id]
+                    ))) AS any_id,
+                    argMin(old_id, toString(old_id)) AS survivor_id
+                FROM {remap_table} FINAL
+                WHERE new_id IN (SELECT new_id FROM {target_relation})
+                GROUP BY new_id
+            ) AS touched_groups
+            GROUP BY any_id
+        ) AS deduplicated_touched_map
+    ) AS {pair_name},
+    {map_name} AS (
+        SELECT
+            tupleElement(pair, 1) AS any_id,
+            tupleElement(pair, 2) AS survivor_id
+        FROM (SELECT arrayJoin({pair_name}) AS pair)
+    )
+    """
 
 
 def _session_membership_plan(
@@ -2671,7 +2850,6 @@ def _session_aggregate_source_sql(
         project_id=project_id,
         filters=span_filters,
     )
-    session_survivor_map = survivor_map_subquery("trace_session_id_remap")
     resolved_session_id = (
         "if(ts_remap.survivor_id IS NULL OR "
         "ts_remap.survivor_id = "
@@ -2740,6 +2918,13 @@ def _session_aggregate_source_sql(
         )
     else:
         raise ValueError("session source requires an entity-safe candidate scope")
+    session_map_ctes = _finite_survivor_map_ctes(
+        remap_table="trace_session_id_remap",
+        candidate_relation="candidate_physical_session_ids",
+        candidate_column="physical_session_id",
+        prefix="candidate_session_remap",
+        map_name="ts_survivor_map",
+    )
     membership_ctes = ""
     selected_session_predicates: list[str] = []
     if membership_plan.scalar_predicates:
@@ -2784,7 +2969,7 @@ def _session_aggregate_source_sql(
             latest_session_filter_spans.*,
             {scalar_resolved_session_id} AS session_id
         FROM latest_session_filter_spans
-        LEFT JOIN ({session_survivor_map}) AS scalar_ts_remap
+        LEFT JOIN ts_survivor_map AS scalar_ts_remap
           ON latest_trace_session_id = scalar_ts_remap.any_id
         WHERE latest_is_deleted = 0
           AND latest_start_time >= %(snapshot_start_date)s
@@ -2817,7 +3002,7 @@ def _session_aggregate_source_sql(
         FROM (
             {session_root_rows}
         ) AS rs
-        LEFT JOIN ({session_survivor_map}) AS ts_remap
+        LEFT JOIN ts_survivor_map AS ts_remap
           ON rs.trace_session_id = ts_remap.any_id
         WHERE {resolved_session_id} IN (
             SELECT session_id FROM candidate_sessions
@@ -2871,20 +3056,30 @@ def _session_aggregate_source_sql(
         else ""
     )
     source = f"""
-    WITH candidate_sessions AS (
+    WITH
+    candidate_physical_session_ids AS (
+        SELECT DISTINCT
+            candidate_rs.trace_session_id AS physical_session_id
+        FROM (
+            {session_root_rows}
+        ) AS candidate_rs
+        WHERE 1 = 1
+          {candidate_trace_clause}
+    ),
+    {session_map_ctes},
+    candidate_sessions AS (
         SELECT DISTINCT
             if(candidate_remap.survivor_id IS NULL OR
                candidate_remap.survivor_id =
                    toUUID('00000000-0000-0000-0000-000000000000'),
-               candidate_rs.trace_session_id,
+               physical_session_id,
                candidate_remap.survivor_id) AS session_id
         FROM (
-            {session_root_rows}
-        ) AS candidate_rs
-        LEFT JOIN ({session_survivor_map}) AS candidate_remap
-          ON candidate_rs.trace_session_id = candidate_remap.any_id
-        WHERE 1 = 1
-          {candidate_trace_clause}
+            SELECT arrayJoin(candidate_session_remap_candidate_ids)
+                AS physical_session_id
+        ) AS candidate_session_ids
+        LEFT JOIN ts_survivor_map AS candidate_remap
+          ON physical_session_id = candidate_remap.any_id
     ){membership_ctes}
     SELECT
         {resolved_session_id} AS session_id,
@@ -2905,7 +3100,7 @@ def _session_aggregate_source_sql(
     FROM (
         {session_root_rows}
     ) AS rs
-    LEFT JOIN ({session_survivor_map}) AS ts_remap
+    LEFT JOIN ts_survivor_map AS ts_remap
       ON rs.trace_session_id = ts_remap.any_id
     {session_id_fragment}
     GROUP BY session_id
@@ -2950,7 +3145,6 @@ def _session_trace_membership_sql(
         )
     else:  # Guarded by _session_aggregate_source_sql, kept fail closed here too.
         raise ValueError("session membership requires a candidate trace scope")
-    session_survivor_map = survivor_map_subquery("trace_session_id_remap")
     resolved_session_id = resolved_id_expr(
         "candidate_member.trace_session_id",
         "candidate_member_remap",
@@ -2968,16 +3162,36 @@ def _session_trace_membership_sql(
           AND snapshot_members.start_time < %(snapshot_end_date)s
           AND snapshot_members.is_deleted = 0
     """
+    member_map_ctes = _finite_survivor_map_ctes(
+        remap_table="trace_session_id_remap",
+        candidate_relation="candidate_member_session_ids",
+        candidate_column="physical_session_id",
+        prefix="candidate_member_session_remap",
+        map_name="candidate_member_ts_survivor_map",
+    )
     return (
         f"""
+        WITH
+        candidate_members AS (
+            SELECT *
+            FROM (
+                {session_member_rows}
+            ) AS candidate_member
+            WHERE {candidate_clause}
+        ),
+        candidate_member_session_ids AS (
+            SELECT DISTINCT trace_session_id AS physical_session_id
+            FROM candidate_members
+            WHERE isNotNull(trace_session_id)
+              AND trace_session_id !=
+                  toUUID('00000000-0000-0000-0000-000000000000')
+        ),
+        {member_map_ctes}
         SELECT DISTINCT toString(candidate_member.trace_id) AS trace_id
-        FROM (
-            {session_member_rows}
-        ) AS candidate_member
-        LEFT JOIN ({session_survivor_map}) AS candidate_member_remap
+        FROM candidate_members AS candidate_member
+        LEFT JOIN candidate_member_ts_survivor_map AS candidate_member_remap
           ON candidate_member.trace_session_id = candidate_member_remap.any_id
-        WHERE {candidate_clause}
-          AND {resolved_session_id} IN (
+        WHERE {resolved_session_id} IN (
               SELECT session_id
               FROM ({source}) AS selected_sessions
           )
@@ -3121,8 +3335,6 @@ def _user_aggregate_source_sql(
     span_predicate, user_predicate, filter_params, needs_eval = _user_filter_clauses(
         filters, project_id=project_id
     )
-    eu_survivor_map = survivor_map_subquery("end_user_id_remap")
-    ts_survivor_map = survivor_map_subquery("trace_session_id_remap")
     resolved_eu = resolved_id_expr("rs.end_user_id", "span_eu_remap")
     resolved_session = resolved_id_expr("rs.trace_session_id", "span_ts_remap")
     resolved_dimension_eu = resolved_id_expr("eu.end_user_id", "eu_remap")
@@ -3144,6 +3356,20 @@ def _user_aggregate_source_sql(
         )
     else:
         raise ValueError("user source requires an entity-safe candidate scope")
+    end_user_map_ctes = _finite_survivor_map_ctes(
+        remap_table="end_user_id_remap",
+        candidate_relation="candidate_physical_end_user_ids",
+        candidate_column="physical_end_user_id",
+        prefix="candidate_end_user_remap",
+        map_name="eu_survivor_map",
+    )
+    session_map_ctes = _finite_survivor_map_ctes(
+        remap_table="trace_session_id_remap",
+        candidate_relation="candidate_user_session_ids",
+        candidate_column="physical_session_id",
+        prefix="candidate_user_session_remap",
+        map_name="ts_survivor_map",
+    )
     trace_ids_select = (
         ",\n            groupUniqArray(trace_id) AS user_trace_ids"
         if include_trace_ids
@@ -3201,15 +3427,10 @@ def _user_aggregate_source_sql(
 
     source = f"""
     WITH
-    eu_survivor_map AS ({eu_survivor_map}),
-    ts_survivor_map AS ({ts_survivor_map}),
-    candidate_users AS (
+    candidate_physical_end_user_ids AS (
         SELECT DISTINCT
-            {resolved_id_expr("candidate_rs.end_user_id", "candidate_eu_remap")}
-                AS end_user_id
+            candidate_rs.end_user_id AS physical_end_user_id
         FROM spans AS candidate_rs FINAL
-        LEFT JOIN eu_survivor_map AS candidate_eu_remap
-          ON candidate_rs.end_user_id = candidate_eu_remap.any_id
         PREWHERE candidate_rs.project_id = toUUID(%(project_id)s)
           AND candidate_rs.start_time >= %(snapshot_start_date)s
           AND candidate_rs.start_time < %(snapshot_end_date)s
@@ -3217,13 +3438,47 @@ def _user_aggregate_source_sql(
           AND isNotNull(candidate_rs.end_user_id)
           AND {candidate_trace_clause}
     ),
+    {end_user_map_ctes},
+    candidate_users AS (
+        SELECT DISTINCT
+            {resolved_id_expr("physical_end_user_id", "candidate_eu_remap")}
+                AS end_user_id
+        FROM (
+            SELECT arrayJoin(candidate_end_user_remap_candidate_ids)
+                AS physical_end_user_id
+        ) AS candidate_end_user_ids
+        LEFT JOIN eu_survivor_map AS candidate_eu_remap
+          ON physical_end_user_id = candidate_eu_remap.any_id
+    ),
     candidate_physical_users AS (
-        SELECT end_user_id FROM candidate_users
+        SELECT arrayJoin(candidate_end_user_remap_candidate_ids)
+            AS physical_end_user_id
         UNION DISTINCT
-        SELECT any_id AS end_user_id
+        SELECT any_id AS physical_end_user_id
         FROM eu_survivor_map
         WHERE survivor_id IN (SELECT end_user_id FROM candidate_users)
     ),
+    candidate_user_spans AS (
+        SELECT *
+        FROM spans FINAL
+        PREWHERE project_id = toUUID(%(project_id)s)
+          AND start_time >= %(snapshot_start_date)s
+          AND start_time < %(snapshot_end_date)s
+        WHERE is_deleted = 0
+          AND isNotNull(end_user_id)
+          AND end_user_id IN (
+              SELECT physical_end_user_id FROM candidate_physical_users
+          )
+          AND {span_predicate}
+    ),
+    candidate_user_session_ids AS (
+        SELECT DISTINCT trace_session_id AS physical_session_id
+        FROM candidate_user_spans
+        WHERE isNotNull(trace_session_id)
+          AND trace_session_id !=
+              toUUID('00000000-0000-0000-0000-000000000000')
+    ),
+    {session_map_ctes},
     resolved_spans AS (
         SELECT
             {resolved_eu} AS end_user_id,
@@ -3238,17 +3493,7 @@ def _user_aggregate_source_sql(
             rs.latency_ms AS latency_ms,
             rs.observation_type AS observation_type,
             rs.status AS status
-        FROM (
-            SELECT *
-            FROM spans FINAL
-            PREWHERE project_id = toUUID(%(project_id)s)
-              AND start_time >= %(snapshot_start_date)s
-              AND start_time < %(snapshot_end_date)s
-            WHERE is_deleted = 0
-              AND isNotNull(end_user_id)
-              AND end_user_id IN (SELECT end_user_id FROM candidate_physical_users)
-              AND {span_predicate}
-        ) AS rs
+        FROM candidate_user_spans AS rs
         LEFT JOIN eu_survivor_map AS span_eu_remap
           ON rs.end_user_id = span_eu_remap.any_id
         LEFT JOIN ts_survivor_map AS span_ts_remap
@@ -3270,6 +3515,9 @@ def _user_aggregate_source_sql(
         WHERE eu.project_id = toUUID(%(project_id)s)
           AND eu.is_deleted = 0
           AND notEmpty(eu.user_id)
+          AND eu.end_user_id IN (
+              SELECT physical_end_user_id FROM candidate_physical_users
+          )
           AND {resolved_dimension_eu} IN (SELECT end_user_id FROM candidate_users)
     ),
     user_dimensions AS (
@@ -3414,24 +3662,40 @@ def _user_trace_membership_sql(
         )
     else:  # Guarded by _user_aggregate_source_sql, kept fail closed here too.
         raise ValueError("user membership requires a candidate trace scope")
-    eu_survivor_map = survivor_map_subquery("end_user_id_remap")
     resolved_user_id = resolved_id_expr(
         "candidate_member.end_user_id",
         "candidate_member_remap",
     )
+    member_map_ctes = _finite_survivor_map_ctes(
+        remap_table="end_user_id_remap",
+        candidate_relation="candidate_member_end_user_ids",
+        candidate_column="physical_end_user_id",
+        prefix="candidate_member_end_user_remap",
+        map_name="candidate_member_eu_survivor_map",
+    )
     return (
         f"""
+        WITH
+        candidate_members AS (
+            SELECT *
+            FROM spans AS candidate_member FINAL
+            PREWHERE candidate_member.project_id = toUUID(%(project_id)s)
+              AND candidate_member.start_time >= %(snapshot_start_date)s
+              AND candidate_member.start_time < %(snapshot_end_date)s
+            WHERE candidate_member.is_deleted = 0
+              AND isNotNull(candidate_member.end_user_id)
+              AND {candidate_clause}
+        ),
+        candidate_member_end_user_ids AS (
+            SELECT DISTINCT end_user_id AS physical_end_user_id
+            FROM candidate_members
+        ),
+        {member_map_ctes}
         SELECT DISTINCT toString(candidate_member.trace_id) AS trace_id
-        FROM spans AS candidate_member FINAL
-        LEFT JOIN ({eu_survivor_map}) AS candidate_member_remap
+        FROM candidate_members AS candidate_member
+        LEFT JOIN candidate_member_eu_survivor_map AS candidate_member_remap
           ON candidate_member.end_user_id = candidate_member_remap.any_id
-        PREWHERE candidate_member.project_id = toUUID(%(project_id)s)
-          AND candidate_member.start_time >= %(snapshot_start_date)s
-          AND candidate_member.start_time < %(snapshot_end_date)s
-        WHERE candidate_member.is_deleted = 0
-          AND isNotNull(candidate_member.end_user_id)
-          AND {candidate_clause}
-          AND {resolved_user_id} IN (
+        WHERE {resolved_user_id} IN (
               SELECT end_user_id
               FROM ({source}) AS selected_users
           )
@@ -3463,15 +3727,18 @@ def read_exact_user_system_graph(
         builder.end_date = end_date
         formatted = builder.format_result([], [])
         metric_key = metric_id if metric_id in formatted else "active_users"
-        return {
-            "metric_name": metric_id,
-            "data": formatted.get(metric_key, []),
-            **_metadata(
-                started=started,
-                query_count=0,
-                rows_returned=0,
-            ),
-        }
+        return _finalize_exact_graph_payload(
+            {
+                "metric_name": metric_id,
+                "data": formatted.get(metric_key, []),
+                **_metadata(
+                    started=started,
+                    query_count=0,
+                    rows_returned=0,
+                ),
+            },
+            started=started,
+        )
 
     user_membership_sql, user_membership_params, _needs_eval = _user_id_membership_sql(
         project_id=str(project_id),
@@ -3492,10 +3759,11 @@ def read_exact_user_system_graph(
         exact_snapshot_end=end_date,
     )
     query, params = builder.build()
-    result = analytics.execute_ch_query(
-        query,
-        params,
-        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+    result = _execute_direct_exact_graph_query(
+        analytics=analytics,
+        query=query,
+        params=params,
+        started=started,
         settings=EXACT_GRAPH_READ_SETTINGS,
     )
     rows = list(result.data or [])
@@ -3506,22 +3774,25 @@ def read_exact_user_system_graph(
         point.get("timestamp"): point.get("traffic", 0)
         for point in formatted.get("traffic", [])
     }
-    return {
-        "metric_name": metric_id,
-        "data": [
-            {
-                "timestamp": point.get("timestamp"),
-                "value": point.get("value", 0),
-                "primary_traffic": traffic.get(point.get("timestamp"), 0),
-            }
-            for point in formatted.get(metric_key, [])
-        ],
-        **_metadata(
-            started=started,
-            query_count=1,
-            rows_returned=len(rows),
-        ),
-    }
+    return _finalize_exact_graph_payload(
+        {
+            "metric_name": metric_id,
+            "data": [
+                {
+                    "timestamp": point.get("timestamp"),
+                    "value": point.get("value", 0),
+                    "primary_traffic": traffic.get(point.get("timestamp"), 0),
+                }
+                for point in formatted.get(metric_key, [])
+            ],
+            **_metadata(
+                started=started,
+                query_count=1,
+                rows_returned=len(rows),
+            ),
+        },
+        started=started,
+    )
 
 
 def read_exact_session_system_graph(
@@ -3535,15 +3806,18 @@ def read_exact_session_system_graph(
     started = monotonic()
     start_date, end_date, empty = _snapshot_window(filters)
     if empty:
-        return {
-            "metric_name": metric_id,
-            "data": [],
-            **_metadata(
-                started=started,
-                query_count=0,
-                rows_returned=0,
-            ),
-        }
+        return _finalize_exact_graph_payload(
+            {
+                "metric_name": metric_id,
+                "data": [],
+                **_metadata(
+                    started=started,
+                    query_count=0,
+                    rows_returned=0,
+                ),
+            },
+            started=started,
+        )
     bucket_fn = BaseQueryBuilder.time_bucket_expr(interval)
     session_value = {
         "latency": "avg(session_avg_latency)",
@@ -3587,10 +3861,11 @@ def read_exact_session_system_graph(
     GROUP BY time_bucket
     ORDER BY time_bucket
     """
-    result = analytics.execute_ch_query(
-        query,
-        query_params,
-        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+    result = _execute_direct_exact_graph_query(
+        analytics=analytics,
+        query=query,
+        params=query_params,
+        started=started,
         settings=EXACT_GRAPH_READ_SETTINGS,
     )
     rows = list(result.data or [])
@@ -3619,15 +3894,18 @@ def read_exact_session_system_graph(
                 "primary_traffic": traffic,
             }
         )
-    return {
-        "metric_name": metric_id,
-        "data": points,
-        **_metadata(
-            started=started,
-            query_count=1,
-            rows_returned=len(rows),
-        ),
-    }
+    return _finalize_exact_graph_payload(
+        {
+            "metric_name": metric_id,
+            "data": points,
+            **_metadata(
+                started=started,
+                query_count=1,
+                rows_returned=len(rows),
+            ),
+        },
+        started=started,
+    )
 
 
 __all__ = [

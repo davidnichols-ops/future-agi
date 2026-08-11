@@ -253,10 +253,10 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
         """Build phase one of bounded, dictionary-free user enrichment.
 
         Return at most one target row per supplied ``(project_id, trace_id)``.
-        The remap table is grouped once and expanded into an equality-join lookup
-        referenced once; unlike a reusable ClickHouse CTE, it therefore cannot
-        be macro-expanded into repeated physical reads.  The result freezes each
-        trace's canonical id and the finite physical ids phase two may inspect.
+        The selected page users are frozen into one scalar array, then the remap
+        lookup discovers and expands only consolidation groups touched by those
+        IDs. The result freezes each trace's canonical id and the finite physical
+        ids phase two may inspect without a tenant-global remap aggregate.
 
         ``trace_identities`` is authoritative when supplied.  It is mandatory
         for an organization-scoped page because trace text is not globally
@@ -297,6 +297,58 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
 
         query = f"""
         WITH
+        (
+            SELECT groupArray(tuple(project_id, trace_id, selected_end_user_id))
+            FROM (
+                SELECT
+                    project_id,
+                    trace_id,
+                    assumeNotNull(
+                        argMax(
+                            tuple(latest_end_user_id),
+                            tuple(start_time, id)
+                        ).1
+                    ) AS selected_end_user_id
+                FROM (
+                    SELECT
+                        sp.project_id,
+                        sp.trace_id,
+                        sp.id,
+                        sp.start_time,
+                        argMax(tuple(sp.end_user_id), sp._version).1
+                            AS latest_end_user_id,
+                        argMax(sp.is_deleted, sp._version) AS latest_is_deleted
+                    FROM spans AS sp
+                    PREWHERE {page_filter}
+                      {span_window}
+                    GROUP BY sp.project_id, sp.trace_id, sp.id, sp.start_time
+                ) AS latest_page_spans
+                WHERE latest_is_deleted = 0
+                  AND latest_end_user_id IS NOT NULL
+                  AND latest_end_user_id !=
+                      toUUID('00000000-0000-0000-0000-000000000000')
+                GROUP BY project_id, trace_id
+            ) AS selected_page_users
+        ) AS page_trace_user_rows,
+        latest_trace_users AS (
+            SELECT
+                tupleElement(page_user, 1) AS project_id,
+                tupleElement(page_user, 2) AS trace_id,
+                tupleElement(page_user, 3) AS selected_end_user_id
+            FROM (
+                SELECT arrayJoin(page_trace_user_rows) AS page_user
+            )
+        ),
+        page_end_user_group_ids AS (
+            SELECT DISTINCT remap_match.new_id
+            FROM end_user_id_remap AS remap_match FINAL
+            WHERE remap_match.old_id IN (
+                SELECT selected_end_user_id FROM latest_trace_users
+            )
+               OR remap_match.new_id IN (
+                SELECT selected_end_user_id FROM latest_trace_users
+            )
+        ),
         remap_lookup AS (
             SELECT
                 any_id,
@@ -321,40 +373,11 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
                         )
                     ) AS all_physical_end_user_ids
                 FROM end_user_id_remap FINAL
+                WHERE new_id IN (SELECT new_id FROM page_end_user_group_ids)
                 GROUP BY new_id
             )
             ARRAY JOIN all_physical_end_user_ids AS any_id
             GROUP BY any_id
-        ),
-        latest_page_spans AS (
-            SELECT
-                sp.project_id,
-                sp.trace_id,
-                sp.id,
-                sp.start_time,
-                argMax(tuple(sp.end_user_id), sp._version).1 AS latest_end_user_id,
-                argMax(sp.is_deleted, sp._version) AS latest_is_deleted
-            FROM spans AS sp
-            PREWHERE {page_filter}
-              {span_window}
-            GROUP BY sp.project_id, sp.trace_id, sp.id, sp.start_time
-        ),
-        latest_trace_users AS (
-            SELECT
-                project_id,
-                trace_id,
-                assumeNotNull(
-                    argMax(
-                        tuple(latest_end_user_id),
-                        tuple(start_time, id)
-                    ).1
-                ) AS selected_end_user_id
-            FROM latest_page_spans
-            WHERE latest_is_deleted = 0
-              AND latest_end_user_id IS NOT NULL
-              AND latest_end_user_id !=
-                  toUUID('00000000-0000-0000-0000-000000000000')
-            GROUP BY project_id, trace_id
         ),
         resolved_trace_users AS (
             SELECT

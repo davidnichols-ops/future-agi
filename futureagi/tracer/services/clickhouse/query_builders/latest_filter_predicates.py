@@ -1542,6 +1542,11 @@ _CANDIDATE_RESIDUAL_TYPES = {"ANNOTATION", "EVAL_METRIC"}
 def _is_candidate_residual_filter(item: dict[str, Any]) -> bool:
     key, config = _parts(item)
     col_type = str(config.get("col_type") or config.get("colType") or "").upper()
+    if (
+        col_type == "SPAN_ATTRIBUTE"
+        and key in ClickHouseFilterBuilder._ENDUSER_STRING_COLUMNS
+    ):
+        return False
     return key in _CANDIDATE_RESIDUAL_KEYS or col_type in _CANDIDATE_RESIDUAL_TYPES
 
 

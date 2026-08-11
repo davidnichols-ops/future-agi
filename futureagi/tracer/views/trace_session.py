@@ -142,23 +142,21 @@ from tracer.utils.session import get_session_navigation
 logger = structlog.get_logger(__name__)
 session_logger = structlog.get_logger(__name__)
 
-# Filtered sessions need one root seed plus finite all-span latest-state replay.
-# Keep the user-accepted 3-5 second envelope while reserving a full second for
-# page-scoped enrichments.  The selector remains independently bounded by the
-# finite statement/count/row/byte caps below; this is not a broad CH timeout.
-SESSION_LIST_WALL_DEADLINE_MS = 5_000
-SESSION_LIST_QUERY_TIMEOUT_MS = 3_800
-SESSION_LIST_ENRICHMENT_TIMEOUT_MS = 1_000
+# All session reads share one infrastructure-aligned 30-second wall deadline.
+# Individual phases receive only the request's remaining time, so concurrent
+# finite enrichments cannot extend the endpoint beyond that ceiling.
+SESSION_LIST_WALL_DEADLINE_MS = 30_000
+SESSION_LIST_QUERY_TIMEOUT_MS = 30_000
+SESSION_LIST_ENRICHMENT_TIMEOUT_MS = 30_000
 SESSION_LIST_FILTER_MAX_CANDIDATES = 200
 SESSION_LIST_FILTER_MAX_SEED_ATTEMPTS = 24
 SESSION_LIST_FILTER_MAX_QUERIES = 48
 SESSION_LIST_READ_SETTINGS = {
     "max_threads": 2,
     "max_block_size": 8192,
-    "max_rows_to_read": 10_000_000,
     "read_overflow_mode": "throw",
     "max_bytes_to_read": 512 * 1024 * 1024,
-    "max_memory_usage": 256 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "timeout_overflow_mode": "throw",
 }
 SESSION_LIST_RESULT_BYTES = 32 * 1024 * 1024
@@ -243,14 +241,23 @@ def _resolve_session_ids_to_canonical(
     survivor; an unmapped id (1:1 / net-new) maps to itself. Pre-flip a no-op
     (gate B). See id_remap_sql.
     """
-    from tracer.services.clickhouse.v2.id_remap_sql import survivor_map_subquery
+    from tracer.services.clickhouse.v2.id_remap_sql import (
+        bounded_survivor_map_subquery,
+    )
 
     ids = {str(s) for s in (session_ids or []) if s}
     if not ids:
         return {}
+    # The caller always owns a finite page/detail id set. Do not materialize the
+    # global window-function survivor map and filter it afterward: on large
+    # production remap tables that intermediate alone can exceed the 256 MiB
+    # read ceiling. Discover and expand only groups touched by these ids.
+    bounded_map = bounded_survivor_map_subquery(
+        "trace_session_id_remap", candidate_param="ids"
+    )
     q = (
         "SELECT toString(any_id) AS any_id, toString(survivor_id) AS survivor_id "
-        f"FROM ({survivor_map_subquery('trace_session_id_remap')}) "
+        f"FROM ({bounded_map}) "
         "WHERE any_id IN %(ids)s"
     )
     timeout_ms = (
@@ -1110,14 +1117,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         "offset": page * page_size,
                         **({"search": f"%{search}%"} if search else {}),
                     },
-                    timeout_ms=5000,
+                    timeout_ms=SESSION_LIST_QUERY_TIMEOUT_MS,
                     settings={
-                        "max_threads": 2,
-                        "max_rows_to_read": 500_000,
-                        "read_overflow_mode": "throw",
+                        **_session_read_settings(max_result_rows=page_size),
                         "max_bytes_to_read": 256 * 1024 * 1024,
-                        "max_memory_usage": 128 * 1024 * 1024,
-                        "timeout_overflow_mode": "throw",
+                        "max_memory_usage": 36 * 1024 * 1024 * 1024,
                     },
                 )
                 session_ids = [str(row["val"]) for row in result.data]
@@ -1214,14 +1218,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             result = analytics.execute_ch_query(
                 query,
                 params,
-                timeout_ms=5000,
+                timeout_ms=SESSION_LIST_QUERY_TIMEOUT_MS,
                 settings={
-                    "max_threads": 2,
-                    "max_rows_to_read": 500_000,
-                    "read_overflow_mode": "throw",
+                    **_session_read_settings(max_result_rows=page_size),
                     "max_bytes_to_read": 256 * 1024 * 1024,
-                    "max_memory_usage": 128 * 1024 * 1024,
-                    "timeout_overflow_mode": "throw",
+                    "max_memory_usage": 36 * 1024 * 1024 * 1024,
                 },
             )
             values = [
@@ -2105,8 +2106,8 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         # `resolve_end_user_fields` (prior slice), so a straddler whose user label
         # also straddles still resolves to one user.
         from tracer.services.clickhouse.v2.id_remap_sql import (
+            bounded_survivor_map_subquery,
             resolved_id_expr,
-            survivor_map_subquery,
         )
 
         ts_resolved = resolved_id_expr("latest_trace_session_id", "ts_remap")
@@ -2144,7 +2145,9 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         # 0-UUID (NIL) default and are dropped in the Python pass below. The
         # resolved `trace_session_id` is the GROUP key (so old+new straddler spans
         # land in ONE group keyed by the OLD/canonical id).
-        ts_map = survivor_map_subquery("trace_session_id_remap")
+        ts_map = bounded_survivor_map_subquery(
+            "trace_session_id_remap", candidate_param="session_ids"
+        )
         eu_by_session_q = f"""
             WITH
             ts_survivor_map AS ({ts_map}),
@@ -2910,17 +2913,50 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 # They overlap the native-driver futures above while sharing
                 # the same remaining wall deadline.
                 if candidate_ids:
-                    completed["names"] = self._fetch_session_names(
-                        candidate_ids,
-                        curated_project_ids,
-                        read_deadline,
-                    )
-                    completed["end_users"] = self._fetch_end_user_info(
-                        candidate_ids,
-                        analytics,
-                        curated_project_ids,
-                        read_deadline,
-                    )
+                    try:
+                        completed["names"] = self._fetch_session_names(
+                            candidate_ids,
+                            curated_project_ids,
+                            read_deadline,
+                        )
+                    except Exception as exc:
+                        if not (
+                            is_read_budget_error(exc) or is_clickhouse_query_error(exc)
+                        ):
+                            raise
+                        # A display-name lookup is optional enrichment: the
+                        # selector and page hydration are already exact. Keep
+                        # the rows/cursor and fall back to a null display label.
+                        session_logger.warning(
+                            "session_list_name_enrichment_unavailable",
+                            project_id=str(project_id) if project_id else None,
+                            page_number=page_number,
+                            error_type=type(exc).__name__,
+                        )
+                        completed["names"] = {}
+                    try:
+                        completed["end_users"] = self._fetch_end_user_info(
+                            candidate_ids,
+                            analytics,
+                            curated_project_ids,
+                            read_deadline,
+                        )
+                    except Exception as exc:
+                        if not (
+                            is_read_budget_error(exc) or is_clickhouse_query_error(exc)
+                        ):
+                            raise
+                        # User labels are likewise presentation-only here;
+                        # membership was decided by the bounded selector. A CH
+                        # memory/timeout failure must not discard that exact page
+                        # or advance a different cursor checkpoint on retry.
+                        session_logger.warning(
+                            "session_list_end_user_enrichment_unavailable",
+                            project_id=str(project_id) if project_id else None,
+                            page_number=page_number,
+                            error_type=type(exc).__name__,
+                        )
+                        completed["end_users"] = {}
                 for future, phase in futures.items():
                     completed[phase] = future.result(
                         timeout=read_deadline.remaining_ms() / 1000
@@ -3530,6 +3566,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             )
 
             analytics = V2AnalyticsQueryService()
+            read_deadline = ReadDeadline.start(SESSION_LIST_WALL_DEADLINE_MS)
             el_table, _ = eval_logger_source()
             _, el_pred = eval_logger_source(
                 "latest_eval", include_cdc_tombstone_guard=True
@@ -3540,12 +3577,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 for column in eval_logger_live_state_columns(el_table)
             )
             read_settings = {
-                "max_threads": 2,
-                "max_rows_to_read": 2_000_000,
-                "read_overflow_mode": "throw",
+                **SESSION_LIST_READ_SETTINGS,
                 "max_bytes_to_read": 256 * 1024 * 1024,
-                "max_memory_usage": 128 * 1024 * 1024,
-                "timeout_overflow_mode": "throw",
+                "max_memory_usage": 36 * 1024 * 1024 * 1024,
+                "max_result_bytes": 8 * 1024 * 1024,
+                "result_overflow_mode": "throw",
             }
 
             count_q = f"""
@@ -3565,8 +3601,8 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             count_r = analytics.execute_ch_query(
                 count_q,
                 {"sid": session_id},
-                timeout_ms=3000,
-                settings=read_settings,
+                timeout_ms=read_deadline.remaining_ms(SESSION_LIST_QUERY_TIMEOUT_MS),
+                settings={**read_settings, "max_result_rows": 1},
             )
             total = count_r.data[0]["cnt"] if count_r.data else 0
 
@@ -3613,12 +3649,12 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 logs_r = analytics.execute_ch_query(
                     logs_q,
                     {"sid": session_id, "limit": page_size, "offset": start},
-                    timeout_ms=5000,
+                    timeout_ms=read_deadline.remaining_ms(
+                        SESSION_LIST_QUERY_TIMEOUT_MS
+                    ),
                     settings={
                         **read_settings,
                         "max_result_rows": page_size,
-                        "max_result_bytes": 8 * 1024 * 1024,
-                        "result_overflow_mode": "throw",
                     },
                 )
 

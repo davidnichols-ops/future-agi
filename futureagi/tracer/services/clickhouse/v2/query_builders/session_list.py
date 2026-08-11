@@ -16,10 +16,7 @@ from typing import Any
 from tracer.services.clickhouse.query_builders.session_list import (
     SessionListQueryBuilder,
 )
-from tracer.services.clickhouse.v2.id_remap_sql import (
-    resolved_id_expr,
-    survivor_map_subquery,
-)
+from tracer.services.clickhouse.v2.id_remap_sql import resolved_id_expr
 from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 from tracer.services.clickhouse.v2.query_builders.filters import (
     ClickHouseFilterBuilderV2,
@@ -64,11 +61,11 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
         attr_exclusion_fragment = (
             f"\n              AND {attr_exclusion}" if attr_exclusion else ""
         )
-        ts_map = survivor_map_subquery("trace_session_id_remap")
+        ts_map_ctes = self._candidate_survivor_map_ctes(params, ids)
         resolved_ts = resolved_id_expr("latest_trace_session_id", "ts_remap")
         sql = f"""
         WITH
-        ts_survivor_map AS ({ts_map}),
+        {ts_map_ctes},
         candidate_root_identities AS (
             SELECT DISTINCT project_id, trace_id, id, start_time
             FROM {self.TABLE}

@@ -50,8 +50,8 @@ GRAPH_CANDIDATE_LIMIT = 4_096
 # 4,096 graph ceiling.
 GRAPH_TRACE_CLASSIFY_BATCH_BUDGET = 32
 GRAPH_TRACE_ROOT_CANDIDATE_LIMIT = (50 * GRAPH_TRACE_CLASSIFY_BATCH_BUDGET) - 1
-GRAPH_CANDIDATE_DEADLINE_MS = 3_900
-GRAPH_DECORATION_CANDIDATE_DEADLINE_MS = 3_100
+GRAPH_CANDIDATE_DEADLINE_MS = 30_000
+GRAPH_DECORATION_CANDIDATE_DEADLINE_MS = 30_000
 GRAPH_MAX_POINTS = 10_000
 GRAPH_ANY_SPAN_STRATA = 8
 # Indexed trace candidates still require one or more ClickHouse decoration
@@ -113,7 +113,7 @@ GRAPH_TRACE_UNION_MAX_QUERY_COUNT = 32
 GRAPH_TRACE_UNION_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
-    "max_memory_usage": 256 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_bytes_to_read": 512 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "max_result_rows": GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE,

@@ -10,7 +10,7 @@ from tracer.services.clickhouse.query_builders.user_time_series import (
     UserTimeSeriesQueryBuilder,
 )
 from tracer.services.clickhouse.v2.id_remap_sql import (
-    remap_left_join,
+    bounded_survivor_map_subquery,
     resolved_id_expr,
 )
 from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
@@ -73,6 +73,41 @@ def _entity_safe_latest_spans_ctes(*, table: str, project_predicate: str) -> str
           AND trace_id IN (SELECT trace_id FROM candidate_trace_ids)
         WHERE is_deleted = 0
     )
+    """
+
+
+def _touched_survivor_map_subquery(
+    *,
+    remap_table: str,
+    candidate_cte: str,
+    candidate_column: str,
+) -> str:
+    """Resolve only remap groups touched by a request-bounded candidate CTE."""
+
+    return f"""
+        SELECT
+            any_id,
+            argMin(survivor_id, toString(survivor_id)) AS survivor_id
+        FROM (
+            SELECT
+                arrayJoin(
+                    arrayDistinct(arrayConcat(groupArray(old_id), [new_id]))
+                ) AS any_id,
+                argMin(old_id, toString(old_id)) AS survivor_id
+            FROM {remap_table} FINAL
+            WHERE new_id IN (
+                SELECT DISTINCT new_id
+                FROM {remap_table} FINAL
+                WHERE old_id IN (
+                    SELECT {candidate_column} FROM {candidate_cte}
+                )
+                   OR new_id IN (
+                    SELECT {candidate_column} FROM {candidate_cte}
+                )
+            )
+            GROUP BY new_id
+        )
+        GROUP BY any_id
     """
 
 
@@ -147,14 +182,23 @@ class UserTimeSeriesQueryBuilderV2(V2RewriteMixin, UserTimeSeriesQueryBuilder):
                 project_predicate=self.project_filter_sql(),
             )
         )
-        remap_join = remap_left_join(
-            "rs.end_user_id",
-            self.END_USER_REMAP_TABLE,
+        eu_map = _touched_survivor_map_subquery(
+            remap_table=self.END_USER_REMAP_TABLE,
+            candidate_cte="candidate_end_user_ids",
+            candidate_column="end_user_id",
         )
         resolved_eu = resolved_id_expr("rs.end_user_id")
 
         query = f"""
-        WITH {latest_spans_cte}
+        WITH
+        {latest_spans_cte},
+        candidate_end_user_ids AS (
+            SELECT DISTINCT end_user_id
+            FROM latest_spans
+            WHERE isNotNull(end_user_id)
+              AND end_user_id != toUUID('00000000-0000-0000-0000-000000000000')
+        ),
+        eu_survivor_map AS ({eu_map})
         SELECT
             time_bucket,
             avg(user_avg_latency) AS avg_latency,
@@ -193,7 +237,8 @@ class UserTimeSeriesQueryBuilderV2(V2RewriteMixin, UserTimeSeriesQueryBuilder):
                     sum(rs.completion_tokens) AS span_completion_tokens,
                     max(if(rs.status = 'ERROR', 1, 0)) AS span_has_error
                 FROM latest_spans AS rs
-                {remap_join}
+                LEFT JOIN eu_survivor_map AS id_remap
+                    ON rs.end_user_id = id_remap.any_id
                 WHERE rs.end_user_id IS NOT NULL
                   AND {where_clause}
                 GROUP BY end_user_id, trace_id
@@ -238,6 +283,7 @@ class UserDetailTimeSeriesQueryBuilderV2(V2RewriteMixin, BaseQueryBuilder):
             {
                 "org_id": self.organization_id,
                 "end_user_id": self.end_user_id,
+                "target_end_user_ids": (self.end_user_id,),
                 "start_date": self.start_date,
                 "end_date": self.end_date,
             }
@@ -254,43 +300,85 @@ class UserDetailTimeSeriesQueryBuilderV2(V2RewriteMixin, BaseQueryBuilder):
         self.params.update(extra_params)
         where_clause = extra_where if extra_where else "1 = 1"
 
-        latest_spans_ctes = _latest_start_time_spans_cte(
-            table=self.TABLE,
-            project_predicate=self.project_filter_sql(),
-        )
-        eu_remap_join = remap_left_join(
-            "rs.end_user_id",
+        eu_map = bounded_survivor_map_subquery(
             self.END_USER_REMAP_TABLE,
-            "eu_remap",
+            candidate_param="target_end_user_ids",
         )
-        ts_remap_join = remap_left_join(
-            "rs.trace_session_id",
-            self.TRACE_SESSION_REMAP_TABLE,
-            "ts_remap",
+        ts_map = _touched_survivor_map_subquery(
+            remap_table=self.TRACE_SESSION_REMAP_TABLE,
+            candidate_cte="candidate_trace_session_ids",
+            candidate_column="trace_session_id",
         )
         eu_resolved = resolved_id_expr("rs.end_user_id", "eu_remap")
         ts_resolved = resolved_id_expr("rs.trace_session_id", "ts_remap")
+        target_eu_resolved = resolved_id_expr("eu.end_user_id", "target_eu_remap")
 
         query = f"""
         WITH
-        {latest_spans_ctes},
+        eu_survivor_map AS ({eu_map}),
         target_end_user AS (
-            SELECT end_user_id
+            SELECT {target_eu_resolved} AS end_user_id
             FROM (
-                SELECT
-                    end_user_id,
-                    argMax(organization_id, version) AS latest_organization_id,
-                    argMax(project_id, version) AS latest_project_id,
-                    argMax(is_deleted, version) AS latest_is_deleted
-                FROM {self.END_USERS_TABLE}
-                PREWHERE project_id = %(project_id)s
+                SELECT *
+                FROM {self.END_USERS_TABLE} FINAL
+                PREWHERE project_id = toUUID(%(project_id)s)
                   AND end_user_id = toUUID(%(end_user_id)s)
-                GROUP BY end_user_id
+                WHERE organization_id = toUUID(%(org_id)s)
+                  AND is_deleted = 0
+            ) AS eu
+            LEFT JOIN eu_survivor_map AS target_eu_remap
+                ON eu.end_user_id = target_eu_remap.any_id
+        ),
+        expanded_target_end_user_ids AS (
+            SELECT any_id AS end_user_id
+            FROM eu_survivor_map
+            WHERE survivor_id IN (SELECT end_user_id FROM target_end_user)
+            UNION DISTINCT
+            SELECT end_user_id FROM target_end_user
+        ),
+        candidate_span_identities AS (
+            SELECT DISTINCT
+                project_id,
+                trace_id,
+                id,
+                start_time
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND toDate(start_time) BETWEEN
+                  toDate(%(start_date)s) AND toDate(%(end_date)s)
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND end_user_id IN (
+                  SELECT end_user_id FROM expanded_target_end_user_ids
+              )
+        ),
+        latest_spans AS (
+            SELECT *
+            FROM (
+                SELECT *
+                FROM {self.TABLE}
+                PREWHERE {self.project_filter_sql()}
+                  AND toDate(start_time) BETWEEN
+                      toDate(%(start_date)s) AND toDate(%(end_date)s)
+                  AND start_time >= %(start_date)s
+                  AND start_time < %(end_date)s
+                  AND (project_id, trace_id, id, start_time) IN (
+                      SELECT project_id, trace_id, id, start_time
+                      FROM candidate_span_identities
+                  )
+                ORDER BY project_id, trace_id, id, start_time, _version DESC
+                LIMIT 1 BY project_id, trace_id, id, start_time
             )
-            WHERE latest_organization_id = toUUID(%(org_id)s)
-              AND latest_project_id = toUUID(%(project_id)s)
-              AND latest_is_deleted = 0
-        )
+            WHERE is_deleted = 0
+        ),
+        candidate_trace_session_ids AS (
+            SELECT DISTINCT trace_session_id
+            FROM latest_spans
+            WHERE isNotNull(trace_session_id)
+              AND trace_session_id !=
+                  toUUID('00000000-0000-0000-0000-000000000000')
+        ),
+        ts_survivor_map AS ({ts_map})
         SELECT
             {bucket_fn}(start_time) AS time_bucket,
             uniqExactIf(
@@ -311,8 +399,10 @@ class UserDetailTimeSeriesQueryBuilderV2(V2RewriteMixin, BaseQueryBuilder):
                 rs.prompt_tokens AS prompt_tokens,
                 rs.completion_tokens AS completion_tokens
             FROM latest_spans AS rs
-            {eu_remap_join}
-            {ts_remap_join}
+            LEFT JOIN eu_survivor_map AS eu_remap
+                ON rs.end_user_id = eu_remap.any_id
+            LEFT JOIN ts_survivor_map AS ts_remap
+                ON rs.trace_session_id = ts_remap.any_id
             WHERE {where_clause}
         )
         WHERE end_user_id IN (SELECT end_user_id FROM target_end_user)

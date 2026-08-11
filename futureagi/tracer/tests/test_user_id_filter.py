@@ -156,6 +156,23 @@ class UserIdFilterTests(unittest.TestCase):
             )
             self.assertIn("FROM tracer_enduser", sql)
 
+    def test_explicit_user_named_span_attributes_keep_raw_map_semantics(self):
+        for column_id in ("end_user_id", "user", "user_id", "user_id_type"):
+            with self.subTest(column_id=column_id):
+                b = self._build()
+                sql = b._build_condition(
+                    col_id=column_id,
+                    col_type=ClickHouseFilterBuilder.SPAN_ATTRIBUTE,
+                    filter_type="text",
+                    filter_op="equals",
+                    filter_value="raw-provider-value",
+                )
+
+                self.assertIsNotNone(sql)
+                self.assertIn("span_attr_str", sql)
+                self.assertNotIn("FROM tracer_enduser", sql)
+                self.assertNotIn("FROM end_users", sql)
+
     def test_user_filter_always_resolves_via_tracer_enduser(self):
         """``col_id == 'user'`` is treated as a string filter against
         ``tracer_enduser.user_id`` regardless of value shape — every value is
