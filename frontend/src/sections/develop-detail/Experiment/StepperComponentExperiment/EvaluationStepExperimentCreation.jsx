@@ -214,7 +214,8 @@ const EvaluationStepExperimentCreation = ({
           if (versionData?.result?.id) evalEntry.pinnedVersionId = versionData.result.id;
         }
         queryClient.invalidateQueries({ queryKey: ["evals", "versions", evalConfig.templateId] });
-      } catch (err) {
+      } catch {
+        // Version creation is best-effort; fall back to the picker's selected version.
       }
     }
 
