@@ -492,6 +492,50 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return None
         return item
 
+    def _positive_exact_annotator_seed_filter(self) -> dict[str, Any] | None:
+        """Return one positive global annotator leaf usable as a candidate set.
+
+        Annotation membership is relational and therefore stays in the exact
+        classifier.  A positive annotator equality/IN is also a necessary
+        condition for the complete conjunction, though: every matching trace
+        must occur in the project-scoped Score relation for that user.  Using
+        that relation to constrain the ordered-root seed avoids replaying every
+        root batch across a long window before applying the same sparse Score
+        predicate.  Negative/null shapes cannot provide that candidate bound.
+        """
+
+        if self.search:
+            return None
+        for item in self._active_non_time_filters():
+            if (item.get("column_id") or item.get("columnId")) != "annotator":
+                continue
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            if not isinstance(config, dict):
+                continue
+            col_type = str(
+                config.get("col_type") or config.get("colType") or ""
+            ).upper()
+            if col_type not in {"", "NORMAL", "SYSTEM_METRIC", "ANNOTATION_METRIC"}:
+                continue
+            filter_type = str(
+                config.get("filter_type") or config.get("filterType") or ""
+            ).lower()
+            if filter_type not in {"", "annotator"}:
+                continue
+            operation = normalize_filter_op(
+                config.get("filter_op") or config.get("filterOp")
+            )
+            if operation not in {"equals", "in"}:
+                continue
+            raw_value = config.get("filter_value", config.get("filterValue"))
+            values = raw_value if isinstance(raw_value, (list, tuple)) else [raw_value]
+            if not values or any(
+                not isinstance(value, str) or not value for value in values
+            ):
+                continue
+            return item
+        return None
+
     def _positive_exact_end_user_span_seed(self) -> tuple[str, dict[str, Any]]:
         """Compile the direct span predicate for candidate-first user seeding.
 
@@ -548,7 +592,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return predicate or "", dict(filter_builder._params)
 
     def supports_filter_candidate_seed_page(self) -> bool:
-        """Use candidate-first roots only for the public user-detail shape."""
+        """Use an exact relational candidate set before ordered public roots."""
 
         return bool(
             not self._bounded_internal_scan
@@ -556,7 +600,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._bounded_bulk_scan
             and not self._bounded_population_proof
             and not self.sort_params
-            and self._positive_exact_end_user_seed_filter() is not None
+            and (
+                self._positive_exact_end_user_seed_filter() is not None
+                or self._positive_exact_annotator_seed_filter() is not None
+            )
         )
 
     @staticmethod
@@ -579,6 +626,29 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             score_date_scope=False,
             span_date_scope=True,
             strict_enduser_project_correlation=True,
+        )
+        predicate, params = filter_builder.translate([filter_item])
+        return predicate or "", params
+
+    def _positive_exact_annotator_seed(self) -> tuple[str, dict[str, Any]]:
+        """Compile all-history Score membership for one positive annotator."""
+
+        filter_item = self._positive_exact_annotator_seed_filter()
+        if filter_item is None:
+            return "", {}
+        filter_builder = self._FILTER_BUILDER_CLS(
+            table=self.TABLE,
+            query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_TRACE,
+            annotation_label_ids=self.annotation_label_ids,
+            project_id=self.project_id,
+            project_ids=self.project_ids,
+            # Annotation creation and the annotated child can both fall outside
+            # the root's display window.  Project + annotator + exact identity
+            # are the safe pruning boundary; the classifier repeats the full
+            # relation predicate before publication.
+            score_date_scope=False,
+            span_date_scope=False,
+            strict_trace_project_correlation=True,
         )
         predicate, params = filter_builder.translate([filter_item])
         return predicate or "", params
@@ -1106,12 +1176,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._bounded_bulk_scan
             and not self._bounded_population_proof
             and request_width >= timedelta(minutes=5)
-            and self._positive_exact_end_user_seed_filter() is not None
+            and (
+                self._positive_exact_end_user_seed_filter() is not None
+                or self._positive_exact_annotator_seed_filter() is not None
+            )
         ):
-            # The root seed is constrained by a project/time-scoped
-            # ``end_user_id`` membership subquery.  Read the requested window
-            # once instead of serially proving dozens of empty two-day slices
-            # for a sparse organization user.
+            # The root seed is constrained by an exact project-scoped
+            # end-user or Score membership subquery. Read the requested window
+            # once instead of serially proving empty two-day slices for a
+            # sparse relational value.
             return request_width
         if (
             not self._bounded_identity_only
@@ -1141,7 +1214,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._bounded_bulk_scan
             and not self._bounded_population_proof
             and request_width >= timedelta(minutes=5)
-            and self._positive_exact_end_user_seed_filter() is not None
+            and (
+                self._positive_exact_end_user_seed_filter() is not None
+                or self._positive_exact_annotator_seed_filter() is not None
+            )
         ):
             return request_width
         if (
@@ -2398,6 +2474,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         before_id: Any = None,
         direction: str = "older",
         _positive_user_candidate_first: bool = False,
+        _positive_annotator_candidate_first: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Return a root-ordered superset after a common anchor sentinel.
 
@@ -2417,6 +2494,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self.supports_filter_candidate_seed_page()
         ):
             raise ValueError("trace user candidate seed is unavailable")
+        if (
+            _positive_annotator_candidate_first
+            and self._positive_exact_annotator_seed_filter() is None
+        ):
+            raise ValueError("trace annotator candidate seed is unavailable")
+        if _positive_user_candidate_first and _positive_annotator_candidate_first:
+            raise ValueError("trace candidate seed must use one relational anchor")
         request_start, request_end = self.parse_time_range(self.filters)
         if not request_start <= slice_start < slice_end <= request_end:
             raise ValueError("trace seed slice must stay inside the request window")
@@ -2477,6 +2561,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         params.update(end_user_seed_params)
         if end_user_seed_predicate and not _positive_user_candidate_first:
             root_seed_predicates.append(end_user_seed_predicate)
+        if _positive_annotator_candidate_first:
+            annotator_seed_predicate, annotator_seed_params = (
+                self._positive_exact_annotator_seed()
+            )
+            if not annotator_seed_predicate:
+                raise ValueError("trace annotator candidate predicate is unavailable")
+            params.update(annotator_seed_params)
+            root_seed_predicates.append(annotator_seed_predicate)
         root_predicate = " AND ".join(root_seed_predicates)
         predicate_fragment = f"AND {root_predicate}" if root_predicate else ""
         trace_id_prewhere_predicate = " AND ".join(trace_id_prewhere_predicates)
@@ -2614,7 +2706,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         before_start_time: datetime | None = None,
         before_id: Any = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Seed ordered roots from a sole positive structural user first."""
+        """Seed ordered roots from an exact positive relational candidate."""
+
+        positive_user = self._positive_exact_end_user_seed_filter() is not None
+        positive_annotator = self._positive_exact_annotator_seed_filter() is not None
+        if not (positive_user or positive_annotator):
+            # Preserve the established domain error for unsupported callers.
+            raise ValueError("trace user candidate seed is unavailable")
 
         return TraceListQueryBuilder.build_filter_ordered_seed_page(
             self,
@@ -2623,7 +2721,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             limit=limit,
             before_start_time=before_start_time,
             before_id=before_id,
-            _positive_user_candidate_first=True,
+            _positive_user_candidate_first=positive_user,
+            _positive_annotator_candidate_first=(
+                positive_annotator and not positive_user
+            ),
         )
 
     def build_filter_navigation_seed_page(

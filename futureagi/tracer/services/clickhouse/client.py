@@ -12,6 +12,7 @@ from typing import Any
 
 import structlog
 from django.conf import settings
+
 from tracer.services.clickhouse.server_readonly import (
     ensure_read_statement,
     without_query_settings,
@@ -22,6 +23,8 @@ logger = structlog.get_logger(__name__)
 _QUERY_TRANSPORT_GRACE_SECONDS = 5.0
 _TOO_MANY_SIMULTANEOUS_QUERIES_CODE = 202
 _READ_ADMISSION_RETRY_DELAYS_SECONDS = (0.025, 0.075, 0.150)
+_APPLICATION_READ_TIMEOUT_MS = 30_000
+_APPLICATION_READ_MAX_MEMORY_USAGE = 36 * 1024 * 1024 * 1024
 
 # Try to import clickhouse-driver, gracefully handle if not installed
 try:
@@ -329,10 +332,23 @@ class ClickHouseClient:
                 requested_timeout_ms=timeout_ms,
             )
         else:
-            query_settings = {**(settings or {}), "readonly": 2}
-            if timeout_ms is not None:
-                # max_execution_time is in seconds
-                query_settings["max_execution_time"] = max(timeout_ms / 1000.0, 0.001)
+            timeout_ms = max(
+                1,
+                min(
+                    int(
+                        _APPLICATION_READ_TIMEOUT_MS
+                        if timeout_ms is None
+                        else timeout_ms
+                    ),
+                    _APPLICATION_READ_TIMEOUT_MS,
+                ),
+            )
+            query_settings = dict(settings or {})
+            query_settings.pop("max_rows_to_read", None)
+            query_settings["max_memory_usage"] = _APPLICATION_READ_MAX_MEMORY_USAGE
+            query_settings["readonly"] = 2
+            # max_execution_time is in seconds.
+            query_settings["max_execution_time"] = timeout_ms / 1000.0
 
         configured_transport_timeout = float(
             max(self.send_timeout, self.receive_timeout)

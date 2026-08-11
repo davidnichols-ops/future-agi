@@ -30,9 +30,11 @@ _MAX_PUBLIC_CANDIDATES = 10_000
 _MAX_QUERY_ATTEMPTS = 128
 _SAMPLE_CHUNK = 1_000
 _RELATION_PAGE_SIZE = 200
+_MAX_STATEMENT_TIMEOUT_MS = 30_000
 _READ_SETTINGS = {
+    "max_execution_time": 30,
     "max_threads": 2,
-    "max_memory_usage": 512 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_bytes_to_read": 2 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "timeout_overflow_mode": "throw",
@@ -72,7 +74,7 @@ class _ReadBudget:
         if remaining <= 0:
             raise ContinuousCandidateReadError("continuous read deadline exceeded")
         self.attempts += 1
-        return max(1, int(remaining * 1000))
+        return min(_MAX_STATEMENT_TIMEOUT_MS, max(1, int(remaining * 1000)))
 
 
 def discover_continuous_candidates(

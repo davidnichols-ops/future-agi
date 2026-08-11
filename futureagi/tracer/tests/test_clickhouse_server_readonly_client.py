@@ -93,14 +93,31 @@ def test_regular_read_keeps_client_side_guardrails(monkeypatch):
     client.execute_read(
         "SELECT 1",
         timeout_ms=250,
-        settings={"max_threads": 1},
+        settings={
+            "max_threads": 1,
+            "max_rows_to_read": 1,
+            "max_memory_usage": 2 * 1024 * 1024 * 1024,
+        },
     )
 
     assert native.execute.call_args.kwargs["settings"] == {
         "max_threads": 1,
+        "max_memory_usage": 36 * 1024 * 1024 * 1024,
         "readonly": 2,
         "max_execution_time": 0.25,
     }
+
+
+def test_regular_read_does_not_revive_exhausted_timeout(monkeypatch):
+    native = Mock()
+    native.execute.return_value = ([], [])
+    client = _client(server_enforced_readonly=False)
+    monkeypatch.setattr(client, "_get_client", Mock(return_value=native))
+    monkeypatch.setattr(client, "_return_client", Mock())
+
+    client.execute_read("SELECT 1", timeout_ms=0)
+
+    assert native.execute.call_args.kwargs["settings"]["max_execution_time"] == 0.001
 
 
 def test_progress_read_adds_native_rows_and_bytes_without_changing_read_api(
@@ -163,6 +180,7 @@ def test_regular_read_retries_transient_admission_without_mutating_settings(
     assert native.execute.call_count == 3
     assert native.execute.call_args_list[0].kwargs["settings"] == {
         "max_threads": 1,
+        "max_memory_usage": 36 * 1024 * 1024 * 1024,
         "readonly": 2,
         "max_execution_time": 1.0,
     }
@@ -213,25 +231,28 @@ def test_regular_read_does_not_retry_non_admission_error(monkeypatch):
     sleep.assert_not_called()
 
 
-def test_long_read_uses_matching_disposable_native_transport(monkeypatch):
+def test_long_read_is_clamped_to_application_read_policy(monkeypatch):
     native = Mock()
     native.execute.return_value = ([], [])
     driver = Mock(return_value=native)
     monkeypatch.setattr(client_module, "CHDriver", driver)
     monkeypatch.setattr(client_module, "CLICKHOUSE_AVAILABLE", True)
     client = _client(server_enforced_readonly=False)
-    get_pooled_client = Mock()
+    get_pooled_client = Mock(return_value=native)
     monkeypatch.setattr(client, "_get_client", get_pooled_client)
     return_pooled_client = Mock()
     monkeypatch.setattr(client, "_return_client", return_pooled_client)
 
     client.execute_read("SELECT 1", timeout_ms=1_200_000)
 
-    get_pooled_client.assert_not_called()
-    return_pooled_client.assert_not_called()
-    assert driver.call_args.kwargs["send_receive_timeout"] == 1_205.0
-    assert native.execute.call_args.kwargs["settings"]["max_execution_time"] == 1200
-    native.disconnect.assert_called_once_with()
+    get_pooled_client.assert_called_once_with()
+    return_pooled_client.assert_called_once_with(native)
+    driver.assert_not_called()
+    assert native.execute.call_args.kwargs["settings"] == {
+        "max_memory_usage": 36 * 1024 * 1024 * 1024,
+        "readonly": 2,
+        "max_execution_time": 30.0,
+    }
 
 
 def test_query_settings_stripper_preserves_nested_literals_and_format():

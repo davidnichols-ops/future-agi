@@ -89,7 +89,10 @@ from tracer.services.clickhouse.v2.id_remap_sql import (
     remap_left_join,
     resolved_id_expr,
 )
-from tracer.services.clickhouse.v2.query_settings import current_settings
+from tracer.services.clickhouse.v2.query_settings import (
+    application_read_settings,
+    current_settings,
+)
 
 log = structlog.get_logger("ch25.trace_session_dict_reader")
 
@@ -245,13 +248,12 @@ def resolve_external_session_ids(
         # arrayJoin over the literal id list resolves the whole batch in ONE
         # round-trip. dictGetOrNull keeps the missing-key → NULL semantics.
         query_kwargs = {"parameters": {"ids": list(ids)}}
-        query_settings = dict(settings or {})
-        if timeout_ms is not None:
-            if timeout_ms <= 0:
-                raise ValueError("timeout_ms must be positive")
-            query_settings["max_execution_time"] = timeout_ms / 1000
-        if query_settings:
-            query_kwargs["settings"] = query_settings
+        if timeout_ms is not None and timeout_ms <= 0:
+            raise ValueError("timeout_ms must be positive")
+        query_kwargs["settings"] = application_read_settings(
+            {**current_settings(), **(settings or {})},
+            timeout_ms=timeout_ms,
+        )
         result = client.query(
             (
                 f"SELECT toString(sid), "

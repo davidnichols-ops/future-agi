@@ -1016,6 +1016,7 @@ class ObservabilityService:
                 "status": _normalize_voice_call_status(attrs.get("call.status"))
                 or "completed",
                 "call_type": attrs.get("call_type"),
+                "ended_reason": attrs.get("ended_reason"),
                 "cost_cents": cost_cents,
                 "started_at": None,  # span start_time is authoritative
                 "duration_seconds": int(duration) if duration is not None else None,

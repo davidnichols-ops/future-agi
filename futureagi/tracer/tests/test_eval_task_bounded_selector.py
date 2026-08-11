@@ -954,8 +954,8 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
             assert settings["max_threads"] == 1
             assert settings["max_block_size"] == 2_048
             assert settings["preferred_max_column_in_block_size_bytes"] == 1_048_576
-            assert settings["max_rows_to_read"] == 5_000_000
-            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert "max_rows_to_read" not in settings
+            assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
             assert settings["max_result_rows"] == 1
             return QueryResult(
@@ -1051,14 +1051,14 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
             self.calls.append((query, params))
             assert timeout_ms <= 3_000
             assert settings["max_threads"] == 1
-            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
 
             candidate_ids = params.get("candidate_trace_ids")
             if candidate_ids is not None:
                 assert "filter_witness_0" in query
                 assert "argMinIf(tuple(grouped_id, latest_start_time)" in query
-                assert settings["max_rows_to_read"] == 5_000_000
+                assert "max_rows_to_read" not in settings
                 assert settings["max_block_size"] == 2_048
                 assert settings["preferred_max_column_in_block_size_bytes"] == 1_048_576
                 rows = [
@@ -1150,7 +1150,6 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
     assert "preferred_max_column_in_block_size_bytes" not in captured["read_settings"]
     assert captured["classify_read_settings"] == {
         "max_block_size": 2_048,
-        "max_rows_to_read": 5_000_000,
         "preferred_max_column_in_block_size_bytes": 1_048_576,
     }
     assert captured["builder"]._bounded_include_filter_witnesses is True
@@ -1216,11 +1215,10 @@ def test_trace_eval_witness_replay_uses_ten_id_batches_with_hard_caps(
                 "max_threads": 1,
                 "max_block_size": 2_048,
                 "preferred_max_column_in_block_size_bytes": 1_048_576,
-                "max_memory_usage": 256 * 1024 * 1024,
+                "max_memory_usage": 36 * 1024 * 1024 * 1024,
                 "max_bytes_to_read": 512 * 1024 * 1024,
                 "read_overflow_mode": "throw",
                 "result_overflow_mode": "throw",
-                "max_rows_to_read": 5_000_000,
                 "max_result_rows": len(trace_ids),
             }
             by_trace = {row["trace_id"]: row for row in rows}
@@ -1288,7 +1286,7 @@ def test_dense_100k_custom_trace_witness_replay_is_a_bounded_fail_safe_only(
             assert timeout_ms == 3_000
             assert settings["max_execution_time"] == 3
             assert settings["max_threads"] == 1
-            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
             assert settings["max_result_rows"] == len(params["candidate_trace_ids"])
             replayed = []
@@ -1349,7 +1347,6 @@ def test_trace_eval_witness_routes_to_workflow_before_interactive_replay_cap(
         assert "preferred_max_column_in_block_size_bytes" not in kwargs["read_settings"]
         assert kwargs["classify_read_settings"] == {
             "max_block_size": 2_048,
-            "max_rows_to_read": 5_000_000,
             "preferred_max_column_in_block_size_bytes": 1_048_576,
         }
         return BoundedFilterPage(
@@ -1537,7 +1534,7 @@ def test_workflow_one_phase_late_classifier_failure_never_returns_partial_rows()
         def execute_ch_query(self, query, params, *, timeout_ms, settings):
             assert timeout_ms <= 3_000
             assert settings["max_threads"] == 1
-            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
             candidate_ids = params.get("candidate_trace_ids")
             if candidate_ids is not None:

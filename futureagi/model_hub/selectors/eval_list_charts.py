@@ -262,10 +262,9 @@ def read_eval_list_charts(
             timeout_ms=READ_TIMEOUT_MS,
             settings={
                 "max_threads": 2,
-                "max_rows_to_read": 8_000_000,
                 "read_overflow_mode": "throw",
                 "max_bytes_to_read": 512 * 1024 * 1024,
-                "max_memory_usage": 128 * 1024 * 1024,
+                "max_memory_usage": 36 * 1024 * 1024 * 1024,
                 "max_result_rows": MAX_TEMPLATE_IDS * 31,
                 "max_result_bytes": 2 * 1024 * 1024,
                 "result_overflow_mode": "throw",

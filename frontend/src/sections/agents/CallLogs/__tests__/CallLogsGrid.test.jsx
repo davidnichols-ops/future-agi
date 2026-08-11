@@ -166,6 +166,51 @@ describe("CallLogsGrid bounded-read state", () => {
     );
   });
 
+  it("does not repeat prefetch when equivalent filter params are recreated", async () => {
+    useCallLogsMock.mockReturnValue({
+      data: completeData,
+      isLoading: false,
+      error: null,
+      queryKey: ["callLogs", "project", "project-1", 15, {}, 1],
+    });
+    const annotatorFilters = JSON.stringify([
+      {
+        column_id: "annotator",
+        filter_config: {
+          col_type: "SYSTEM_METRIC",
+          filter_op: "equals",
+          filter_value: "annotator-1",
+        },
+      },
+    ]);
+    const view = render(
+      <CallLogsGrid
+        id="project-1"
+        module="project"
+        hideDrawer
+        params={{ project_id: "project-1", filters: annotatorFilters }}
+      />,
+    );
+
+    await waitFor(() => expect(prefetchCallLogsMock).toHaveBeenCalledOnce());
+
+    // LLMTracingView recreates this object on ordinary parent renders. That
+    // must not restart the already-issued speculative page-two request.
+    view.rerender(
+      <CallLogsGrid
+        id="project-1"
+        module="project"
+        hideDrawer
+        params={{ project_id: "project-1", filters: annotatorFilters }}
+      />,
+    );
+
+    expect(prefetchCallLogsMock).toHaveBeenCalledOnce();
+    expect(useCallLogsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ paginationRevision: 0 }),
+    );
+  });
+
   it("does not request a cursor for a terminal overflow page already buffered locally", async () => {
     useCallLogsMock.mockReturnValue({
       data: {

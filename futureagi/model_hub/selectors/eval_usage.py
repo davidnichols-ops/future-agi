@@ -19,8 +19,8 @@ from tracer.services.clickhouse.trace_project_scope import (
     latest_live_trace_projects_sql,
 )
 
-READ_TIMEOUT_MS = 55 * 60 * 1000
-QUERY_TIMEOUT_MS = 120_000
+READ_TIMEOUT_MS = 30_000
+QUERY_TIMEOUT_MS = 30_000
 MAX_PAGE_SIZE = 100
 _USAGE_TABLE = "usage_apicalllog"
 _MAX_PAGE_SELECTION_ROWS = 10_000
@@ -28,15 +28,9 @@ _MIN_PAGE_WINDOW = timedelta(microseconds=1)
 
 _READ_SETTINGS = {
     "max_threads": 2,
-    # Candidate-scoped project validation reads the narrow usage identity
-    # slice once more inside the same statement.  The previous 25M ceiling
-    # therefore rejected otherwise healthy 12M-row exact windows before any
-    # result could be produced.  Keep a finite, worker-only ceiling while
-    # allowing that exact two-scan shape plus the bounded trace candidates.
-    "max_rows_to_read": 100_000_000,
     "read_overflow_mode": "throw",
     "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
-    "max_memory_usage": 512 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "timeout_overflow_mode": "throw",
 }
 

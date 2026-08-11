@@ -853,6 +853,107 @@ def test_structural_end_user_id_candidate_seed_uses_direct_uuid_predicate() -> N
     assert params["col_1"] == end_user_id
 
 
+def test_voice_annotator_and_turn_count_use_one_exact_candidate_seed() -> None:
+    annotator_id = "00000000-0000-4000-8000-000000000099"
+    filters = [
+        _time_filter(),
+        {
+            "column_id": "turn_count",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "number",
+                "filter_op": "greater_than",
+                "filter_value": 4,
+            },
+        },
+        {
+            "column_id": "annotator",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "annotator",
+                "filter_op": "equals",
+                "filter_value": annotator_id,
+            },
+        },
+    ]
+    builder = VoiceCallListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        page_size=25,
+        filters=filters,
+    )
+
+    sql, params = builder.build_filter_candidate_seed_page(
+        slice_start=START,
+        slice_end=END,
+        limit=26,
+    )
+    compact_sql = " ".join(sql.split())
+
+    assert builder.supports_filter_candidate_seed_page() is True
+    assert builder.filter_candidate_seed_proves_result_order() is True
+    assert builder.recommended_filter_initial_slice_width() == END - START
+    assert builder.recommended_filter_max_slice_width() == END - START
+    assert builder.recommended_filter_query_timeout_ms() == 30_000
+    assert "FROM model_hub_score AS s FINAL" in compact_sql
+    assert "s.tracer_project_id = toUUID(%(project_id)s)" in compact_sql
+    assert "s.annotator_id IN (toUUID(%(uid_1)s))" in compact_sql
+    assert "s.created_at >=" not in compact_sql
+    assert "trace_id IN (SELECT DISTINCT" in compact_sql
+    assert "call.total_turns" in compact_sql
+    assert "observation_type" in compact_sql
+    assert "ORDER BY start_time DESC, trace_id DESC" in compact_sql
+    assert "LIMIT 1 BY trace_id LIMIT %(filter_seed_limit)s" in compact_sql
+    assert params["uid_1"] == annotator_id
+    assert params["filter_seed_limit"] == 26
+
+
+def test_negative_voice_annotator_stays_on_exact_bounded_classifier() -> None:
+    builder = VoiceCallListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            {
+                "column_id": "annotator",
+                "filter_config": {
+                    "filter_type": "annotator",
+                    "filter_op": "not_equals",
+                    "filter_value": "00000000-0000-4000-8000-000000000099",
+                },
+            },
+        ],
+    )
+
+    assert builder.supports_filter_candidate_seed_page() is False
+    assert builder.recommended_filter_initial_slice_width() is None
+    assert builder.recommended_filter_max_slice_width() is None
+    with pytest.raises(ValueError, match="voice annotator candidate seed"):
+        builder.build_filter_candidate_seed_page(
+            slice_start=START,
+            slice_end=END,
+            limit=26,
+        )
+
+
+def test_raw_annotator_span_attribute_never_uses_score_candidate_seed() -> None:
+    builder = VoiceCallListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            {
+                "column_id": "annotator",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "raw-annotator-value",
+                },
+            },
+        ],
+    )
+
+    assert builder.supports_filter_candidate_seed_page() is False
+
+
 @pytest.mark.parametrize("column_id", ["end_user_id", "user", "user_id"])
 def test_raw_user_named_span_attribute_does_not_use_candidate_seed(
     column_id: str,

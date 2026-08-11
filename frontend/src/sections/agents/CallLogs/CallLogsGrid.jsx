@@ -135,6 +135,12 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     selectedVersion,
     params,
   });
+  // LLMTracingView builds request params inline. Keep the latest equivalent
+  // object available to effects without making its reference an effect
+  // dependency: otherwise any unrelated parent render re-runs a stale
+  // next-page prefetch for the same semantic query.
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
   const [lastCursorQuerySignature, setLastCursorQuerySignature] =
     useState(cursorQuerySignature);
   const [callLogsColumnDefs, setCallLogsColumnDefs] = useState(null);
@@ -430,7 +436,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
         version: selectedVersion,
         page: page + 1,
         pageLimit,
-        params,
+        params: paramsRef.current,
         paginationParams: nextPaginationParams,
         paginationRevision: cursorTransportRevision,
         cursorPagination:
@@ -450,7 +456,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     id,
     selectedVersion,
     pageLimit,
-    params,
+    cursorQuerySignature,
     exactPage,
     cursorTransportRevision,
     isUsableListRead,

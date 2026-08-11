@@ -45,6 +45,10 @@ from tracer.services.clickhouse.v2.id_remap_sql import (
     bounded_survivor_map_subquery,
     resolved_id_expr,
 )
+from tracer.services.clickhouse.v2.query_settings import (
+    application_read_settings,
+    current_settings,
+)
 
 log = structlog.get_logger("ch25.end_user_dict_reader")
 
@@ -165,6 +169,7 @@ def resolve_user_ids(end_user_ids: Iterable[object]) -> dict[str, str | None]:
                 f"{remap_join}"
             ),
             parameters={"ids": list(ids)},
+            settings=current_settings(),
         )
     except Exception:
         # A read error is real (parity must not silently degrade). Reset the
@@ -230,13 +235,12 @@ def resolve_end_user_fields(
         # stays the ORIGINAL input id (`eid`) so callers key by the id they
         # passed. Pre-flip a no-op (no id matches a `new_id`) → gate B.
         query_kwargs = {"parameters": {"ids": list(ids)}}
-        query_settings = dict(settings or {})
-        if timeout_ms is not None:
-            if timeout_ms <= 0:
-                raise ValueError("timeout_ms must be positive")
-            query_settings["max_execution_time"] = timeout_ms / 1000
-        if query_settings:
-            query_kwargs["settings"] = query_settings
+        if timeout_ms is not None and timeout_ms <= 0:
+            raise ValueError("timeout_ms must be positive")
+        query_kwargs["settings"] = application_read_settings(
+            {**current_settings(), **(settings or {})},
+            timeout_ms=timeout_ms,
+        )
         result = client.query(
             (
                 f"SELECT toString(ids.eid), "
@@ -368,11 +372,10 @@ def resolve_end_user_ids_by_user_id(
     where = " AND ".join(conds)
     try:
         query_kwargs = {"parameters": params}
-        query_settings = dict(settings or {})
-        if timeout_ms is not None:
-            query_settings["max_execution_time"] = timeout_ms / 1000
-        if query_settings:
-            query_kwargs["settings"] = query_settings
+        query_kwargs["settings"] = application_read_settings(
+            {**current_settings(), **(settings or {})},
+            timeout_ms=timeout_ms,
+        )
         result = client.query(
             f"SELECT DISTINCT toString(end_user_id) FROM end_users FINAL WHERE {where}",
             **query_kwargs,

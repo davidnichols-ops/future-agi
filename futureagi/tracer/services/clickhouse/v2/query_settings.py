@@ -13,9 +13,49 @@ from contextvars import ContextVar
 
 _settings: ContextVar[dict | None] = ContextVar("ch_query_settings", default=None)
 
+_APPLICATION_READ_MAX_MEMORY_USAGE = 36 * 1024 * 1024 * 1024
+_APPLICATION_READ_MAX_EXECUTION_TIME_SECONDS = 30
+
+
+def application_read_settings(
+    settings: dict | None = None,
+    *,
+    timeout_ms: int | None = None,
+) -> dict:
+    """Normalize one ordinary v2 read without weakening tighter overrides."""
+
+    settings = dict(settings or {})
+    settings.pop("max_rows_to_read", None)
+    settings.setdefault("max_memory_usage", _APPLICATION_READ_MAX_MEMORY_USAGE)
+    requested_timeout = settings.get("max_execution_time")
+    timeout_seconds = (
+        max(
+            0.001,
+            min(
+                float(requested_timeout),
+                _APPLICATION_READ_MAX_EXECUTION_TIME_SECONDS,
+            ),
+        )
+        if requested_timeout is not None
+        else _APPLICATION_READ_MAX_EXECUTION_TIME_SECONDS
+    )
+    if timeout_ms is not None:
+        timeout_seconds = min(
+            timeout_seconds,
+            max(
+                0.001,
+                min(
+                    timeout_ms / 1000,
+                    _APPLICATION_READ_MAX_EXECUTION_TIME_SECONDS,
+                ),
+            ),
+        )
+    settings["max_execution_time"] = timeout_seconds
+    return settings
+
 
 def current_settings() -> dict:
-    return dict(_settings.get() or {})
+    return application_read_settings(_settings.get())
 
 
 @contextmanager

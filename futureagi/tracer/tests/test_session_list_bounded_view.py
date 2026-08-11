@@ -460,9 +460,11 @@ def test_user_detail_reverse_lookup_keeps_transport_and_query_under_30_seconds(
             reader.resolve_end_user_ids_by_user_id(
                 "customer-1",
                 organization_id=str(uuid.uuid4()),
-                timeout_ms=29_500,
+                timeout_ms=120_000,
                 settings={
                     "max_threads": 2,
+                    "max_rows_to_read": 1,
+                    "max_execution_time": 120,
                     "max_bytes_to_read": 256 * 1024 * 1024,
                     "max_memory_usage": 36 * 1024 * 1024 * 1024,
                     "max_result_rows": 10_000,
@@ -474,9 +476,11 @@ def test_user_detail_reverse_lookup_keeps_transport_and_query_under_30_seconds(
         reader._reset_client()
 
     assert client_factory.call_args.kwargs["send_receive_timeout"] == 30
+    assert "settings" not in client_factory.call_args.kwargs
     query_settings = client.query.call_args.kwargs["settings"]
-    assert query_settings["max_execution_time"] == 29.5
+    assert query_settings["max_execution_time"] == 30
     assert "max_rows_to_read" not in query_settings
+    assert query_settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
     assert query_settings["max_threads"] == 2
     assert query_settings["max_result_rows"] == 10_000
 

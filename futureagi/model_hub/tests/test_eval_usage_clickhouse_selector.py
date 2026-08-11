@@ -343,7 +343,8 @@ def test_eval_usage_heavy_12m_uses_three_full_window_statements(monkeypatch):
         for _query, call_params, _timeout, call_settings in fake.calls
     )
     assert all(
-        call_settings["max_rows_to_read"] == 100_000_000
+        "max_rows_to_read" not in call_settings
+        and call_settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         for _query, _params, _timeout, call_settings in fake.calls
     )
 

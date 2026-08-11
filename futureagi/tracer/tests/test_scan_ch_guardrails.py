@@ -20,6 +20,13 @@ from tracer.tasks import trace_scanner as scanner
 _NOW = datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC)
 
 
+def test_scan_guardrails_follow_shared_clickhouse_policy():
+    assert scanner.SCAN_CH_GUARDRAILS["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+    assert scanner.SCAN_CH_GUARDRAILS["max_execution_time"] == 30
+    assert "max_rows_to_read" not in scanner.SCAN_CH_GUARDRAILS
+    assert scanner.SCAN_CH_GUARDRAILS["max_bytes_before_external_sort"] > 0
+
+
 def _reader_cm():
     """A ``with get_reader() as reader`` context manager over a mock reader."""
     reader = MagicMock()

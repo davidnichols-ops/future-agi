@@ -42,7 +42,29 @@ from tracer.services.clickhouse.v2.query_builders.trace_list import (
 from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
     VoiceCallListQueryBuilderV2,
 )
+from tracer.services.eval_tasks.ch_guardrails import EVAL_CH_GUARDRAILS
 from tracer.services.eval_tasks.config_hash import resolved_config_hash
+
+
+@pytest.mark.unit
+def test_background_eval_reads_follow_shared_clickhouse_policy() -> None:
+    settings_sets = (
+        EVAL_CH_GUARDRAILS,
+        row_resolver._EVAL_TASK_STREAM_READ_SETTINGS,
+        row_resolver._EVAL_TASK_FILTER_CLASSIFY_READ_SETTINGS,
+        continuous_candidates._READ_SETTINGS,
+    )
+    for settings in settings_sets:
+        assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+        assert "max_rows_to_read" not in settings
+        assert settings["max_execution_time"] <= 30
+
+    assert continuous_candidates._MAX_STATEMENT_TIMEOUT_MS == 30_000
+    assert row_resolver._EVAL_TASK_MAX_READ_ATTEMPTS > 0
+    assert row_resolver._EVAL_TASK_FILTER_CLASSIFY_READ_SETTINGS["max_threads"] > 0
+    assert (
+        row_resolver._EVAL_TASK_FILTER_CLASSIFY_READ_SETTINGS["max_bytes_to_read"] > 0
+    )
 
 
 def _attribute_filter(key: str = "final_status", value: str = "Rejected") -> dict:
@@ -660,7 +682,7 @@ def test_continuous_10k_custom_attribute_classifier_has_finite_exact_budget(
         assert settings["max_execution_time"] == 3
         assert settings["timeout_overflow_mode"] == "throw"
         assert settings["max_threads"] == 1
-        assert settings["max_memory_usage"] == 256 * 1024 * 1024
+        assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
         assert settings["read_overflow_mode"] == "throw"
         assert settings["max_result_rows"] == 10

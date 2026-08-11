@@ -1094,6 +1094,64 @@ describe("voice-call property parity", () => {
     document.body.removeChild(anchorEl);
   });
 
+  it("keeps system and raw ended_reason value requests category-qualified", () => {
+    dashboardFilterValuesMock.mockClear();
+    const propertiesWithRawEndedReason = mergeTraceFilterProperties({
+      tab: "voiceCalls",
+      dynamicProperties: [
+        {
+          id: "ended_reason",
+          name: "ended_reason",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          attributeTypes: ["string"],
+          attributeTypesExact: true,
+        },
+      ],
+    });
+    const { anchorEl } = renderPanel({
+      properties: propertiesWithRawEndedReason,
+      projectId: "project-1",
+      currentFilters: [
+        {
+          field: "ended_reason",
+          fieldName: "Ended Reason",
+          fieldCategory: "system",
+          fieldType: "string",
+          apiColType: "SYSTEM_METRIC",
+          operator: "in",
+          value: [],
+        },
+        {
+          field: "ended_reason",
+          fieldName: "ended_reason",
+          fieldCategory: "attribute",
+          fieldType: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          operator: "in",
+          value: [],
+        },
+      ],
+    });
+
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metricName: "ended_reason",
+        metricType: "system_metric",
+        attributeType: undefined,
+      }),
+    );
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metricName: "ended_reason",
+        metricType: "custom_attribute",
+        attributeType: "string",
+      }),
+    );
+    document.body.removeChild(anchorEl);
+  });
+
   it("selects raw cost_cents independently from canonical system cost", async () => {
     const propertiesWithRawCost = mergeTraceFilterProperties({
       tab: "voiceCalls",

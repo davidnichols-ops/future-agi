@@ -68,7 +68,7 @@ _EVAL_TASK_STREAM_READ_SETTINGS = {
     "max_execution_time": 10,
     "timeout_overflow_mode": "throw",
     "max_threads": 2,
-    "max_memory_usage": 512 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_bytes_to_read": 2 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
 }
@@ -87,14 +87,12 @@ _EVAL_TASK_FILTER_CLASSIFY_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
     "max_threads": 1,
     "max_block_size": 2_048,
-    "max_memory_usage": 256 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_bytes_to_read": 512 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "result_overflow_mode": "throw",
 }
-_EVAL_TASK_TRACE_WITNESS_EXTRA_READ_SETTINGS = {
-    "max_rows_to_read": 5_000_000,
-}
+_EVAL_TASK_TRACE_WITNESS_EXTRA_READ_SETTINGS: dict[str, int] = {}
 _SAFE_READ_BUDGET_MESSAGE = (
     "Evaluation task row selection exceeded its read budget. "
     "Narrow the time range and retry."
@@ -1061,10 +1059,8 @@ def _resolve_bounded_historical_span_ids(
 
     # Ordered root discovery can legitimately scan more than one custom
     # classifier statement. Keep the common execution/thread/memory/byte caps
-    # on every statement, but scope the 2,048 block and 5M row ceilings to the
-    # expensive custom classifier/witness query itself. Applying those row
-    # caps to seeds rejects large projects before their finite workflow budget
-    # has a chance to classify the requested prefix.
+    # on every statement, while scoping the 2,048 block-size cap to the
+    # expensive custom classifier/witness query itself.
     bounded_read_settings = _filter_classifier_read_settings(builder)
     classifier_only_setting_names = {
         "max_block_size",

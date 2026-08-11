@@ -33,6 +33,9 @@ from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 
 logger = structlog.get_logger(__name__)
 
+APPLICATION_READ_TIMEOUT_MS = 30_000
+APPLICATION_READ_MAX_MEMORY_USAGE = 36 * 1024 * 1024 * 1024
+
 
 class SpanTraceMapIntegrityError(ReadDeadlineExceeded):
     """A finite scored span did not resolve to one unambiguous live trace."""
@@ -163,6 +166,20 @@ class AnalyticsQueryService:
         settings: dict | None = None,
     ) -> QueryResult:
         """Execute a query on ClickHouse and return QueryResult."""
+        # Normalize the ordinary application read lane even for older callers
+        # that omit settings. Row-count ceilings reject healthy high-volume
+        # reads before their finite byte/time/result budgets are reached.
+        if self.supports_per_query_read_settings:
+            requested_timeout_ms = (
+                APPLICATION_READ_TIMEOUT_MS if timeout_ms is None else int(timeout_ms)
+            )
+            timeout_ms = min(
+                APPLICATION_READ_TIMEOUT_MS,
+                max(1, requested_timeout_ms),
+            )
+            settings = dict(settings or {})
+            settings.pop("max_rows_to_read", None)
+            settings["max_memory_usage"] = APPLICATION_READ_MAX_MEMORY_USAGE
         start = time.monotonic()
         try:
             rows, columns, qt = self.ch_client.execute_read(

@@ -185,9 +185,18 @@ VOICE_CALL_STATUS_FILTER_EXPRESSION = (
     f"if({_VOICE_VAPI_RAW_STATUS} = 'ended', 'completed', 'in-progress'), "
     f"{_VOICE_OTHER_RAW_STATUS})"
 )
-VOICE_ENDED_REASON_FILTER_EXPRESSION = (
+_VOICE_STORED_ENDED_REASON = (
     "if(mapContains(span_attr_str, 'ended_reason'), "
     "nullIf(span_attr_str['ended_reason'], ''), null)"
+)
+_VOICE_VAPI_RAW_ENDED_REASON = _raw_log_string(("endedReason",))
+_VOICE_RETELL_RAW_ENDED_REASON = _raw_log_string(("disconnection_reason",))
+VOICE_ENDED_REASON_FILTER_EXPRESSION = (
+    "multiIf("
+    f"NOT {_VOICE_HAS_NONEMPTY_RAW_LOG}, {_VOICE_STORED_ENDED_REASON}, "
+    f"({_VOICE_RESOLVED_PROVIDER}) = 'retell', {_VOICE_RETELL_RAW_ENDED_REASON}, "
+    f"({_VOICE_RESOLVED_PROVIDER}) = 'vapi', {_VOICE_VAPI_RAW_ENDED_REASON}, "
+    "CAST(NULL AS Nullable(String)))"
 )
 
 
