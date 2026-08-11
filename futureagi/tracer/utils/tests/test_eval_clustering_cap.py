@@ -9,12 +9,17 @@ This replaced an in-function self-continuation whose distinct-id follow-up ran
 concurrently with the next per-eval trigger and double-counted. These tests pin:
 
   * the inner batch is bounded and never self-continues, and
-  * the caller's drain loop terminates on a short batch (backlog drained) or on
+  * the caller's drain loop terminates on an EMPTY fetch (backlog drained) or on
     zero progress (downstream down), aggregates counters across batches, and is
-    backstopped so one dispatch can't run away on a very large backlog.
+    backstopped so one dispatch can't run away on a very large backlog — loudly,
+    because a capped-out drain leaves a backlog nothing else will pick up.
 
-Termination is sound because every clustered row leaves a junction row and so
-drops out of the next fetch — that invariant is pinned in
+A short-but-nonempty batch must NOT stop the loop: triggers arriving mid-run are
+coalesced away by the fixed-workflow-id gate, so rows committed while the final
+batch was being processed are only picked up if the loop looks again.
+
+Terminating on empty is sound because every row that clusters leaves a junction
+row and so drops out of the next fetch — that invariant is pinned in
 ``tracer/tests/test_eval_clustering_membership.py``.
 """
 
@@ -85,7 +90,8 @@ def test_full_batch_reports_fetched_at_cap():
 
 
 def test_partial_batch_reports_fetched_below_cap():
-    """A short batch signals the fetchable set is drained (caller then stops)."""
+    """A short batch reports its true size — it does not imply "drained"; only a
+    zero fetch does."""
     summary = _run_batch(_CLUSTER_BATCH_LIMIT - 1)
     assert summary.fetched == _CLUSTER_BATCH_LIMIT - 1
 
@@ -121,6 +127,11 @@ def _short(n: int = 3) -> EvalClusteringSummary:
     )
 
 
+def _empty() -> EvalClusteringSummary:
+    """Nothing left to fetch — the only clean stop."""
+    return EvalClusteringSummary()
+
+
 def _drain_with(summaries):
     """Run the drain loop with ``cluster_eval_results`` scripted to return the
     given summaries in order (repeating the last if the loop asks for more);
@@ -144,19 +155,31 @@ def _drain_with(summaries):
 # — that touches the DB connection, so these need the django_db mark even though
 # cluster_eval_results itself is mocked out.
 @pytest.mark.django_db
-def test_drain_loops_until_short_batch():
-    """Full batches keep the loop going; the first short batch ends it. Counters
+def test_drain_loops_until_empty_batch():
+    """Full batches keep the loop going; the first EMPTY fetch ends it. Counters
     aggregate across every batch."""
-    result, n = _drain_with([_full(5), _full(5), _short(2)])
+    result, n = _drain_with([_full(5), _full(5), _empty()])
     assert n == 3
-    assert result["clustered"] == 12  # 5 + 5 + 2
+    assert result["clustered"] == 10  # 5 + 5, the empty batch adds nothing
 
 
 @pytest.mark.django_db
-def test_single_short_batch_runs_once():
-    result, n = _drain_with([_short(4)])
+def test_short_batch_keeps_draining():
+    """The pin for the coalescing gap: a short-but-nonempty batch means "nothing
+    more right now", NOT "drained". A trigger that arrived while this batch was
+    being processed was folded into this run and dropped, so stopping here would
+    strand its rows until the project's next failing eval — which a finished
+    one-shot task never produces. The loop must look again."""
+    result, n = _drain_with([_short(2), _short(3), _empty()])
+    assert n == 3, "a short batch must not terminate the drain"
+    assert result["clustered"] == 5
+
+
+@pytest.mark.django_db
+def test_single_empty_batch_runs_once():
+    result, n = _drain_with([_empty()])
     assert n == 1
-    assert result["clustered"] == 4
+    assert result["clustered"] == 0
 
 
 @pytest.mark.django_db
@@ -173,7 +196,18 @@ def test_drain_stops_on_zero_progress():
 def test_drain_backstops_at_max_batches():
     """A backlog bigger than the loop can drain in one dispatch: every batch
     comes back full AND makes progress, so nothing self-terminates it. The
-    ``_MAX_DRAIN_BATCHES`` backstop bounds the dispatch; the next trigger (or the
-    sweep) picks the remainder up."""
+    ``_MAX_DRAIN_BATCHES`` backstop bounds the dispatch, and the next trigger
+    continues from where it stopped."""
     result, n = _drain_with([_full(1)])  # always full + progress
     assert n == _MAX_DRAIN_BATCHES
+
+
+@pytest.mark.django_db
+def test_capped_drain_is_logged_as_an_error():
+    """Capping out leaves a backlog that nothing else is guaranteed to pick up —
+    a finished one-shot task produces no further trigger. It must not be
+    indistinguishable from a clean drain in the logs."""
+    with patch("tracer.tasks.eval_clustering.logger") as log:
+        _drain_with([_full(1)])
+    assert log.error.called, "a capped-out drain must not exit quietly"
+    assert log.error.call_args.args[0] == "eval_clustering_drain_cap_exhausted"

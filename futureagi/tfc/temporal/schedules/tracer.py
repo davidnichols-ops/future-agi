@@ -64,19 +64,6 @@ TRACER_SCHEDULES: list[ScheduleConfig] = [
         queue="agent_compass",
         description="Scan completed, unscanned (collector-ingested) traces",
     ),
-    # Eval clustering is triggered per failing eval-task eval, coalesced onto one
-    # workflow per project — so a trigger arriving while a drain is past its
-    # final fetch is folded into that run and dropped. This sweep re-dispatches
-    # recently active projects through the same gate, so a finished one-shot task
-    # can't strand the tail of its failures. Low frequency on purpose: it exists
-    # to catch a narrow race, and a dispatch for a drained project is a no-op.
-    ScheduleConfig(
-        schedule_id="sweep-eval-clustering",
-        activity_name="sweep_eval_clustering",
-        interval_seconds=900,
-        queue="agent_compass",
-        description="Re-dispatch eval clustering for recently active eval tasks",
-    ),
     # Deep analysis beat DISABLED — replaced by event-driven trace scanner (TH-3817)
     # Scanner triggers from OTLP ingestion via scan_traces_task.
     # Deep analysis kept for on-demand use (Layer 3) but no longer auto-runs.

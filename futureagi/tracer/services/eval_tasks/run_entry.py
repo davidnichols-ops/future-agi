@@ -88,8 +88,8 @@ def _reseed_eval_clustering(entry: EvalLogger, project_id) -> None:
     The dispatch itself (per-project coalescing, fail-open logging) lives in
     ``dispatch_eval_clustering`` — shared with the span-eval wrapper, which is
     the trigger for feedback-driven re-evals that never reach ``run_entry``.
-    A coalesced trigger that lands mid-drain is dropped by design; the
-    ``sweep-eval-clustering`` schedule is the backstop that re-dispatches it.
+    A coalesced trigger is dropped by design; the drain it folds into keeps
+    re-fetching until empty, so the rows behind that trigger are still picked up.
     """
     # Mirror _FAILING_EVAL_Q's failure clause. A failing eval with no explanation
     # has nothing to embed/cluster, so skip the no-op dispatch RPC.

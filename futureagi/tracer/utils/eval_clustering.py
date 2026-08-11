@@ -91,15 +91,15 @@ def cluster_eval_results(project_id: str) -> EvalClusteringSummary:
     )
 
     # Draining past this batch is handled by the caller
-    # (``cluster_eval_results_task`` loops until a batch comes back short), NOT a
+    # (``cluster_eval_results_task`` loops until a batch comes back empty), NOT a
     # self-continuation here. A self-continuation would necessarily use a distinct
     # workflow id (this run completes right after scheduling it), so it would run
     # concurrently with the next per-eval trigger — both claim the same unlocked
     # oldest-``_CLUSTER_BATCH_LIMIT`` rows (no row lock) and double-count on
     # ``assign_to_cluster``. Omitted on purpose: the trigger's fixed-id +
     # USE_EXISTING coalescing is the only per-project concurrency guard.
-    if summary.fetched >= _CLUSTER_BATCH_LIMIT and summary.clustered == 0:
-        # A full batch that clustered nothing means a downstream dependency
+    if summary.fetched and summary.clustered == 0:
+        # Rows were fetched but none clustered — a downstream dependency
         # (embeddings / centroid store) is failing. Surface it rather than let the
         # caller's loop spin silently.
         logger.error(
