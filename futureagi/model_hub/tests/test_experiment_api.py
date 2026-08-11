@@ -1971,19 +1971,20 @@ class TestExperimentEvalVersionPinning:
             organization=organization,
             workspace=workspace,
         )
-        rerun_ids = _diff_and_update_evals(
-            experiment,
-            [{
-                "id": str(metric.id),
-                "template_id": str(eval_template.id),
-                "name": "test",
-                "config": {"mapping": {}},
-                "pinned_version_id": str(version.id),
-            }],
-            organization,
-            user,
-            workspace,
-        )
+        with patch("model_hub.views.experiment_runner.ExperimentRunner"):
+            rerun_ids = _diff_and_update_evals(
+                experiment,
+                [{
+                    "id": str(metric.id),
+                    "template_id": str(eval_template.id),
+                    "name": "test",
+                    "config": {"mapping": {}},
+                    "pinned_version_id": str(version.id),
+                }],
+                organization,
+                user,
+                workspace,
+            )
         metric.refresh_from_db()
         assert str(metric.pinned_version_id) == str(version.id)
         assert str(metric.id) in [str(r) for r in rerun_ids]
