@@ -1271,6 +1271,48 @@ def test_known_empty_project_eval_configs_fail_positive_closed_and_negative_open
 
 
 @pytest.mark.parametrize(
+    "builder_cls",
+    [TraceListQueryBuilderV2, VoiceCallListQueryBuilderV2],
+    ids=["trace", "voice"],
+)
+@pytest.mark.parametrize(
+    ("filter_value", "membership_op"),
+    [(True, "IN"), (False, "NOT IN")],
+    ids=["positive", "negative"],
+)
+@override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
+def test_unknown_project_eval_configs_resolve_strict_fence_for_residual_filters(
+    builder_cls: type[TraceListQueryBuilderV2] | type[VoiceCallListQueryBuilderV2],
+    filter_value: bool,
+    membership_op: str,
+) -> None:
+    """Legacy callers without metadata still fence same-text trace ids."""
+
+    config_id = "00000000-0000-4000-8000-000000000088"
+    builder = builder_cls(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _has_eval_filter(filter_value)],
+    )
+
+    with mock.patch(
+        "tracer.models.custom_eval_config.CustomEvalConfig.objects"
+    ) as config_manager:
+        config_manager.filter.return_value.values_list.return_value = [config_id]
+        sql, params = builder.build_filter_match_query(["shared-trace"])
+
+    config_manager.filter.assert_called_once_with(
+        project_id__in=[PROJECT_ID],
+        deleted=False,
+    )
+    assert f"trace_id {membership_op} (" in sql
+    assert "eval_scan.custom_eval_config_id IN %(project_eval_cfg_1)s" in sql
+    assert "sp.project_id = %(project_id)s" in sql
+    assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in sql
+    assert params["project_eval_cfg_1"] == (config_id,)
+    assert params["candidate_trace_ids"] == ("shared-trace",)
+
+
+@pytest.mark.parametrize(
     ("relation_filter", "eval_config_ids", "annotation_label_ids", "relation_table"),
     [
         (
@@ -3240,6 +3282,7 @@ def test_trace_has_eval_false_is_latest_state_candidate_scoped(
     builder = TraceListQueryBuilderV2(
         project_id=PROJECT_ID,
         filters=[_time_filter(), _has_eval_filter(filter_value)],
+        eval_config_ids=["00000000-0000-4000-8000-000000000088"],
     )
 
     seed_sql, seed_params = builder.build_filter_seed_page(
@@ -3273,6 +3316,7 @@ def test_trace_has_eval_true_regression_and_false_combination_remain_exact() -> 
     positive = TraceListQueryBuilderV2(
         project_id=PROJECT_ID,
         filters=[_time_filter(), _has_eval_filter(True)],
+        eval_config_ids=["00000000-0000-4000-8000-000000000088"],
     )
     positive_sql, _ = positive.build_filter_match_query(["trace-a"])
 
@@ -3283,6 +3327,7 @@ def test_trace_has_eval_true_regression_and_false_combination_remain_exact() -> 
             _attribute_filter("final_status", "Rejected"),
             _has_eval_filter(False),
         ],
+        eval_config_ids=["00000000-0000-4000-8000-000000000088"],
     )
     combined_sql, combined_params = combined.build_filter_match_query(["trace-a"])
 

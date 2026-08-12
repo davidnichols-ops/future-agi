@@ -3589,7 +3589,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     candidate_ids_param="candidate_trace_ids",
                     strict_trace_project_correlation=bool(
                         self._positive_relational_seed_filter() is not None
-                        or (has_eval_residual and self._eval_config_ids_known)
+                        or has_eval_residual
                     ),
                     trace_project_eval_config_ids=(
                         self.eval_config_ids if self._eval_config_ids_known else None
