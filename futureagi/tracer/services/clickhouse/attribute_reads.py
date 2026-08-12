@@ -252,11 +252,11 @@ ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT = timedelta(days=60)
 # doomed halvings. No cursor progress is published until that retry succeeds.
 # Every successful statement therefore stays inside the same byte/time
 # ceilings while sparse retained history remains reachable in practical pages.
-# Sixty days is the largest ordinary empty slice.  After a successful empty
-# proof, older slices may grow beyond it under a short speculative statement
-# timeout.  This lets partition-pruned years before a project's first span
-# collapse quickly, while a dense/slow wide slice falls back to the ordinary
-# 60-day ceiling without sacrificing any retained range.
+# The first six-hour slice is the authoritative production-qualified read.
+# Every wider empty-slice growth probe is speculative: a short failure moves no
+# cursor state and retries the identical frontier at five minutes. Sixty days
+# remains the intermediate ceiling when a still-wider historical probe fails,
+# so partition-pruned years can collapse quickly without sacrificing range.
 ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT = timedelta(days=60)
 ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS = 250
 ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES = 16
@@ -3864,11 +3864,16 @@ class AttributeReadSelector:
                         or (
                             cursor_before is None
                             and (
-                                current_segment_end - current_segment_start
-                                > ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT
-                                or exact_key is not None
-                                and current_segment_end - current_segment_start
-                                > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                                (
+                                    exact_key is None
+                                    and current_segment_end - current_segment_start
+                                    > ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                                )
+                                or (
+                                    exact_key is not None
+                                    and current_segment_end - current_segment_start
+                                    > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                                )
                             )
                         )
                         else None

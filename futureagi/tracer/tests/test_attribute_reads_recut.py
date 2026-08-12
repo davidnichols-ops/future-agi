@@ -9769,6 +9769,65 @@ def test_span_attribute_key_cursor_remembers_safe_width_after_slow_budget_failur
     assert page.browse_status == "continuation"
 
 
+def test_span_attribute_key_cursor_caps_generic_growth_before_dense_retry(
+    monkeypatch,
+):
+    clock_value = [100.0]
+
+    def clock():
+        return clock_value[0]
+
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        wall_timeout_ms=8_000,
+        clock=clock,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    attempted: list[tuple[timedelta, int | None]] = []
+
+    def candidates(_projects, segment, **kwargs):
+        width = segment[1] - segment[0]
+        timeout_ms = kwargs.get("query_timeout_ms")
+        attempted.append((width, timeout_ms))
+        if width == ATTRIBUTE_READ_EXPLICIT_SEGMENT:
+            clock_value[0] += 0.02
+            return (), False, {}
+        if width > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT:
+            assert timeout_ms == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+            clock_value[0] += ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS / 1000
+            raise ReadDeadlineExceeded("speculative generic growth timed out")
+        clock_value[0] += 0.01
+        return (), False, {}
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(selector, "_verify_latest", lambda *_args, **_kwargs: [])
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=50,
+        window_start=NOW - timedelta(days=30),
+        window_end=NOW,
+    )
+
+    assert attempted[:3] == [
+        (ATTRIBUTE_READ_EXPLICIT_SEGMENT, None),
+        (
+            ATTRIBUTE_READ_EXPLICIT_SEGMENT * 2,
+            ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
+        ),
+        (ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT, None),
+    ]
+    assert clock() < 101.0
+    assert selector._deadline is not None
+    assert selector._deadline - clock() > 7.0
+    assert page.metadata.query_complete is True
+    assert page.has_more is True
+    assert page.browse_status == "continuation"
+    assert page.next_segment_end < NOW
+
+
 def test_span_attribute_key_cursor_jumps_from_slow_base_window_to_five_minutes(
     monkeypatch,
 ):
