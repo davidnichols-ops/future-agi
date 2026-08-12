@@ -185,6 +185,7 @@ const TaskCreatePage = () => {
               control={control}
               projectId={project}
               onTestStateChange={handleTestStateChange}
+              waitForProjectKind
             />
           }
         />

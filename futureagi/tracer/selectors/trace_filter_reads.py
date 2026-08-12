@@ -1244,6 +1244,20 @@ def read_bounded_filter_page(
         Hashable, tuple[dict[str, Any], datetime, datetime]
     ] = {}
     continuation_progressed = False
+    # Hydration is the final publication gate for identity-only trace pages.
+    # Remember the last committed position *before* this request's first match
+    # so a failed hydration can retry that matching classifier batch instead of
+    # either skipping its rows or returning the original, non-advancing token.
+    pre_match_continuation: (
+        tuple[
+            datetime | None,
+            datetime,
+            datetime | None,
+            Any,
+            bool,
+        ]
+        | None
+    ) = None
 
     def checkpoint_continuation() -> None:
         """Commit only a fully classified candidate-prefix scan position."""
@@ -1266,6 +1280,25 @@ def read_bounded_filter_page(
         safe_matched_by_id = dict(matched_by_id)
         safe_pending_identity_candidates = dict(pending_identity_candidates)
         continuation_progressed = True
+
+    def rollback_unhydrated_page() -> None:
+        """Restore the honest scan position from before unpublished matches."""
+
+        nonlocal safe_active_slice_start
+        nonlocal safe_slice_end
+        nonlocal safe_before_start_time
+        nonlocal safe_before_id
+        nonlocal continuation_progressed
+        if pre_match_continuation is None:
+            continuation_progressed = False
+            return
+        (
+            safe_active_slice_start,
+            safe_slice_end,
+            safe_before_start_time,
+            safe_before_id,
+            continuation_progressed,
+        ) = pre_match_continuation
 
     def execute(
         *,
@@ -1469,6 +1502,7 @@ def read_bounded_filter_page(
         nonlocal candidate_witness_probe_started
         nonlocal before_id
         nonlocal before_start_time
+        nonlocal pre_match_continuation
 
         candidate_identities = list(candidate_seed_rows)
         if defer_classification:
@@ -1719,6 +1753,13 @@ def read_bounded_filter_page(
             if identity_batch:
                 if not match_query:
                     continue
+                continuation_before_query = (
+                    safe_active_slice_start,
+                    safe_slice_end,
+                    safe_before_start_time,
+                    safe_before_id,
+                    continuation_progressed,
+                )
                 match_result = execute(
                     kind="classify",
                     query=match_query,
@@ -1758,6 +1799,8 @@ def read_bounded_filter_page(
                     and not had_matches_before_query
                     and matched_by_id
                 ):
+                    if bounded_continuation and pre_match_continuation is None:
+                        pre_match_continuation = continuation_before_query
                     if len(attempts) > max_query_count - reserved_hydration_queries:
                         raise _BudgetExceeded("query_budget_exceeded")
                     if monotonic() > classification_deadline:
@@ -2541,6 +2584,19 @@ def read_bounded_filter_page(
             before_id = None
             if bounded_continuation:
                 checkpoint_continuation()
+                if (
+                    identity_only_classification
+                    and seed_proves_result_order
+                    and matched_by_id
+                    and len(matched_by_id) < prefix_needed
+                ):
+                    # Every root in this half-open slice has crossed the exact
+                    # latest-state classifier. Its matches are therefore a
+                    # canonical ordered prefix, even when the next older slice
+                    # cannot fit in this request. Hydration below remains the
+                    # publication gate and the signed checkpoint proves that
+                    # the window is not exhausted.
+                    break
     except _BudgetExceeded as exc:
         page_complete = False
         degraded_error_code = exc.error_code
@@ -2632,7 +2688,7 @@ def read_bounded_filter_page(
                 # The committed scan checkpoint is after these identities.
                 # Without a hydrated page we must not hand that checkpoint to
                 # the caller or the matching rows would be skipped forever.
-                continuation_progressed = False
+                rollback_unhydrated_page()
             else:
                 page_rows = sorted(
                     hydrated_by_id.values(), key=result_row_key, reverse=True
@@ -2642,7 +2698,7 @@ def read_bounded_filter_page(
             degraded_error_code = exc.error_code
             page_rows = []
             has_more = False
-            continuation_progressed = False
+            rollback_unhydrated_page()
 
     error_code = (
         None if page_complete else degraded_error_code or "scan_budget_exceeded"

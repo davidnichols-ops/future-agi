@@ -473,12 +473,19 @@ class TraceVoiceCallDetailResultSerializer(serializers.Serializer):
     ended_at = serializers.CharField(required=False, allow_null=True)
     created_at = serializers.CharField(required=False, allow_null=True)
     duration_seconds = serializers.IntegerField(required=False, allow_null=True)
-    recording_url = serializers.CharField(required=False, allow_null=True)
+    # Provider adapters preserve an explicit empty string when the provider
+    # supplied the field but no recording/summary was available.  That is a
+    # valid normalized voice-detail value, not response-contract drift.
+    recording_url = serializers.CharField(
+        required=False, allow_null=True, allow_blank=True
+    )
     stereo_recording_url = serializers.CharField(required=False, allow_null=True)
     cost_cents = serializers.FloatField(required=False, allow_null=True)
     cost_breakdown = JsonObjectField(required=False, allow_null=True)
     error_message = serializers.CharField(required=False, allow_null=True)
-    call_summary = serializers.CharField(required=False, allow_null=True)
+    call_summary = serializers.CharField(
+        required=False, allow_null=True, allow_blank=True
+    )
     ended_reason = serializers.CharField(required=False, allow_null=True)
     overall_score = serializers.FloatField(required=False, allow_null=True)
     response_time_ms = serializers.FloatField(required=False, allow_null=True)

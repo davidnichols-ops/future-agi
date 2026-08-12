@@ -118,6 +118,16 @@ def test_detail_allows_project_in_active_org_not_user_home_org(
         return _detail(project.id, trace_id)
 
     monkeypatch.setattr("tracer.views.trace.read_trace_detail", fake_read)
+    monkeypatch.setattr(
+        "tracer.views.trace.ObservabilityService.process_raw_logs",
+        lambda *_args, **_kwargs: {
+            # Real Vapi rows can preserve present-but-empty optional text.
+            # Strict response validation must publish the successful detail
+            # response instead of turning these values into HTTP 400.
+            "recording_url": "",
+            "call_summary": "",
+        },
+    )
 
     response = auth_client.get(
         VOICE_CALL_DETAIL_URL,
@@ -128,6 +138,8 @@ def test_detail_allows_project_in_active_org_not_user_home_org(
     assert response.data["status"] is True
     assert response.data["result"]["project_id"] == str(project.id)
     assert response.data["result"]["trace_id"] == trace_id
+    assert response.data["result"]["recording_url"] == ""
+    assert response.data["result"]["call_summary"] == ""
 
 
 @pytest.mark.parametrize(
@@ -160,6 +172,12 @@ def test_detail_success_contract_requires_envelope_and_named_result_shape():
                 "provider_call_id": None,
                 "phone_number": None,
                 "duration_seconds": None,
+                # Provider normalization distinguishes unavailable-but-present
+                # text from an omitted value with an empty string. Strict
+                # response validation must publish this shape instead of
+                # converting an otherwise successful detail read into HTTP 400.
+                "recording_url": "",
+                "call_summary": "",
                 "cost_breakdown": None,
                 "transcript": [{"role": "user", "content": "hello"}],
                 "messages": None,
@@ -188,6 +206,8 @@ def test_detail_success_contract_requires_envelope_and_named_result_shape():
     assert serializer.validated_data["result"]["transcript"] == [
         {"role": "user", "content": "hello"}
     ]
+    assert serializer.validated_data["result"]["recording_url"] == ""
+    assert serializer.validated_data["result"]["call_summary"] == ""
     missing_status = TraceVoiceCallDetailResponseSerializer(data={"result": {}})
     assert not missing_status.is_valid()
     assert "status" in missing_status.errors

@@ -10297,6 +10297,313 @@ def test_partial_identity_cursor_page_is_hydrated_before_publication() -> None:
     assert "hydrate" in [attempt.kind for attempt in page.attempts]
 
 
+def test_sparse_identity_cursor_publishes_each_hydrated_classified_slice() -> None:
+    request_start = END - timedelta(minutes=30)
+    rows = [
+        {
+            "id": row_id,
+            "root_span_id": f"root-{row_id}",
+            "start_time": END - timedelta(minutes=minute),
+            "trace_name": f"presented-{row_id}",
+        }
+        for row_id, minute in (
+            ("newer-nonmatch", 1),
+            ("match-a", 6),
+            ("match-b", 7),
+            ("match-c", 16),
+        )
+    ]
+    expected_matches = rows[1:]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=expected_matches,
+        recommended_batch_size=10,
+        recommended_seed_batch_size=10,
+    )
+    cursor_start_time = None
+    cursor_order_token = None
+    continuation_slice_start = None
+    continuation_slice_end = None
+    continuation_before_start_time = None
+    continuation_before_id = None
+    pages: list[BoundedFilterPage] = []
+    published_ids: list[str] = []
+
+    for _ in range(4):
+        executor = _IdentityHydrationFakeExecutor(builder, reverse_hydration=True)
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(request_start, END)],
+            key_field="id",
+            page_number=0,
+            page_size=5,
+            deadline_ms=5_000,
+            max_seed_attempts=24,
+            max_candidates=10,
+            max_query_count=50,
+            classify_batch_size=10,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+            cursor_start_time=cursor_start_time,
+            cursor_order_token=cursor_order_token,
+            continuation_slice_start=continuation_slice_start,
+            continuation_slice_end=continuation_slice_end,
+            continuation_before_start_time=continuation_before_start_time,
+            continuation_before_id=continuation_before_id,
+        )
+        pages.append(page)
+        published_ids.extend(row["id"] for row in page.rows)
+
+        if page.complete:
+            break
+
+        assert page.has_more is False
+        assert page.continuation_slice_end is not None
+        assert page.rows
+        assert [attempt.kind for attempt in page.attempts][-1] == "hydrate"
+        cursor_start_time = page.rows[-1]["start_time"]
+        cursor_order_token = page.rows[-1]["id"]
+        continuation_slice_start = page.continuation_slice_start
+        continuation_slice_end = page.continuation_slice_end
+        continuation_before_start_time = page.continuation_before_start_time
+        continuation_before_id = page.continuation_before_id
+    else:
+        pytest.fail("sparse hydrated cursor chain did not terminate")
+
+    assert len(pages) == 3
+    assert [row["id"] for row in pages[0].rows] == ["match-a", "match-b"]
+    assert [row["id"] for row in pages[1].rows] == ["match-c"]
+    assert pages[0].continuation_slice_end == END - timedelta(minutes=15)
+    assert pages[1].continuation_slice_end == END - timedelta(minutes=20)
+    assert pages[2].complete is True
+    assert pages[2].rows == []
+    assert pages[2].continuation_slice_end is None
+    assert published_ids == [row["id"] for row in expected_matches]
+    assert len(published_ids) == len(set(published_ids))
+    assert all(
+        row["trace_name"].startswith("presented-")
+        for page in pages
+        for row in page.rows
+    )
+
+
+def test_sparse_identity_cursor_waits_for_the_whole_active_slice() -> None:
+    request_start = END - timedelta(minutes=30)
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(minutes=6, microseconds=index),
+            "trace_name": f"presented-{index}",
+        }
+        for index in range(7)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=rows[:1],
+        recommended_batch_size=10,
+        recommended_seed_batch_size=6,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        page_size=5,
+        deadline_ms=5_000,
+        max_seed_attempts=24,
+        max_candidates=10,
+        max_query_count=50,
+        classify_batch_size=10,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    seed_calls = [params for query, params in executor.calls if query == "seed"]
+    assert len(seed_calls) == 3
+    assert seed_calls[1]["before_start_time"] is None
+    assert seed_calls[1]["before_id"] is None
+    assert seed_calls[2]["before_start_time"] == rows[5]["start_time"]
+    assert seed_calls[2]["before_id"] == rows[5]["id"]
+    assert seed_calls[2]["slice_end"] == END - timedelta(minutes=5)
+    assert [row["id"] for row in page.rows] == ["trace-0"]
+    assert page.complete is False
+    assert page.continuation_slice_start is None
+    assert page.continuation_slice_end == END - timedelta(minutes=15)
+
+
+@pytest.mark.parametrize(
+    ("bounded_continuation", "seed_proves_order"),
+    [(False, True), (True, False)],
+)
+def test_short_slice_prefix_does_not_change_non_cursor_or_unordered_contracts(
+    bounded_continuation: bool,
+    seed_proves_order: bool,
+) -> None:
+    request_start = END - timedelta(minutes=30)
+    rows = [
+        {
+            "id": row_id,
+            "root_span_id": f"root-{row_id}",
+            "start_time": END - timedelta(minutes=minute),
+            "trace_name": f"presented-{row_id}",
+        }
+        for row_id, minute in (("match-a", 6), ("match-b", 16))
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        seed_proves_order=seed_proves_order,
+        recommended_batch_size=10,
+        recommended_seed_batch_size=10,
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=_IdentityHydrationFakeExecutor(builder),
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        page_size=5,
+        deadline_ms=5_000,
+        max_seed_attempts=24,
+        max_candidates=10,
+        max_query_count=50,
+        classify_batch_size=10,
+        include_incomplete_rows=bounded_continuation,
+        bounded_continuation=bounded_continuation,
+    )
+
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == ["match-a", "match-b"]
+    assert page.has_more is False
+    assert page.continuation_slice_end is None
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_error_code"),
+    [("timeout", "read_budget_exceeded"), ("drift", "classification_drift")],
+)
+def test_sparse_identity_hydration_failure_rewinds_before_unpublished_match(
+    failure_mode: str,
+    expected_error_code: str,
+) -> None:
+    request_start = END - timedelta(minutes=30)
+    rows = [
+        {
+            "id": row_id,
+            "root_span_id": f"root-{row_id}",
+            "start_time": END - timedelta(minutes=minute),
+            "trace_name": f"presented-{row_id}",
+        }
+        for row_id, minute in (
+            ("newer-nonmatch", 1),
+            ("match-a", 6),
+            ("match-b", 16),
+        )
+    ]
+    expected_matches = rows[1:]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=expected_matches,
+        recommended_batch_size=10,
+        recommended_seed_batch_size=10,
+    )
+
+    if failure_mode == "timeout":
+
+        class FailHydration(_IdentityHydrationFakeExecutor):
+            def execute_ch_query(self, query, params, *, timeout_ms, settings):
+                if query == "hydrate":
+                    self.calls.append((query, params))
+                    raise ReadDeadlineExceeded("Code: 159. Timeout exceeded")
+                return super().execute_ch_query(
+                    query, params, timeout_ms=timeout_ms, settings=settings
+                )
+
+        failing_executor = FailHydration(builder)
+    else:
+        drifted_match = {**rows[1], "root_span_id": "replacement-root"}
+        failing_executor = _IdentityHydrationFakeExecutor(
+            builder,
+            hydration_rows=[drifted_match],
+        )
+
+    failed = read_bounded_filter_page(
+        builder=builder,
+        analytics=failing_executor,
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        page_size=5,
+        deadline_ms=5_000,
+        max_seed_attempts=24,
+        max_candidates=10,
+        max_query_count=50,
+        classify_batch_size=10,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert failed.complete is False
+    assert failed.rows == []
+    assert failed.has_more is False
+    assert failed.error_code == expected_error_code
+    # The successful scan reached the end of the matching 5-15 minute slice,
+    # but its failed publication must resume at the preceding empty boundary.
+    assert failed.continuation_slice_start is None
+    assert failed.continuation_slice_end == END - timedelta(minutes=5)
+    assert failed.continuation_before_start_time is None
+    assert failed.continuation_before_id is None
+
+    cursor_start_time = failed.continuation_slice_end
+    cursor_order_token = "\U0010ffff"
+    continuation_slice_end = failed.continuation_slice_end
+    published_ids: list[str] = []
+    for _ in range(4):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=_IdentityHydrationFakeExecutor(builder),
+            filters=[_time_filter(request_start, END)],
+            key_field="id",
+            page_number=0,
+            page_size=5,
+            deadline_ms=5_000,
+            max_seed_attempts=24,
+            max_candidates=10,
+            max_query_count=50,
+            classify_batch_size=10,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+            cursor_start_time=cursor_start_time,
+            cursor_order_token=cursor_order_token,
+            continuation_slice_end=continuation_slice_end,
+        )
+        published_ids.extend(row["id"] for row in page.rows)
+        if page.complete:
+            break
+        assert page.continuation_slice_end is not None
+        cursor_start_time = page.rows[-1]["start_time"]
+        cursor_order_token = page.rows[-1]["id"]
+        continuation_slice_end = page.continuation_slice_end
+    else:
+        pytest.fail("rewound hydration cursor chain did not terminate")
+
+    assert published_ids == [row["id"] for row in expected_matches]
+    assert len(published_ids) == len(set(published_ids))
+
+
 def test_graph_stratum_anchor_classifies_one_finite_sentinel_without_ordered_seed():
     rows = _rows(1, 2, 3)
     builder = _AnchorFakeBuilder(rows, seed_proves_order=False)

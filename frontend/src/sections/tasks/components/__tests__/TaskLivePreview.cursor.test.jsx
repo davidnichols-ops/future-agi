@@ -19,6 +19,7 @@ vi.mock("src/utils/axios", () => ({
       getTrace: (id) => `/traces/${id}/`,
       getVoiceCallDetail: "/calls/detail/",
       traceSession: "/sessions/",
+      projectExperimentDetail: (id) => `/projects/${id}/`,
     },
   },
 }));
@@ -44,7 +45,11 @@ import TaskLivePreview from "../TaskLivePreview";
 
 const PROJECT_ID = "00000000-0000-4000-8000-000000000902";
 
-function PreviewHarness({ rowType = "spans", projectId = PROJECT_ID }) {
+function PreviewHarness({
+  rowType = "spans",
+  projectId = PROJECT_ID,
+  waitForProjectKind = false,
+}) {
   const { control } = useForm({
     defaultValues: {
       filters: [],
@@ -54,12 +59,19 @@ function PreviewHarness({ rowType = "spans", projectId = PROJECT_ID }) {
       rowType,
     },
   });
-  return <TaskLivePreview control={control} projectId={projectId} />;
+  return (
+    <TaskLivePreview
+      control={control}
+      projectId={projectId}
+      waitForProjectKind={waitForProjectKind}
+    />
+  );
 }
 
 PreviewHarness.propTypes = {
   rowType: PropTypes.string,
   projectId: PropTypes.string,
+  waitForProjectKind: PropTypes.bool,
 };
 
 const voiceListPage = ({
@@ -109,6 +121,110 @@ const observeListPage = ({
 describe("TaskLivePreview sparse cursor continuation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("waits for simulator project kind instead of starting disposable lists", async () => {
+    let resolveProjectDetails;
+    const pendingProjectDetails = new Promise((resolve) => {
+      resolveProjectDetails = resolve;
+    });
+    mocks.get.mockImplementation(async (url) => {
+      if (url === `/projects/${PROJECT_ID}/`) return pendingProjectDetails;
+      if (url === "/calls/") {
+        return voiceListPage({
+          results: [{ id: "voice-row", trace_id: "voice-trace" }],
+          hasMore: false,
+          nextCursor: null,
+        });
+      }
+      if (url === "/calls/detail/") {
+        return { data: { status: true, result: { status: "completed" } } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness rowType="voiceCalls" waitForProjectKind />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() =>
+      expect(
+        mocks.get.mock.calls.filter(
+          ([url]) => url === `/projects/${PROJECT_ID}/`,
+        ),
+      ).toHaveLength(1),
+    );
+    expect(
+      mocks.get.mock.calls.filter(
+        ([url]) => url === "/calls/" || url === "/spans/",
+      ),
+    ).toHaveLength(0);
+
+    await act(async () => {
+      resolveProjectDetails({ data: { result: { source: "simulator" } } });
+      await pendingProjectDetails;
+    });
+
+    await screen.findByText("Row 1 of 1");
+    expect(
+      mocks.get.mock.calls.filter(([url]) => url === "/calls/"),
+    ).toHaveLength(1);
+    expect(
+      mocks.get.mock.calls.filter(([url]) => url === "/spans/"),
+    ).toHaveLength(0);
+  });
+
+  it("shows a retryable error when project kind cannot be resolved", async () => {
+    let detailCalls = 0;
+    mocks.get.mockImplementation(async (url) => {
+      if (url === `/projects/${PROJECT_ID}/`) {
+        detailCalls += 1;
+        if (detailCalls === 1) throw new Error("private project lookup detail");
+        return { data: { result: { source: "simulator" } } };
+      }
+      if (url === "/calls/") {
+        return voiceListPage({
+          results: [{ id: "voice-row", trace_id: "voice-trace" }],
+          hasMore: false,
+          nextCursor: null,
+        });
+      }
+      if (url === "/calls/detail/") {
+        return { data: { status: true, result: { status: "completed" } } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness rowType="voiceCalls" waitForProjectKind />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText(QUERY_FAILED_RETRY_MESSAGE)).toBeVisible();
+    expect(
+      mocks.get.mock.calls.filter(
+        ([url]) => url === "/calls/" || url === "/spans/",
+      ),
+    ).toHaveLength(0);
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Retry search" }).click();
+    });
+    await screen.findByText("Row 1 of 1");
+    expect(detailCalls).toBe(2);
+    expect(
+      mocks.get.mock.calls.filter(([url]) => url === "/calls/"),
+    ).toHaveLength(1);
+    expect(screen.queryByText("private project lookup detail")).toBeNull();
   });
 
   it("finds a sparse span on the final allowed continuation", async () => {
@@ -542,6 +658,46 @@ describe("TaskLivePreview sparse cursor continuation", () => {
     expect(listCalls).toBe(2);
     expect(screen.getByText(/≥37 matching total/)).toBeVisible();
     expect(screen.getByRole("button", { name: "Next row" })).toBeDisabled();
+  });
+
+  it("keeps the voice list row visible when optional detail hydration fails", async () => {
+    mocks.get.mockImplementation(async (url) => {
+      if (url === "/calls/") {
+        return voiceListPage({
+          results: [
+            {
+              id: "voice-fallback",
+              trace_id: "voice-fallback-trace",
+              phone_number: "fallback-number",
+            },
+          ],
+          hasMore: false,
+          nextCursor: null,
+        });
+      }
+      if (url === "/calls/detail/") {
+        const error = new Error("private response validation detail");
+        error.response = { status: 400 };
+        throw error;
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness rowType="voiceCalls" />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText(/fallback-number/);
+    expect(
+      mocks.get.mock.calls.filter(([url]) => url === "/calls/detail/"),
+    ).toHaveLength(1);
+    expect(screen.queryByText(QUERY_FAILED_RETRY_MESSAGE)).toBeNull();
+    expect(screen.queryByText("private response validation detail")).toBeNull();
   });
 
   it("disables backward navigation while a lazy next row is pending", async () => {

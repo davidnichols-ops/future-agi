@@ -47,6 +47,8 @@ import {
   isRecordingObjectKey,
 } from "src/components/inline-audio/audio-detection";
 import { ID_ONLY_FIELDS } from "src/sections/projects/LLMTracing/idFields";
+import { useGetProjectDetails } from "src/api/project/project-detail";
+import { isTaskPreviewProjectKindReady } from "../taskProjectKind";
 import {
   collectExactListRows,
   createListCursorProtocolError,
@@ -277,7 +279,7 @@ function flattenSpanTree(
 // Main
 // ───────────────────────────────────────────────────────────────
 const TaskLivePreview = forwardRef(function TaskLivePreview(
-  { control, projectId, onTestStateChange },
+  { control, projectId, onTestStateChange, waitForProjectKind = false },
   ref,
 ) {
   const [currentRowIndex, setCurrentRowIndex] = useState(0);
@@ -297,6 +299,24 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
   const evalsDetails = useWatch({ control, name: "evalsDetails" });
   const rowType = useWatch({ control, name: "rowType" }) || "spans";
   const isCursorPreview = isTaskPreviewCursorRowType(rowType);
+  // The create form starts with `spans`, then resolves simulator projects to
+  // `voiceCalls`. Reuse TaskConfigPanel's cached project-detail query and do
+  // not start a list request until that reconciliation is complete. This
+  // removes the voice -> span -> voice abort chain from Live Preview without
+  // adding another HTTP request (React Query deduplicates the shared key).
+  const {
+    data: previewProjectDetails,
+    isSuccess: previewProjectDetailsResolved,
+    isError: previewProjectDetailsError,
+    isFetching: previewProjectDetailsFetching,
+    refetch: refetchPreviewProjectDetails,
+  } = useGetProjectDetails(projectId, waitForProjectKind && Boolean(projectId));
+  const previewProjectKindReady = isTaskPreviewProjectKindReady({
+    waitForProjectKind,
+    projectDetailsResolved: previewProjectDetailsResolved,
+    projectSource: previewProjectDetails?.source,
+    rowType,
+  });
 
   const apiFilters = useMemo(
     () => buildApiFilterArray(formFilters, startDate, endDate),
@@ -598,7 +618,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         }),
       });
     },
-    enabled: !!projectId,
+    enabled: !!projectId && previewProjectKindReady,
     refetchOnWindowFocus: false,
     staleTime: 10000,
     // A continuation is the same immutable preview scope. Keep its current row
@@ -935,7 +955,9 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
               />
             )}
           </Box>
-          {listFetching && <CircularProgress size={12} />}
+          {(listFetching || previewProjectDetailsFetching) && (
+            <CircularProgress size={12} />
+          )}
         </Box>
         <Typography
           variant="caption"
@@ -957,7 +979,32 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             icon="solar:filter-outline"
             text="Select a project to preview matching rows"
           />
-        ) : listLoading ? (
+        ) : waitForProjectKind && previewProjectDetailsError ? (
+          <Box
+            role="status"
+            sx={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 1,
+              minHeight: 160,
+              justifyContent: "center",
+              textAlign: "center",
+            }}
+          >
+            <Typography variant="body2" color="error" sx={{ fontSize: "12px" }}>
+              {QUERY_FAILED_RETRY_MESSAGE}
+            </Typography>
+            <Button
+              size="small"
+              variant="outlined"
+              disabled={previewProjectDetailsFetching}
+              onClick={() => refetchPreviewProjectDetails()}
+            >
+              Retry search
+            </Button>
+          </Box>
+        ) : !previewProjectKindReady || listLoading ? (
           <Box
             sx={{
               display: "flex",
@@ -1170,6 +1217,7 @@ TaskLivePreview.propTypes = {
   control: PropTypes.object.isRequired,
   projectId: PropTypes.string,
   onTestStateChange: PropTypes.func,
+  waitForProjectKind: PropTypes.bool,
 };
 
 // ───────────────────────────────────────────────────────────────
