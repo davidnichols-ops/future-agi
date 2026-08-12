@@ -792,7 +792,7 @@ const EvalDetailPage = () => {
       setOpenModelMenuSignal((n) => n + 1);
       return;
     }
-    if (fagiLocked && evalType !== "code" && !model) {
+    if (fagiLocked && evalType !== "code" && !model && !isComposite) {
       enqueueSnackbar("Please select a model.", { variant: "error" });
       setOpenModelMenuSignal((n) => n + 1);
       return;
@@ -970,7 +970,7 @@ const EvalDetailPage = () => {
 
   // Test evaluation — auto-saves current config before running
   const handleTestEvaluation = useCallback(async () => {
-    if (fagiLocked && evalType !== "code" && !model) {
+    if (fagiLocked && evalType !== "code" && !model && !isComposite) {
       enqueueSnackbar("Please select a model.", { variant: "error" });
       setOpenModelMenuSignal((n) => n + 1);
       return;
