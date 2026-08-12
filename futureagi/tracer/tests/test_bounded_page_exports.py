@@ -121,7 +121,76 @@ def test_trace_list_forces_export_bound_after_request_revalidation():
     assert response is sentinel
     internal_data = internal_list.call_args.args[2]
     assert internal_data["page_number"] == 0
-    assert internal_data["page_size"] == 500
+    assert internal_data["page_size"] == 100
+
+
+def test_span_list_forces_shared_export_bound_after_request_revalidation():
+    request = _request({})
+    request.validated_query_data = {
+        "project_id": "00000000-0000-0000-0000-000000000001",
+        "filters": [],
+        "page_number": 9,
+        "page_size": 1,
+    }
+    view = ObservationSpanView()
+    view.request = request
+    sentinel = object()
+
+    with (
+        patch("tracer.views.observation_span.Project.objects.get"),
+        patch("tracer.views.observation_span.V2AnalyticsQueryService"),
+        patch.object(
+            ObservationSpanView,
+            "_list_spans_clickhouse",
+            return_value=sentinel,
+        ) as internal_list,
+    ):
+        response = ObservationSpanView.list_spans_observe.__wrapped__(
+            view, request, bounded_export=True
+        )
+
+    assert response is sentinel
+    internal_data = internal_list.call_args.args[2]
+    assert internal_data["page_number"] == 0
+    assert internal_data["page_size"] == 100
+
+
+def test_session_list_forces_shared_export_bound_after_request_revalidation():
+    request = _request({})
+    request.validated_query_data = {
+        "project_id": "00000000-0000-0000-0000-000000000001",
+        "filters": [],
+        "page_number": 9,
+        "page_size": 1,
+    }
+    view = TraceSessionView()
+    view.request = request
+    project = SimpleNamespace(source="observe")
+    sentinel = object()
+
+    with (
+        patch("tracer.views.trace_session._project_queryset_for_request") as projects,
+        patch("tracer.views.trace_session.V2AnalyticsQueryService"),
+        patch.object(
+            TraceSessionView,
+            "_build_bookmark_filter",
+            return_value=None,
+        ),
+        patch.object(
+            TraceSessionView,
+            "_list_sessions_clickhouse",
+            return_value=sentinel,
+        ) as internal_list,
+    ):
+        projects.return_value.get.return_value = project
+        response = TraceSessionView.list_sessions.__wrapped__(
+            view, request, bounded_export=True
+        )
+
+    assert response is sentinel
+    internal_data = internal_list.call_args.args[4]
+    assert internal_data["page_number"] == 0
+    assert internal_data["page_size"] == 100
 
 
 def test_span_export_propagates_list_failure_before_starting_csv():

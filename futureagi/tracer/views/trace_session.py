@@ -124,7 +124,10 @@ from tracer.services.filter_principal_context import (
     FilterPrincipalContextError,
     bind_request_my_annotations_principal,
 )
-from tracer.utils.bounded_csv import bounded_page_csv_response
+from tracer.utils.bounded_csv import (
+    BOUNDED_EXPORT_PAGE_SIZE,
+    bounded_page_csv_response,
+)
 from tracer.utils.filters import FilterEngine, apply_created_at_filters
 from tracer.utils.helper import (
     FieldConfig,
@@ -166,7 +169,6 @@ SESSION_GRAPH_RETRYABLE_ERROR_CODES = {
     "read_budget_exceeded",
     "sample_limit",
 }
-SESSION_EXPORT_PAGE_SIZE = 500
 
 
 def _session_read_settings(*, max_result_rows: int) -> dict[str, int | str]:
@@ -1461,7 +1463,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             if kwargs.get("bounded_export"):
                 validated_data.update(
                     page_number=0,
-                    page_size=SESSION_EXPORT_PAGE_SIZE,
+                    page_size=BOUNDED_EXPORT_PAGE_SIZE,
                     cursor_mode=False,
                 )
             validated_data["filters"] = bind_request_my_annotations_principal(

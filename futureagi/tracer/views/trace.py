@@ -144,7 +144,10 @@ from tracer.services.users_list_manager import UsersListManager
 from tracer.utils.annotations import (
     build_annotation_subqueries as _build_annotation_subqueries_impl,
 )
-from tracer.utils.bounded_csv import bounded_page_csv_response
+from tracer.utils.bounded_csv import (
+    BOUNDED_EXPORT_PAGE_SIZE,
+    bounded_page_csv_response,
+)
 from tracer.utils.filters import FilterEngine
 from tracer.utils.helper import (
     eval_output_type_for_config,
@@ -209,7 +212,6 @@ TRACE_NAVIGATION_MAX_QUERIES = 128
 TRACE_NAVIGATION_WALL_DEADLINE_MS = 9_500
 _CLICKHOUSE_ERROR_CODE_RE = re.compile(r"\bcode:\s*(\d+)\b", re.IGNORECASE)
 _OPTIONAL_USER_ENRICHMENT_ERROR_CODES = frozenset({497})
-EXPORT_PAGE_SIZE = 500
 
 
 class AnnotationScoreReadBoundExceeded(ReadDeadlineExceeded):
@@ -3340,7 +3342,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if kwargs.get("bounded_export"):
                 validated_data.update(
                     page_number=0,
-                    page_size=EXPORT_PAGE_SIZE,
+                    page_size=BOUNDED_EXPORT_PAGE_SIZE,
                     cursor_mode=False,
                 )
             validated_data["filters"] = bind_request_my_annotations_principal(

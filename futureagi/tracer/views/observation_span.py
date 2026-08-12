@@ -146,7 +146,10 @@ from tracer.services.filter_principal_context import (
     bind_request_my_annotations_principal,
 )
 from tracer.utils.annotations import build_annotation_subqueries
-from tracer.utils.bounded_csv import bounded_page_csv_response
+from tracer.utils.bounded_csv import (
+    BOUNDED_EXPORT_PAGE_SIZE,
+    bounded_page_csv_response,
+)
 from tracer.utils.create_otel_span import create_single_otel_span
 from tracer.utils.eval import (
     evaluate_observation_span,
@@ -169,7 +172,6 @@ from tracer.utils.sql_queries import SQL_query_handler
 
 logger = structlog.get_logger(__name__)
 
-EXPORT_PAGE_SIZE = 500
 
 SPAN_LIST_WALL_DEADLINE_MS = 9_500
 SPAN_LIST_CANDIDATE_DEADLINE_MS = 9_500
@@ -1609,7 +1611,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             if kwargs.get("bounded_export"):
                 validated_data.update(
                     page_number=0,
-                    page_size=EXPORT_PAGE_SIZE,
+                    page_size=BOUNDED_EXPORT_PAGE_SIZE,
                     cursor_mode=False,
                 )
             validated_data["filters"] = bind_request_my_annotations_principal(
