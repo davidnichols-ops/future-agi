@@ -3875,6 +3875,109 @@ class TestDashboardQueryBuilder:
         assert "Rechazado" not in filtered_sql
         assert "rechazado" in filtered_params.values()
 
+    def test_numeric_custom_metric_seeds_with_the_typed_key_bloom_index(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        metric = {
+            "id": "call.total_turns",
+            "name": "call.total_turns",
+            "type": "custom_attribute",
+            "attribute_key": "call.total_turns",
+            "attribute_type": "number",
+            "aggregation": "avg",
+        }
+
+        sql, params, _metric_info = DashboardQueryBuilderV2(
+            {**sample_query_config, "metrics": [metric]}
+        ).build_all_queries()[0]
+        candidate_sql, replay_and_live_sql = sql.split(
+            "), latest_custom_metric_spans AS (", 1
+        )
+
+        assert "custom_metric_candidate_identities AS" in candidate_sql
+        assert "indexHint(has(mapKeys(" in candidate_sql
+        assert "custom_metric_candidate_source.attrs_number" in candidate_sql
+        assert "%(custom_metric_attr_key)s" in candidate_sql
+        assert "mapContains(" in candidate_sql
+        assert "GROUP BY" in candidate_sql
+        compact_candidate_sql = " ".join(candidate_sql.split())
+        assert (
+            "custom_metric_candidate_source.observation_type AS observation_type"
+            in compact_candidate_sql
+        )
+        assert (
+            "custom_metric_candidate_source.service_name AS service_name"
+            in compact_candidate_sql
+        )
+        assert (
+            "toStartOfHour( custom_metric_candidate_source.start_time ) "
+            "AS identity_hour"
+        ) in compact_candidate_sql
+        assert "start_time AS start_time" not in compact_candidate_sql
+        assert params["custom_metric_attr_key"] == "call.total_turns"
+        # The hint is a candidate-seed optimization, never a mutable predicate
+        # on the latest-version replay itself.
+        assert "indexHint(" not in replay_and_live_sql
+
+    def test_numeric_custom_metric_replays_key_removals_and_tombstones(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        metric = {
+            "id": "call.total_turns",
+            "name": "call.total_turns",
+            "type": "custom_attribute",
+            "attribute_key": "call.total_turns",
+            "attribute_type": "number",
+            "aggregation": "avg",
+        }
+
+        sql, _params, _metric_info = DashboardQueryBuilderV2(
+            {**sample_query_config, "metrics": [metric]}
+        ).build_all_queries()[0]
+        _candidate_sql, replay_and_live_sql = sql.split(
+            "), latest_custom_metric_spans AS (", 1
+        )
+        replay_sql, live_sql = replay_and_live_sql.split(
+            "), live_custom_metric_spans AS (", 1
+        )
+        compact_replay_sql = " ".join(replay_sql.split())
+
+        assert "INNER JOIN custom_metric_candidate_identities" in compact_replay_sql
+        assert (
+            "custom_metric_candidate.project_id = custom_metric_source.project_id"
+        ) in compact_replay_sql
+        assert (
+            "custom_metric_candidate.observation_type "
+            "= custom_metric_source.observation_type"
+        ) in compact_replay_sql
+        assert (
+            "custom_metric_candidate.service_name = custom_metric_source.service_name"
+        ) in compact_replay_sql
+        assert (
+            "custom_metric_candidate.identity_hour "
+            "= toStartOfHour(custom_metric_source.start_time)"
+        ) in compact_replay_sql
+        assert (
+            "custom_metric_candidate.trace_id = custom_metric_source.trace_id"
+        ) in compact_replay_sql
+        assert (
+            "custom_metric_candidate.id = custom_metric_source.id"
+        ) in compact_replay_sql
+        assert "custom_metric_candidate.start_time" not in compact_replay_sql
+        assert ">= toStartOfHour(%(start_date)s)" in compact_replay_sql
+        assert "< toStartOfHour(%(end_date)s) + INTERVAL 1 HOUR" in compact_replay_sql
+        assert replay_sql.count("mapContains(") == 1
+        assert "custom_metric_source.is_deleted" in replay_sql
+        assert "custom_metric_source._version" in replay_sql
+        assert "indexHint(" not in replay_sql
+        assert "tupleElement(latest_metric_state, 1) = 0" in live_sql
+        assert "tupleElement(latest_metric_state, 3) = 1" in live_sql
+        assert sql.index("argMax(") < sql.index(
+            "tupleElement(latest_metric_state, 1) = 0"
+        )
+
     def test_time_to_first_token_exact_read_uses_metric_key(
         self, sample_query_config, settings
     ):
@@ -7338,14 +7441,18 @@ class TestDashboardQuerySerializer:
         sql, params = DashboardQueryBuilderV2(
             serializer.validated_data
         ).build_metric_query(metric)
+        compact_sql = "".join(sql.split())
         assert "avg(metric_value)" in sql
         assert "latest_custom_metric_spans AS" in sql
         assert "FROM spans FINAL" not in sql
         assert "mapContains(" in sql
-        assert "attrs_number[%(custom_metric_attr_key)s]" in sql
+        assert (
+            "custom_metric_source.attrs_number[%(custom_metric_attr_key)s]"
+            in compact_sql
+        )
         assert "tupleElement(latest_metric_state, 1) = 0" in sql
         assert "tupleElement(latest_metric_state, 3) = 1" in sql
-        assert "GROUP BY\n                    project_id," in sql
+        assert "GROUP BY\n                    custom_metric_source.project_id," in sql
         assert params["custom_metric_attr_key"] == "call.total_turns"
 
     @pytest.mark.parametrize("aggregation", ["min", "max"])
@@ -10565,9 +10672,7 @@ def test_dashboard_query_replays_legacy_metric_filter_without_400(
 
     assert response.status_code == 200
     assert captured["namespace"] == "dashboard-query"
-    normalized_filter = captured["identity"]["query_config"]["metrics"][0][
-        "filters"
-    ][0]
+    normalized_filter = captured["identity"]["query_config"]["metrics"][0]["filters"][0]
     assert {
         key: value
         for key, value in normalized_filter.items()

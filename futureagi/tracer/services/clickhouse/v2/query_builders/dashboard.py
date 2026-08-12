@@ -148,37 +148,99 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
             col="metric_value"
         )
         sql = f"""
-            WITH latest_custom_metric_spans AS (
+            WITH custom_metric_candidate_identities AS (
+                /*
+                 * Use the deployed typed-Map key bloom index only to discover
+                 * immutable span identities that have carried this metric. The
+                 * latest-state stage below replays every version of those
+                 * identities. Applying the mutable predicate there could hide
+                 * a tombstone or key removal and resurrect an older value.
+                 */
                 SELECT
-                    project_id,
-                    observation_type,
-                    service_name,
-                    toStartOfHour(start_time) AS identity_hour,
-                    trace_id,
-                    id,
+                    custom_metric_candidate_source.project_id AS project_id,
+                    custom_metric_candidate_source.observation_type
+                        AS observation_type,
+                    custom_metric_candidate_source.service_name AS service_name,
+                    toStartOfHour(
+                        custom_metric_candidate_source.start_time
+                    ) AS identity_hour,
+                    custom_metric_candidate_source.trace_id AS trace_id,
+                    custom_metric_candidate_source.id AS id
+                FROM spans AS custom_metric_candidate_source
+                PREWHERE custom_metric_candidate_source.project_id
+                            IN %(project_ids)s
+                  AND custom_metric_candidate_source.start_time
+                            >= %(start_date)s
+                  AND custom_metric_candidate_source.start_time
+                            < %(end_date)s
+                WHERE indexHint(has(mapKeys(
+                          custom_metric_candidate_source.attrs_number
+                      ), %(custom_metric_attr_key)s))
+                  AND mapContains(
+                          custom_metric_candidate_source.attrs_number,
+                          %(custom_metric_attr_key)s
+                      )
+                GROUP BY
+                    custom_metric_candidate_source.project_id,
+                    custom_metric_candidate_source.observation_type,
+                    custom_metric_candidate_source.service_name,
+                    identity_hour,
+                    custom_metric_candidate_source.trace_id,
+                    custom_metric_candidate_source.id
+            ), latest_custom_metric_spans AS (
+                SELECT
+                    custom_metric_source.project_id,
+                    custom_metric_source.observation_type,
+                    custom_metric_source.service_name,
+                    toStartOfHour(
+                        custom_metric_source.start_time
+                    ) AS identity_hour,
+                    custom_metric_source.trace_id,
+                    custom_metric_source.id,
                     argMax(
                         tuple(
-                            is_deleted,
-                            start_time,
+                            custom_metric_source.is_deleted,
+                            custom_metric_source.start_time,
                             mapContains(
-                                attrs_number,
+                                custom_metric_source.attrs_number,
                                 %(custom_metric_attr_key)s
                             ),
-                            attrs_number[%(custom_metric_attr_key)s]
+                            custom_metric_source.attrs_number[
+                                %(custom_metric_attr_key)s
+                            ]
                         ),
-                        _version
+                        custom_metric_source._version
                     ) AS latest_metric_state
-                FROM spans
-                PREWHERE project_id IN %(project_ids)s
-                  AND start_time >= %(start_date)s
-                  AND start_time < %(end_date)s
+                FROM spans AS custom_metric_source
+                INNER JOIN custom_metric_candidate_identities
+                    AS custom_metric_candidate
+                  ON custom_metric_candidate.project_id
+                        = custom_metric_source.project_id
+                 AND custom_metric_candidate.observation_type
+                        = custom_metric_source.observation_type
+                 AND custom_metric_candidate.service_name
+                        = custom_metric_source.service_name
+                 AND custom_metric_candidate.identity_hour
+                        = toStartOfHour(custom_metric_source.start_time)
+                 AND custom_metric_candidate.trace_id
+                        = custom_metric_source.trace_id
+                 AND custom_metric_candidate.id = custom_metric_source.id
+                PREWHERE custom_metric_source.project_id IN %(project_ids)s
+                  /*
+                   * Widen exact event bounds to their storage-key hours so a
+                   * corrected start_time still participates in argMax.
+                   */
+                  AND custom_metric_source.start_time
+                            >= toStartOfHour(%(start_date)s)
+                  AND custom_metric_source.start_time
+                            < toStartOfHour(%(end_date)s) + INTERVAL 1 HOUR
                 GROUP BY
-                    project_id,
-                    observation_type,
-                    service_name,
+                    custom_metric_source.project_id,
+                    custom_metric_source.observation_type,
+                    custom_metric_source.service_name,
                     identity_hour,
-                    trace_id,
-                    id
+                    custom_metric_source.trace_id,
+                    custom_metric_source.id
             ), live_custom_metric_spans AS (
                 SELECT
                     tupleElement(latest_metric_state, 2) AS start_time,
