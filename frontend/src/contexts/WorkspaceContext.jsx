@@ -235,7 +235,14 @@ export function WorkspaceProvider({ children }) {
           displayName: wsData.display_name || wsData.name || null,
           role: response?.data?.user_role || null,
           wsLevel: workspace.wsLevel, // preserve until user-info re-fetched
-          orgId: currentOrganizationId || workspace.orgId || null,
+          // A null here removes workspaceOrgId, and the reader then rejects
+          // the row after the reload below, silently dropping the user back on
+          // their default workspace. The tab's pinned org is the last resort.
+          orgId:
+            currentOrganizationId ||
+            workspace.orgId ||
+            readSessionOrgId() ||
+            null,
         };
 
         // 1. Update sessionStorage

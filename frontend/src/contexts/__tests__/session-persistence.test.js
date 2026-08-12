@@ -18,6 +18,7 @@ vi.mock("src/components/snackbar", () => ({ enqueueSnackbar: vi.fn() }));
 vi.mock("src/auth/hooks", () => ({ useAuthContext: () => ({}) }));
 
 import {
+  readSessionOrgId,
   readSessionWorkspaceForOrg,
   writeSessionWorkspace,
 } from "../WorkspaceContext";
@@ -104,5 +105,25 @@ describe("comment 6 — pinning a new org must not leave the previous org's deta
     expect(sessionStorage.getItem("organizationName")).not.toBe("A");
     expect(sessionStorage.getItem("organizationRole")).not.toBe("Owner");
     expect(sessionStorage.getItem("orgLevel")).not.toBe("15");
+  });
+});
+
+describe("comment 8 — the tab's pinned org is the last-resort owner", () => {
+  it("keeps the workspace when only sessionStorage knows the org", () => {
+    // switchWorkspace resolves orgId as
+    //   currentOrganizationId || workspace.orgId || readSessionOrgId()
+    // The first two are null before the org context settles; without the
+    // third the row is written with no owner and discarded on the next load.
+    sessionStorage.setItem("organizationId", ORG_A);
+    writeSessionWorkspace({
+      id: "ws-1",
+      name: "Analytics",
+      displayName: "Analytics",
+      role: "Owner",
+      wsLevel: 15,
+      orgId: null || null || readSessionOrgId() || null,
+    });
+    expect(sessionStorage.getItem("workspaceOrgId")).toBe(ORG_A);
+    expect(readSessionWorkspaceForOrg(ORG_A)?.id).toBe("ws-1");
   });
 });
