@@ -703,6 +703,36 @@ def test_continuous_10k_custom_attribute_classifier_has_finite_exact_budget(
 
 
 @pytest.mark.unit
+def test_continuous_discovery_restores_background_two_minute_wall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, float] = {}
+
+    def discover(*_args, **kwargs):
+        observed["deadline_seconds"] = kwargs["deadline_seconds"]
+        return continuous_candidates.ContinuousCandidates((), ())
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        discover,
+    )
+
+    resolved = row_resolver._resolve_continuous_rows(
+        _continuous_trace_task_for_filter(_attribute_filter()),
+        ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        sampling_rate=100.0,
+    )
+
+    # Regression for the US-prod failure where 2.2s + 1.2s discovery reads
+    # exhausted a new four-second (10s * 0.4) wall before the next statement.
+    # Continuous reconciliation is background work and retains per-statement
+    # caps, but its shared discovery proof gets the former two-minute envelope.
+    assert observed == {"deadline_seconds": 120.0}
+    assert resolved == row_resolver.ResolvedRowSet((), (), False)
+
+
+@pytest.mark.unit
 def test_continuous_classifier_query_cap_fails_before_first_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -747,7 +777,7 @@ def test_continuous_classifier_query_cap_fails_before_first_read(
     )
 
     with pytest.raises(
-        row_resolver.EvalTaskReadBudgetExceeded,
+        row_resolver.EvalTaskSelectionRejected,
         match="exceeded its read budget",
     ):
         row_resolver._resolve_continuous_rows(
@@ -757,6 +787,72 @@ def test_continuous_classifier_query_cap_fails_before_first_read(
         )
 
     assert calls == 0
+
+
+@pytest.mark.unit
+def test_continuous_candidate_query_cap_is_deterministic_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget = continuous_candidates._ReadBudget(
+        continuous_candidates.time.monotonic() + 30,
+        attempts=continuous_candidates._MAX_QUERY_ATTEMPTS,
+    )
+
+    def discover(*_args, **_kwargs):
+        # Exercise the same cap classification through the public resolver.
+        budget.timeout_ms()
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        discover,
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskSelectionRejected,
+        match="exceeded its read budget",
+    ):
+        row_resolver._resolve_continuous_rows(
+            _continuous_trace_task_for_filter(_attribute_filter()),
+            ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+            sampling_rate=100.0,
+        )
+
+
+@pytest.mark.unit
+def test_continuous_candidate_read_wraps_only_transient_failures() -> None:
+    class Analytics:
+        def __init__(self, failure: Exception):
+            self.failure = failure
+
+        def execute_ch_query(self, *_args, **_kwargs):
+            raise self.failure
+
+    def budget() -> continuous_candidates._ReadBudget:
+        return continuous_candidates._ReadBudget(
+            continuous_candidates.time.monotonic() + 30
+        )
+
+    with pytest.raises(
+        continuous_candidates.ContinuousCandidateReadError,
+        match="TimeoutError",
+    ):
+        continuous_candidates._execute(
+            Analytics(TimeoutError("temporary ClickHouse timeout")),
+            "SELECT 1",
+            {},
+            budget(),
+        )
+
+    programming_error = RuntimeError("malformed candidate query")
+    with pytest.raises(RuntimeError, match="malformed candidate query") as captured:
+        continuous_candidates._execute(
+            Analytics(programming_error),
+            "SELECT broken",
+            {},
+            budget(),
+        )
+    assert captured.value is programming_error
 
 
 @pytest.mark.unit

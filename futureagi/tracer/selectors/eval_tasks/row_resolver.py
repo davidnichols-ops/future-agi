@@ -40,8 +40,10 @@ _BUILDER_BY_ROW_TYPE = {
     "sessions": ("SESSION_LIST", "session_id"),
 }
 
-_EVAL_TASK_TOTAL_READ_SECONDS = 10.0
-_EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS = 26.0
+# Historical reconciliation is background workflow work. Give its completely
+# buffered proof a two-minute aggregate envelope while keeping every
+# statement/query/result/resource cap below unchanged.
+_EVAL_TASK_HISTORICAL_READ_SECONDS = 120.0
 _EVAL_TASK_MAX_READ_ATTEMPTS = 128
 # Seed pages are identity-only and capped at the shared production-proven 512
 # rows. Classifiers remain separately chunked to 200 physical identities.
@@ -76,6 +78,13 @@ _EVAL_TASK_FILTER_CLASSIFY_QUERY_TIMEOUT_MS = 3_000
 _EVAL_TASK_FILTER_CLASSIFY_WALL_MS_PER_QUERY = 3_500
 _EVAL_TASK_CONTINUOUS_CLASSIFY_FIXED_WALL_MS = 5_000
 _EVAL_TASK_CONTINUOUS_MAX_CLASSIFY_QUERIES = 1_000
+# Continuous reconciliation is a heartbeating background activity, not an HTTP
+# request.  Its candidate proof can legitimately need several bounded reads,
+# especially for eval/annotation-dependent voice filters. Use an explicit
+# two-minute aggregate allowance for this background proof, while retaining the
+# 30-second per-statement and 128-statement caps in ``continuous_candidates``.
+_EVAL_TASK_CONTINUOUS_DISCOVERY_SECONDS = 120.0
+_EVAL_TASK_CONTINUOUS_SAMPLING_SECONDS = 120.0
 _EVAL_TASK_RECONCILE_ACTIVITY_SECONDS = 3 * 60 * 60
 _EVAL_TASK_CONTINUOUS_ACTIVITY_RESERVE_SECONDS = 5 * 60
 _EVAL_TASK_CONTINUOUS_CLASSIFY_MAX_WALL_MS = (
@@ -115,7 +124,11 @@ _SAFE_ANNOTATION_METADATA_MESSAGE = (
 
 
 class EvalTaskReadBudgetExceeded(RuntimeError):
-    """Safe error used when exact task membership cannot be proven in budget."""
+    """Transient safe error when exact membership cannot be proven in budget."""
+
+
+class EvalTaskSelectionRejected(EvalTaskReadBudgetExceeded):
+    """Deterministic task/filter contract rejection that retries cannot fix."""
 
 
 def _annotation_label_ids_for_filters(
@@ -150,7 +163,7 @@ def _annotation_label_ids_for_filters(
             if getattr(label, "id", None)
         )
     except (AnnotationScoreReadUnavailable, DatabaseError):
-        raise RuntimeError(_SAFE_ANNOTATION_METADATA_MESSAGE) from None
+        raise EvalTaskReadBudgetExceeded(_SAFE_ANNOTATION_METADATA_MESSAGE) from None
 
 
 @dataclass(frozen=True)
@@ -327,7 +340,7 @@ def _replay_historical_trace_filter_witnesses(
     witness_wall_ms_per_query: int,
     witness_read_settings: dict[str, Any],
     max_query_count: int = _EVAL_TASK_MAX_READ_ATTEMPTS,
-    total_deadline_seconds: float = _EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS,
+    total_deadline_seconds: float = _EVAL_TASK_HISTORICAL_READ_SECONDS,
     aggregate_deadline_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Replay only proven traces to attach exact any-span filter witnesses.
@@ -346,12 +359,12 @@ def _replay_historical_trace_filter_witnesses(
         return rows
 
     if witness_batch_size < 1 or witness_wall_ms_per_query < 1:
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
     required_queries = ceil(len(rows) / witness_batch_size)
     if required_queries > _EVAL_TASK_WORKFLOW_MAX_WITNESS_QUERIES:
-        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_READ_BUDGET_MESSAGE)
     if phase_one_query_count + required_queries > max_query_count:
-        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_READ_BUDGET_MESSAGE)
 
     expected_by_trace: dict[str, tuple[str, str, str, datetime]] = {}
     for row in rows:
@@ -361,8 +374,8 @@ def _replay_historical_trace_filter_witnesses(
         expected_by_trace[identity[1]] = identity
 
     total_deadline = read_started + total_deadline_seconds
-    # Interactive reads reserve one full per-query wall allowance for every
-    # exact replay batch. The aggregate-only option is a finite background
+    # Ordinary historical reads reserve one full per-query wall allowance for
+    # every exact replay batch. The aggregate-only option is a finite background
     # fail-safe for mechanically bounded workloads; it is not evidence that a
     # dense 100k production workload will complete within the activity wall.
     # Every statement remains capped and the buffered proof still fails
@@ -388,8 +401,11 @@ def _replay_historical_trace_filter_witnesses(
                 batch,
                 include_filter_witnesses=True,
             )
-            if not query:
-                raise ValueError("trace witness replay query is empty")
+        except (TypeError, ValueError):
+            raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE) from None
+        if not query:
+            raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        try:
             result = analytics.execute_ch_query(
                 query,
                 query_params,
@@ -399,10 +415,11 @@ def _replay_historical_trace_filter_witnesses(
                     "max_result_rows": len(batch),
                 },
             )
+        except (TypeError, ValueError):
+            raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE) from None
         except Exception as exc:
             if (
-                not isinstance(exc, ValueError)
-                and not isinstance(exc, TimeoutError)
+                not isinstance(exc, TimeoutError)
                 and not is_read_budget_error(exc)
                 and not is_clickhouse_query_error(exc)
             ):
@@ -540,16 +557,16 @@ def _continuous_classifier_budget_ms(
     """
 
     if candidate_count < 0 or classify_size < 1:
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
     required_queries = ceil(candidate_count / classify_size) if candidate_count else 0
     if required_queries > _EVAL_TASK_CONTINUOUS_MAX_CLASSIFY_QUERIES:
-        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_READ_BUDGET_MESSAGE)
     budget_ms = (
         _EVAL_TASK_CONTINUOUS_CLASSIFY_FIXED_WALL_MS
         + required_queries * _EVAL_TASK_FILTER_CLASSIFY_WALL_MS_PER_QUERY
     )
     if budget_ms > _EVAL_TASK_CONTINUOUS_CLASSIFY_MAX_WALL_MS:
-        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_READ_BUDGET_MESSAGE)
     return required_queries, budget_ms
 
 
@@ -557,7 +574,7 @@ def _recommended_filter_classify_batch_size(builder: Any, *, maximum: int) -> in
     """Return a positive builder recommendation without widening ``maximum``."""
 
     if maximum < 1:
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
     recommendation = getattr(builder, "recommended_filter_classify_batch_size", None)
     if not callable(recommendation):
         return maximum
@@ -565,9 +582,9 @@ def _recommended_filter_classify_batch_size(builder: Any, *, maximum: int) -> in
     if recommended is None:
         return maximum
     if isinstance(recommended, bool) or not isinstance(recommended, int):
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
     if recommended < 1:
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
     return min(maximum, recommended)
 
 
@@ -586,7 +603,7 @@ def _filter_classifier_read_settings(builder: Any) -> dict[str, Any]:
         "preferred_max_column_in_block_size_bytes",
     }
     if not isinstance(recommended, dict) or set(recommended) - allowed_recommendations:
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
     for setting_name in allowed_recommendations:
         recommended_value = recommended.get(setting_name)
         if recommended_value is None:
@@ -594,9 +611,9 @@ def _filter_classifier_read_settings(builder: Any) -> dict[str, Any]:
         if isinstance(recommended_value, bool) or not isinstance(
             recommended_value, int
         ):
-            raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+            raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
         if recommended_value < 1:
-            raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+            raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
         existing_value = settings.get(setting_name)
         # A recommendation may tighten an application-qualified default but
         # can never relax it for an eval/task classifier.
@@ -618,6 +635,7 @@ def _resolve_continuous_rows(
 
     from tracer.selectors.eval_tasks.continuous_candidates import (
         ContinuousCandidateOverflow,
+        ContinuousCandidateQueryCapExceeded,
         ContinuousCandidateReadError,
         discover_continuous_candidates,
         sample_public_ids,
@@ -627,7 +645,7 @@ def _resolve_continuous_rows(
 
     floor = _continuous_floor(task)
     if floor is None:
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
     frozen_ceiling = ceiling or datetime.now(UTC)
     if frozen_ceiling.tzinfo is None:
         frozen_ceiling = frozen_ceiling.replace(tzinfo=UTC)
@@ -658,7 +676,7 @@ def _resolve_continuous_rows(
             ceiling=frozen_ceiling,
             salt=str(task.id),
             sampling_rate=sampling_rate,
-            deadline_seconds=_EVAL_TASK_TOTAL_READ_SECONDS * 0.4,
+            deadline_seconds=_EVAL_TASK_CONTINUOUS_DISCOVERY_SECONDS,
         )
         if not candidates.classifier_ids:
             return ResolvedRowSet(candidates.public_ids, (), full_state)
@@ -675,7 +693,7 @@ def _resolve_continuous_rows(
             builder_kwargs["bounded_bulk_scan"] = True
         builder = get_v2_class(query_type)(**builder_kwargs)
         if not builder.supports_bounded_filter_scan():
-            raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+            raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
 
         classify_size = _EVAL_TASK_CLASSIFY_BATCH_SIZE
         classify_size = _recommended_filter_classify_batch_size(
@@ -704,7 +722,7 @@ def _resolve_continuous_rows(
                 candidate_full_state=True,
             )
             if not query:
-                raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+                raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
             try:
                 result = analytics.execute_ch_query(
                     query,
@@ -737,7 +755,7 @@ def _resolve_continuous_rows(
             )
 
         if executed_queries != required_queries:
-            raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+            raise EvalTaskSelectionRejected(_SAFE_READ_BUDGET_MESSAGE)
 
         matched_ids = tuple(sorted(dict.fromkeys(matched)))
         if task.row_type == RowType.VOICE_CALLS:
@@ -746,7 +764,7 @@ def _resolve_continuous_rows(
                 matched_ids,
                 salt=str(task.id),
                 sampling_rate=sampling_rate,
-                deadline_seconds=_EVAL_TASK_TOTAL_READ_SECONDS * 0.1,
+                deadline_seconds=_EVAL_TASK_CONTINUOUS_SAMPLING_SECONDS,
             )
         # A classifier may only admit public identities proved by C. This also
         # fences malformed/multi-root output before reconciliation can write.
@@ -777,11 +795,13 @@ def _resolve_continuous_rows(
     except EvalTaskReadBudgetExceeded:
         raise
     except ContinuousCandidateOverflow:
-        raise EvalTaskReadBudgetExceeded(_SAFE_ROW_LIMIT_MESSAGE) from None
+        raise EvalTaskSelectionRejected(_SAFE_ROW_LIMIT_MESSAGE) from None
+    except ContinuousCandidateQueryCapExceeded:
+        raise EvalTaskSelectionRejected(_SAFE_READ_BUDGET_MESSAGE) from None
     except ContinuousCandidateReadError:
         raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
     except (TypeError, ValueError):
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE) from None
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE) from None
 
 
 def _resolve_bounded_historical_span_ids(
@@ -900,14 +920,14 @@ def _resolve_bounded_historical_span_ids(
         # Never fall back to the broad compatibility statement for a filter
         # the latest-state candidate classifier cannot prove. In particular,
         # eval/annotation predicates must remain candidate-scoped.
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
 
     try:
         start_date, end_date = builder.parse_time_range(ui_filters)
     except (TypeError, ValueError):
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE) from None
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE) from None
     if not isinstance(start_date, datetime) or not isinstance(end_date, datetime):
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
     if start_date >= end_date:
         return resolved_result(())
     if not has_time_filter:
@@ -1024,7 +1044,7 @@ def _resolve_bounded_historical_span_ids(
         builder_kwargs["bounded_include_filter_witnesses"] = True
         builder = get_v2_class(query_type)(**builder_kwargs)
         if not builder.supports_bounded_filter_scan():
-            raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+            raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
         classify_batch_size = _recommended_filter_classify_batch_size(
             builder,
             maximum=_EVAL_TASK_TRACE_WITNESS_BATCH_SIZE,
@@ -1033,18 +1053,18 @@ def _resolve_bounded_historical_span_ids(
             ceil((bounded_limit + 1) / classify_batch_size)
             > _EVAL_TASK_WORKFLOW_MAX_WITNESS_QUERIES
         ):
-            raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+            raise EvalTaskSelectionRejected(_SAFE_READ_BUDGET_MESSAGE)
 
     read_started = time.monotonic()
-    phase_one_deadline_seconds = _EVAL_TASK_TOTAL_READ_SECONDS
+    phase_one_deadline_seconds = _EVAL_TASK_HISTORICAL_READ_SECONDS
     phase_one_query_count = _EVAL_TASK_MAX_READ_ATTEMPTS
     phase_one_seed_attempts = _EVAL_TASK_MAX_READ_ATTEMPTS
     if trace_witness_required:
         phase_one_deadline_seconds = (
-            _EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS
+            _EVAL_TASK_HISTORICAL_READ_SECONDS
             - _EVAL_TASK_TRACE_WITNESS_SECONDS_RESERVE
         )
-        # Interactive trace tasks reserve the final fourteen seconds for exact
+        # Trace tasks reserve the final fourteen seconds for exact
         # witness replay. The replay preflights the actual phase-one query count
         # plus its exact number of builder-qualified batches before reading.
         phase_one_query_count -= _EVAL_TASK_TRACE_WITNESS_QUERY_RESERVE
@@ -1094,13 +1114,21 @@ def _resolve_bounded_historical_span_ids(
             workflow_exact=workflow_exact,
             query_timeout_ms=_EVAL_TASK_FILTER_CLASSIFY_QUERY_TIMEOUT_MS,
         )
+    except (TypeError, ValueError):
+        raise EvalTaskSelectionRejected(_SAFE_UNSUPPORTED_FILTER_MESSAGE) from None
     except Exception as exc:
-        if not is_read_budget_error(exc) and not isinstance(
-            exc, (TimeoutError, ValueError)
-        ):
+        if not is_read_budget_error(exc) and not isinstance(exc, TimeoutError):
             raise
         raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
 
+    if not page.complete and page.error_code in {
+        "query_budget_exceeded",
+        "scan_budget_exceeded",
+    }:
+        # These codes mean the selector's fixed statement envelope cannot prove
+        # this requested prefix. Re-running the same immutable task contract
+        # cannot add query capacity, unlike a deadline/resource/drift failure.
+        raise EvalTaskSelectionRejected(_SAFE_READ_BUDGET_MESSAGE)
     if not page.complete:
         raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
     resolved_rows = page.rows
@@ -1146,7 +1174,7 @@ def _resolve_bounded_historical_span_ids(
             witness_wall_ms_per_query=trace_witness_wall_ms_per_query,
             witness_read_settings=trace_witness_read_settings,
             max_query_count=_EVAL_TASK_MAX_READ_ATTEMPTS,
-            total_deadline_seconds=_EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS,
+            total_deadline_seconds=_EVAL_TASK_HISTORICAL_READ_SECONDS,
         )
     if row_type == RowType.SPANS:
         identities_by_span_id: dict[str, set[tuple[str, Any]]] = {}
@@ -1162,7 +1190,7 @@ def _resolve_bounded_historical_span_ids(
                 # EvalTaskEntry's public/storage contract carries only the
                 # span ID. It cannot represent two distinct physical spans
                 # that reuse that ID, so never silently target one.
-                raise EvalTaskReadBudgetExceeded(_SAFE_AMBIGUOUS_SPAN_MESSAGE)
+                raise EvalTaskSelectionRejected(_SAFE_AMBIGUOUS_SPAN_MESSAGE)
         resolved = list(
             dict.fromkeys(
                 str(row[key_field])
@@ -1210,7 +1238,7 @@ def _resolve_buffered_legacy_ids(
         ):
             resolved.extend(str(value) for value in batch)
             if len(resolved) > limit:
-                raise EvalTaskReadBudgetExceeded(_SAFE_ROW_LIMIT_MESSAGE)
+                raise EvalTaskSelectionRejected(_SAFE_ROW_LIMIT_MESSAGE)
     except Exception as exc:
         if isinstance(exc, EvalTaskReadBudgetExceeded):
             raise

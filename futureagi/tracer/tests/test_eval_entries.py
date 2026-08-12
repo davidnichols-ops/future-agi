@@ -23,7 +23,7 @@ from tracer.models.observation_span import (
 from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession
 from tracer.selectors.eval_tasks.row_resolver import (
-    EvalTaskReadBudgetExceeded,
+    EvalTaskSelectionRejected,
     TraceFilterWitness,
 )
 from tracer.services.eval_tasks.config_hash import resolved_config_hash
@@ -113,7 +113,7 @@ def test_entry_fk_resolution_rejects_off_page_cross_trace_span_id_collision():
             ]
 
     with pytest.raises(
-        EvalTaskReadBudgetExceeded,
+        EvalTaskSelectionRejected,
         match="could not safely distinguish",
     ):
         _resolve_entry_fks(

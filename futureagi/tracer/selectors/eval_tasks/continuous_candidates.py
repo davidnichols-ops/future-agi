@@ -20,6 +20,10 @@ from typing import Any
 
 from tracer.models.eval_task import RowType
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
+from tracer.services.clickhouse.read_budget import (
+    is_clickhouse_query_error,
+    is_read_budget_error,
+)
 from tracer.services.clickhouse.v2.id_remap_sql import (
     NIL_UUID,
     resolved_id_expr,
@@ -49,6 +53,10 @@ class ContinuousCandidateOverflow(ContinuousCandidateReadError):
     """More candidates changed than can safely be buffered in one pass."""
 
 
+class ContinuousCandidateQueryCapExceeded(ContinuousCandidateReadError):
+    """The deterministic statement-count envelope cannot prove the window."""
+
+
 @dataclass(frozen=True)
 class ContinuousCandidates:
     """Classifier keys plus sampled public row identities.
@@ -69,7 +77,7 @@ class _ReadBudget:
 
     def timeout_ms(self) -> int:
         if self.attempts >= _MAX_QUERY_ATTEMPTS:
-            raise ContinuousCandidateReadError("continuous query cap exceeded")
+            raise ContinuousCandidateQueryCapExceeded("continuous query cap exceeded")
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise ContinuousCandidateReadError("continuous read deadline exceeded")
@@ -288,6 +296,12 @@ def _execute(analytics, query: str, params: dict[str, Any], budget: _ReadBudget)
     except ContinuousCandidateReadError:
         raise
     except Exception as exc:
+        if (
+            not isinstance(exc, TimeoutError)
+            and not is_read_budget_error(exc)
+            and not is_clickhouse_query_error(exc)
+        ):
+            raise
         raise ContinuousCandidateReadError(type(exc).__name__) from exc
     return list(result.data)
 
@@ -895,6 +909,7 @@ def _epoch_nanoseconds(value: datetime) -> int:
 
 __all__ = [
     "ContinuousCandidateOverflow",
+    "ContinuousCandidateQueryCapExceeded",
     "ContinuousCandidateReadError",
     "ContinuousCandidates",
     "discover_continuous_candidates",

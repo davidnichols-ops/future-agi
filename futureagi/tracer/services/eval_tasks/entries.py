@@ -20,7 +20,7 @@ from django.utils import timezone
 from tracer.models.eval_task import RowType
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger, EvalTargetType
 from tracer.selectors.eval_tasks.row_resolver import (
-    EvalTaskReadBudgetExceeded,
+    EvalTaskSelectionRejected,
     TraceFilterWitness,
     iter_desired_rows,
 )
@@ -416,7 +416,7 @@ def _resolve_entry_fks(
                     # EvalLogger stores only observation_span_id. If another
                     # trace in this project reuses the OTel ID, materializing
                     # either row would make the eventual target arbitrary.
-                    raise EvalTaskReadBudgetExceeded(_SAFE_AMBIGUOUS_SPAN_MESSAGE)
+                    raise EvalTaskSelectionRejected(_SAFE_AMBIGUOUS_SPAN_MESSAGE)
             fks.update(
                 {
                     str(s.id): {

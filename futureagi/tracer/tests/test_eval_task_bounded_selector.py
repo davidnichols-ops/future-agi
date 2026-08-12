@@ -430,7 +430,7 @@ def test_bounded_resolver_returns_only_a_complete_latest_state_page(
     )
 
     assert ids == ["row-a", "row-b"]
-    assert captured["deadline_ms"] == 10_000
+    assert captured["deadline_ms"] == 120_000
     assert captured["max_query_count"] == 128
     assert captured["max_candidates"] == 512
     assert captured["classify_batch_size"] == expected_classify_batch
@@ -453,6 +453,131 @@ def test_bounded_resolver_returns_only_a_complete_latest_state_page(
         )
         assert "filter_witness_0" not in membership_sql
         assert "argMinIf(tuple(grouped_id, latest_start_time)" not in membership_sql
+
+
+@pytest.mark.parametrize(
+    "row_type",
+    [RowType.SPANS, RowType.TRACES, RowType.SESSIONS, RowType.VOICE_CALLS],
+)
+def test_ordinary_historical_workflow_uses_two_minute_aggregate_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    row_type: str,
+) -> None:
+    captured: dict = {}
+
+    def fake_read(**kwargs):
+        captured.update(kwargs)
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=0,
+            elapsed_ms=1,
+            query_count=1,
+            rows_returned=0,
+            result_payload_bytes=2,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    assert (
+        row_resolver._resolve_bounded_historical_span_ids(
+            object(),
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters={
+                "filters": [_attribute_filter("final_status", "Rejected")],
+                "date_range": [START, END],
+            },
+            limit=25,
+            batch_size=25,
+            row_type=row_type,
+        )
+        == []
+    )
+    assert captured["workflow_exact"] is False
+    assert captured["deadline_ms"] == 120_000
+    assert captured["max_query_count"] == 128
+    assert captured["query_timeout_ms"] == 3_000
+
+
+def test_ordinary_trace_witness_proof_reserves_replay_from_two_minute_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    witness_start = END - timedelta(minutes=1)
+    membership_row = {
+        "trace_id": "trace-a",
+        "root_span_id": "root-a",
+        "start_time": witness_start,
+    }
+
+    def fake_read(**kwargs):
+        captured["page"] = kwargs
+        return BoundedFilterPage(
+            rows=[membership_row],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=1,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=1,
+            result_payload_bytes=20,
+            attempts=(),
+        )
+
+    def fake_replay(_analytics, **kwargs):
+        captured["replay"] = kwargs
+        return [
+            {
+                **membership_row,
+                "filter_witness_0": ("span-a", witness_start),
+            }
+        ]
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+    monkeypatch.setattr(
+        row_resolver,
+        "_replay_historical_trace_filter_witnesses",
+        fake_replay,
+    )
+
+    result = row_resolver._resolve_bounded_historical_span_ids(
+        object(),
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={
+            "filters": [_attribute_filter("final_status", "Rejected")],
+            "date_range": [START, END],
+        },
+        limit=25,
+        batch_size=25,
+        row_type=RowType.TRACES,
+        include_trace_filter_witnesses=True,
+    )
+
+    assert result.ids == ("trace-a",)
+    assert captured["page"]["workflow_exact"] is False
+    assert captured["page"]["deadline_ms"] == 106_000
+    assert captured["page"]["max_query_count"] == 112
+    assert captured["page"]["query_timeout_ms"] == 3_000
+    assert captured["replay"]["total_deadline_seconds"] == 120.0
+    assert captured["replay"]["max_query_count"] == 128
 
 
 @pytest.mark.parametrize("value", [False, "false"])
@@ -576,7 +701,7 @@ def test_bounded_historical_session_selector_keeps_exact_newest_first_prefix(
     assert ids == ["session-b", "session-a"]
     assert captured["key_field"] == "session_id"
     assert captured["page_size"] == 25
-    assert captured["deadline_ms"] == 10_000
+    assert captured["deadline_ms"] == 120_000
     assert captured["max_query_count"] == 128
     assert captured["max_candidates"] == 512
     assert captured["classify_batch_size"] == 50
@@ -999,7 +1124,7 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
         "final_status",
         "customer_tier",
     ]
-    assert captured["deadline_ms"] == 12_000
+    assert captured["deadline_ms"] == 106_000
     assert captured["max_query_count"] == 112
     assert captured["classify_batch_size"] == 10
     phase_one_builder = captured["builder"]
@@ -1181,7 +1306,7 @@ def test_trace_eval_witness_replay_uses_ten_id_batches_with_hard_caps(
         assert kwargs["max_query_count"] == 112
         assert kwargs["classify_batch_size"] == 10
         assert kwargs["workflow_exact"] is False
-        assert kwargs["deadline_ms"] == 12_000
+        assert kwargs["deadline_ms"] == 106_000
         assert kwargs["builder"]._bounded_include_filter_witnesses is False
         return BoundedFilterPage(
             rows=rows,
@@ -1333,6 +1458,133 @@ def test_dense_100k_custom_trace_witness_replay_is_a_bounded_fail_safe_only(
     assert replayed[-1]["trace_id"] == "trace-099999"
 
 
+@pytest.mark.parametrize(
+    ("phase_one_query_count", "max_query_count", "max_witness_queries"),
+    [(0, 128, 1), (1, 2, 10_001)],
+    ids=["witness-query-cap", "combined-query-cap"],
+)
+def test_historical_witness_static_query_caps_are_deterministic_rejections(
+    monkeypatch: pytest.MonkeyPatch,
+    phase_one_query_count: int,
+    max_query_count: int,
+    max_witness_queries: int,
+) -> None:
+    rows = [
+        {
+            "trace_id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(minutes=1),
+        }
+        for index in range(2)
+    ]
+
+    class Analytics:
+        def execute_ch_query(self, *_args, **_kwargs):
+            raise AssertionError("static cap must reject before the first read")
+
+    monkeypatch.setattr(
+        row_resolver,
+        "_EVAL_TASK_WORKFLOW_MAX_WITNESS_QUERIES",
+        max_witness_queries,
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskSelectionRejected,
+        match="Narrow the time range",
+    ):
+        row_resolver._replay_historical_trace_filter_witnesses(
+            Analytics(),
+            builder=object(),
+            rows=rows,
+            phase_one_query_count=phase_one_query_count,
+            read_started=0.0,
+            ui_filters=[_attribute_filter("final_status", "Rejected")],
+            project_id=PROJECT_ID,
+            witness_batch_size=1,
+            witness_wall_ms_per_query=500,
+            witness_read_settings={},
+            max_query_count=max_query_count,
+            total_deadline_seconds=120.0,
+        )
+
+
+def test_historical_witness_builder_value_error_is_deterministic_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    witness_start = END - timedelta(minutes=1)
+
+    class Builder:
+        @staticmethod
+        def build_filter_match_query(*_args, **_kwargs):
+            raise ValueError("invalid witness builder contract")
+
+    class Analytics:
+        def execute_ch_query(self, *_args, **_kwargs):
+            raise AssertionError("invalid builder must reject before a CH read")
+
+    monkeypatch.setattr(
+        row_resolver,
+        "time",
+        SimpleNamespace(monotonic=lambda: 0.0),
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskSelectionRejected,
+        match="cannot be resolved safely",
+    ):
+        row_resolver._replay_historical_trace_filter_witnesses(
+            Analytics(),
+            builder=Builder(),
+            rows=[
+                {
+                    "trace_id": "trace-a",
+                    "root_span_id": "root-a",
+                    "start_time": witness_start,
+                }
+            ],
+            phase_one_query_count=1,
+            read_started=0.0,
+            ui_filters=[_attribute_filter("final_status", "Rejected")],
+            project_id=PROJECT_ID,
+            witness_batch_size=10,
+            witness_wall_ms_per_query=500,
+            witness_read_settings={},
+            total_deadline_seconds=120.0,
+        )
+
+
+def test_historical_bounded_reader_value_error_is_deterministic_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def invalid_read(**_kwargs):
+        raise ValueError("invalid bounded reader contract")
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+        invalid_read,
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskSelectionRejected,
+        match="cannot be resolved safely",
+    ):
+        row_resolver._resolve_bounded_historical_span_ids(
+            object(),
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters={
+                "filters": [_attribute_filter("final_status", "Rejected")],
+                "date_range": [START, END],
+            },
+            limit=25,
+            batch_size=25,
+            row_type=RowType.SPANS,
+        )
+
+
 def test_trace_eval_witness_routes_to_workflow_before_interactive_replay_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1439,7 +1691,7 @@ def test_workflow_one_phase_witness_bound_includes_exact_has_more_sentinel(
 
     if rejected:
         with pytest.raises(
-            row_resolver.EvalTaskReadBudgetExceeded,
+            row_resolver.EvalTaskSelectionRejected,
             match="Narrow the time range",
         ):
             row_resolver._resolve_bounded_historical_span_ids(**kwargs)
@@ -1643,8 +1895,8 @@ def test_trace_eval_witness_replay_never_returns_a_partial_second_phase(
 
     analytics = SecondBatchFails()
     with pytest.raises(
-        row_resolver.EvalTaskReadBudgetExceeded,
-        match="Narrow the time range",
+        row_resolver.EvalTaskSelectionRejected,
+        match="cannot be resolved safely",
     ):
         row_resolver._resolve_bounded_historical_span_ids(
             analytics,
@@ -2138,8 +2390,20 @@ def test_time_only_limit_transition_preserves_newest_first_prefix(
     assert calls[1]["workflow_exact"] is True
 
 
+@pytest.mark.parametrize(
+    ("error_code", "error_type"),
+    [
+        ("deadline_exceeded", row_resolver.EvalTaskReadBudgetExceeded),
+        ("read_budget_exceeded", row_resolver.EvalTaskReadBudgetExceeded),
+        ("classification_drift", row_resolver.EvalTaskReadBudgetExceeded),
+        ("query_budget_exceeded", row_resolver.EvalTaskSelectionRejected),
+        ("scan_budget_exceeded", row_resolver.EvalTaskSelectionRejected),
+    ],
+)
 def test_bounded_resolver_rejects_incomplete_page_without_partial_ids(
     monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    error_type: type[Exception],
 ) -> None:
     def fake_read(**_kwargs):
         return BoundedFilterPage(
@@ -2147,7 +2411,7 @@ def test_bounded_resolver_rejects_incomplete_page_without_partial_ids(
             has_more=False,
             complete=False,
             status="degraded",
-            error_code="deadline_exceeded",
+            error_code=error_code,
             total_rows_lower_bound=1,
             elapsed_ms=4500,
             query_count=12,
@@ -2160,10 +2424,7 @@ def test_bounded_resolver_rejects_incomplete_page_without_partial_ids(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
     )
 
-    with pytest.raises(
-        row_resolver.EvalTaskReadBudgetExceeded,
-        match="Narrow the time range",
-    ):
+    with pytest.raises(error_type, match="Narrow the time range") as captured:
         row_resolver._resolve_bounded_historical_span_ids(
             object(),
             sql="baseline-protocol-sql",
@@ -2179,6 +2440,7 @@ def test_bounded_resolver_rejects_incomplete_page_without_partial_ids(
             batch_size=256,
             row_type=RowType.SPANS,
         )
+    assert type(captured.value) is error_type
 
 
 def test_bounded_resolver_sanitizes_plain_timeout_without_partial_ids(
