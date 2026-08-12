@@ -120,3 +120,52 @@ describe("applyQuickFilters", () => {
     expect(f.filter_config.col_type).toBe("EVAL_METRIC");
   });
 });
+
+// Runs the updater against an existing filter list so the dedupe branch is
+// exercised, rather than always starting from [].
+function runQuickFilterOver(prev, col, value) {
+  let produced;
+  const setFilters = (updater) => {
+    produced = typeof updater === "function" ? updater(prev) : updater;
+  };
+  const noop = () => {};
+  applyQuickFilters(setFilters, noop, noop)({ col, value, filterAnchor: {} });
+  return produced;
+}
+
+describe("applyQuickFilters — one filter per column", () => {
+  const col = { id: "ended_reason", name: "Ended reason" };
+
+  it("replaces the existing filter when the same column is clicked with a new value", () => {
+    // Two values for one column would be ANDed and match nothing, leaving two
+    // indistinguishable chips for the same column.
+    const first = runQuickFilterOver([], col, "customer-ended-call");
+    const second = runQuickFilterOver(first, col, "silence-timed-out");
+
+    expect(second).toHaveLength(1);
+    expect(second[0].column_id).toBe("ended_reason");
+    expect(second[0].filter_config.filter_value).toBe("silence-timed-out");
+  });
+
+  it("leaves filters on other columns alone", () => {
+    const prev = runQuickFilterOver(
+      [],
+      { id: "provider", name: "Provider" },
+      "anthropic",
+    );
+    const next = runQuickFilterOver(prev, col, "silence-timed-out");
+
+    expect(next).toHaveLength(2);
+    expect(next.map((f) => f.column_id).sort()).toEqual([
+      "ended_reason",
+      "provider",
+    ]);
+  });
+
+  it("is a no-op when the same column and value are clicked twice", () => {
+    const first = runQuickFilterOver([], col, "customer-ended-call");
+    const second = runQuickFilterOver(first, col, "customer-ended-call");
+    expect(second).toHaveLength(1);
+    expect(second[0].filter_config.filter_value).toBe("customer-ended-call");
+  });
+});

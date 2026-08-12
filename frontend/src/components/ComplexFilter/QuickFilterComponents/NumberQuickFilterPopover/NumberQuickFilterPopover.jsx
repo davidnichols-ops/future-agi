@@ -46,7 +46,7 @@ const NumberQuickFilterPopoverChild = ({ filterData, onClose, setFilters }) => {
       <Stack gap={1}>
         <Stack direction="row" gap={2} alignItems="center">
           <Typography typography="s3" sx={{ whiteSpace: "nowrap" }}>
-            Where score is
+            Where {filterData?.filter?.display_name || "value"} is
           </Typography>
           <FormSelectField
             control={control}

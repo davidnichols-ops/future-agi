@@ -678,13 +678,30 @@ const VOICE_QUICK_FILTER_COLUMNS = {
   ended_reason: { id: "ended_reason", name: "Ended reason" },
 };
 
+// VoiceLatencyCell displays `avg_agent_latency_ms || turnLatencyAverage`, but
+// this column only filters the former — `turnLatencyAverage` is a separate
+// backend column (aliased `response_time`). Suppress the affordance when the
+// number on screen came from the fallback, so a click can never filter a value
+// the row never displayed. Returning null hides the button.
+export const getAgentLatencyFilterValue = (params) => {
+  const value = Number(params?.data?.avg_agent_latency_ms);
+  return Number.isFinite(value) && value > 0 ? value : null;
+};
+
+const VOICE_QUICK_FILTER_VALUE_GETTERS = {
+  avg_agent_latency_ms: getAgentLatencyFilterValue,
+};
+
 const withQuickFilterIfSupported = (column) => {
   const sourceColumn = VOICE_QUICK_FILTER_COLUMNS[column.field];
   if (!sourceColumn || !column.cellRenderer) return column;
   return {
     ...column,
     context: { ...column.context, sourceColumn },
-    cellRenderer: withVoiceQuickFilter(column.cellRenderer),
+    cellRenderer: withVoiceQuickFilter(
+      column.cellRenderer,
+      VOICE_QUICK_FILTER_VALUE_GETTERS[column.field],
+    ),
   };
 };
 

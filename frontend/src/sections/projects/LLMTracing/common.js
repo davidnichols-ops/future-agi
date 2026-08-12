@@ -452,15 +452,10 @@ export const applyQuickFilters =
         operator,
         value,
       });
-      setFilters((prev) => {
-        const exists = (prev || []).some(
-          (f) =>
-            f.column_id === extraFilter.column_id &&
-            f.filter_config?.filter_value ===
-              extraFilter.filter_config.filter_value,
-        );
-        return exists ? prev : [...(prev || []), extraFilter];
-      });
+      // Replace by column_id, matching the popover path's avoidDuplicateFilterSet.
+      // Appending instead would AND two values for one column — the grid empties
+      // and the chips give no clue which of the two to remove.
+      setFilters((prev) => avoidDuplicateFilterSet(prev || [], extraFilter));
     }
   };
 
