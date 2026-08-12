@@ -22,6 +22,10 @@ import { ShowComponent } from "src/components/show";
 import ConfirmRunEvaluations from "src/sections/common/EvaluationDrawer/ConfirmRunEvaluations";
 import { getVersionedEvalName } from "src/components/run-tests/common";
 import { EvalPickerDrawer } from "src/sections/common/EvalPicker";
+import {
+  buildExperimentRunConfig,
+  createEvalVersionForExperiment,
+} from "src/sections/develop-detail/Experiment/utils";
 
 const isUUID = (str) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
@@ -45,7 +49,7 @@ const transformEvals = (evalList) =>
     ...(evalItem.compositeWeightOverrides
       ? { composite_weight_overrides: evalItem.compositeWeightOverrides }
       : {}),
-    pinned_version_id: evalItem.pinnedVersionId || evalItem.pinned_version_id || null,
+    pinned_version_id: evalItem.pinned_version_id || null,
   }));
 
 const ManageExperimentEvalsDrawer = ({
@@ -186,29 +190,7 @@ const ManageExperimentEvalsDrawer = ({
       evalConfig.evalTemplate?.template_type === "composite" ||
       evalConfig.evalTemplate?.templateType === "composite";
 
-    const runConfig = {};
-    if (!isCompositeEval) {
-      if (evalConfig.model) runConfig.model = evalConfig.model;
-      if (evalConfig.agent_mode) runConfig.agent_mode = evalConfig.agent_mode;
-      if (evalConfig.check_internet !== undefined)
-        runConfig.check_internet = !!evalConfig.check_internet;
-      if (evalConfig.summary) runConfig.summary = evalConfig.summary;
-      if (evalConfig.knowledge_base_id)
-        runConfig.knowledge_base_id = evalConfig.knowledge_base_id;
-      if (evalConfig.knowledge_bases)
-        runConfig.knowledge_bases = evalConfig.knowledge_bases;
-      if (evalConfig.tools) runConfig.tools = evalConfig.tools;
-      if (evalConfig.pass_threshold !== undefined)
-        runConfig.pass_threshold = evalConfig.pass_threshold;
-      if (evalConfig.choice_scores && Object.keys(evalConfig.choice_scores).length)
-        runConfig.choice_scores = evalConfig.choice_scores;
-      if (evalConfig.multi_choice !== undefined)
-        runConfig.multi_choice = !!evalConfig.multi_choice;
-    }
-    if (evalConfig.data_injection)
-      runConfig.data_injection = evalConfig.data_injection;
-    if (evalConfig.error_localizer_enabled !== undefined)
-      runConfig.error_localizer_enabled = !!evalConfig.error_localizer_enabled;
+    const runConfig = buildExperimentRunConfig(evalConfig);
 
     const builtEval = {
       templateId: evalConfig.templateId,
@@ -229,61 +211,21 @@ const ManageExperimentEvalsDrawer = ({
               evalConfig.composite_weight_overrides,
           }
         : {}),
-      pinnedVersionId: evalConfig.versionId || null,
+      pinned_version_id: evalConfig.versionId || null,
     };
 
-    // Create a version only when the user actually edited config fields.
     if (evalConfig.isDirty && evalConfig.templateId) {
       try {
-        if (isCompositeEval) {
-          const patchPayload = {};
-          if (evalConfig.composite_weight_overrides) {
-            const weights = {};
-            for (const [childId, w] of Object.entries(evalConfig.composite_weight_overrides)) {
-              if (w != null) weights[childId] = w;
-            }
-            if (Object.keys(weights).length) patchPayload.child_weights = weights;
-          }
-          await axios.patch(
-            endpoints.develop.eval.getCompositeDetail(evalConfig.templateId),
-            patchPayload,
-          );
-          const { data: versionsData } = await axios.get(
-            endpoints.develop.eval.getEvalVersions(evalConfig.templateId),
-          );
-          const latest = versionsData?.result?.versions?.[0];
-          if (latest?.id) builtEval.pinnedVersionId = latest.id;
-        } else {
-          const updatePayload = Object.fromEntries(
-            Object.entries({
-              instructions: evalConfig.instructions,
-              model: evalConfig.model,
-              pass_threshold: evalConfig.pass_threshold,
-              choice_scores: evalConfig.choice_scores,
-              multi_choice: evalConfig.multi_choice,
-              messages: evalConfig.messages,
-              mode: evalConfig.agent_mode,
-              check_internet: evalConfig.check_internet,
-              summary: evalConfig.summary,
-              tools: evalConfig.tools,
-              knowledge_bases: evalConfig.knowledge_bases,
-              data_injection: evalConfig.data_injection,
-              error_localizer_enabled: evalConfig.error_localizer_enabled,
-            }).filter(([, v]) => v !== undefined),
-          );
-          await axios.put(
-            endpoints.develop.eval.updateEvalTemplate(evalConfig.templateId),
-            updatePayload,
-          );
-          const { data: versionData } = await axios.post(
-            endpoints.develop.eval.createEvalVersion(evalConfig.templateId),
-            {},
-          );
-          if (versionData?.result?.id) builtEval.pinnedVersionId = versionData.result.id;
-        }
-        queryClient.invalidateQueries({ queryKey: ["evals", "versions", evalConfig.templateId] });
-      } catch {
-        // Fall back to the version the user selected in the picker
+        const versionId = await createEvalVersionForExperiment(
+          evalConfig,
+          queryClient,
+        );
+        if (versionId) builtEval.pinned_version_id = versionId;
+      } catch (err) {
+        enqueueSnackbar(
+          err?.response?.data?.result || err?.message || "Failed to create eval version",
+          { variant: "error" },
+        );
       }
     }
 
@@ -351,7 +293,7 @@ const ManageExperimentEvalsDrawer = ({
       compositeWeightOverrides:
         evalItem.compositeWeightOverrides ||
         evalItem.composite_weight_overrides,
-      pinned_version_id: evalItem.pinnedVersionId || evalItem.pinned_version_id || null,
+      pinned_version_id: evalItem.pinned_version_id || null,
     });
     setOpenEvaluationDialog(true);
   };

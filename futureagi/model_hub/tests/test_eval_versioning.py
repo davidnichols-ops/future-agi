@@ -859,6 +859,50 @@ class TestVersionsCreateCapturesLiveState:
         # And no camelCase leak (we sourced from template.config, not req)
         assert "agentMode" not in cs
 
+    def test_fe_supplied_config_snapshot_overrides_template_fields(
+        self, auth_client, user_template
+    ):
+        """When the experiment wizard sends a config_snapshot, its
+        snake_case fields override the template config so the version
+        captures the user's edits without mutating the shared template."""
+        user_template.config = {
+            "rule_prompt": "original prompt",
+            "model": "turing_large",
+            "eval_type_id": "AgentEvaluator",
+            "choices": ["Yes", "No"],
+            "pass_threshold": 0.5,
+        }
+        user_template.save()
+
+        response = auth_client.post(
+            _versions_create_url(user_template.id),
+            {
+                "config_snapshot": {
+                    "rule_prompt": "edited prompt from wizard",
+                    "model": "gpt-5.5",
+                    "pass_threshold": 0.7,
+                },
+                "criteria": "edited prompt from wizard",
+                "model": "gpt-5.5",
+            },
+            format="json",
+        )
+        assert response.status_code == 200, response.data
+        version = EvalTemplateVersion.objects.get(
+            id=response.data["result"]["id"]
+        )
+        cs = version.config_snapshot
+        assert cs["rule_prompt"] == "edited prompt from wizard"
+        assert cs["model"] == "gpt-5.5"
+        assert cs["pass_threshold"] == 0.7
+        # Template-only fields are preserved
+        assert cs["eval_type_id"] == "AgentEvaluator"
+        assert cs["choices"] == ["Yes", "No"]
+        # Shared template is NOT mutated
+        user_template.refresh_from_db()
+        assert user_template.config["rule_prompt"] == "original prompt"
+        assert user_template.config["model"] == "turing_large"
+
 
 # =============================================================================
 # Integration: Set default version flips cleanly

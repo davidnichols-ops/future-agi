@@ -387,6 +387,7 @@ class CompositeDetailResponse(BaseModel):
     tags: list[str]
     created_at: str = ""
     updated_at: str = ""
+    version_id: str | None = None
     version_number: int | None = None
 
 

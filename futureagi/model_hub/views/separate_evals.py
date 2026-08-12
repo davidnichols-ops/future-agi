@@ -2943,8 +2943,16 @@ class EvalTemplateVersionCreateView(APIView):
             except EvalTemplate.DoesNotExist:
                 return self._gm.not_found("Eval template not found or not editable.")
 
-            # Use live template.config; FE-supplied snapshot is incomplete.
-            effective_config = template.config or {}
+            # Start from the live template config (authoritative for
+            # structural fields like choices, choices_map, eval_type_id)
+            # then overlay the caller-supplied snapshot so the experiment
+            # wizard can create a version without mutating the template.
+            effective_config = dict(template.config or {})
+            if req.config_snapshot:
+                for k, v in req.config_snapshot.items():
+                    if k != k.lower():
+                        continue
+                    effective_config[k] = v
             version = EvalTemplateVersion.objects.create_version(
                 eval_template=template,
                 prompt_messages=effective_config.get("messages") or [],
@@ -4036,6 +4044,7 @@ class CompositeEvalDetailView(APIView):
                 tags=parent.eval_tags or [],
                 created_at=parent.created_at.isoformat() if parent.created_at else "",
                 updated_at=parent.updated_at.isoformat() if parent.updated_at else "",
+                version_id=str(new_version.id),
                 version_number=new_version.version_number,
             )
             return self._gm.success_response(response.model_dump())

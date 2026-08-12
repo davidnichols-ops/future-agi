@@ -119,6 +119,17 @@ const SOURCE_NAME_SLUGS = {
 const getEvalPromptText = (evalData, config = {}) =>
   evalData?.instructions || config?.rule_prompt || "";
 
+const buildCompositeWeightsFromSnapshot = (children) => {
+  const weights = {};
+  if (!Array.isArray(children)) return weights;
+  children.forEach((c) => {
+    if (c?.child_id != null) {
+      weights[c.child_id] = c.weight ?? 1;
+    }
+  });
+  return weights;
+};
+
 const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
   // Fail closed while capabilities load (both flags true) so gated controls
   // never flash as available before the fetch resolves.
@@ -162,7 +173,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
 
   // ── Editable state (mirrors EvalDetailPage) ──
   const [selectedVersionId, setSelectedVersionId] = useState(
-    evalData?.pinned_version_id ?? evalData?.pinnedVersionId ?? null,
+    evalData?.pinned_version_id ?? null,
   );
   const [instructions, setInstructions] = useState("");
   const [code, setCode] = useState("");
@@ -197,17 +208,11 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
   const [dataReady, setDataReady] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
   useEffect(() => {
-    const pinned =
-      evalData?.pinned_version_id ?? evalData?.pinnedVersionId ?? null;
-    if (pinned && !selectedVersionId && !isDirty) {
+    const pinned = evalData?.pinned_version_id ?? null;
+    if (pinned && pinned !== selectedVersionId && !isDirty) {
       setSelectedVersionId(pinned);
     }
-  }, [
-    evalData?.pinned_version_id,
-    evalData?.pinnedVersionId,
-    selectedVersionId,
-    isDirty,
-  ]);
+  }, [evalData?.pinned_version_id, selectedVersionId, isDirty]);
   const [isTesting, setIsTesting] = useState(false);
   const [testPassed, setTestPassed] = useState(false);
   const [testError, setTestError] = useState(null);
@@ -483,11 +488,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
     }
 
     if (Array.isArray(config.children)) {
-      const weights = {};
-      config.children.forEach((c) => {
-        weights[c.child_id] = c.weight ?? 1;
-      });
-      setCompositeChildWeights(weights);
+      setCompositeChildWeights(buildCompositeWeightsFromSnapshot(config.children));
     }
 
     if (isEditMode) setEvalName(evalData?.name || fullEval?.name || "");
@@ -834,11 +835,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
         );
         setUseInternet(config.check_internet ?? false);
         if (Array.isArray(config.children)) {
-          const weights = {};
-          config.children.forEach((c) => {
-            weights[c.child_id] = c.weight ?? 1;
-          });
-          setCompositeChildWeights(weights);
+          setCompositeChildWeights(buildCompositeWeightsFromSnapshot(config.children));
         }
         setIsDirty(false);
       }
@@ -1290,14 +1287,18 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
           {versions.length > 0 && (
             <Select
               size="small"
-              value={selectedVersionId || (versions.find((v) => v.is_default || v.isDefault)?.id ?? versions[0]?.id ?? "")}
+              value={selectedVersionId || ""}
               onChange={handleVersionChange}
+              displayEmpty
               sx={{ fontSize: "12px", minWidth: 130, height: 30 }}
             >
+              <MenuItem value="" sx={{ fontSize: "12px" }}>
+                Default version
+              </MenuItem>
               {versions.map((v) => (
                 <MenuItem key={v.id} value={v.id} sx={{ fontSize: "12px" }}>
-                  V{v.version_number ?? v.versionNumber}
-                  {v.is_default || v.isDefault ? " (default)" : ""}
+                  V{v.version_number}
+                  {v.is_default ? " (default)" : ""}
                 </MenuItem>
               ))}
             </Select>
