@@ -242,6 +242,120 @@ def test_voice_trace_export_preserves_legacy_schema_on_one_bounded_page():
     )
 
 
+def test_simulator_voice_export_skips_the_expensive_modality_probe():
+    request = _request({})
+    request.validated_query_data = {
+        "project_id": "00000000-0000-0000-0000-000000000001",
+        "filters": [],
+        "attribute_keys": [],
+    }
+    page = SimpleNamespace(
+        status_code=status.HTTP_200_OK,
+        data={
+            "count": 1,
+            "has_more": True,
+            "query_complete": False,
+            "results": [{"id": "trace-1"}],
+        },
+    )
+
+    with (
+        patch("tracer.views.trace._project_queryset_for_request") as projects,
+        patch(
+            "tracer.views.trace._has_configured_voice_agent", return_value=True
+        ) as configured_voice,
+        patch(
+            "tracer.views.trace._has_voice_conversation_roots",
+            side_effect=AssertionError("simulator projects need no CH modality probe"),
+        ) as voice_detection,
+        patch.object(TraceView, "list_voice_calls", return_value=page) as listing,
+    ):
+        projects.return_value.filter.return_value.first.return_value = SimpleNamespace(
+            id="00000000-0000-0000-0000-000000000001",
+            name="Voice",
+            source="simulator",
+        )
+        view = TraceView()
+        response = view.get_trace_export_data.__wrapped__(view, request)
+
+    assert response.status_code == status.HTTP_200_OK
+    assert len(_rows(response)) == 3
+    assert _rows(response)[-1][0].startswith("# export truncated after 1 rows")
+    configured_voice.assert_called_once()
+    voice_detection.assert_not_called()
+    listing.assert_called_once_with(
+        request,
+        bounded_export=True,
+        read_deadline=ANY,
+    )
+
+
+def test_configured_voice_signal_requires_a_voice_agent_not_source_alone():
+    from tracer.views.trace import _has_configured_voice_agent
+
+    project = SimpleNamespace(
+        id="00000000-0000-0000-0000-000000000001",
+        source="simulator",
+    )
+
+    with patch(
+        "simulate.models.agent_definition.AgentDefinition.objects.filter"
+    ) as agents:
+        agents.return_value.exists.return_value = False
+        assert not _has_configured_voice_agent(project)
+
+    agents.assert_called_once_with(
+        deleted=False,
+        agent_type="voice",
+        observability_provider__deleted=False,
+        observability_provider__project_id=project.id,
+    )
+
+
+def test_text_simulator_export_uses_the_legacy_voice_compatibility_probe():
+    request = _request({})
+    request.validated_query_data = {
+        "project_id": "00000000-0000-0000-0000-000000000001",
+        "filters": [],
+        "attribute_keys": [],
+    }
+    page = SimpleNamespace(
+        status_code=status.HTTP_200_OK,
+        data={
+            "result": {
+                "table": [{"trace_id": "trace-1"}],
+                "metadata": {"has_more": False, "query_complete": True},
+            }
+        },
+    )
+
+    with (
+        patch("tracer.views.trace._project_queryset_for_request") as projects,
+        patch(
+            "tracer.views.trace._has_configured_voice_agent", return_value=False
+        ) as configured_voice,
+        patch(
+            "tracer.views.trace._has_voice_conversation_roots", return_value=False
+        ) as voice_detection,
+        patch.object(TraceView, "list_traces_of_session", return_value=page),
+    ):
+        project = SimpleNamespace(
+            id="00000000-0000-0000-0000-000000000001",
+            name="Text simulator",
+            source="simulator",
+        )
+        projects.return_value.filter.return_value.first.return_value = project
+        view = TraceView()
+        response = view.get_trace_export_data.__wrapped__(view, request)
+
+    assert _rows(response) == [["trace_id"], ["trace-1"]]
+    configured_voice.assert_called_once_with(project)
+    voice_detection.assert_called_once_with(
+        str(project.id),
+        read_deadline=ANY,
+    )
+
+
 def test_empty_voice_trace_export_still_has_legacy_headers():
     request = _request({})
     request.validated_query_data = {

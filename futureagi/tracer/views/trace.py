@@ -47,7 +47,7 @@ from tfc.utils.error_codes import get_error_message
 from tfc.utils.general_methods import GeneralMethods
 from tracer.models.custom_eval_config import CustomEvalConfig, EvalOutputType
 from tracer.models.observation_span import EvalLogger, ObservationSpan
-from tracer.models.project import Project
+from tracer.models.project import Project, ProjectSourceChoices
 from tracer.models.project_version import ProjectVersion
 from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession
@@ -912,6 +912,23 @@ def _has_voice_conversation_roots(
         },
     )
     return bool(result.data)
+
+
+def _has_configured_voice_agent(project: Project) -> bool:
+    """Resolve the cheap project-level voice signal without classifying text agents."""
+
+    if getattr(project, "source", None) != ProjectSourceChoices.SIMULATOR.value:
+        return False
+
+    # Import lazily: simulate models already depend on tracer's provider model.
+    from simulate.models.agent_definition import AgentDefinition, AgentTypeChoices
+
+    return AgentDefinition.objects.filter(
+        deleted=False,
+        agent_type=AgentTypeChoices.VOICE,
+        observability_provider__deleted=False,
+        observability_provider__project_id=project.id,
+    ).exists()
 
 
 def _voice_call_export_projection(
@@ -4242,7 +4259,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if not project:
                 return self._gm.bad_request("Project not found")
 
-            if _has_voice_conversation_roots(project_id, read_deadline=read_deadline):
+            # A configured voice agent is the canonical project-level signal.
+            # Do not spend 1.5s of the shared export deadline rediscovering it
+            # with ``spans FINAL``. A simulator project can also host a text
+            # agent, so source alone is intentionally insufficient. Keep the
+            # bounded CH probe as compatibility fallback for older/provider-only
+            # voice projects.
+            is_voice_export = _has_configured_voice_agent(
+                project
+            ) or _has_voice_conversation_roots(project_id, read_deadline=read_deadline)
+            if is_voice_export:
                 page_response = self.list_voice_calls(
                     request,
                     bounded_export=True,
