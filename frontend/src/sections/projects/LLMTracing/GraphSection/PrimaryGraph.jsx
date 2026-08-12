@@ -695,6 +695,12 @@ const PrimaryGraph = ({
     graphReadState === "sampled" && displayGraphData === graphData
       ? GRAPH_SAMPLED_MESSAGE
       : null;
+  // A cold exact aggregation can move from the transport request into a
+  // server-side pending state. Keep the same skeleton throughout that phase
+  // so the loader does not visibly change mid-request. Retained snapshots are
+  // never covered while refreshing, and terminal/paused states render copy.
+  const isColdGraphLoading =
+    !displaySnapshot && graphStatusMessage === GRAPH_LOADING_MESSAGE;
 
   // Parse API data → [{timestamp, value, primary_traffic}, ...]
   const { metricData, trafficData } = useMemo(() => {
@@ -898,9 +904,13 @@ const PrimaryGraph = ({
     ],
   );
 
-  if (isLoading && !displaySnapshot) {
+  if (isColdGraphLoading) {
     return (
-      <Box sx={{ px: 2, py: 1, height: CHART_HEIGHT + 40 }}>
+      <Box
+        role="status"
+        aria-label={GRAPH_LOADING_MESSAGE}
+        sx={{ px: 2, py: 1, height: CHART_HEIGHT + 40 }}
+      >
         <GraphSkeleton />
       </Box>
     );

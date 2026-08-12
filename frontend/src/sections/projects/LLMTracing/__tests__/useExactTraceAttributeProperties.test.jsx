@@ -581,6 +581,87 @@ describe("useExactTraceAttributeProperties", () => {
     expect(result.current.hasNextPage).toBe(false);
   });
 
+  it("advances only the exact prompt_slug cursor after one sparse bounded search", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (!params.q) {
+        return Promise.resolve({
+          data: {
+            result: [{ key: "recent_attribute", type: "string" }],
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: "catalog-page-2",
+          },
+        });
+      }
+      if (params.cursor === "exact-13") {
+        return Promise.resolve({
+          data: {
+            result: [{ key: "prompt_slug", type: "string" }],
+            lookup_mode: "exact",
+            exact_match: true,
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
+          },
+        });
+      }
+      const index = params.cursor
+        ? Number(params.cursor.slice("exact-".length))
+        : 0;
+      return Promise.resolve({
+        data: {
+          result: [],
+          lookup_mode: "exact",
+          exact_match: false,
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: `exact-${index + 1}`,
+        },
+      });
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-coletia",
+          search: "prompt_slug",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.hasNextExactPage).toBe(true);
+    expect(result.current.exactSearchMatched).toBe(false);
+    await act(async () => result.current.fetchNextExactPage());
+    await waitFor(() => expect(result.current.exactSearchMatched).toBe(true));
+
+    expect(
+      mocks.get.mock.calls.some(
+        ([, options]) => options.params.cursor === "catalog-page-2",
+      ),
+    ).toBe(false);
+    expect(mocks.get).toHaveBeenCalledWith(
+      "/api/traces/span-attribute-keys/",
+      expect.objectContaining({
+        params: {
+          project_id: "project-coletia",
+          page_size: 10,
+          q: "prompt_slug",
+          cursor: "exact-13",
+        },
+      }),
+    );
+    expect(result.current.data[0]).toEqual(
+      expect.objectContaining({
+        id: "prompt_slug",
+        type: "string",
+        attributeTypesExact: false,
+      }),
+    );
+    expect(result.current.hasNextPage).toBe(false);
+  });
+
   it("does not certify a punctuation-normalized but distinct raw key", async () => {
     mocks.get.mockImplementation((_url, { params }) =>
       Promise.resolve({

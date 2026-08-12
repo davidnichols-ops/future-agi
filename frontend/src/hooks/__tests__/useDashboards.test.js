@@ -647,6 +647,7 @@ describe("useDashboardFilterValues bounded-read state", () => {
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(mocks.get).toHaveBeenCalledTimes(13);
+    expect(result.current.data).toEqual([]);
     expect(result.current.hasNextPage).toBe(true);
 
     for (const expectedRequestCount of [26, 39]) {
@@ -707,6 +708,49 @@ describe("useDashboardFilterValues bounded-read state", () => {
       search: "fail",
       page_size: 10,
     });
+    expect(mocks.get.mock.calls[1][1].params).not.toHaveProperty("cursor");
+  });
+
+  it("starts a new property value lookup from cursorless page one", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: {
+          values: [],
+          query_complete: true,
+          query_status: "complete",
+          browse_status: "exhausted",
+          has_more: false,
+          next_cursor: null,
+        },
+      },
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { rerender } = renderHook(
+      ({ metricName }) =>
+        useDashboardFilterValues({
+          metricName,
+          metricType: "custom_attribute",
+          projectIds: ["project-coletia"],
+          source: "traces",
+          search: "",
+          pageSize: 10,
+        }),
+      {
+        initialProps: { metricName: "prompt_slug" },
+        wrapper: createQueryWrapper(queryClient),
+      },
+    );
+
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(1));
+    rerender({ metricName: "another_attribute" });
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+
+    expect(mocks.get.mock.calls[0][1].params.metric_name).toBe("prompt_slug");
+    expect(mocks.get.mock.calls[1][1].params.metric_name).toBe(
+      "another_attribute",
+    );
     expect(mocks.get.mock.calls[1][1].params).not.toHaveProperty("cursor");
   });
 });

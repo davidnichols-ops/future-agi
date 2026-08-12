@@ -264,6 +264,21 @@ export function useExactTraceAttributeProperties({
     }
     return reads.length === 1 ? reads[0] : Promise.allSettled(reads);
   };
+  const fetchNextExactPage = (...args) => {
+    if (!shouldAdvanceExact) return Promise.resolve();
+    if (exactStoppedRetryAvailable) {
+      setCursorRetryState((current) => ({
+        ...current,
+        exact: {
+          identity: exactRetryIdentity,
+          signature: exactStopSignature,
+        },
+      }));
+      return exactQuery.refetch(...args);
+    }
+    if (exactQuery.hasNextPage) return exactQuery.fetchNextPage(...args);
+    return Promise.resolve();
+  };
   const refetch = (...args) => {
     const reads = [retainedQuery.refetch(...args)];
     if (debouncedSearch) reads.push(exactQuery.refetch(...args));
@@ -292,6 +307,15 @@ export function useExactTraceAttributeProperties({
       retainedQuery.isSuccess && (!debouncedSearch || exactQuery.isSuccess),
     error: exactQuery.error || retainedQuery.error,
     hasNextPage,
+    // Exact typed search has its own cursor chain. The property picker may
+    // advance this once automatically for a settled search without also
+    // walking the unrelated retained-catalog cursor.
+    hasNextExactPage: exactHasNextPage,
+    fetchNextExactPage,
+    isFetchingExactSearch: Boolean(debouncedSearch) && exactQuery.isFetching,
+    isFetchingNextExactPage:
+      (shouldAdvanceExact && exactQuery.isFetchingNextPage) ||
+      (shouldAdvanceExact && exactCursorStopped && exactQuery.isFetching),
     // One scroll advances both independent cursors until an exact key is
     // verified. A long-running/absent exact lookup therefore cannot starve
     // discovery of older catalog keys that match partial text locally.

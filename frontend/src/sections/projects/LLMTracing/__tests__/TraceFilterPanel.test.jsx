@@ -33,6 +33,7 @@ const defaultDashboardFilterValues = () => ({
   fetchNextPage: vi.fn(),
   hasNextPage: false,
   isFetchingNextPage: false,
+  isFetchNextPageError: false,
   refetch: vi.fn(),
 });
 
@@ -44,6 +45,10 @@ beforeEach(() => {
     fetchNextPage: vi.fn(),
     hasNextPage: false,
     isFetchingNextPage: false,
+    fetchNextExactPage: vi.fn(),
+    hasNextExactPage: false,
+    isFetchingExactSearch: false,
+    isFetchingNextExactPage: false,
     isFetchNextPageError: false,
     queryReadState: "complete",
     browseStatus: "exhausted",
@@ -1370,6 +1375,56 @@ describe("exact manual attribute fallback", () => {
     ).toBeNull();
   });
 
+  it("continues one settled prompt_slug exact search without draining the cursor", async () => {
+    const fetchNextPage = vi.fn();
+    const fetchNextExactPage = vi.fn(() => Promise.resolve());
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [],
+      isFetching: false,
+      fetchNextPage,
+      hasNextPage: true,
+      isFetchingNextPage: false,
+      fetchNextExactPage,
+      hasNextExactPage: true,
+      isFetchingExactSearch: false,
+      isFetchingNextExactPage: false,
+      isFetchNextPageError: false,
+      queryReadState: "complete",
+      browseStatus: "continuation",
+      pageCount: 1,
+      exactSearchMatched: false,
+      cursorRetryExhausted: false,
+      debouncedSearch: "prompt_slug",
+      refetch: vi.fn(),
+    });
+    const { anchorEl, rerenderPanel } = renderPanel({
+      properties: [],
+      projectId: "project-coletia",
+      source: "traces",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "prompt_slug" },
+    });
+
+    await waitFor(() => expect(fetchNextExactPage).toHaveBeenCalledOnce());
+    rerenderPanel();
+    expect(fetchNextExactPage).toHaveBeenCalledOnce();
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    expect(screen.queryByText("No properties found")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "No matching attribute found yet. Continue searching older attributes.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Continue searching attributes" }),
+    ).toBeInTheDocument();
+
+    document.body.removeChild(anchorEl);
+  });
+
   it("keeps properties beyond the first 500 browseable and selectable", () => {
     exactAttributePropertiesMock.mockReturnValue({
       data: Array.from({ length: 510 }, (_, index) => ({
@@ -1721,6 +1776,98 @@ describe("filter-value picker bounded-read UX", () => {
     expect(
       screen.getByText("completed", { selector: "strong" }),
     ).toBeInTheDocument();
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("continues one empty prompt_slug value checkpoint and keeps later pages explicit", async () => {
+    const fetchNextPage = vi.fn(() => Promise.resolve());
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [],
+      browseStatus: "continuation",
+      hasNextPage: true,
+      fetchNextPage,
+    });
+    const promptSlugProperty = {
+      id: "prompt_slug",
+      name: "prompt_slug",
+      category: "attribute",
+      type: "string",
+      attributeTypes: ["string"],
+      attributeTypesExact: false,
+      apiColType: "SPAN_ATTRIBUTE",
+    };
+    const { anchorEl, rerenderPanel } = renderPanel({
+      currentFilters: [
+        {
+          field: "prompt_slug",
+          fieldName: "prompt_slug",
+          fieldCategory: "attribute",
+          fieldType: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          operator: "in",
+          value: [],
+        },
+      ],
+      properties: [promptSlugProperty],
+      projectId: "project-coletia",
+      source: "traces",
+    });
+
+    fireEvent.click(
+      document.querySelector('[data-filter-value-trigger="prompt_slug"]'),
+    );
+
+    await waitFor(() => expect(fetchNextPage).toHaveBeenCalledOnce());
+    rerenderPanel();
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+    expect(
+      screen.queryByText(/No retained values found/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "No values found yet. Continue searching or enter an exact value.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Continue searching values" }),
+    );
+    expect(fetchNextPage).toHaveBeenCalledTimes(2);
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("stops on a failed value continuation until the user retries", () => {
+    const fetchNextPage = vi.fn();
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [],
+      browseStatus: "continuation",
+      hasNextPage: true,
+      isFetchNextPageError: true,
+      fetchNextPage,
+    });
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [statusProperty],
+    });
+
+    openValuePicker();
+
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(
+        "More values could not be loaded. Retry searching below.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Searching more values…"),
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry searching values" }),
+    );
+    expect(fetchNextPage).toHaveBeenCalledOnce();
 
     document.body.removeChild(anchorEl);
   });
@@ -2275,6 +2422,45 @@ describe("filter-value picker bounded-read UX", () => {
         valueTypes: ["string"],
       }),
     ]);
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("keeps a cursor continuation distinct from the initial Query field load", async () => {
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [],
+      isFetching: true,
+      fetchNextPage: vi.fn(),
+      hasNextPage: true,
+      isFetchingNextPage: true,
+      isFetchNextPageError: false,
+      queryReadState: "complete",
+      browseStatus: "continuation",
+      pageCount: 1,
+      exactSearchMatched: false,
+      cursorRetryExhausted: false,
+      debouncedSearch: "",
+      refetch: vi.fn(),
+    });
+    const { anchorEl } = renderPanel({
+      properties: [],
+      projectId: "project-coletia",
+      source: "traces",
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    const input = screen.getByRole("combobox");
+    expect(input).toHaveAttribute(
+      "placeholder",
+      "type to filter — e.g. field → operator → value",
+    );
+    expect(input).not.toHaveAttribute("placeholder", "loading fields...");
+
+    fireEvent.focus(input);
+    expect(
+      await screen.findByText("Loading more fields..."),
+    ).toBeInTheDocument();
 
     document.body.removeChild(anchorEl);
   });

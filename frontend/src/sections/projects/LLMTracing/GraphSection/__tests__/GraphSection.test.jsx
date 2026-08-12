@@ -6,6 +6,7 @@ import axios from "src/utils/axios";
 import {
   AGGREGATION_POLLING_PAUSED_MESSAGE,
   AGGREGATION_REQUEST_TIMEOUT_MS,
+  GRAPH_LOADING_MESSAGE,
 } from "src/utils/queryReadState";
 import GraphSection from "../GraphSection";
 
@@ -207,8 +208,34 @@ describe("GraphSection exact graph boundary", () => {
         "We couldn't load this data. Please retry in a moment.",
       ),
     ).toBeInTheDocument();
-    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText(/DB::Exception/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps the accessible graph skeleton while an exact request is pending", async () => {
+    axios.post.mockResolvedValue({
+      data: {
+        result: {
+          metric_name: "latency",
+          data: [],
+          query_complete: false,
+          query_status: "pending",
+          query_sampled: false,
+          query_refreshing: true,
+        },
+      },
+    });
+
+    renderGraph();
+    fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
+
+    await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
+    expect(
+      screen.getByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
   });
 
   it("renders a completed exact response without waiting for snapshot persistence", async () => {
@@ -234,7 +261,9 @@ describe("GraphSection exact graph boundary", () => {
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
 
     expect(await screen.findByTestId("apex-chart")).toBeInTheDocument();
-    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).not.toBeInTheDocument();
   });
 
   it("renders a complete empty graph as empty, not loading or a chart", async () => {
@@ -258,7 +287,9 @@ describe("GraphSection exact graph boundary", () => {
       await screen.findByText("No data available for this time range"),
     ).toBeInTheDocument();
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
-    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).not.toBeInTheDocument();
   });
 
   it("treats nullable exact buckets without values as an empty graph", async () => {
@@ -384,7 +415,9 @@ describe("GraphSection exact graph boundary", () => {
       "data-primary-first-y",
       "18",
     );
-    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).not.toBeInTheDocument();
   });
 
   it.each(["trace", "spans"])(

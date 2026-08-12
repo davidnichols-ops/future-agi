@@ -591,17 +591,26 @@ const GraphSection = ({
     (Boolean(apiGraphData) &&
       apiGraphReadState !== "complete" &&
       apiGraphReadState !== "pending");
-  const apiGraphReadMessage = apiGraphReadFailed
-    ? QUERY_FAILED_RETRY_MESSAGE
-    : aggregationPollingPaused
-      ? AGGREGATION_POLLING_PAUSED_MESSAGE
-      : !exactSnapshot &&
-          (apiGraphLoading ||
-            refreshUnavailable ||
-            apiGraphReadState === "pending" ||
-            !apiGraphData)
-        ? GRAPH_LOADING_MESSAGE
-        : null;
+  const graphRequestEnabled = Boolean(selectedGraphConfig?.id);
+  const apiGraphReadMessage = !graphRequestEnabled
+    ? null
+    : apiGraphReadFailed
+      ? QUERY_FAILED_RETRY_MESSAGE
+      : aggregationPollingPaused
+        ? AGGREGATION_POLLING_PAUSED_MESSAGE
+        : !exactSnapshot &&
+            (apiGraphLoading ||
+              refreshUnavailable ||
+              apiGraphReadState === "pending" ||
+              !apiGraphData)
+          ? GRAPH_LOADING_MESSAGE
+          : null;
+  // Keep one stable cold-load treatment while an exact aggregation moves
+  // from the initial request into server-side preparation. A retained exact
+  // snapshot still wins during refresh, and terminal/paused states replace
+  // the skeleton with their actionable status copy.
+  const isColdGraphLoading =
+    !exactSnapshot && apiGraphReadMessage === GRAPH_LOADING_MESSAGE;
 
   const chartData = useMemo(() => {
     const primaryData = [];
@@ -1069,15 +1078,19 @@ const GraphSection = ({
               </Box>
             </ShowComponent>
 
-            <ShowComponent condition={apiGraphLoading}>
-              <Box sx={{ height: isCollapsed ? 124 : 248 }}>
+            <ShowComponent condition={isColdGraphLoading}>
+              <Box
+                role="status"
+                aria-label={GRAPH_LOADING_MESSAGE}
+                sx={{ height: isCollapsed ? 124 : 248 }}
+              >
                 <GraphSkeleton />
               </Box>
             </ShowComponent>
 
             <ShowComponent
               condition={
-                !apiGraphLoading && apiGraphReadMessage && !exactSnapshot
+                !isColdGraphLoading && apiGraphReadMessage && !exactSnapshot
               }
             >
               <Box

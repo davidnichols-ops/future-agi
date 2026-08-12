@@ -6,6 +6,7 @@ import axios from "src/utils/axios";
 import {
   AGGREGATION_POLLING_PAUSED_MESSAGE,
   AGGREGATION_REQUEST_TIMEOUT_MS,
+  GRAPH_LOADING_MESSAGE,
 } from "src/utils/queryReadState";
 import PrimaryGraph from "../PrimaryGraph";
 
@@ -284,7 +285,9 @@ describe("PrimaryGraph", () => {
         "We couldn't load this data. Please retry in a moment.",
       ),
     ).toBeInTheDocument();
-    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText(/DB::Exception/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Stack trace/i)).not.toBeInTheDocument();
   });
@@ -362,7 +365,9 @@ describe("PrimaryGraph", () => {
       }),
     );
     expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/Loading graph data/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).not.toBeInTheDocument();
   });
 
   it("polls a cold pending graph without refresh and publishes only final completion", async () => {
@@ -408,7 +413,9 @@ describe("PrimaryGraph", () => {
     await act(async () => vi.advanceTimersByTimeAsync(10));
 
     expect(axios.post).toHaveBeenCalledOnce();
-    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).toBeInTheDocument();
     expect(exactCompletion).not.toHaveBeenCalled();
 
     await act(async () => vi.advanceTimersByTimeAsync(1000));
@@ -491,7 +498,9 @@ describe("PrimaryGraph", () => {
       "data-primary-first-y",
       "42",
     );
-    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps a confirmed pending job neutral during transient failures and stops after three consecutive failures", async () => {
@@ -525,12 +534,16 @@ describe("PrimaryGraph", () => {
       <PrimaryGraph observeIdOverride="project-override" />,
     );
     await act(async () => vi.advanceTimersByTimeAsync(10));
-    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).toBeInTheDocument();
     expect(refreshStates.at(-1)).toBe(true);
 
     await act(async () => vi.advanceTimersByTimeAsync(1_000));
     expect(axios.post).toHaveBeenCalledTimes(2);
-    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).toBeInTheDocument();
     expect(
       screen.queryByText(
         "We couldn't load this data. Please retry in a moment.",
@@ -539,7 +552,9 @@ describe("PrimaryGraph", () => {
 
     await act(async () => vi.advanceTimersByTimeAsync(2_000));
     expect(axios.post).toHaveBeenCalledTimes(3);
-    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).toBeInTheDocument();
 
     await act(async () => vi.advanceTimersByTimeAsync(4_000));
     expect(axios.post).toHaveBeenCalledTimes(4);
@@ -812,6 +827,8 @@ describe("PrimaryGraph", () => {
     expect(
       screen.queryByText("No data available for this time range"),
     ).not.toBeInTheDocument();
-    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: GRAPH_LOADING_MESSAGE }),
+    ).not.toBeInTheDocument();
   });
 });

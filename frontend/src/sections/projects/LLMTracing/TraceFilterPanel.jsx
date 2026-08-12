@@ -1058,6 +1058,7 @@ function PropertyPicker({
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("all");
   const autoAttributeScrollPageUsedRef = useRef(false);
+  const autoExactSearchIdentityRef = useRef(null);
   const [visiblePropertyLimit, setVisiblePropertyLimit] = useState(
     PROPERTY_PICKER_RENDER_BATCH_SIZE,
   );
@@ -1068,6 +1069,10 @@ function PropertyPicker({
     fetchNextPage: fetchNextAttributePage,
     hasNextPage: hasNextAttributePage,
     isFetchingNextPage: isFetchingNextAttributePage,
+    fetchNextExactPage: fetchNextExactAttributePage,
+    hasNextExactPage: hasNextExactAttributePage = false,
+    isFetchingExactSearch = false,
+    isFetchingNextExactPage = false,
     isFetchNextPageError: isNextAttributePageError,
     queryReadState: exactAttributeReadState,
     browseStatus: exactAttributeBrowseStatus,
@@ -1086,6 +1091,7 @@ function PropertyPicker({
   useEffect(() => {
     if (!open) {
       autoAttributeScrollPageUsedRef.current = false;
+      autoExactSearchIdentityRef.current = null;
       setSearch("");
       setCategory("all");
     }
@@ -1198,6 +1204,54 @@ function PropertyPicker({
       return fetchNextAttributePage();
     },
   });
+  const loadNextExactAttributePage = useSingleFlightPageRequest({
+    identity: JSON.stringify(["exact", projectId, source, debouncedSearch]),
+    enabled:
+      hasNextExactAttributePage &&
+      !isFetchingExactSearch &&
+      !isFetchingNextExactPage,
+    request: fetchNextExactAttributePage,
+  });
+  useEffect(() => {
+    const settledSearch = search.trim();
+    if (
+      !open ||
+      !settledSearch ||
+      debouncedSearch !== settledSearch ||
+      exactAttributeSearchMatched ||
+      filtered.length > 0 ||
+      !hasNextExactAttributePage ||
+      isFetchingExactSearch ||
+      isFetchingNextExactPage ||
+      isNextAttributePageError ||
+      exactAttributeCursorRetryExhausted ||
+      typeof fetchNextExactAttributePage !== "function"
+    ) {
+      return;
+    }
+    const identity = JSON.stringify([projectId, source, debouncedSearch]);
+    if (autoExactSearchIdentityRef.current === identity) return;
+    autoExactSearchIdentityRef.current = identity;
+    // One bounded automatic continuation makes an empty checkpoint feel like
+    // one search instead of requiring a scroll. Never loop: later pages stay
+    // behind the explicit Continue searching action.
+    void loadNextExactAttributePage();
+  }, [
+    debouncedSearch,
+    exactAttributeSearchMatched,
+    fetchNextExactAttributePage,
+    filtered.length,
+    hasNextExactAttributePage,
+    isFetchingExactSearch,
+    isFetchingNextExactPage,
+    isNextAttributePageError,
+    loadNextExactAttributePage,
+    open,
+    projectId,
+    search,
+    source,
+    exactAttributeCursorRetryExhausted,
+  ]);
   const revealNextPropertyBatch = useCallback(() => {
     autoAttributeScrollPageUsedRef.current = true;
     setVisiblePropertyLimit((current) =>
@@ -1409,6 +1463,7 @@ function PropertyPicker({
             >
               {filtered.length === 0 &&
                 !manualAttributeProperty &&
+                !canLoadNextAttributePage &&
                 !exactAttributeLoading && (
                   <Typography
                     sx={{
@@ -1421,11 +1476,43 @@ function PropertyPicker({
                     No properties found
                   </Typography>
                 )}
-              {filtered.length === 0 && exactAttributeLoading && (
-                <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
-                  <CircularProgress size={16} />
-                </Box>
-              )}
+              {filtered.length === 0 &&
+                !manualAttributeProperty &&
+                canLoadNextAttributePage &&
+                !exactAttributeLoading &&
+                !isFetchingNextAttributePage && (
+                  <Typography
+                    role="status"
+                    sx={{
+                      p: 2,
+                      textAlign: "center",
+                      fontSize: 12,
+                      color: "text.secondary",
+                    }}
+                  >
+                    No matching attribute found yet. Continue searching older
+                    attributes.
+                  </Typography>
+                )}
+              {filtered.length === 0 &&
+                exactAttributeLoading &&
+                !isFetchingNextAttributePage && (
+                  <Box
+                    role="status"
+                    sx={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: 0.75,
+                      py: 2,
+                    }}
+                  >
+                    <CircularProgress size={16} />
+                    <Typography sx={{ fontSize: 11, color: "text.secondary" }}>
+                      Loading attributes…
+                    </Typography>
+                  </Box>
+                )}
               {visibleProperties.map((prop, idx) => (
                 <Box
                   key={`${prop.category}:${prop.id}:${idx}`}
@@ -1531,8 +1618,20 @@ function PropertyPicker({
                 </Box>
               )}
               {isFetchingNextAttributePage && (
-                <Box sx={{ display: "flex", justifyContent: "center", py: 1 }}>
+                <Box
+                  role="status"
+                  sx={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 0.75,
+                    py: 1,
+                  }}
+                >
                   <CircularProgress size={14} />
+                  <Typography sx={{ fontSize: 11, color: "text.secondary" }}>
+                    Searching more attributes…
+                  </Typography>
                 </Box>
               )}
               {isNextAttributePageError && !isFetchingNextAttributePage && (
@@ -1571,12 +1670,20 @@ function PropertyPicker({
                     <Button
                       data-filter-property-load-more
                       size="small"
-                      onClick={loadNextAttributePage}
+                      onClick={
+                        search.trim() && hasNextExactAttributePage
+                          ? loadNextExactAttributePage
+                          : loadNextAttributePage
+                      }
                       sx={{ fontSize: 11 }}
                     >
                       {isNextAttributePageError
-                        ? "Retry loading attributes"
-                        : "Load more attributes"}
+                        ? hasNextExactAttributePage
+                          ? "Retry searching attributes"
+                          : "Retry loading attributes"
+                        : hasNextExactAttributePage
+                          ? "Continue searching attributes"
+                          : "Load more attributes"}
                     </Button>
                   </Box>
                 )}
@@ -1641,9 +1748,13 @@ function ValuePicker({
   // Load one exact continuation automatically; the existing Load more button
   // remains available for every subsequent page.
   const autoScrollPageUsedRef = useRef(false);
+  const autoEmptyValueContinuationIdentityRef = useRef(null);
 
   useEffect(() => {
-    if (!anchorEl) autoScrollPageUsedRef.current = false;
+    if (!anchorEl) {
+      autoScrollPageUsedRef.current = false;
+      autoEmptyValueContinuationIdentityRef.current = null;
+    }
   }, [anchorEl]);
 
   useEffect(() => {
@@ -1692,6 +1803,7 @@ function ValuePicker({
     fetchNextPage: fetchNextDashboardPage,
     hasNextPage: hasNextDashboardPage,
     isFetchingNextPage: isFetchingNextDashboardPage,
+    isFetchNextPageError: isNextDashboardPageError,
     refetch: refetchDashboardOptions,
   } = useDashboardFilterValues({
     metricName: propertyId,
@@ -1730,6 +1842,48 @@ function ValuePicker({
     enabled: hasMoreDashboardValues && !isFetchingNextDashboardPage,
     request: fetchNextDashboardPage,
   });
+  useEffect(() => {
+    if (
+      !anchorEl ||
+      hasStaticChoices ||
+      isSessionField ||
+      dashLoading ||
+      dashError ||
+      dashboardOptions.length > 0 ||
+      !hasMoreDashboardValues ||
+      isFetchingNextDashboardPage ||
+      isNextDashboardPageError
+    ) {
+      return;
+    }
+    const identity = JSON.stringify([
+      projectId,
+      source,
+      propertyId,
+      usesBackendSearch ? debouncedSearch : "",
+    ]);
+    if (autoEmptyValueContinuationIdentityRef.current === identity) return;
+    autoEmptyValueContinuationIdentityRef.current = identity;
+    // Resume one empty-but-advancing checkpoint automatically. If another
+    // bounded chunk is needed the picker leaves a truthful manual action.
+    void loadNextDashboardValues();
+  }, [
+    anchorEl,
+    dashLoading,
+    dashError,
+    dashboardOptions.length,
+    debouncedSearch,
+    hasMoreDashboardValues,
+    hasStaticChoices,
+    isFetchingNextDashboardPage,
+    isNextDashboardPageError,
+    isSessionField,
+    loadNextDashboardValues,
+    projectId,
+    propertyId,
+    source,
+    usesBackendSearch,
+  ]);
 
   // Fallback: session filter values endpoint (for session-specific fields)
   const {
@@ -2090,8 +2244,20 @@ function ValuePicker({
           sx={{ maxHeight: 220, overflow: "auto" }}
         >
           {isLoading && (
-            <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
+            <Box
+              role="status"
+              sx={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 0.75,
+                py: 2,
+              }}
+            >
               <CircularProgress size={16} />
+              <Typography sx={{ fontSize: 11, color: "text.secondary" }}>
+                Loading values…
+              </Typography>
             </Box>
           )}
           {!isLoading && readMessage && (
@@ -2126,18 +2292,24 @@ function ValuePicker({
               )}
             </Box>
           )}
-          {!isLoading && !readMessage && !search && filtered.length === 0 && (
-            <Typography
-              sx={{
-                p: 1.5,
-                textAlign: "center",
-                fontSize: 12,
-                color: "text.disabled",
-              }}
-            >
-              {FREE_TEXT_NO_OPTIONS_TEXT}
-            </Typography>
-          )}
+          {!isLoading &&
+            !isFetchingNextDashboardPage &&
+            !readMessage &&
+            !search &&
+            filtered.length === 0 && (
+              <Typography
+                sx={{
+                  p: 1.5,
+                  textAlign: "center",
+                  fontSize: 12,
+                  color: "text.disabled",
+                }}
+              >
+                {hasMoreDashboardValues
+                  ? "No values found yet. Continue searching or enter an exact value."
+                  : FREE_TEXT_NO_OPTIONS_TEXT}
+              </Typography>
+            )}
           {/* Custom-value row is rendered below in the showCustomValueRow
               block — keeps a single source of truth for the "Specify"
               fallback (search did not match any fetched option). */}
@@ -2247,9 +2419,29 @@ function ValuePicker({
             </>
           )}
           {isFetchingNextDashboardPage && (
-            <Box sx={{ display: "flex", justifyContent: "center", py: 1 }}>
+            <Box
+              role="status"
+              sx={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 0.75,
+                py: 1,
+              }}
+            >
               <CircularProgress size={14} />
+              <Typography sx={{ fontSize: 11, color: "text.secondary" }}>
+                Searching more values…
+              </Typography>
             </Box>
+          )}
+          {isNextDashboardPageError && !isFetchingNextDashboardPage && (
+            <Typography
+              role="status"
+              sx={{ px: 1.5, py: 0.75, fontSize: 11, color: "warning.main" }}
+            >
+              More values could not be loaded. Retry searching below.
+            </Typography>
           )}
           {!isLoading &&
             dashboardBrowseLimitReached &&
@@ -2273,7 +2465,11 @@ function ValuePicker({
                 onClick={loadNextDashboardValues}
                 sx={{ fontSize: 11 }}
               >
-                Load more
+                {isNextDashboardPageError
+                  ? "Retry searching values"
+                  : options.length === 0
+                    ? "Continue searching values"
+                    : "Load more"}
               </Button>
             </Box>
           )}
@@ -3634,7 +3830,7 @@ const TraceFilterPanel = ({
               valueOptions={queryValueOptions}
               fieldLoading={
                 queryAttributeLookupEnabled &&
-                (queryAttributeLoading ||
+                ((queryAttributeLoading && !isFetchingNextQueryAttributePage) ||
                   queryFieldSearch.trim() !== debouncedQueryFieldSearch)
               }
               fieldLoadingMore={isFetchingNextQueryAttributePage}
