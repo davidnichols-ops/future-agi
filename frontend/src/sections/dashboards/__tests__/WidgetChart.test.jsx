@@ -82,6 +82,41 @@ describe("WidgetChart — empty time-range state", () => {
     expect(screen.queryByText(NO_DATA_MESSAGE)).not.toBeInTheDocument();
   });
 
+  it("restores a saved stable-key series selection through the exact-result series builder", () => {
+    const response = queryResult([
+      { timestamp: "2026-07-09T00:00:00Z", value: 12 },
+    ]);
+    response.data.result.metrics[0].id = "latency-metric";
+    response.data.result.metrics[0].series = [
+      {
+        name: "us",
+        data: [{ timestamp: "2026-07-09T00:00:00Z", value: 12 }],
+      },
+      {
+        name: "eu",
+        data: [{ timestamp: "2026-07-09T00:00:00Z", value: 18 }],
+      },
+    ];
+    h.query.data = response;
+
+    render(
+      <WidgetChart
+        widget={{
+          ...baseWidget,
+          chart_config: {
+            chart_type: "line",
+            visible_series: ["latency-metric|avg|eu"],
+          },
+        }}
+        globalDateRange={null}
+      />,
+    );
+
+    expect(h.apex.mock.calls.at(-1)[0].series.map(({ name }) => name)).toEqual([
+      "eu",
+    ]);
+  });
+
   it("connects exact line points across null buckets without coercing zeroes", () => {
     h.query.data = queryResult([
       { timestamp: "2026-07-09T00:00:00Z", value: 12 },

@@ -18,6 +18,7 @@ import {
   getSuggestedUnitConfig,
   getUnitRendering,
   getYAxisRangeWarning,
+  resolveSavedSelection,
   seriesHasDataPoints,
   shouldConnectAcrossMissingBuckets,
 } from "./widgetUtils";
@@ -457,7 +458,21 @@ export default function WidgetChart({
   const MAX_CHART_SERIES = 10;
   const [visibleSeries, setVisibleSeries] = useState(null); // null = all visible
 
+  // JSON-keyed so a re-created widget object doesn't needlessly re-run the effect.
+  const savedVisibleSeries = chartConfig.visible_series;
+  const savedVisibleKey = JSON.stringify(savedVisibleSeries ?? "__default__");
+
   useEffect(() => {
+    if (series.length === 0) return;
+
+    // Honor the editor's saved selection. Nothing saved, or a stale selection
+    // (saved keys that match no current series), falls through to the default.
+    const decision = resolveSavedSelection(savedVisibleSeries, series);
+    if (decision !== undefined) {
+      setVisibleSeries(decision);
+      return;
+    }
+
     if (series.length <= MAX_CHART_SERIES) {
       if (visibleSeries !== null) setVisibleSeries(null);
       return;
@@ -472,7 +487,8 @@ export default function WidgetChart({
       ranked.slice(0, MAX_CHART_SERIES).map((r) => r.i),
     );
     setVisibleSeries(topIndices);
-  }, [series]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [series, savedVisibleKey]);
 
   const chartSeries = useMemo(() => {
     if (visibleSeries === null) return series;
