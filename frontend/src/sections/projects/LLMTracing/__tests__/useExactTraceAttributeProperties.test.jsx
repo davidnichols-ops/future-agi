@@ -633,7 +633,10 @@ describe("useExactTraceAttributeProperties", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.hasNextExactPage).toBe(true);
     expect(result.current.exactSearchMatched).toBe(false);
-    await act(async () => result.current.fetchNextExactPage());
+    // The shared Load-more method is what Basic/Query picker gestures call.
+    // With an active search it must advance exactly one logical cursor chain,
+    // never the unrelated retained catalog.
+    await act(async () => result.current.fetchNextPage());
     await waitFor(() => expect(result.current.exactSearchMatched).toBe(true));
 
     expect(
@@ -662,27 +665,41 @@ describe("useExactTraceAttributeProperties", () => {
     expect(result.current.hasNextPage).toBe(false);
   });
 
-  it("does not certify a punctuation-normalized but distinct raw key", async () => {
-    mocks.get.mockImplementation((_url, { params }) =>
-      Promise.resolve({
-        data: params.q
-          ? {
-              result: [{ key: "trace_id", type: "string", count: 1 }],
-              lookup_mode: "exact",
-              exact_match: false,
-              browse_status: "exhausted",
-              has_more: false,
-              next_cursor: null,
-            }
-          : {
-              result: [{ key: "trace_id", type: "string", count: 1 }],
-              browse_mode: "recent_suggestions",
-              browse_status: "continuation",
-              has_more: true,
-              next_cursor: "catalog-page-2",
-            },
-      }),
-    );
+  it("resumes only the retained cursor after an absent exact search is exhausted", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (params.q) {
+        return Promise.resolve({
+          data: {
+            result: [{ key: "trace_id", type: "string", count: 1 }],
+            lookup_mode: "exact",
+            exact_match: false,
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
+          },
+        });
+      }
+      if (params.cursor === "catalog-page-2") {
+        return Promise.resolve({
+          data: {
+            result: [{ key: "trace.id.archive", type: "string", count: 1 }],
+            browse_mode: "recent_suggestions",
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
+          },
+        });
+      }
+      return Promise.resolve({
+        data: {
+          result: [{ key: "trace_id", type: "string", count: 1 }],
+          browse_mode: "recent_suggestions",
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "catalog-page-2",
+        },
+      });
+    });
 
     const { result } = renderHook(
       () =>
@@ -697,7 +714,28 @@ describe("useExactTraceAttributeProperties", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data.map(({ id }) => id)).toEqual(["trace_id"]);
     expect(result.current.exactSearchMatched).toBe(false);
+    expect(result.current.hasNextExactPage).toBe(false);
     expect(result.current.hasNextPage).toBe(true);
+    const completedRequestCount = mocks.get.mock.calls.length;
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() =>
+      expect(mocks.get).toHaveBeenCalledTimes(completedRequestCount + 1),
+    );
+    expect(mocks.get).toHaveBeenLastCalledWith(
+      "/api/traces/span-attribute-keys/",
+      expect.objectContaining({
+        params: {
+          project_id: "project-synthetic",
+          page_size: 10,
+          cursor: "catalog-page-2",
+        },
+      }),
+    );
+    expect(result.current.data.map(({ id }) => id)).toEqual([
+      "trace_id",
+      "trace.id.archive",
+    ]);
+    expect(result.current.hasNextPage).toBe(false);
   });
 
   it("prefers authoritative exact type metadata over the retained duplicate", async () => {

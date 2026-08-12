@@ -230,10 +230,14 @@ export function useExactTraceAttributeProperties({
   const exactHasNextPage =
     shouldAdvanceExact &&
     (exactQuery.hasNextPage || exactStoppedRetryAvailable);
-  // The base cursor remains cached for browse/partial-search continuation, but
-  // a verified exact key is terminal for the current search. Advancing the
-  // unrelated base catalog after that point produced a no-op Load more loop.
-  const shouldAdvanceRetained = !exactSearchMatched;
+  // Give the exact-q chain first priority, but do not turn an absent exact key
+  // into a hidden retained-catalog ceiling. Once exact search is exhausted, a
+  // later deliberate gesture resumes the cached retained cursor so partial
+  // local matches remain eventually reachable. These predicates are mutually
+  // exclusive: one gesture can issue an exact request or a retained request,
+  // never both. A certified positive exact identity remains terminal.
+  const shouldAdvanceRetained =
+    !exactSearchMatched && (!debouncedSearch || !exactHasNextPage);
   const hasNextPage =
     exactHasNextPage || (shouldAdvanceRetained && retainedHasNextPage);
   const fetchNextPage = (...args) => {

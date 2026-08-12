@@ -49,6 +49,7 @@ from tracer.services.clickhouse.attribute_cursor_state import (
     persist_attribute_cursor_seen_state,
 )
 from tracer.services.clickhouse.attribute_reads import (
+    ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
     AttributeReadSelector,
     InvalidAttributeKey,
 )
@@ -2542,6 +2543,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 selector = AttributeReadSelector(
                     typed_only=True,
                     json_attribute_mode="arrays",
+                    wall_timeout_ms=ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
                 )
                 try:
                     page_size = query_params.get("page_size")

@@ -44,6 +44,7 @@ from tracer.services.clickhouse.attribute_cursor_state import (
     persist_attribute_cursor_seen_state,
 )
 from tracer.services.clickhouse.attribute_reads import (
+    ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
     AttributeReadMetadata,
     AttributeValueCursorPageRead,
     AttributeValueRead,
@@ -2522,6 +2523,11 @@ class TestMetricsEndpoint:
         assert first_payload["query_complete"] is True
         assert first_payload["query_status"] == "complete"
         assert "query_error_code" not in first_payload
+        assert mock_selector_cls.call_args_list[0].kwargs == {
+            "typed_only": True,
+            "json_attribute_mode": "arrays",
+            "wall_timeout_ms": ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
+        }
         first_kwargs = selector.read_value_cursor_page.call_args_list[0].kwargs
         assert first_kwargs["window_start"] == retained_start
         assert first_kwargs["continue_operation"] is True

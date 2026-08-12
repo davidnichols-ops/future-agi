@@ -37,6 +37,7 @@ from tracer.services.clickhouse.attribute_cursor_state import (
     persist_attribute_cursor_seen_state,
 )
 from tracer.services.clickhouse.attribute_reads import (
+    ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
     ATTRIBUTE_READ_EXPLICIT_SEGMENT,
     AttributeReadSelector,
 )
@@ -190,6 +191,7 @@ class SpanAttributeKeysView(APIView):
                 json_attribute_mode=(
                     "all" if discovery_mode == "eval_mapping" else "structured"
                 ),
+                wall_timeout_ms=ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
             )
             if not _project_is_in_request_scope(request, project_id):
                 return self._gm.not_found("Project not found")

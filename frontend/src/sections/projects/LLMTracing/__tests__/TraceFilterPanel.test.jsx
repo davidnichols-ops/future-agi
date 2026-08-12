@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "src/utils/test-utils";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { buildApiFilterFromPanelRow } from "src/api/contracts/filter-contract";
+import axios, { endpoints } from "src/utils/axios";
 import TraceFilterPanel, {
   buildManualAttributeProperty,
   buildQueryPropertyEntries,
@@ -1211,6 +1212,53 @@ describe("voice-call property parity", () => {
 });
 
 describe("exact manual attribute fallback", () => {
+  it("keeps property selection usable and prefetches retained keys while the catalog is pending", async () => {
+    let resolveCatalog;
+    const pendingCatalog = new Promise((resolve) => {
+      resolveCatalog = resolve;
+    });
+    const getSpy = vi.spyOn(axios, "get").mockImplementation((url) => {
+      if (url === endpoints.dashboard.metrics) return pendingCatalog;
+      return Promise.resolve({ data: { result: {} } });
+    });
+
+    const { anchorEl } = renderPanel({
+      projectId: "project-whatfix",
+      source: "traces",
+    });
+
+    expect(
+      screen.getByText(
+        "Loading additional evaluation and annotation properties…",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Property" })).toBeEnabled();
+    expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: "project-whatfix",
+        search: "",
+        source: "traces",
+        enabled: true,
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    expect(
+      screen.getByPlaceholderText("Search properties..."),
+    ).toBeInTheDocument();
+
+    resolveCatalog({ data: { result: { metrics: [] } } });
+    await waitFor(() =>
+      expect(
+        screen.queryByText(
+          "Loading additional evaluation and annotation properties…",
+        ),
+      ).not.toBeInTheDocument(),
+    );
+    getSpy.mockRestore();
+    document.body.removeChild(anchorEl);
+  });
+
   it("decouples retained key discovery from session value semantics", () => {
     dashboardFilterValuesMock.mockClear();
     exactAttributePropertiesMock.mockClear();
@@ -1472,6 +1520,73 @@ describe("exact manual attribute fallback", () => {
       screen.getByRole("button", { name: "Continue searching attributes" }),
     ).toBeInTheDocument();
 
+    document.body.removeChild(anchorEl);
+  });
+
+  it("coalesces exact-search scroll and button gestures into one continuation", () => {
+    let resolveExactPage;
+    const exactPage = new Promise((resolve) => {
+      resolveExactPage = resolve;
+    });
+    const fetchNextPage = vi.fn();
+    const fetchNextExactPage = vi.fn(() => exactPage);
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [
+        {
+          id: "prompt_slug_archive",
+          name: "prompt_slug_archive",
+          category: "attribute",
+          rawCategory: "custom_attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      isFetching: false,
+      fetchNextPage,
+      hasNextPage: true,
+      isFetchingNextPage: false,
+      fetchNextExactPage,
+      hasNextExactPage: true,
+      isFetchingExactSearch: false,
+      isFetchingNextExactPage: false,
+      isFetchNextPageError: false,
+      queryReadState: "complete",
+      browseStatus: "continuation",
+      pageCount: 1,
+      exactSearchMatched: false,
+      cursorRetryExhausted: false,
+      debouncedSearch: "prompt_slug",
+      refetch: vi.fn(),
+    });
+    const { anchorEl } = renderPanel({
+      properties: [],
+      projectId: "project-coletia",
+      source: "traces",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "prompt_slug" },
+    });
+    const propertyList = document.querySelector(
+      "[data-filter-property-options-list]",
+    );
+    Object.defineProperties(propertyList, {
+      scrollTop: { configurable: true, value: 200 },
+      clientHeight: { configurable: true, value: 200 },
+      scrollHeight: { configurable: true, value: 400 },
+    });
+
+    fireEvent.scroll(propertyList);
+    fireEvent.scroll(propertyList);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Continue searching attributes" }),
+    );
+
+    expect(fetchNextExactPage).toHaveBeenCalledOnce();
+    expect(fetchNextPage).not.toHaveBeenCalled();
+
+    resolveExactPage();
     document.body.removeChild(anchorEl);
   });
 

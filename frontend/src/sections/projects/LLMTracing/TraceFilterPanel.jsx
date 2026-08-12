@@ -1212,6 +1212,10 @@ function PropertyPicker({
       !isFetchingNextExactPage,
     request: fetchNextExactAttributePage,
   });
+  const loadNextVisibleAttributePage =
+    search.trim() && hasNextExactAttributePage
+      ? loadNextExactAttributePage
+      : loadNextAttributePage;
   useEffect(() => {
     const settledSearch = search.trim();
     if (
@@ -1275,14 +1279,14 @@ function PropertyPicker({
           (canLoadNextAttributePage && !isFetchingNextAttributePage))
       ) {
         if (hiddenCount > 0) revealNextPropertyBatch();
-        else loadNextAttributePage();
+        else loadNextVisibleAttributePage();
       }
     },
     [
       canLoadNextAttributePage,
       hiddenCount,
       isFetchingNextAttributePage,
-      loadNextAttributePage,
+      loadNextVisibleAttributePage,
       revealNextPropertyBatch,
     ],
   );
@@ -1670,11 +1674,7 @@ function PropertyPicker({
                     <Button
                       data-filter-property-load-more
                       size="small"
-                      onClick={
-                        search.trim() && hasNextExactAttributePage
-                          ? loadNextExactAttributePage
-                          : loadNextAttributePage
-                      }
+                      onClick={loadNextVisibleAttributePage}
                       sx={{ fontSize: 11 }}
                     >
                       {isNextAttributePageError
@@ -3073,6 +3073,21 @@ const TraceFilterPanel = ({
   const exactAttributeSource =
     attributeSourceOverride ||
     (source === "traces" ? dynamicPropertySource : source);
+  // Warm the retained attribute cursor as soon as the filter panel opens.
+  // This request has its own React Query key and runs concurrently with the
+  // dashboard metric catalog. Property browsing must never wait for the broad
+  // catalog (whose cold path also discovers compatibility attributes) before
+  // it can start the canonical retained-data read.
+  useExactTraceAttributeProperties({
+    projectId: observeId,
+    search: "",
+    source: exactAttributeSource,
+    enabled: Boolean(
+      open &&
+        observeId &&
+        (exactAttributeSource === "traces" || exactAttributeSource === "spans"),
+    ),
+  });
   const {
     data: dynamicProperties = [],
     isLoading: dynamicPropsLoading,
@@ -3725,38 +3740,43 @@ const TraceFilterPanel = ({
         {/* Basic tab */}
         {(activeTab === "basic" || !showQueryTab) && (
           <Box sx={{ px: 0.5, pt: 0.25 }}>
-            {propsLoading ? (
-              <Box sx={{ display: "flex", justifyContent: "center", py: 3 }}>
-                <CircularProgress size={20} />
-              </Box>
-            ) : (
-              <Stack spacing={1}>
-                {rows.map((row, idx) => (
-                  <FilterRow
-                    key={idx}
-                    filter={row}
-                    index={idx}
-                    properties={properties}
-                    projectId={observeId}
-                    onChange={handleChange}
-                    onRemove={handleRemove}
-                    source={source}
-                    ValuePickerOverride={ValuePickerOverride}
-                    categories={effectiveCategories}
-                    freeSoloValues={freeSoloValues}
-                    operatorFilter={operatorFilter}
-                    defaultOperatorForType={defaultOperatorForType}
-                    enableExactAttributeLookup={Boolean(
-                      observeId &&
-                        (exactAttributeSource === "traces" ||
-                          exactAttributeSource === "spans"),
-                    )}
-                    catalogError={!skipDynamicProperties && dynamicPropsError}
-                    attributeSource={exactAttributeSource}
-                  />
-                ))}
-              </Stack>
-            )}
+            <Stack spacing={1}>
+              {propsLoading && (
+                <Box
+                  role="status"
+                  sx={{ display: "flex", alignItems: "center", gap: 0.75 }}
+                >
+                  <CircularProgress size={14} />
+                  <Typography sx={{ fontSize: 11, color: "text.secondary" }}>
+                    Loading additional evaluation and annotation properties…
+                  </Typography>
+                </Box>
+              )}
+              {rows.map((row, idx) => (
+                <FilterRow
+                  key={idx}
+                  filter={row}
+                  index={idx}
+                  properties={properties}
+                  projectId={observeId}
+                  onChange={handleChange}
+                  onRemove={handleRemove}
+                  source={source}
+                  ValuePickerOverride={ValuePickerOverride}
+                  categories={effectiveCategories}
+                  freeSoloValues={freeSoloValues}
+                  operatorFilter={operatorFilter}
+                  defaultOperatorForType={defaultOperatorForType}
+                  enableExactAttributeLookup={Boolean(
+                    observeId &&
+                      (exactAttributeSource === "traces" ||
+                        exactAttributeSource === "spans"),
+                  )}
+                  catalogError={!skipDynamicProperties && dynamicPropsError}
+                  attributeSource={exactAttributeSource}
+                />
+              ))}
+            </Stack>
             <Stack
               direction="row"
               justifyContent="space-between"

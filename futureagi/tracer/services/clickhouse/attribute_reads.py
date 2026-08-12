@@ -61,6 +61,13 @@ ATTRIBUTE_READ_HORIZON_DAYS = (7, 14, 30, 180, 365)
 ATTRIBUTE_READ_WALL_TIMEOUT_MS = 8_000
 ATTRIBUTE_READ_QUERY_TIMEOUT_MS = 8_000
 ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS = 8_000
+# Interactive property pickers have a stricter product SLA than the shared
+# compatibility/sample reads above.  Reserve a full second for Django/DRF,
+# cursor-state persistence, serialization, and transport by bounding the
+# selector itself to four seconds.  This is a per-request work budget, not a
+# data or pagination limit: cursor reads publish only proven progress and keep
+# the same frozen retained window reachable through exact continuations.
+ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS = 4_000
 # Keep one operation below the production low-load harness ceiling (32) even
 # when a typed value page needs candidate, version-certificate, and hydration
 # queries. Candidate-page caps bound discovery breadth; this separate ceiling
@@ -200,6 +207,16 @@ ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION = 0.25
 # retry its identical newest-first frontier in this smaller exact slice before
 # exposing an unavailable picker response.
 ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT = timedelta(seconds=5)
+# The first unsearched value page used to begin with a six-hour Map scan. On a
+# dense production project that single candidate statement read 6.52 GB and
+# consumed 4.78 seconds before the exact replay even began. Start a brand-new
+# cursor at the already-qualified five-second floor and grow only after a
+# complete empty-slice proof. This changes request work, not reachability: every
+# successful empty slice advances the frozen physical frontier and every wider
+# failure leaves that frontier at its last proven boundary. Legacy cursors with
+# a carried adaptive slice or physical checkpoint retain their exact resume
+# state; a bare legacy empty frontier safely uses the new lossless seed.
+ATTRIBUTE_VALUE_CURSOR_INITIAL_SEGMENT = ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
 # An unpinned physical page can require candidate, version certificate, typed
 # hydration and isolated JSON hydration.  Leave that full fallback available
 # when a speculative distinct proof cannot certify its slice.
@@ -263,6 +280,7 @@ ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT = timedelta(days=60)
 # so partition-pruned years can collapse quickly without sacrificing range.
 ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT = timedelta(days=60)
 ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS = 250
+ATTRIBUTE_KEY_CURSOR_RETRY_GUARD_MARGIN_MS = 100
 ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES = 16
 # The absolute returned-token guard covers unexpected high-entropy identity
 # shapes as well as the modeled 255-byte trace/span maximum. The endpoint adds
@@ -3591,6 +3609,28 @@ class AttributeReadSelector:
             else ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
         )
 
+        def request_has_progress() -> bool:
+            """Whether this request has an exact checkpoint safe to publish."""
+
+            return (
+                current_segment_end,
+                cursor_before,
+                next_resume_identity,
+                next_resume_key_offset,
+            ) != initial_cursor_state
+
+        def should_publish_progress_after_budget_error() -> bool:
+            """Stop only when a safe retry no longer fits the picker wall."""
+
+            if not request_has_progress() or self._deadline is None:
+                return False
+            remaining_ms = int((self._deadline - self._clock()) * 1000)
+            retry_reserve_ms = (
+                2 * ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+                + ATTRIBUTE_KEY_CURSOR_RETRY_GUARD_MARGIN_MS
+            )
+            return remaining_ms <= retry_reserve_ms
+
         def anchor_checkpoint_window(
             checkpoint: PhysicalSpanIdentity,
             *,
@@ -3911,6 +3951,16 @@ class AttributeReadSelector:
                     candidate_query_settings={"use_skip_indexes": 0},
                 )
             except Exception as exc:
+                if (
+                    is_read_budget_error(exc)
+                    and should_publish_progress_after_budget_error()
+                ):
+                    # This statement proved nothing, but an earlier complete
+                    # candidate/replay batch already advanced the exact
+                    # physical frontier. Publish only that proven checkpoint
+                    # so an interactive page stays inside its four-second wall;
+                    # the next request resumes without a gap or duplicate.
+                    break
                 if is_read_budget_error(exc) and exact_key is not None:
                     if candidate_limit > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT:
                         # The larger duplicate-only batch is optional. Retry at
@@ -4024,6 +4074,14 @@ class AttributeReadSelector:
                     ),
                 )
             except Exception as exc:
+                if (
+                    is_read_budget_error(exc)
+                    and should_publish_progress_after_budget_error()
+                ):
+                    # Candidate identities from this failed replay are not
+                    # certified. Retain only the checkpoint from a prior
+                    # complete batch and let its continuation own a fresh wall.
+                    break
                 if is_read_budget_error(exc) and exact_key is not None:
                     if candidate_limit > 1 and len(candidate_ids) > 1:
                         # Hydrating exact latest state can be dominated by one
@@ -4368,6 +4426,19 @@ class AttributeReadSelector:
         elif int(resume_member_offset) != 0:
             raise ValueError("member offset requires a resume identity")
 
+        seen = tuple(dict.fromkeys(str(value) for value in seen_value_digests))
+        if any(
+            len(value) != 32 or any(char not in "0123456789abcdef" for char in value)
+            for value in seen
+        ):
+            raise ValueError("invalid filter-value seen-value state")
+        seen_set = set(seen)
+        resolved_seen_count = (
+            len(seen) if seen_value_count is None else int(seen_value_count)
+        )
+        if resolved_seen_count < len(seen) or resolved_seen_count < 0:
+            raise ValueError("invalid filter-value seen-value state")
+
         active_segment_start = (
             _utc(segment_start) if segment_start is not None else None
         )
@@ -4387,11 +4458,14 @@ class AttributeReadSelector:
         # the following adjacent segment starts below it, so recovery neither
         # repeats nor skips a physical row.
         incoming_checkpoint = resume_identity or before_identity
+        fresh_value_cursor = incoming_checkpoint is None and resolved_seen_count == 0
         incoming_segment_width = (
             current_segment_end - active_segment_start
             if active_segment_start is not None
             else ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
             if normalized_search
+            else ATTRIBUTE_VALUE_CURSOR_INITIAL_SEGMENT
+            if fresh_value_cursor
             else ATTRIBUTE_READ_EXPLICIT_SEGMENT
         )
         if (
@@ -4410,19 +4484,6 @@ class AttributeReadSelector:
             )
         ):
             raise ValueError("invalid filter-value physical cursor")
-
-        seen = tuple(dict.fromkeys(str(value) for value in seen_value_digests))
-        if any(
-            len(value) != 32 or any(char not in "0123456789abcdef" for char in value)
-            for value in seen
-        ):
-            raise ValueError("invalid filter-value seen-value state")
-        seen_set = set(seen)
-        resolved_seen_count = (
-            len(seen) if seen_value_count is None else int(seen_value_count)
-        )
-        if resolved_seen_count < len(seen) or resolved_seen_count < 0:
-            raise ValueError("invalid filter-value seen-value state")
 
         def value_was_seen(digest: str) -> bool:
             return digest in seen_set or (
@@ -4462,16 +4523,21 @@ class AttributeReadSelector:
             else ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
         )
         cursor_before = before_identity
-        # A searched value request starts at the production-qualified five-second
-        # floor, then grows only after a complete adjacent-slice proof. Signed
-        # continuations retain their next adaptive width so page N does not
-        # restart at the floor. Wider statements remain speculative and fall
-        # back at the identical unconsumed frontier on any read-budget error.
+        # A brand-new value request starts at the production-qualified
+        # five-second floor, then grows only after a complete adjacent-slice
+        # proof. Signed continuations retain their next adaptive width so page N
+        # does not restart at the floor. A legacy cursor carrying a physical
+        # checkpoint retains the six-hour compatibility width; an empty legacy
+        # frontier safely adopts the lossless five-second seed. Wider statements
+        # remain speculative and fall back at the identical unconsumed frontier
+        # on any read-budget error.
         empty_segment_width = (
             current_segment_end - active_segment_start
             if active_segment_start is not None
             else ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
             if normalized_search
+            else ATTRIBUTE_VALUE_CURSOR_INITIAL_SEGMENT
+            if fresh_value_cursor
             else ATTRIBUTE_READ_EXPLICIT_SEGMENT
         )
         max_empty_segment_width = ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT
@@ -5026,6 +5092,13 @@ class AttributeReadSelector:
                 and current_segment_end - segment_start
                 > ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
             )
+            adaptive_first_page_probe = (
+                not needle
+                and fresh_value_cursor
+                and active_segment_start is None
+                and current_segment_end - segment_start
+                > ATTRIBUTE_VALUE_CURSOR_INITIAL_SEGMENT
+            )
             try:
                 (
                     candidate_ids,
@@ -5047,6 +5120,7 @@ class AttributeReadSelector:
                         <= ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
                         else ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
                         if adaptive_search_probe
+                        or adaptive_first_page_probe
                         or widened_probe
                         or (
                             unpinned_cursor_read
@@ -5724,6 +5798,7 @@ __all__ = [
     "ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS",
     "ATTRIBUTE_READ_HORIZON_DAYS",
     "ATTRIBUTE_READ_MAX_PROJECTS",
+    "ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS",
     "ATTRIBUTE_READ_SETTINGS",
     "AttributeCardinalityRead",
     "AttributeKeyCursorPageRead",
