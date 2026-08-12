@@ -125,7 +125,7 @@ from tracer.services.filter_principal_context import (
     bind_request_my_annotations_principal,
 )
 from tracer.utils.bounded_csv import (
-    BOUNDED_EXPORT_PAGE_SIZE,
+    BOUNDED_SESSION_EXPORT_PAGE_SIZE,
     bounded_page_csv_response,
 )
 from tracer.utils.filters import FilterEngine, apply_created_at_filters
@@ -1463,8 +1463,8 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             if kwargs.get("bounded_export"):
                 validated_data.update(
                     page_number=0,
-                    page_size=BOUNDED_EXPORT_PAGE_SIZE,
-                    cursor_mode=False,
+                    page_size=BOUNDED_SESSION_EXPORT_PAGE_SIZE,
+                    cursor_mode=True,
                 )
             validated_data["filters"] = bind_request_my_annotations_principal(
                 request,

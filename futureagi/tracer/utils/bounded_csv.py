@@ -8,13 +8,14 @@ from typing import Any
 from django.http import HttpResponse
 
 _CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
-# Keep synchronous trace/session CSV work to one already-qualified list
-# hydration chunk. Span export has a smaller cursor-bounded cap because its
-# filtered selector may need several classify reads before page hydration.
+# Keep synchronous trace CSV work to one already-qualified list hydration
+# chunk. Span and session exports have smaller cursor-bounded caps because
+# their filtered selectors may need several classify reads before hydration.
 # These are bounded-page contracts, not all-row exports; callers disclose the
 # remaining population with the terminal truncation row below.
 BOUNDED_EXPORT_PAGE_SIZE = 100
 BOUNDED_SPAN_EXPORT_PAGE_SIZE = 20
+BOUNDED_SESSION_EXPORT_PAGE_SIZE = 20
 
 
 def _format_csv_cell(value: Any) -> Any:
@@ -52,14 +53,28 @@ def bounded_page_csv_response(
         writer.writerow([_format_csv_cell(row.get(field)) for field in fieldnames])
 
     read_metadata = metadata or {}
-    if (
+    truncated = bool(
         read_metadata.get("has_more")
         or read_metadata.get("total_rows_is_lower_bound")
         or read_metadata.get("query_complete") is False
-    ):
+    )
+    inexact_candidates = bool(
+        read_metadata.get("query_exact") is False
+        or read_metadata.get("ordering_exact") is False
+    )
+    if truncated:
+        marker = (
+            f"# export truncated after {len(page_rows)} rows; "
+            "refine filters to export a complete bounded page"
+        )
+        if inexact_candidates:
+            marker += "; candidate membership or ordering is inexact"
+        writer.writerow([marker])
+    elif inexact_candidates:
         writer.writerow(
             [
-                f"# export truncated after {len(page_rows)} rows; refine filters to export a complete bounded page"
+                "# export candidate membership or ordering is inexact; "
+                "results are not an exact ordered population"
             ]
         )
 

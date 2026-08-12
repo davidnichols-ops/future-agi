@@ -158,13 +158,14 @@ def test_span_list_forces_cursor_export_bound_after_request_revalidation():
     assert internal_data["cursor_mode"] is True
 
 
-def test_session_list_forces_shared_export_bound_after_request_revalidation():
+def test_session_list_forces_cursor_export_bound_after_request_revalidation():
     request = _request({})
     request.validated_query_data = {
         "project_id": "00000000-0000-0000-0000-000000000001",
         "filters": [],
         "page_number": 9,
         "page_size": 1,
+        "cursor_mode": False,
     }
     view = TraceSessionView()
     view.request = request
@@ -193,8 +194,8 @@ def test_session_list_forces_shared_export_bound_after_request_revalidation():
     assert response is sentinel
     internal_data = internal_list.call_args.args[4]
     assert internal_data["page_number"] == 0
-    assert internal_data["page_size"] == 100
-    assert internal_data["cursor_mode"] is False
+    assert internal_data["page_size"] == 20
+    assert internal_data["cursor_mode"] is True
 
 
 def test_span_export_propagates_list_failure_before_starting_csv():
@@ -285,3 +286,68 @@ def test_session_export_marks_lower_bound_page_in_band():
     assert response.status_code == status.HTTP_200_OK
     assert _rows(response)[-1][0].startswith("# export truncated after 1 rows")
     assert listing.call_args.kwargs == {"bounded_export": True}
+
+
+def test_session_export_marks_inexact_cursor_partial_page_in_band():
+    request = _request({"project_id": "00000000-0000-0000-0000-000000000001"})
+    project = SimpleNamespace(name="Observe")
+    page = SimpleNamespace(
+        status_code=status.HTTP_200_OK,
+        data={
+            "result": {
+                "table": [
+                    {
+                        "session_id": "session-1",
+                        "first_message": "classified",
+                        "last_message": "hydrated",
+                    }
+                ],
+                "metadata": {
+                    "total_rows_exact": 21,
+                    "total_rows_is_lower_bound": False,
+                    "has_more": True,
+                    "next_cursor": "signed-continuation",
+                    "query_complete": True,
+                    "query_exact": False,
+                    "query_provenance": "spans_per_session_candidate",
+                    "ordering_exact": False,
+                },
+            }
+        },
+    )
+
+    with (
+        patch.object(TraceSessionView, "list_sessions", return_value=page) as listing,
+        patch("tracer.views.trace_session._project_queryset_for_request") as projects,
+    ):
+        projects.return_value.get.return_value = project
+        response = TraceSessionView().get_trace_session_export_data(request)
+
+    assert response.status_code == status.HTTP_200_OK
+    assert _rows(response) == [
+        ["session_id", "first_message", "last_message"],
+        ["session-1", "classified", "hydrated"],
+        [
+            "# export truncated after 1 rows; refine filters to export a complete bounded page; candidate membership or ordering is inexact"
+        ],
+    ]
+    assert listing.call_args.kwargs == {"bounded_export": True}
+
+
+def test_bounded_csv_marks_inexact_candidate_order_without_truncation():
+    from tracer.utils.bounded_csv import bounded_page_csv_response
+
+    response = bounded_page_csv_response(
+        rows=[{"session_id": "session-1"}],
+        filename="sessions.csv",
+        metadata={
+            "has_more": False,
+            "query_complete": True,
+            "query_exact": True,
+            "ordering_exact": False,
+        },
+    )
+
+    assert _rows(response)[-1] == [
+        "# export candidate membership or ordering is inexact; results are not an exact ordered population"
+    ]
