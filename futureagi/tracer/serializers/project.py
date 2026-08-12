@@ -63,6 +63,74 @@ class ProjectIdListResponseSerializer(serializers.Serializer):
     result = ProjectIdListResultSerializer()
 
 
+class ProjectListMetadataSerializer(serializers.Serializer):
+    total_rows = serializers.IntegerField(min_value=0)
+    page_number = serializers.IntegerField(min_value=0)
+    page_size = serializers.IntegerField(min_value=1, max_value=100)
+    total_pages = serializers.IntegerField(min_value=0)
+
+
+class ProjectListItemSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    name = serializers.CharField()
+    last_30_days_vol = serializers.IntegerField(min_value=0, allow_null=True)
+    daily_volume = serializers.ListField(
+        child=serializers.IntegerField(min_value=0), allow_null=True
+    )
+    created_at = serializers.DateTimeField()
+    updated_at = serializers.DateTimeField()
+    last_active = serializers.DateTimeField(allow_null=True)
+    activity_query_complete = serializers.BooleanField()
+    activity_error_code = serializers.CharField(allow_null=True)
+    activity_query_exact = serializers.BooleanField()
+    activity_query_provenance = serializers.CharField()
+    run_count = serializers.IntegerField(min_value=0)
+    issues = serializers.IntegerField(min_value=0)
+    tags = serializers.ListField(child=serializers.CharField())
+
+
+class ProjectListResultSerializer(serializers.Serializer):
+    metadata = ProjectListMetadataSerializer()
+    table = ProjectListItemSerializer(many=True)
+
+
+class ProjectListResponseSerializer(serializers.Serializer):
+    """Wire contract for ``GET /tracer/project/list_projects/``."""
+
+    status = serializers.BooleanField(default=True)
+    result = ProjectListResultSerializer()
+
+
+class ProjectListQuerySerializer(StrictInputSerializer):
+    """Zero-based bounded query contract for the project table and pickers."""
+
+    name = serializers.CharField(required=False, allow_blank=True)
+    project_type = serializers.CharField(required=False, allow_blank=True)
+    tags = serializers.CharField(required=False, allow_blank=True)
+    filters = filter_list_query_param_field(
+        required=False,
+        allow_blank=True,
+        default=list,
+    )
+    sort_by = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="created_at",
+    )
+    sort_direction = serializers.ChoiceField(
+        required=False,
+        choices=("asc", "desc"),
+        default="desc",
+    )
+    page_number = serializers.IntegerField(required=False, default=0, min_value=0)
+    page_size = serializers.IntegerField(
+        required=False,
+        default=20,
+        min_value=1,
+        max_value=100,
+    )
+
+
 class ProjectNameUpdateSerializer(serializers.Serializer):
     project_id = serializers.UUIDField(required=True)
     name = serializers.CharField(required=True)

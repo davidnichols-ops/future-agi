@@ -33,6 +33,8 @@ from tracer.serializers.project import (
     ProjectGraphDataQuerySerializer,
     ProjectGraphDataResponseSerializer,
     ProjectIdListResponseSerializer,
+    ProjectListQuerySerializer,
+    ProjectListResponseSerializer,
     ProjectNameUpdateSerializer,
     ProjectSerializer,
     ProjectUserGraphDataQuerySerializer,
@@ -457,7 +459,11 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                 get_error_message("FAILED_TO_UPDATE_PROJECT_CONFIG")
             )
 
-    @action(detail=False, methods=["get"])
+    @validated_request(
+        query_serializer=ProjectListQuerySerializer,
+        responses={200: ProjectListResponseSerializer},
+    )
+    @action(detail=False, methods=["get"], pagination_class=None)
     @db_connection_required
     @monitor_query_performance
     @uses_db(DATABASE_FOR_PROJECT_LIST, feature_key="feature:project_list")

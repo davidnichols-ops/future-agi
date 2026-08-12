@@ -330,6 +330,11 @@ class TraceObserveListResponseSerializer(serializers.Serializer):
     result = TraceObserveListResultSerializer()
 
 
+class TracePropertiesResponseSerializer(serializers.Serializer):
+    status = serializers.BooleanField(default=True)
+    result = serializers.ListField(child=serializers.CharField())
+
+
 class TraceSessionListResultSerializer(TraceObserveListResultSerializer):
     metadata = TraceSessionListMetadataSerializer()
 

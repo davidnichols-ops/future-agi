@@ -429,13 +429,7 @@ const ObserveToolbar = ({
             tab={effectiveFilterTab}
             isSimulator={isSimulator}
             isSpansView={isSpansView}
-            source={
-              mode === "sessions"
-                ? "sessions"
-                : mode === "users"
-                  ? "users"
-                  : "traces"
-            }
+            source={mode === "sessions" ? "sessions" : "traces"}
             projectId={projectId}
             onApply={(newFilters) => {
               setPanelFilters(newFilters);

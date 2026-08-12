@@ -76,6 +76,7 @@ from tracer.serializers.trace import (
     TraceObserveIndexQuerySerializer,
     TraceObserveListQuerySerializer,
     TraceObserveListResponseSerializer,
+    TracePropertiesResponseSerializer,
     TracePrototypeListResponseSerializer,
     TraceSerializer,
     TraceVoiceCallDetailQuerySerializer,
@@ -2339,7 +2340,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             logger.exception(f"Error updating trace tags: {e}")
             return self._gm.bad_request("Error updating tags")
 
-    @action(detail=False, methods=["get"])
+    @validated_request(responses={200: TracePropertiesResponseSerializer})
+    @action(detail=False, methods=["get"], pagination_class=None)
     def get_properties(self, request, *args, **kwargs):
         """
         Fetch all properties for graphing.

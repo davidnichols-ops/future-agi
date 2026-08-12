@@ -67,4 +67,23 @@ describe("ObserveToolbar status filter registry", () => {
       expect.objectContaining({ projectId: "project-from-query-string" }),
     );
   });
+
+  it("uses trace-backed value catalogs for Users filters", () => {
+    renderToolbar({ mode: "users", projectId: "users-project" });
+
+    expect(traceFilterPanelPropsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ source: "traces", projectId: "users-project" }),
+    );
+  });
+
+  it("keeps the session value catalog for session filters", () => {
+    renderToolbar({ mode: "sessions", projectId: "sessions-project" });
+
+    expect(traceFilterPanelPropsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        source: "sessions",
+        projectId: "sessions-project",
+      }),
+    );
+  });
 });
