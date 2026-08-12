@@ -3966,8 +3966,17 @@ class TestDashboardQueryBuilder:
             "custom_metric_candidate.id = custom_metric_source.id"
         ) in compact_replay_sql
         assert "custom_metric_candidate.start_time" not in compact_replay_sql
-        assert ">= toStartOfHour(%(start_date)s)" in compact_replay_sql
-        assert "< toStartOfHour(%(end_date)s) + INTERVAL 1 HOUR" in compact_replay_sql
+        assert (
+            ">= toStartOfHour(toDateTime64( %(start_date)s, 6, 'UTC' ))"
+            in compact_replay_sql
+        )
+        assert (
+            "< toStartOfHour(toDateTime64( %(end_date)s, 6, 'UTC' )) + INTERVAL 1 HOUR"
+        ) in compact_replay_sql
+        # clickhouse-driver serializes datetime values as quoted SQL literals;
+        # date functions reject those literals unless the query restores type.
+        assert "toStartOfHour(%(start_date)s)" not in compact_replay_sql
+        assert "toStartOfHour(%(end_date)s)" not in compact_replay_sql
         assert replay_sql.count("mapContains(") == 1
         assert "custom_metric_source.is_deleted" in replay_sql
         assert "custom_metric_source._version" in replay_sql

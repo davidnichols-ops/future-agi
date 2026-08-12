@@ -228,12 +228,18 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
                 PREWHERE custom_metric_source.project_id IN %(project_ids)s
                   /*
                    * Widen exact event bounds to their storage-key hours so a
-                   * corrected start_time still participates in argMax.
+                   * corrected start_time still participates in argMax. The
+                   * native driver renders datetime parameters as SQL string
+                   * literals, so type them before applying date functions.
                    */
                   AND custom_metric_source.start_time
-                            >= toStartOfHour(%(start_date)s)
+                            >= toStartOfHour(toDateTime64(
+                                %(start_date)s, 6, 'UTC'
+                            ))
                   AND custom_metric_source.start_time
-                            < toStartOfHour(%(end_date)s) + INTERVAL 1 HOUR
+                            < toStartOfHour(toDateTime64(
+                                %(end_date)s, 6, 'UTC'
+                            )) + INTERVAL 1 HOUR
                 GROUP BY
                     custom_metric_source.project_id,
                     custom_metric_source.observation_type,
