@@ -1054,7 +1054,7 @@ class TestEvalTaskGetDetailsAPI:
 
         _assert_sanitized(
             response,
-            "Invalid evaluation usage date range",
+            "start_date",
             status.HTTP_400_BAD_REQUEST,
         )
 
