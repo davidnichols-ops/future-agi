@@ -3482,6 +3482,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         residual_predicate = "1 = 1"
         if residual_filters:
+            has_eval_residual = any(
+                (item.get("column_id") or item.get("columnId")) == "has_eval"
+                for item in residual_filters
+            )
             if org_scope:
                 requires_project_label_sets = any(
                     (item.get("column_id") or item.get("columnId")) == "has_annotation"
@@ -3585,14 +3589,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     candidate_ids_param="candidate_trace_ids",
                     strict_trace_project_correlation=bool(
                         self._positive_relational_seed_filter() is not None
-                        and (
-                            not any(
-                                (item.get("column_id") or item.get("columnId"))
-                                == "has_eval"
-                                for item in residual_filters
-                            )
-                            or self._eval_config_ids_known
-                        )
+                        or (has_eval_residual and self._eval_config_ids_known)
                     ),
                     trace_project_eval_config_ids=(
                         self.eval_config_ids if self._eval_config_ids_known else None

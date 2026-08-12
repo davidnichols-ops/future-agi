@@ -1178,6 +1178,99 @@ def test_non_positive_or_conjoined_relation_does_not_use_candidate_seed(
 
 
 @pytest.mark.parametrize(
+    "builder_cls",
+    [TraceListQueryBuilderV2, VoiceCallListQueryBuilderV2],
+    ids=["trace", "voice"],
+)
+@pytest.mark.parametrize(
+    ("filters", "membership_op"),
+    [
+        (
+            [
+                _time_filter(),
+                _has_eval_filter(True),
+                _attribute_filter("final_status", "Rejected"),
+            ],
+            "IN",
+        ),
+        ([_time_filter(), _has_eval_filter(False)], "NOT IN"),
+    ],
+    ids=["conjoined-true", "false"],
+)
+@override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
+def test_known_project_eval_configs_fence_residual_trace_id_collisions(
+    builder_cls: type[TraceListQueryBuilderV2] | type[VoiceCallListQueryBuilderV2],
+    filters: list[dict[str, Any]],
+    membership_op: str,
+) -> None:
+    """A same-text trace id cannot borrow an eval owned by another project."""
+
+    config_id = "00000000-0000-4000-8000-000000000088"
+    builder = builder_cls(
+        project_id=PROJECT_ID,
+        filters=filters,
+        eval_config_ids=[config_id],
+    )
+
+    with mock.patch(
+        "tracer.models.custom_eval_config.CustomEvalConfig.objects"
+    ) as config_manager:
+        sql, params = builder.build_filter_match_query(["shared-trace"])
+
+    assert config_manager.filter.call_count == 0
+    assert f"trace_id {membership_op} (" in sql
+    assert "eval_scan.custom_eval_config_id IN %(project_eval_cfg_1)s" in sql
+    assert "sp.project_id = %(project_id)s" in sql
+    assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in sql
+    assert params["project_eval_cfg_1"] == (config_id,)
+    assert params["candidate_trace_ids"] == ("shared-trace",)
+    if builder_cls is VoiceCallListQueryBuilderV2:
+        assert "conversation" in params.values()
+
+
+@pytest.mark.parametrize(
+    "builder_cls",
+    [TraceListQueryBuilderV2, VoiceCallListQueryBuilderV2],
+    ids=["trace", "voice"],
+)
+@override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
+def test_known_empty_project_eval_configs_fail_positive_closed_and_negative_open(
+    builder_cls: type[TraceListQueryBuilderV2] | type[VoiceCallListQueryBuilderV2],
+) -> None:
+    positive = builder_cls(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _has_eval_filter(True)],
+        eval_config_ids=[],
+    )
+    negative = builder_cls(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _has_eval_filter(False)],
+        eval_config_ids=[],
+    )
+
+    with mock.patch(
+        "tracer.models.custom_eval_config.CustomEvalConfig.objects"
+    ) as config_manager:
+        positive_sql, positive_params = positive.build_filter_match_query(
+            ["shared-trace"]
+        )
+        negative_sql, negative_params = negative.build_filter_match_query(
+            ["shared-trace"]
+        )
+
+    impossible_relation = (
+        "SELECT toUUID('00000000-0000-0000-0000-000000000000')"
+    )
+    assert config_manager.filter.call_count == 0
+    assert f"trace_id IN ({impossible_relation})" in positive_sql
+    assert f"trace_id NOT IN ({impossible_relation})" in negative_sql
+    assert "tracer_eval_logger_v2" not in positive_sql
+    assert "tracer_eval_logger_v2" not in negative_sql
+    assert not any(key.startswith("project_eval_cfg") for key in positive_params)
+    assert not any(key.startswith("project_eval_cfg") for key in negative_params)
+
+
+@pytest.mark.parametrize(
     ("relation_filter", "eval_config_ids", "annotation_label_ids", "relation_table"),
     [
         (
