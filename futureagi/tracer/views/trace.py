@@ -2,7 +2,7 @@ import concurrent.futures
 import json
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -207,6 +207,24 @@ TRACE_LIST_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
 }
 _VOICE_CONTENT_MAX_QUERY_ATTEMPTS = 64
+VOICE_CALL_EXPORT_FIELDNAMES = (
+    "ID",
+    "Call ID",
+    "Phone Number",
+    "Call Type",
+    "Status",
+    "Started At",
+    "Ended At",
+    "Duration (s)",
+    "Recording URL",
+    "Stereo Recording URL",
+    "Call Summary",
+    "Overall Score",
+    "Response Time (ms)",
+    "Cost (cents)",
+    "Ended Reason",
+    "Transcript",
+)
 TRACE_NAVIGATION_CANDIDATE_LIMIT = 4_095
 TRACE_NAVIGATION_SCAN_PAGE_SIZE = 200
 TRACE_NAVIGATION_MAX_QUERIES = 128
@@ -872,6 +890,125 @@ def _project_queryset_for_request(request):
         _project_workspace_scope_q(request, project_prefix=""),
         deleted=False,
     )
+
+
+def _has_voice_conversation_roots(
+    project_id: str, *, read_deadline: ReadDeadline
+) -> bool:
+    """Detect the legacy voice-export modality with one bounded exact read."""
+
+    result = V2AnalyticsQueryService().execute_ch_query(
+        "SELECT 1 AS present FROM spans FINAL "
+        "WHERE is_deleted = 0 AND project_id = %(project_id)s "
+        "AND observation_type = 'conversation' AND parent_span_id = '' LIMIT 1",
+        {"project_id": project_id},
+        timeout_ms=read_deadline.remaining_ms(1_500),
+        settings={
+            "max_threads": 1,
+            "max_memory_usage": 512 * 1024 * 1024,
+            "max_bytes_to_read": 512 * 1024 * 1024,
+            "max_result_rows": 1,
+            "result_overflow_mode": "throw",
+        },
+    )
+    return bool(result.data)
+
+
+def _voice_call_export_projection(
+    rows: Iterable[Mapping[str, Any]] | None,
+    *,
+    attribute_keys: Iterable[str] = (),
+    eval_names: Iterable[str] = (),
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Project a finite voice list page onto the historical CSV schema."""
+
+    source_rows = list(rows or ())
+    configured_eval_columns = {str(eval_name) for eval_name in eval_names if eval_name}
+    page_eval_columns = {
+        str(eval_data.get("name") or f"Eval_{config_id}")
+        for row in source_rows
+        for config_id, eval_data in (row.get("eval_outputs") or {}).items()
+        if isinstance(eval_data, Mapping)
+    }
+    eval_columns = sorted(configured_eval_columns | page_eval_columns)
+    eval_reason_columns = [f"{eval_name}_reason" for eval_name in eval_columns]
+    reserved_columns = {
+        *VOICE_CALL_EXPORT_FIELDNAMES,
+        *eval_columns,
+        *eval_reason_columns,
+    }
+    custom_columns = [
+        key
+        for key in dict.fromkeys(str(key) for key in attribute_keys if key)
+        if key not in reserved_columns
+    ]
+    fieldnames = [*VOICE_CALL_EXPORT_FIELDNAMES]
+    for eval_name in eval_columns:
+        fieldnames.extend((eval_name, f"{eval_name}_reason"))
+    fieldnames.extend(custom_columns)
+
+    export_rows: list[dict[str, Any]] = []
+    for result in source_rows:
+        transcript = result.get("transcript")
+        if isinstance(transcript, (list, tuple)):
+            transcript_text = "\n".join(
+                f"{entry.get('role', 'unknown')}: {entry.get('content', '')}"
+                if isinstance(entry, Mapping)
+                else str(entry)
+                for entry in transcript
+            )
+        else:
+            transcript_text = str(transcript) if transcript not in (None, "") else ""
+
+        recording = result.get("recording")
+        recording = recording if isinstance(recording, Mapping) else {}
+        mono = recording.get("mono")
+        mono = mono if isinstance(mono, Mapping) else {}
+        recording_url = (
+            result.get("recording_url")
+            or mono.get("combined_url")
+            or mono.get("combinedUrl")
+            or ""
+        )
+        stereo_url = (
+            result.get("stereo_recording_url")
+            or recording.get("stereo_url")
+            or recording.get("stereoUrl")
+            or ""
+        )
+
+        row_data: dict[str, Any] = {
+            "ID": result.get("id", ""),
+            "Call ID": result.get("call_id", ""),
+            "Phone Number": result.get("phone_number", ""),
+            "Call Type": result.get("call_type", ""),
+            "Status": result.get("status", ""),
+            "Started At": result.get("started_at", ""),
+            "Ended At": result.get("ended_at", ""),
+            "Duration (s)": result.get("duration_seconds", ""),
+            "Recording URL": recording_url,
+            "Stereo Recording URL": stereo_url,
+            "Call Summary": result.get("call_summary", ""),
+            "Overall Score": result.get("overall_score", ""),
+            "Response Time (ms)": result.get("response_time_ms", ""),
+            "Cost (cents)": result.get("cost_cents", ""),
+            "Ended Reason": result.get("ended_reason", ""),
+            "Transcript": transcript_text,
+        }
+        row_data.update(dict.fromkeys([*eval_columns, *eval_reason_columns], ""))
+        for config_id, eval_data in (result.get("eval_outputs") or {}).items():
+            if not isinstance(eval_data, Mapping):
+                continue
+            eval_name = str(eval_data.get("name") or f"Eval_{config_id}")
+            output = eval_data.get("output", "")
+            reason = eval_data.get("reason", "")
+            row_data[eval_name] = "" if output is None else str(output)
+            row_data[f"{eval_name}_reason"] = "" if reason is None else str(reason)
+        for attribute_key in custom_columns:
+            row_data[attribute_key] = result.get(attribute_key, "")
+        export_rows.append(row_data)
+
+    return export_rows, fieldnames
 
 
 def _project_version_queryset_for_request(request):
@@ -3400,6 +3537,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 analytics,
                 org_project_ids=org_project_ids,
                 org=org,
+                read_deadline=kwargs.get("read_deadline"),
             )
 
         except ListCursorError as exc:
@@ -3472,6 +3610,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     return self._gm.bad_request(serializer.errors)
                 validated_data = serializer.validated_data
             validated_data = dict(validated_data)
+            bounded_export = bool(kwargs.get("bounded_export"))
+            if bounded_export:
+                # A synchronous CSV is one explicitly classified page. Opting
+                # into a bounded partial lets the terminal CSV marker disclose
+                # an unfinished selector instead of walking the retained set.
+                validated_data.update(
+                    page=1,
+                    page_size=BOUNDED_EXPORT_PAGE_SIZE,
+                    cursor_mode=False,
+                    allow_sampled=True,
+                )
             validated_data["filters"] = bind_request_my_annotations_principal(
                 request,
                 validated_data.get("filters", []),
@@ -3505,6 +3654,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 validated_data,
                 remove_simulation_calls,
                 analytics,
+                include_export_fields=bounded_export,
+                read_deadline=kwargs.get("read_deadline"),
             )
 
         except ListCursorError as exc:
@@ -4068,7 +4219,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         query_serializer=TraceExportQuerySerializer,
         responses={
             200: openapi.Response(
-                "Bounded CSV export; a terminal comment row discloses truncation.",
+                "Bounded trace or voice-call CSV export; a terminal comment "
+                "row discloses truncation.",
                 schema=openapi.Schema(type=openapi.TYPE_STRING),
             ),
             **ERROR_RESPONSES,
@@ -4078,8 +4230,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     )
     @action(detail=False, methods=["get"])
     def get_trace_export_data(self, request, *args, **kwargs):
-        """Export one bounded list page, disclosing any remaining rows in-band."""
+        """Export one bounded trace/voice page and disclose remaining rows."""
         try:
+            read_deadline = ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
             validated_data = request.validated_query_data
             project_id = str(validated_data["project_id"])
 
@@ -4089,17 +4242,69 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if not project:
                 return self._gm.bad_request("Project not found")
 
-            page_response = self.list_traces_of_session(request, bounded_export=True)
+            if _has_voice_conversation_roots(project_id, read_deadline=read_deadline):
+                page_response = self.list_voice_calls(
+                    request,
+                    bounded_export=True,
+                    read_deadline=read_deadline,
+                )
+                if page_response.status_code != status.HTTP_200_OK:
+                    return page_response
+                result = page_response.data or {}
+                export_rows, fieldnames = _voice_call_export_projection(
+                    result.get("results"),
+                    attribute_keys=validated_data.get("attribute_keys", ()),
+                    eval_names=result.get("_export_eval_names", ()),
+                )
+                return bounded_page_csv_response(
+                    rows=export_rows,
+                    metadata={
+                        "has_more": result.get("has_more"),
+                        "query_complete": result.get("query_complete"),
+                        "ordering_exact": result.get("query_complete") is not False,
+                    },
+                    fieldnames=fieldnames,
+                    filename=f"{project.name or 'project'}_voice_calls.csv",
+                )
+
+            page_response = self.list_traces_of_session(
+                request,
+                bounded_export=True,
+                read_deadline=read_deadline,
+            )
             if page_response.status_code != status.HTTP_200_OK:
                 return page_response
             result = page_response.data.get("result", {})
+            table = result.get("table") or []
+            fieldnames = list(dict.fromkeys(key for row in table for key in row))
+            fieldnames.extend(
+                key
+                for key in validated_data.get("attribute_keys", ())
+                if key not in fieldnames
+            )
             return bounded_page_csv_response(
-                rows=result.get("table"),
+                rows=table,
                 metadata=result.get("metadata"),
+                fieldnames=fieldnames,
                 filename=f"{project.name or 'project'}_traces.csv",
             )
 
         except Exception as exc:
+            if is_clickhouse_api_read_unavailable_error(exc):
+                logger.warning(
+                    "trace_export_query_unavailable",
+                    project_id=str(
+                        getattr(request, "validated_query_data", {}).get(
+                            "project_id", ""
+                        )
+                    ),
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Trace export data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
             logger.exception(
                 "trace_export_failed",
                 error_type=type(exc).__name__,
@@ -4118,6 +4323,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         analytics,
         org_project_ids=None,
         org=None,
+        read_deadline=None,
     ):
         """List traces-of-session using ClickHouse backend.
 
@@ -4133,7 +4339,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             TraceListQueryBuilderV2,
         )
 
-        read_deadline = ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
+        read_deadline = read_deadline or ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
 
         org_scope = bool(org_project_ids)
         filters = list(validated_data.get("filters", []) or [])
@@ -5267,7 +5473,15 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         return self._gm.success_response(response)
 
     def _list_voice_calls_clickhouse(
-        self, request, project_id, validated_data, remove_simulation_calls, analytics
+        self,
+        request,
+        project_id,
+        validated_data,
+        remove_simulation_calls,
+        analytics,
+        *,
+        include_export_fields=False,
+        read_deadline=None,
     ):
         """List voice calls using ClickHouse backend.
 
@@ -5282,7 +5496,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             VoiceCallListQueryBuilderV2,
         )
 
-        read_deadline = ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
+        read_deadline = read_deadline or ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
 
         filters = list(validated_data.get("filters", []) or [])
         page = validated_data.get("page", 1)
@@ -5882,10 +6096,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if not entry.get("response_time_ms") and entry.get("avg_agent_latency_ms"):
                 entry["response_time_ms"] = entry["avg_agent_latency_ms"]
 
-            # Strip heavy fields from list response — these are served by
-            # the voice_call_detail endpoint.
-            for key in self._VOICE_CALL_HEAVY_KEYS:
-                entry.pop(key, None)
+            # Ordinary list responses keep heavy content in the detail API.
+            # The bounded compatibility CSV needs the historical transcript
+            # and recording columns, and content hydration is already limited
+            # to this finite page before provider processing reaches here.
+            if not include_export_fields:
+                for key in self._VOICE_CALL_HEAVY_KEYS:
+                    entry.pop(key, None)
             # Heavy-key strip drops observation_span, which the drawer needs to route to
             # voice; collector rows lack raw_log to fall back. Seed a stub (detail fetch replaces it).
             entry["observation_span"] = (
@@ -6094,6 +6311,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "complete" if public_chunk_complete else bounded_page.status
             ),
         }
+        if include_export_fields:
+            response_data["_export_eval_names"] = sorted(
+                {
+                    str(
+                        getattr(config, "name", None)
+                        or getattr(getattr(config, "eval_template", None), "name", None)
+                        or f"Eval_{config.id}"
+                    )
+                    for config in eval_configs
+                }
+            )
         if cursor_enabled:
             response_data["next_cursor"] = next_cursor
         if bounded_page.error_code and not public_chunk_complete:

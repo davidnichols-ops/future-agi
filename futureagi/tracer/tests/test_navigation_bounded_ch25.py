@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from clickhouse_driver.errors import ServerException
@@ -378,10 +378,15 @@ def test_trace_export_uses_bounded_list_page():
             "tracer.views.trace._project_queryset_for_request",
             return_value=project_queryset,
         ),
+        patch("tracer.views.trace._has_voice_conversation_roots", return_value=False),
         patch.object(view, "list_traces_of_session", return_value=page) as list_traces,
     ):
         response = view.get_trace_export_data.__wrapped__(view, request)
 
     assert response.status_code == 200
     assert response["Content-Type"].startswith("text/csv")
-    list_traces.assert_called_once_with(request, bounded_export=True)
+    list_traces.assert_called_once_with(
+        request,
+        bounded_export=True,
+        read_deadline=ANY,
+    )

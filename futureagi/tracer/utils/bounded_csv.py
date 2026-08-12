@@ -41,14 +41,16 @@ def bounded_page_csv_response(
     rows: Iterable[Mapping[str, Any]] | None,
     filename: str,
     metadata: Mapping[str, Any] | None = None,
+    fieldnames: Iterable[str] | None = None,
 ) -> HttpResponse:
     """Serialize one finite list page and disclose any incomplete export."""
 
     page_rows = list(rows or ())
-    fieldnames = list(dict.fromkeys(key for row in page_rows for key in row))
+    derived_fieldnames = (key for row in page_rows for key in row)
+    fieldnames = list(dict.fromkeys([*(fieldnames or ()), *derived_fieldnames]))
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(fieldnames)
+    writer.writerow([_format_csv_cell(field) for field in fieldnames])
     for row in page_rows:
         writer.writerow([_format_csv_cell(row.get(field)) for field in fieldnames])
 

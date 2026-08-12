@@ -2,7 +2,7 @@ import csv
 import io
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from rest_framework import status
@@ -46,6 +46,9 @@ def test_trace_export_returns_bounded_csv_and_marks_partial_page():
 
     with (
         patch("tracer.views.trace._project_queryset_for_request") as projects,
+        patch(
+            "tracer.views.trace._has_voice_conversation_roots", return_value=False
+        ) as voice_detection,
         patch.object(TraceView, "list_traces_of_session", return_value=page) as listing,
     ):
         projects.return_value.filter.return_value.first.return_value = project
@@ -63,8 +66,289 @@ def test_trace_export_returns_bounded_csv_and_marks_partial_page():
         ],
     ]
     list_request = listing.call_args.args[0]
-    assert listing.call_args.kwargs == {"bounded_export": True}
+    assert listing.call_args.kwargs == {
+        "bounded_export": True,
+        "read_deadline": ANY,
+    }
+    assert (
+        voice_detection.call_args.kwargs["read_deadline"]
+        is listing.call_args.kwargs["read_deadline"]
+    )
     assert list_request is request
+
+
+def test_trace_export_keeps_requested_attribute_header_when_page_has_no_value():
+    request = _request({})
+    request.validated_query_data = {
+        "project_id": "00000000-0000-0000-0000-000000000001",
+        "filters": [],
+        "attribute_keys": ["prompt_slug"],
+    }
+    page = SimpleNamespace(
+        status_code=status.HTTP_200_OK,
+        data={
+            "result": {
+                "table": [{"trace_id": "trace-1"}],
+                "metadata": {"has_more": False, "query_complete": True},
+            }
+        },
+    )
+
+    with (
+        patch("tracer.views.trace._project_queryset_for_request") as projects,
+        patch("tracer.views.trace._has_voice_conversation_roots", return_value=False),
+        patch.object(TraceView, "list_traces_of_session", return_value=page),
+    ):
+        projects.return_value.filter.return_value.first.return_value = SimpleNamespace(
+            name="Observe"
+        )
+        view = TraceView()
+        response = view.get_trace_export_data.__wrapped__(view, request)
+
+    assert _rows(response) == [["trace_id", "prompt_slug"], ["trace-1", ""]]
+
+
+def test_voice_trace_export_preserves_legacy_schema_on_one_bounded_page():
+    request = _request({})
+    request.validated_query_data = {
+        "project_id": "00000000-0000-0000-0000-000000000001",
+        "filters": [],
+        "attribute_keys": ["prompt_slug", "missing.attribute"],
+    }
+    project = SimpleNamespace(name="Voice")
+    page = SimpleNamespace(
+        status_code=status.HTTP_200_OK,
+        data={
+            "count": 1,
+            "count_is_lower_bound": True,
+            "has_more": True,
+            "query_complete": False,
+            "results": [
+                {
+                    "id": "trace-1",
+                    "call_id": "call-1",
+                    "phone_number": "+15551234567",
+                    "call_type": "inbound",
+                    "status": "completed",
+                    "started_at": "2026-08-11T12:00:00Z",
+                    "ended_at": "2026-08-11T12:01:00Z",
+                    "duration_seconds": 60,
+                    "recording": {
+                        "mono": {"combined_url": "https://example.test/mono.wav"},
+                        "stereo_url": "https://example.test/stereo.wav",
+                    },
+                    "call_summary": "Resolved",
+                    "overall_score": 0.9,
+                    "response_time_ms": 250,
+                    "cost_cents": 3.5,
+                    "ended_reason": "customer-ended-call",
+                    "transcript": [
+                        {"role": "assistant", "content": "Hello"},
+                        {"role": "user", "content": "Hi"},
+                    ],
+                    "prompt_slug": "agent_5_scores_narrative",
+                    "eval_outputs": {
+                        "eval-b": {
+                            "name": "Quality",
+                            "output": 88,
+                            "reason": "Strong answer",
+                        },
+                        "eval-a": {
+                            "name": "Accuracy",
+                            "output": True,
+                            "reason": "Grounded",
+                        },
+                    },
+                }
+            ],
+            "_export_eval_names": ["Coverage", "Quality"],
+        },
+    )
+
+    with (
+        patch("tracer.views.trace._project_queryset_for_request") as projects,
+        patch("tracer.views.trace._has_voice_conversation_roots", return_value=True),
+        patch.object(TraceView, "list_voice_calls", return_value=page) as listing,
+    ):
+        projects.return_value.filter.return_value.first.return_value = project
+        view = TraceView()
+        response = view.get_trace_export_data.__wrapped__(view, request)
+
+    assert response.status_code == status.HTTP_200_OK
+    assert (
+        response["Content-Disposition"]
+        == 'attachment; filename="Voice_voice_calls.csv"'
+    )
+    rows = _rows(response)
+    assert rows[0] == [
+        "ID",
+        "Call ID",
+        "Phone Number",
+        "Call Type",
+        "Status",
+        "Started At",
+        "Ended At",
+        "Duration (s)",
+        "Recording URL",
+        "Stereo Recording URL",
+        "Call Summary",
+        "Overall Score",
+        "Response Time (ms)",
+        "Cost (cents)",
+        "Ended Reason",
+        "Transcript",
+        "Accuracy",
+        "Accuracy_reason",
+        "Coverage",
+        "Coverage_reason",
+        "Quality",
+        "Quality_reason",
+        "prompt_slug",
+        "missing.attribute",
+    ]
+    assert rows[1] == [
+        "trace-1",
+        "call-1",
+        "'+15551234567",
+        "inbound",
+        "completed",
+        "2026-08-11T12:00:00Z",
+        "2026-08-11T12:01:00Z",
+        "60",
+        "https://example.test/mono.wav",
+        "https://example.test/stereo.wav",
+        "Resolved",
+        "0.9",
+        "250",
+        "3.5",
+        "customer-ended-call",
+        "assistant: Hello\nuser: Hi",
+        "True",
+        "Grounded",
+        "",
+        "",
+        "88",
+        "Strong answer",
+        "agent_5_scores_narrative",
+        "",
+    ]
+    assert rows[-1] == [
+        "# export truncated after 1 rows; refine filters to export a complete bounded page; candidate membership or ordering is inexact"
+    ]
+    listing.assert_called_once_with(
+        request,
+        bounded_export=True,
+        read_deadline=ANY,
+    )
+
+
+def test_empty_voice_trace_export_still_has_legacy_headers():
+    request = _request({})
+    request.validated_query_data = {
+        "project_id": "00000000-0000-0000-0000-000000000001",
+        "filters": [],
+        "attribute_keys": ["prompt_slug"],
+    }
+    page = SimpleNamespace(
+        status_code=status.HTTP_200_OK,
+        data={
+            "count": 0,
+            # Numbered voice responses intentionally report only a lower-bound
+            # count even when the selector proves this page is exhausted. That
+            # flag alone must not fabricate an export-truncation marker.
+            "count_is_lower_bound": True,
+            "has_more": False,
+            "query_complete": True,
+            "results": [],
+        },
+    )
+
+    with (
+        patch("tracer.views.trace._project_queryset_for_request") as projects,
+        patch("tracer.views.trace._has_voice_conversation_roots", return_value=True),
+        patch.object(TraceView, "list_voice_calls", return_value=page),
+    ):
+        projects.return_value.filter.return_value.first.return_value = SimpleNamespace(
+            name="Voice"
+        )
+        view = TraceView()
+        response = view.get_trace_export_data.__wrapped__(view, request)
+
+    assert _rows(response) == [
+        [
+            "ID",
+            "Call ID",
+            "Phone Number",
+            "Call Type",
+            "Status",
+            "Started At",
+            "Ended At",
+            "Duration (s)",
+            "Recording URL",
+            "Stereo Recording URL",
+            "Call Summary",
+            "Overall Score",
+            "Response Time (ms)",
+            "Cost (cents)",
+            "Ended Reason",
+            "Transcript",
+            "prompt_slug",
+        ]
+    ]
+
+
+def test_trace_export_surfaces_voice_detection_read_failure_as_retryable():
+    from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+
+    request = _request({})
+    request.validated_query_data = {
+        "project_id": "00000000-0000-0000-0000-000000000001",
+        "filters": [],
+        "attribute_keys": [],
+    }
+
+    with (
+        patch("tracer.views.trace._project_queryset_for_request") as projects,
+        patch(
+            "tracer.views.trace._has_voice_conversation_roots",
+            side_effect=ReadDeadlineExceeded("bounded detection expired"),
+        ),
+    ):
+        projects.return_value.filter.return_value.first.return_value = SimpleNamespace(
+            name="Observe"
+        )
+        view = TraceView()
+        response = view.get_trace_export_data.__wrapped__(view, request)
+
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert response.data["result"] == (
+        "Trace export data is temporarily unavailable. Please retry."
+    )
+
+
+def test_voice_modality_detection_is_one_tightly_bounded_select():
+    from tracer.views.trace import _has_voice_conversation_roots
+
+    deadline = MagicMock()
+    deadline.remaining_ms.return_value = 1_234
+    analytics = MagicMock()
+    analytics.execute_ch_query.return_value = SimpleNamespace(data=[{"present": 1}])
+
+    with patch("tracer.views.trace.V2AnalyticsQueryService", return_value=analytics):
+        assert _has_voice_conversation_roots(
+            "00000000-0000-0000-0000-000000000001",
+            read_deadline=deadline,
+        )
+
+    deadline.remaining_ms.assert_called_once_with(1_500)
+    query, params = analytics.execute_ch_query.call_args.args
+    assert query.startswith("SELECT 1 AS present FROM spans FINAL")
+    assert query.endswith("LIMIT 1")
+    assert params == {"project_id": "00000000-0000-0000-0000-000000000001"}
+    kwargs = analytics.execute_ch_query.call_args.kwargs
+    assert kwargs["timeout_ms"] == 1_234
+    assert kwargs["settings"]["max_result_rows"] == 1
+    assert kwargs["settings"]["max_bytes_to_read"] == 512 * 1024 * 1024
 
 
 def test_bounded_csv_cells_are_stable_and_formula_safe():
@@ -91,6 +375,18 @@ def test_bounded_csv_cells_are_stable_and_formula_safe():
             "",
         ],
     ]
+
+
+def test_bounded_csv_headers_are_formula_safe():
+    from tracer.utils.bounded_csv import bounded_page_csv_response
+
+    response = bounded_page_csv_response(
+        rows=[{"=dangerous-header": "safe"}],
+        fieldnames=["=dangerous-header"],
+        filename="safe.csv",
+    )
+
+    assert _rows(response) == [["'=dangerous-header"], ["safe"]]
 
 
 def test_trace_list_forces_export_bound_after_request_revalidation():
@@ -123,6 +419,45 @@ def test_trace_list_forces_export_bound_after_request_revalidation():
     assert internal_data["page_number"] == 0
     assert internal_data["page_size"] == 100
     assert internal_data["cursor_mode"] is False
+
+
+def test_voice_list_forces_export_bound_and_retains_csv_fields():
+    request = _request({})
+    request.validated_query_data = {
+        "project_id": "00000000-0000-0000-0000-000000000001",
+        "filters": [],
+        "page": 9,
+        "page_size": 1,
+        "cursor_mode": True,
+        "allow_sampled": False,
+    }
+    view = TraceView()
+    view.request = request
+    sentinel = object()
+
+    with (
+        patch("tracer.views.trace.Project.objects.get"),
+        patch("tracer.views.trace.V2AnalyticsQueryService"),
+        patch.object(
+            TraceView,
+            "_list_voice_calls_clickhouse",
+            return_value=sentinel,
+        ) as internal_list,
+    ):
+        response = TraceView.list_voice_calls.__wrapped__(
+            view, request, bounded_export=True
+        )
+
+    assert response is sentinel
+    internal_data = internal_list.call_args.args[2]
+    assert internal_data["page"] == 1
+    assert internal_data["page_size"] == 100
+    assert internal_data["cursor_mode"] is False
+    assert internal_data["allow_sampled"] is True
+    assert internal_list.call_args.kwargs == {
+        "include_export_fields": True,
+        "read_deadline": None,
+    }
 
 
 def test_span_list_forces_cursor_export_bound_after_request_revalidation():

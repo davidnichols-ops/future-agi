@@ -708,6 +708,42 @@ class TestFilterSerializerContracts:
         assert not serializer.is_valid()
         assert "projectId" in serializer.errors
 
+    def test_trace_export_query_accepts_exact_attribute_columns(self):
+        serializer = TraceExportQuerySerializer(
+            data={
+                "project_id": "1372e742-a10b-4d98-9ca4-31ef4d67115f",
+                "attribute_keys": json.dumps(
+                    ["prompt_slug", "metadata.path,with-comma", "prompt_slug"]
+                ),
+            }
+        )
+
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["attribute_keys"] == [
+            "prompt_slug",
+            "metadata.path,with-comma",
+        ]
+
+    @pytest.mark.parametrize(
+        "attribute_keys",
+        [
+            json.dumps([f"key-{index}" for index in range(101)]),
+            json.dumps(["x" * 513]),
+            json.dumps([f"{index}-" + "x" * 510 for index in range(5)]),
+            json.dumps(["ok", 1]),
+        ],
+    )
+    def test_trace_export_query_rejects_unsafe_attribute_columns(self, attribute_keys):
+        serializer = TraceExportQuerySerializer(
+            data={
+                "project_id": "1372e742-a10b-4d98-9ca4-31ef4d67115f",
+                "attribute_keys": attribute_keys,
+            }
+        )
+
+        assert not serializer.is_valid()
+        assert "attribute_keys" in serializer.errors
+
     def test_trace_voice_call_query_accepts_canonical_pagination(self):
         serializer = TraceVoiceCallListQuerySerializer(
             data={

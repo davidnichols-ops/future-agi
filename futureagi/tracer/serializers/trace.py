@@ -362,6 +362,35 @@ class TracePrototypeListResponseSerializer(serializers.Serializer):
 class TraceExportQuerySerializer(StrictInputSerializer):
     project_id = serializers.UUIDField()
     filters = filter_list_query_param_field(required=False, default=list)
+    attribute_keys = JSONOrCommaSeparatedStringListField(
+        required=False,
+        help_text=(
+            "JSON-encoded list of custom attribute keys to include as CSV "
+            "columns. Comma-separated simple keys remain supported."
+        ),
+    )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        attribute_keys = tuple(dict.fromkeys(attrs.get("attribute_keys") or ()))
+        if len(attribute_keys) > 100 or any(len(key) > 512 for key in attribute_keys):
+            raise serializers.ValidationError(
+                {
+                    "attribute_keys": (
+                        "Request at most 100 attribute keys (512 chars each)."
+                    )
+                }
+            )
+        if sum(len(key.encode("utf-8")) for key in attribute_keys) > 2_048:
+            raise serializers.ValidationError(
+                {
+                    "attribute_keys": (
+                        "Combined attribute keys must be at most 2048 UTF-8 bytes."
+                    )
+                }
+            )
+        attrs["attribute_keys"] = list(attribute_keys)
+        return attrs
 
 
 class TraceVoiceCallListQuerySerializer(TraceExportQuerySerializer):
