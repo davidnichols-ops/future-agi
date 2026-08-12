@@ -120,8 +120,10 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         self.page_number = page_number
         self.page_size = page_size
         self.filters = filters or []
+        self._eval_config_ids_known = eval_config_ids is not None
         self.eval_config_ids = eval_config_ids or []
         self.remove_simulation_calls = remove_simulation_calls
+        self._annotation_label_set_known = annotation_label_ids is not None
         self.annotation_label_ids = annotation_label_ids or []
         self._bounded_internal_scan = bool(bounded_internal_scan)
         self._bounded_identity_only = bool(bounded_identity_only)
@@ -195,8 +197,12 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
             page_number=self.page_number,
             page_size=self.page_size,
             filters=[*delegate_filters, _VOICE_ROOT_FILTER],
-            eval_config_ids=self.eval_config_ids,
-            annotation_label_ids=self.annotation_label_ids,
+            eval_config_ids=(
+                self.eval_config_ids if self._eval_config_ids_known else None
+            ),
+            annotation_label_ids=(
+                self.annotation_label_ids if self._annotation_label_set_known else None
+            ),
             bounded_internal_scan=True,
             bounded_identity_only=self._bounded_identity_only,
         )
@@ -210,6 +216,66 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         """Voice pages always use finite latest-state selection."""
 
         return self._bounded_delegate().supports_bounded_filter_scan()
+
+    def supports_filter_candidate_seed_page(self) -> bool:
+        """Use a positive eval/annotation relation before ordered voice roots.
+
+        Public voice pages delegate through an internal trace selector solely
+        to inject the canonical conversation-root invariant.  Keep historical
+        and identity-only readers on their established chronological scan;
+        only an interactive request with one positive relational leaf may use
+        this candidate-first acquisition path.
+        """
+
+        return bool(
+            not self._bounded_internal_scan
+            and not self._bounded_identity_only
+            and self._bounded_sampling_rate is None
+            and self._bounded_delegate()._positive_relational_seed_filter() is not None
+        )
+
+    @staticmethod
+    def filter_candidate_seed_proves_result_order() -> bool:
+        """Relation membership is followed by canonical ordered-root LIMIT."""
+
+        return True
+
+    def build_filter_candidate_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+        before_start_time: datetime | None = None,
+        before_id: Any = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Build one exact relation-narrowed, root-ordered voice seed page."""
+
+        if not self.supports_filter_candidate_seed_page():
+            raise ValueError("voice relation candidate seed is unavailable")
+        delegate = self._bounded_delegate()
+        return TraceListQueryBuilder.build_filter_ordered_seed_page(
+            delegate,
+            slice_start=slice_start,
+            slice_end=slice_end,
+            limit=limit,
+            before_start_time=before_start_time,
+            before_id=before_id,
+            _positive_relation_candidate_first=True,
+        )
+
+    def recommended_filter_initial_slice_width(self) -> timedelta | None:
+        """Read the frozen window once when an exact relation narrows roots."""
+
+        if not self.supports_filter_candidate_seed_page():
+            return None
+        request_start, request_end = self._bounded_request_window
+        return request_end - request_start
+
+    def recommended_filter_max_slice_width(self) -> timedelta | None:
+        """Keep relation-first continuation on the same full-window contract."""
+
+        return self.recommended_filter_initial_slice_width()
 
     def bounded_filter_degraded_error_code(self) -> str | None:
         return self._bounded_delegate().bounded_filter_degraded_error_code()

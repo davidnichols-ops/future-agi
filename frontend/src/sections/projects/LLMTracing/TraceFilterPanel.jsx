@@ -1074,6 +1074,7 @@ function PropertyPicker({
     isFetchingExactSearch = false,
     isFetchingNextExactPage = false,
     isFetchNextPageError: isNextAttributePageError,
+    exactSearchError: exactAttributeSearchError,
     queryReadState: exactAttributeReadState,
     browseStatus: exactAttributeBrowseStatus,
     pageCount: exactAttributePageCount,
@@ -1087,6 +1088,13 @@ function PropertyPicker({
     source,
     enabled: enableExactAttributeLookup && open,
   });
+  const hasSettledExactAttributeError = Boolean(
+    search.trim() &&
+      debouncedSearch === search.trim() &&
+      exactAttributeSearchError,
+  );
+  const hasAttributePageError =
+    isNextAttributePageError || hasSettledExactAttributeError;
 
   useEffect(() => {
     if (!open) {
@@ -1099,7 +1107,12 @@ function PropertyPicker({
 
   useEffect(() => {
     autoAttributeScrollPageUsedRef.current = false;
-  }, [debouncedSearch, projectId, source]);
+    // The same text can be searched again without closing the picker
+    // (foo -> clear/other -> foo). Each settled search gesture owns one
+    // bounded automatic continuation; retaining the old identity here made
+    // the repeated search look permanently stuck at its cached checkpoint.
+    autoExactSearchIdentityRef.current = null;
+  }, [search, debouncedSearch, projectId, source]);
 
   useEffect(() => {
     setVisiblePropertyLimit(PROPERTY_PICKER_RENDER_BATCH_SIZE);
@@ -1111,7 +1124,7 @@ function PropertyPicker({
     // The next natural downward gesture may therefore advance once without
     // requiring the user to scroll upward merely to clear a permanent latch.
     autoAttributeScrollPageUsedRef.current = false;
-  }, [exactAttributePageCount, isNextAttributePageError, visiblePropertyLimit]);
+  }, [exactAttributePageCount, hasAttributePageError, visiblePropertyLimit]);
 
   const usesRetainedAttributePages = shouldUseRetainedAttributePages({
     enabled: enableExactAttributeLookup,
@@ -1227,7 +1240,7 @@ function PropertyPicker({
       !hasNextExactAttributePage ||
       isFetchingExactSearch ||
       isFetchingNextExactPage ||
-      isNextAttributePageError ||
+      hasAttributePageError ||
       exactAttributeCursorRetryExhausted ||
       typeof fetchNextExactAttributePage !== "function"
     ) {
@@ -1248,7 +1261,7 @@ function PropertyPicker({
     hasNextExactAttributePage,
     isFetchingExactSearch,
     isFetchingNextExactPage,
-    isNextAttributePageError,
+    hasAttributePageError,
     loadNextExactAttributePage,
     open,
     projectId,
@@ -1356,6 +1369,25 @@ function PropertyPicker({
                   {getAttributeLookupMessage(exactAttributeReadState)}
                 </Typography>
               )}
+            {hasSettledExactAttributeError && (
+              <Box
+                role="status"
+                sx={{ mt: 0.75, display: "flex", alignItems: "center", gap: 1 }}
+              >
+                <Typography sx={{ fontSize: 11, color: "warning.main" }}>
+                  Exact attribute search could not be completed. Retained
+                  matches remain available.
+                </Typography>
+                <Button
+                  size="small"
+                  onClick={loadNextExactAttributePage}
+                  disabled={isFetchingNextExactPage}
+                  sx={{ p: 0, minWidth: 0, fontSize: 11, whiteSpace: "nowrap" }}
+                >
+                  Retry exact attribute search
+                </Button>
+              </Box>
+            )}
             {!search.trim() &&
               enableExactAttributeLookup &&
               (source === "traces" || source === "spans") &&
@@ -1379,7 +1411,7 @@ function PropertyPicker({
             {enableExactAttributeLookup &&
               (source === "traces" || source === "spans") &&
               exactAttributeReadState !== "complete" &&
-              !isNextAttributePageError &&
+              !hasAttributePageError &&
               !exactAttributeCursorRetryExhausted &&
               !exactAttributeLoading && (
                 <Button
@@ -1638,7 +1670,7 @@ function PropertyPicker({
                   </Typography>
                 </Box>
               )}
-              {isNextAttributePageError && !isFetchingNextAttributePage && (
+              {hasAttributePageError && !isFetchingNextAttributePage && (
                 <Typography
                   role="status"
                   sx={{
@@ -1677,7 +1709,7 @@ function PropertyPicker({
                       onClick={loadNextVisibleAttributePage}
                       sx={{ fontSize: 11 }}
                     >
-                      {isNextAttributePageError
+                      {hasAttributePageError
                         ? hasNextExactAttributePage
                           ? "Retry searching attributes"
                           : "Retry loading attributes"
@@ -1759,7 +1791,11 @@ function ValuePicker({
 
   useEffect(() => {
     autoScrollPageUsedRef.current = false;
-  }, [debouncedSearch, projectId, propertyId, source]);
+    // Repeating a prior value search in the same open popover is a new user
+    // gesture and may consume one bounded empty checkpoint again. Keep the
+    // one-shot guard per settled search identity, not per popover lifetime.
+    autoEmptyValueContinuationIdentityRef.current = null;
+  }, [search, debouncedSearch, projectId, propertyId, source]);
 
   // If the property declares its own static choices (e.g. the Project filter
   // on the cross-project user-detail page), use them directly. Skips both
@@ -1811,6 +1847,10 @@ function ValuePicker({
     projectIds: projectId ? [projectId] : [],
     source,
     search: usesBackendSearch ? debouncedSearch : "",
+    // Keep the transport keyed by settled text, while allowing the hook to
+    // detect rapid clear/re-entry gestures that happen inside the debounce
+    // interval and recover one cached failed continuation.
+    searchGesture: usesBackendSearch ? search.trim() : "",
     pageSize: 10,
     attributeType:
       propertyCategory === "attribute"
@@ -1847,6 +1887,7 @@ function ValuePicker({
       !anchorEl ||
       hasStaticChoices ||
       isSessionField ||
+      debouncedSearch !== search.trim() ||
       dashLoading ||
       dashError ||
       dashboardOptions.length > 0 ||
@@ -1881,6 +1922,7 @@ function ValuePicker({
     loadNextDashboardValues,
     projectId,
     propertyId,
+    search,
     source,
     usesBackendSearch,
   ]);
@@ -3070,9 +3112,17 @@ const TraceFilterPanel = ({
   const skipDynamicProperties = Boolean(propertiesOverride);
   const dynamicPropertySource =
     isSpansView || tab === "spans" ? "spans" : "traces";
+  // Voice-call rows are conversation roots, but their custom-property names
+  // are still discovered from the span attribute maps.  Keep that key
+  // inventory on its own `spans` cursor/cache identity while leaving
+  // `source="traces"` untouched below for value discovery and list filters.
+  // Conflating the two made a prior trace-key cursor/error appear as the
+  // voice picker's result when users repeated the same search.
+  const defaultAttributeSource =
+    tab === "voiceCalls" ? "spans" : dynamicPropertySource;
   const exactAttributeSource =
     attributeSourceOverride ||
-    (source === "traces" ? dynamicPropertySource : source);
+    (source === "traces" ? defaultAttributeSource : source);
   // Warm the retained attribute cursor as soon as the filter panel opens.
   // This request has its own React Query key and runs concurrently with the
   // dashboard metric catalog. Property browsing must never wait for the broad
@@ -3170,6 +3220,8 @@ const TraceFilterPanel = ({
     fetchNextPage: fetchNextQueryAttributePage,
     hasNextPage: hasNextQueryAttributePage,
     isFetchingNextPage: isFetchingNextQueryAttributePage,
+    isFetchNextPageError: isNextQueryAttributePageError,
+    exactSearchError: queryExactAttributeSearchError,
     queryReadState: queryAttributeReadState,
     browseStatus: queryAttributeBrowseStatus,
     debouncedSearch: debouncedQueryFieldSearch,
@@ -3322,6 +3374,8 @@ const TraceFilterPanel = ({
     debouncedQueryValueSearch?.field === queryField
       ? debouncedQueryValueSearch.value
       : "";
+  const effectiveQueryValueSearchGesture =
+    queryValueSearch?.field === queryField ? queryValueSearch.value : "";
   const {
     data: queryValueOptions = [],
     isLoading: queryValuesLoading,
@@ -3337,6 +3391,10 @@ const TraceFilterPanel = ({
     source,
     search:
       queryMetricType === "custom_attribute" ? effectiveQueryValueSearch : "",
+    searchGesture:
+      queryMetricType === "custom_attribute"
+        ? effectiveQueryValueSearchGesture
+        : "",
     pageSize: queryMetricType === "custom_attribute" ? 10 : undefined,
     attributeType:
       queryMetricType === "custom_attribute"
@@ -3856,6 +3914,9 @@ const TraceFilterPanel = ({
                   queryFieldSearch.trim() !== debouncedQueryFieldSearch)
               }
               fieldLoadingMore={isFetchingNextQueryAttributePage}
+              fieldLoadError={Boolean(
+                isNextQueryAttributePageError || queryExactAttributeSearchError,
+              )}
               hasMoreFields={Boolean(hasNextQueryAttributePage)}
               onLoadMoreFields={loadNextQueryAttributePage}
               onFieldSearchChange={setQueryFieldSearch}

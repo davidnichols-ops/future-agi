@@ -110,6 +110,7 @@ function renderPanel({
   projectId,
   source,
   attributeSource,
+  tab,
 }) {
   const anchorEl = document.createElement("button");
   document.body.appendChild(anchorEl);
@@ -129,6 +130,7 @@ function renderPanel({
         projectId={projectId}
         source={source}
         attributeSource={attributeSource}
+        tab={tab}
       />
     </QueryClientProvider>
   );
@@ -1307,6 +1309,54 @@ describe("exact manual attribute fallback", () => {
     document.body.removeChild(anchorEl);
   });
 
+  it("keeps voice property keys span-scoped and searched values trace-scoped", () => {
+    dashboardFilterValuesMock.mockClear();
+    exactAttributePropertiesMock.mockClear();
+    const finalStatus = {
+      id: "final_status",
+      name: "final_status",
+      category: "attribute",
+      rawCategory: "custom_attribute",
+      type: "string",
+      attributeTypes: ["string"],
+      attributeTypesExact: false,
+      apiColType: "SPAN_ATTRIBUTE",
+    };
+    const { anchorEl } = renderPanel({
+      properties: [finalStatus],
+      projectId: "project-voice-whatfix",
+      source: "traces",
+      tab: "voiceCalls",
+      currentFilters: [
+        {
+          field: "final_status",
+          fieldName: "final_status",
+          fieldCategory: "attribute",
+          fieldType: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          operator: "in",
+          value: [],
+        },
+      ],
+    });
+
+    expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: "project-voice-whatfix",
+        source: "spans",
+      }),
+    );
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metricName: "final_status",
+        metricType: "custom_attribute",
+        source: "traces",
+      }),
+    );
+
+    document.body.removeChild(anchorEl);
+  });
+
   it("uses cursor-discovered attributes as the canonical paginated inventory", () => {
     const systemProperty = {
       id: "status",
@@ -1522,6 +1572,60 @@ describe("exact manual attribute fallback", () => {
 
     document.body.removeChild(anchorEl);
   });
+
+  it.each([
+    ["tracing", undefined, "traces"],
+    ["voice", "voiceCalls", "spans"],
+  ])(
+    "lets %s repeat the same property search in one open picker",
+    async (_surface, tab, expectedAttributeSource) => {
+      const fetchPromptPage = vi.fn(() => Promise.resolve());
+      exactAttributePropertiesMock.mockImplementation(({ search, source }) => ({
+        data: [],
+        isFetching: false,
+        fetchNextPage: vi.fn(),
+        hasNextPage: Boolean(search),
+        isFetchingNextPage: false,
+        fetchNextExactPage:
+          search === "prompt_slug" ? fetchPromptPage : vi.fn(),
+        hasNextExactPage: Boolean(search),
+        isFetchingExactSearch: false,
+        isFetchingNextExactPage: false,
+        isFetchNextPageError: false,
+        queryReadState: "complete",
+        browseStatus: search ? "continuation" : "exhausted",
+        pageCount: 1,
+        exactSearchMatched: false,
+        cursorRetryExhausted: false,
+        debouncedSearch: search.trim(),
+        refetch: vi.fn(),
+        source,
+      }));
+      const { anchorEl } = renderPanel({
+        properties: [],
+        projectId: `project-${_surface}`,
+        source: "traces",
+        tab,
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "Property" }));
+      const searchInput = screen.getByPlaceholderText("Search properties...");
+      fireEvent.change(searchInput, { target: { value: "prompt_slug" } });
+      await waitFor(() => expect(fetchPromptPage).toHaveBeenCalledOnce());
+
+      // Re-enter before the debounce interval elapses. The raw gesture must
+      // clear the one-shot identity even while the settled query stays cached.
+      fireEvent.change(searchInput, { target: { value: "" } });
+      fireEvent.change(searchInput, { target: { value: "prompt_slug" } });
+      await waitFor(() => expect(fetchPromptPage).toHaveBeenCalledTimes(2));
+
+      expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
+        expect.objectContaining({ source: expectedAttributeSource }),
+      );
+      expect(fetchPromptPage).toHaveBeenCalledTimes(2);
+      document.body.removeChild(anchorEl);
+    },
+  );
 
   it("coalesces exact-search scroll and button gestures into one continuation", () => {
     let resolveExactPage;
@@ -1776,6 +1880,63 @@ describe("exact manual attribute fallback", () => {
     document.body.removeChild(anchorEl);
   });
 
+  it("shows a retryable exact-search error without hiding retained partial matches", () => {
+    const fetchNextExactPage = vi.fn();
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [
+        {
+          id: "prompt_slug_archive",
+          name: "prompt_slug_archive",
+          category: "attribute",
+          rawCategory: "custom_attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      isFetching: false,
+      fetchNextPage: vi.fn(),
+      hasNextPage: true,
+      isFetchingNextPage: false,
+      fetchNextExactPage,
+      hasNextExactPage: true,
+      isFetchingExactSearch: false,
+      isFetchingNextExactPage: false,
+      isFetchNextPageError: false,
+      exactSearchError: new Error("sanitized by picker"),
+      queryReadState: "complete",
+      browseStatus: "exhausted",
+      pageCount: 1,
+      exactSearchMatched: false,
+      cursorRetryExhausted: false,
+      debouncedSearch: "prompt",
+      refetch: vi.fn(),
+    });
+    const { anchorEl } = renderPanel({
+      properties: [],
+      projectId: "project-whatfix",
+      source: "traces",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "prompt" },
+    });
+
+    expect(screen.getByText("prompt_slug_archive")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Exact attribute search could not be completed. Retained matches remain available.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry exact attribute search" }),
+    );
+    expect(fetchNextExactPage).toHaveBeenCalledOnce();
+    expect(screen.queryByText("sanitized by picker")).not.toBeInTheDocument();
+
+    document.body.removeChild(anchorEl);
+  });
+
   it("offers a sanitized retry when the initial attribute read is unavailable", () => {
     const refetch = vi.fn();
     exactAttributePropertiesMock.mockReturnValue({
@@ -2002,6 +2163,80 @@ describe("filter-value picker bounded-read UX", () => {
 
     document.body.removeChild(anchorEl);
   });
+
+  it.each([
+    ["tracing", undefined],
+    ["voice", "voiceCalls"],
+  ])(
+    "lets %s repeat the same selected-property value search in one open picker",
+    async (_surface, tab) => {
+      const fetchRejectedPage = vi.fn(() => Promise.resolve());
+      dashboardFilterValuesMock.mockImplementation((request) => ({
+        ...defaultDashboardFilterValues(),
+        data: request.search
+          ? []
+          : [{ value: "recent", label: "recent", type: "string" }],
+        browseStatus: request.search ? "continuation" : "exhausted",
+        hasNextPage: Boolean(request.search),
+        fetchNextPage:
+          request.search === "rejected" ? fetchRejectedPage : vi.fn(),
+      }));
+      const promptSlugProperty = {
+        id: "prompt_slug",
+        name: "prompt_slug",
+        category: "attribute",
+        type: "string",
+        attributeTypes: ["string"],
+        attributeTypesExact: false,
+        apiColType: "SPAN_ATTRIBUTE",
+      };
+      const { anchorEl } = renderPanel({
+        currentFilters: [
+          {
+            field: "prompt_slug",
+            fieldName: "prompt_slug",
+            fieldCategory: "attribute",
+            fieldType: "string",
+            apiColType: "SPAN_ATTRIBUTE",
+            operator: "in",
+            value: [],
+          },
+        ],
+        properties: [promptSlugProperty],
+        projectId: `project-${_surface}`,
+        source: "traces",
+        tab,
+      });
+
+      fireEvent.click(
+        document.querySelector('[data-filter-value-trigger="prompt_slug"]'),
+      );
+      const searchInput = screen.getByPlaceholderText("Search values...");
+      fireEvent.change(searchInput, { target: { value: "rejected" } });
+      await waitFor(() => expect(fetchRejectedPage).toHaveBeenCalledOnce(), {
+        timeout: 1_500,
+      });
+
+      // Clear and re-enter immediately, before the 500 ms value-search
+      // debounce can publish the intermediate empty query.
+      fireEvent.change(searchInput, { target: { value: "" } });
+      fireEvent.change(searchInput, { target: { value: "rejected" } });
+      await waitFor(() => expect(fetchRejectedPage).toHaveBeenCalledTimes(2), {
+        timeout: 1_500,
+      });
+
+      expect(fetchRejectedPage).toHaveBeenCalledTimes(2);
+      expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metricName: "prompt_slug",
+          metricType: "custom_attribute",
+          search: "rejected",
+          source: "traces",
+        }),
+      );
+      document.body.removeChild(anchorEl);
+    },
+  );
 
   it("stops on a failed value continuation until the user retries", () => {
     const fetchNextPage = vi.fn();
@@ -2591,6 +2826,122 @@ describe("filter-value picker bounded-read UX", () => {
     document.body.removeChild(anchorEl);
   });
 
+  it.each([
+    ["tracing", undefined],
+    ["voice", "voiceCalls"],
+  ])(
+    "passes rapid %s Query-value re-entry separately from its settled request",
+    async (_surface, tab) => {
+      const promptSlugProperty = {
+        id: "prompt_slug",
+        name: "prompt_slug",
+        category: "attribute",
+        rawCategory: "custom_attribute",
+        type: "string",
+        attributeTypes: ["string"],
+        attributeTypesExact: false,
+        apiColType: "SPAN_ATTRIBUTE",
+      };
+      exactAttributePropertiesMock.mockImplementation(({ search }) => ({
+        data: [promptSlugProperty],
+        isFetching: false,
+        fetchNextPage: vi.fn(),
+        hasNextPage: false,
+        isFetchingNextPage: false,
+        fetchNextExactPage: vi.fn(),
+        hasNextExactPage: false,
+        isFetchingExactSearch: false,
+        isFetchingNextExactPage: false,
+        isFetchNextPageError: false,
+        exactSearchError: null,
+        queryReadState: "complete",
+        browseStatus: "exhausted",
+        pageCount: 1,
+        exactSearchMatched: search === "prompt_slug",
+        cursorRetryExhausted: false,
+        debouncedSearch: search.trim(),
+        refetch: vi.fn(),
+      }));
+      dashboardFilterValuesMock.mockImplementation((request) => ({
+        ...defaultDashboardFilterValues(),
+        data:
+          request.metricName === "prompt_slug"
+            ? [{ value: "Rejected-old", label: "Rejected-old" }]
+            : [],
+        hasNextPage:
+          request.metricName === "prompt_slug" && request.search === "Rejected",
+        isFetchNextPageError:
+          request.metricName === "prompt_slug" && request.search === "Rejected",
+      }));
+      const { anchorEl } = renderPanel({
+        properties: [promptSlugProperty],
+        projectId: `project-${_surface}`,
+        source: "traces",
+        tab,
+        showQueryTab: true,
+      });
+
+      fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+      const input = await selectQueryPhaseOption(
+        "prompt_slug",
+        "pick operator...",
+      );
+      fireEvent.change(input, { target: { value: "equals" } });
+      fireEvent.click(await screen.findByRole("option", { name: /^equals$/i }));
+      await waitFor(() =>
+        expect(input).toHaveAttribute("placeholder", "type or pick value..."),
+      );
+
+      fireEvent.change(input, { target: { value: "Rejected" } });
+      await waitFor(
+        () =>
+          expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+              metricName: "prompt_slug",
+              metricType: "custom_attribute",
+              source: "traces",
+              search: "Rejected",
+              searchGesture: "Rejected",
+            }),
+          ),
+        { timeout: 1_500 },
+      );
+
+      const callsBeforeRapidReentry =
+        dashboardFilterValuesMock.mock.calls.length;
+      // No wait between these changes: the debounced transport remains on the
+      // cached failed `Rejected` query while raw gesture identity changes.
+      fireEvent.change(input, { target: { value: "" } });
+      fireEvent.change(input, { target: { value: "Rejected" } });
+
+      await waitFor(() => {
+        const rapidRequests = dashboardFilterValuesMock.mock.calls
+          .slice(callsBeforeRapidReentry)
+          .map(([request]) => request)
+          .filter(({ metricName }) => metricName === "prompt_slug");
+        expect(rapidRequests.map(({ searchGesture }) => searchGesture)).toEqual(
+          expect.arrayContaining(["", "Rejected"]),
+        );
+        // Raw and settled identities are observably independent during this
+        // rapid transition; the hook-level regression keeps `search` fixed to
+        // the failed cached key and proves that this gesture retries it once.
+        expect(
+          rapidRequests.some(
+            ({ search, searchGesture }) => search !== searchGesture,
+          ),
+        ).toBe(true);
+        expect(rapidRequests.at(-1)).toEqual(
+          expect.objectContaining({
+            search: "Rejected",
+            searchGesture: "Rejected",
+          }),
+        );
+      });
+
+      document.body.removeChild(anchorEl);
+    },
+  );
+
   it("keeps a cursor continuation distinct from the initial Query field load", async () => {
     exactAttributePropertiesMock.mockReturnValue({
       data: [],
@@ -2626,6 +2977,58 @@ describe("filter-value picker bounded-read UX", () => {
     expect(
       await screen.findByText("Loading more fields..."),
     ).toBeInTheDocument();
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("keeps retained Query fields visible and labels an exact-search retry", async () => {
+    const retryFieldSearch = vi.fn();
+    exactAttributePropertiesMock.mockImplementation(({ search }) => ({
+      data: [
+        {
+          id: "prompt_slug_archive",
+          name: "prompt_slug_archive",
+          category: "attribute",
+          rawCategory: "custom_attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      isFetching: false,
+      fetchNextPage: retryFieldSearch,
+      hasNextPage: Boolean(search),
+      isFetchingNextPage: false,
+      isFetchNextPageError: Boolean(search),
+      exactSearchError: search ? new Error("hidden backend detail") : null,
+      queryReadState: "complete",
+      browseStatus: search ? "continuation" : "exhausted",
+      pageCount: 1,
+      exactSearchMatched: false,
+      cursorRetryExhausted: false,
+      debouncedSearch: search.trim(),
+      refetch: vi.fn(),
+    }));
+    const { anchorEl } = renderPanel({
+      properties: [],
+      projectId: "project-whatfix",
+      source: "traces",
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    const input = screen.getByRole("combobox");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "prompt" } });
+
+    expect(await screen.findByText("prompt_slug_archive")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "More fields could not be loaded. Retained matches remain available.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Retry loading fields"));
+    expect(retryFieldSearch).toHaveBeenCalledOnce();
+    expect(screen.queryByText("hidden backend detail")).not.toBeInTheDocument();
 
     document.body.removeChild(anchorEl);
   });

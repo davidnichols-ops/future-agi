@@ -1,5 +1,5 @@
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
@@ -41,7 +41,8 @@ export function useExactTraceAttributeProperties({
   enabled = true,
 }) {
   const queryClient = useQueryClient();
-  const debouncedSearch = useDebounce(String(search || "").trim(), 350);
+  const normalizedSearch = String(search || "").trim();
+  const debouncedSearch = useDebounce(normalizedSearch, 350);
   const supportedSource = source === "traces" || source === "spans";
   const retainedQueryKey = ["trace-attribute-retained", projectId, source];
   const exactQueryKey = [
@@ -56,10 +57,31 @@ export function useExactTraceAttributeProperties({
     source,
     debouncedSearch,
   ]);
+  const exactRetryGestureIdentity = JSON.stringify([
+    projectId,
+    source,
+    normalizedSearch,
+  ]);
   const [cursorRetryState, setCursorRetryState] = useState({
     retained: null,
     exact: null,
   });
+  const exactSearchGestureStateRef = useRef({
+    scope: null,
+    previous: null,
+    pendingRetry: null,
+  });
+
+  useEffect(() => {
+    // A stopped cursor belongs to one exact project/source/search identity.
+    // Re-entering the same text after another search is a fresh bounded lookup,
+    // so it must not inherit an exhausted retry from the previous session.
+    setCursorRetryState((current) =>
+      current.exact && current.exact.identity !== exactRetryGestureIdentity
+        ? { ...current, exact: null }
+        : current,
+    );
+  }, [exactRetryGestureIdentity]);
 
   const retainedQuery = useInfiniteQuery({
     // Attribute names describe the retained project schema. Task/dashboard
@@ -135,6 +157,57 @@ export function useExactTraceAttributeProperties({
     meta: { errorHandled: true },
   });
 
+  useEffect(() => {
+    const scope = JSON.stringify([projectId, source]);
+    const identity = JSON.stringify([projectId, source, normalizedSearch]);
+    const state = exactSearchGestureStateRef.current;
+    if (state.scope !== scope) {
+      state.scope = scope;
+      state.previous = null;
+      state.pendingRetry = null;
+    }
+    if (state.previous === identity) return;
+    state.previous = identity;
+    if (!enabled || !normalizedSearch) {
+      state.pendingRetry = null;
+      return;
+    }
+    // Every non-empty raw transition may recover an already-cached failed
+    // query. A genuinely new query is fetching and consumes this marker below
+    // without issuing a second request.
+    state.pendingRetry = identity;
+  }, [enabled, normalizedSearch, projectId, source]);
+
+  useEffect(() => {
+    const identity = JSON.stringify([projectId, source, normalizedSearch]);
+    const state = exactSearchGestureStateRef.current;
+    if (
+      state.pendingRetry !== identity ||
+      !normalizedSearch ||
+      debouncedSearch !== normalizedSearch
+    ) {
+      return;
+    }
+    if (exactQuery.isFetching) {
+      state.pendingRetry = null;
+      return;
+    }
+    const continuationFailed =
+      exactQuery.isFetchNextPageError && exactQuery.hasNextPage;
+    const cachedReadFailed = exactQuery.isError || exactQuery.isRefetchError;
+    if (!continuationFailed && !cachedReadFailed) {
+      state.pendingRetry = null;
+      return;
+    }
+
+    // Consume the re-entry before starting I/O. Query state changes cannot
+    // trigger another automatic request; another retry requires another raw
+    // search gesture or the explicit picker action.
+    state.pendingRetry = null;
+    if (continuationFailed) void exactQuery.fetchNextPage();
+    else void exactQuery.refetch();
+  }, [debouncedSearch, exactQuery, normalizedSearch, projectId, source]);
+
   const retainedPages = retainedQuery.data?.pages || [];
   const exactPages = exactQuery.data?.pages || [];
   const retainedCursorStopped = isAttributeKeyCursorChainStopped(
@@ -193,25 +266,23 @@ export function useExactTraceAttributeProperties({
       },
     ),
   );
-  const pageReadStates = [
-    ...retainedPages.map((page) => getAttributeKeyPageReadState(page)),
-    ...exactPages.map((page) =>
-      getAttributeKeyPageReadState(page, { exact: true }),
-    ),
-  ];
-  const queryIsError =
-    retainedQuery.isError || (Boolean(debouncedSearch) && exactQuery.isError);
-  const queryReadState = queryIsError
+  // The retained cursor is the authoritative property inventory. The exact-q
+  // chain is a supplemental accelerator for one raw key, so its timeout or
+  // protocol stop must not hide already-loaded partial matches or turn their
+  // picker into a global error. Keep the exact failure separately retryable.
+  const retainedPageReadStates = retainedPages.map((page) =>
+    getAttributeKeyPageReadState(page),
+  );
+  const queryReadState = retainedQuery.isError
     ? "error"
-    : retainedCursorStopped || exactCursorStopped
+    : retainedCursorStopped
       ? "degraded"
-      : pageReadStates.includes("degraded")
+      : retainedPageReadStates.includes("degraded")
         ? "degraded"
-        : pageReadStates.includes("sampled")
+        : retainedPageReadStates.includes("sampled")
           ? "sampled"
           : "complete";
   const retainedLastPage = retainedPages.at(-1);
-  const exactLastPage = exactPages.at(-1);
   const exactSearchMatched = Boolean(
     debouncedSearch &&
       exactPages.some(
@@ -221,15 +292,26 @@ export function useExactTraceAttributeProperties({
             page.result.some(({ key }) => key === debouncedSearch)),
       ),
   );
-  const browseStatus = debouncedSearch
-    ? exactLastPage?.browse_status || retainedLastPage?.browse_status
-    : retainedLastPage?.browse_status;
+  const browseStatus = retainedLastPage?.browse_status;
   const retainedHasNextPage =
     retainedQuery.hasNextPage || retainedStoppedRetryAvailable;
   const shouldAdvanceExact = Boolean(debouncedSearch) && !exactSearchMatched;
+  // A failed page-one exact probe has no pageParam to retry through
+  // `fetchNextPage`; refetching the same query key correctly starts from a
+  // cursorless page one. A failed later page keeps `hasNextPage` and retries
+  // that same signed continuation instead.
+  const exactInitialError = Boolean(
+    shouldAdvanceExact && exactQuery.isError && !exactQuery.data,
+  );
+  const exactRefetchError = Boolean(
+    shouldAdvanceExact && exactQuery.isRefetchError && exactQuery.data,
+  );
   const exactHasNextPage =
     shouldAdvanceExact &&
-    (exactQuery.hasNextPage || exactStoppedRetryAvailable);
+    (exactQuery.hasNextPage ||
+      exactStoppedRetryAvailable ||
+      exactInitialError ||
+      exactRefetchError);
   // Give the exact-q chain first priority, but do not turn an absent exact key
   // into a hidden retained-catalog ceiling. Once exact search is exhausted, a
   // later deliberate gesture resumes the cached retained cursor so partial
@@ -265,6 +347,10 @@ export function useExactTraceAttributeProperties({
       reads.push(exactQuery.refetch(...args));
     } else if (shouldAdvanceExact && exactQuery.hasNextPage) {
       reads.push(exactQuery.fetchNextPage(...args));
+    } else if (exactInitialError) {
+      reads.push(exactQuery.refetch(...args));
+    } else if (exactRefetchError) {
+      reads.push(exactQuery.refetch(...args));
     }
     return reads.length === 1 ? reads[0] : Promise.allSettled(reads);
   };
@@ -281,6 +367,8 @@ export function useExactTraceAttributeProperties({
       return exactQuery.refetch(...args);
     }
     if (exactQuery.hasNextPage) return exactQuery.fetchNextPage(...args);
+    if (exactInitialError) return exactQuery.refetch(...args);
+    if (exactRefetchError) return exactQuery.refetch(...args);
     return Promise.resolve();
   };
   const refetch = (...args) => {
@@ -303,13 +391,14 @@ export function useExactTraceAttributeProperties({
     isFetching:
       retainedQuery.isFetching ||
       (Boolean(debouncedSearch) && exactQuery.isFetching),
-    isLoading:
-      retainedQuery.isLoading ||
-      (Boolean(debouncedSearch) && exactQuery.isLoading),
-    isError: queryIsError,
-    isSuccess:
-      retainedQuery.isSuccess && (!debouncedSearch || exactQuery.isSuccess),
-    error: exactQuery.error || retainedQuery.error,
+    isLoading: retainedQuery.isLoading,
+    isError: retainedQuery.isError,
+    isSuccess: retainedQuery.isSuccess,
+    error: retainedQuery.error,
+    // Optional exact lookup failures stay visible to the search controls
+    // without poisoning the authoritative retained inventory above.
+    exactSearchError:
+      Boolean(debouncedSearch) && exactQuery.isError ? exactQuery.error : null,
     hasNextPage,
     // Exact typed search has its own cursor chain. The property picker may
     // advance this once automatically for a settled search without also
@@ -319,10 +408,12 @@ export function useExactTraceAttributeProperties({
     isFetchingExactSearch: Boolean(debouncedSearch) && exactQuery.isFetching,
     isFetchingNextExactPage:
       (shouldAdvanceExact && exactQuery.isFetchingNextPage) ||
-      (shouldAdvanceExact && exactCursorStopped && exactQuery.isFetching),
-    // One scroll advances both independent cursors until an exact key is
-    // verified. A long-running/absent exact lookup therefore cannot starve
-    // discovery of older catalog keys that match partial text locally.
+      (shouldAdvanceExact &&
+        (exactCursorStopped || exactInitialError) &&
+        exactQuery.isFetching),
+    // One action advances exactly one chain: exact-q first, then the retained
+    // catalog after exact absence. This keeps partial local search reachable
+    // without racing two unrelated signed cursors.
     fetchNextPage,
     refetch,
     isFetchingNextPage:
@@ -335,6 +426,8 @@ export function useExactTraceAttributeProperties({
     isFetchNextPageError:
       (shouldAdvanceRetained && retainedQuery.isFetchNextPageError) ||
       (shouldAdvanceExact && exactQuery.isFetchNextPageError) ||
+      exactInitialError ||
+      exactRefetchError ||
       (shouldAdvanceRetained && retainedStoppedRetryAvailable) ||
       (shouldAdvanceExact && exactStoppedRetryAvailable),
     cursorRetryExhausted:

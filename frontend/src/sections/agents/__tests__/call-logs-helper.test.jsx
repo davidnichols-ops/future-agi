@@ -220,6 +220,88 @@ describe("useCallLogs", () => {
     );
   });
 
+  it("keeps the searched custom-property filter on voice p1 and p2", async () => {
+    const pagination = createListCursorPagination({
+      pageParam: "page",
+      pageOffset: 1,
+    });
+    const propertyFilters = JSON.stringify([
+      {
+        column_id: "prompt_slug",
+        filter_config: {
+          col_type: "SPAN_ATTRIBUTE",
+          filter_op: "equals",
+          filter_value: "rejected",
+        },
+      },
+    ]);
+    axiosMocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            results: [{ id: "voice-call-1" }],
+            count: 2,
+            count_is_lower_bound: false,
+            has_more: true,
+            next_cursor: "signed-voice-property-page-2",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            results: [{ id: "voice-call-2" }],
+            count: 2,
+            count_is_lower_bound: false,
+            has_more: false,
+            next_cursor: null,
+          },
+        },
+      });
+
+    const { result, rerender } = renderHook(
+      ({ page }) =>
+        useCallLogs({
+          module: "project",
+          id: "project-colly",
+          page,
+          pageLimit: 1,
+          params: {
+            project_id: "project-colly",
+            filters: propertyFilters,
+          },
+          cursorPagination: pagination,
+          paginationGeneration: pagination.generation(),
+        }),
+      { initialProps: { page: 1 }, wrapper: createWrapper() },
+    );
+
+    await waitFor(() =>
+      expect(result.current.data?.results).toEqual([{ id: "voice-call-1" }]),
+    );
+    rerender({ page: 2 });
+    await waitFor(() =>
+      expect(result.current.data?.results).toEqual([{ id: "voice-call-2" }]),
+    );
+
+    expect(axiosMocks.get.mock.calls[0][1].params).toEqual({
+      project_id: "project-colly",
+      filters: propertyFilters,
+      cursor_mode: true,
+      page: 1,
+      page_size: 1,
+    });
+    expect(axiosMocks.get.mock.calls[1][1].params).toEqual({
+      project_id: "project-colly",
+      filters: propertyFilters,
+      cursor_mode: true,
+      cursor: "signed-voice-property-page-2",
+      page_size: 1,
+    });
+    expect(axiosMocks.get.mock.calls[1][1].params).not.toHaveProperty("page");
+    expect(result.current.data.results[0].id).not.toBe("voice-call-1");
+  });
+
   it("retries voice page one once without cursor fields on a legacy API", async () => {
     const pagination = createListCursorPagination({
       pageParam: "page",

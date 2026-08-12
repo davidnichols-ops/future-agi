@@ -612,6 +612,7 @@ const QueryInput = forwardRef(function QueryInput(
     valueLoadingMore = false,
     fieldLoading = false,
     fieldLoadingMore = false,
+    fieldLoadError = false,
     onFieldChange,
     onFieldSearchChange,
     onLoadMoreFields,
@@ -746,11 +747,22 @@ const QueryInput = forwardRef(function QueryInput(
       ...matchingOptions,
       {
         id: QUERY_FIELD_LOAD_MORE_OPTION,
-        label: fieldLoadingMore ? "Loading more fields..." : "Load more fields",
+        label: fieldLoadingMore
+          ? "Loading more fields..."
+          : fieldLoadError
+            ? "Retry loading fields"
+            : "Load more fields",
         type: "field_load_more",
       },
     ];
-  }, [fieldLoadingMore, hasMoreFields, inputValue, options, phase]);
+  }, [
+    fieldLoadError,
+    fieldLoadingMore,
+    hasMoreFields,
+    inputValue,
+    options,
+    phase,
+  ]);
 
   const exactInputOption = useMemo(() => {
     const candidate = inputValue.trim().toLowerCase();
@@ -1450,6 +1462,14 @@ const QueryInput = forwardRef(function QueryInput(
           {...params}
           inputRef={inputRef}
           placeholder={placeholder}
+          helperText={
+            phase === "field" && fieldLoadError
+              ? "More fields could not be loaded. Retained matches remain available."
+              : undefined
+          }
+          FormHelperTextProps={
+            phase === "field" && fieldLoadError ? { role: "status" } : undefined
+          }
           onFocus={() => {
             setFocused(true);
             setDropdownOpen(true);
@@ -1495,6 +1515,7 @@ QueryInput.propTypes = {
   valueLoadingMore: PropTypes.bool,
   fieldLoading: PropTypes.bool,
   fieldLoadingMore: PropTypes.bool,
+  fieldLoadError: PropTypes.bool,
   onFieldChange: PropTypes.func,
   onFieldSearchChange: PropTypes.func,
   onLoadMoreFields: PropTypes.func,

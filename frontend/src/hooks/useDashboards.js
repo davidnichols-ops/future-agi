@@ -4,6 +4,7 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 import axios, { endpoints } from "src/utils/axios";
 import { getFilterValueReadState } from "src/utils/queryReadState";
 import { accumulateUniqueListContinuations } from "src/sections/projects/LLMTracing/listCursorPagination";
@@ -392,10 +393,17 @@ export function useDashboardFilterValues({
   workflow,
   enabled = true,
   search = "",
+  searchGesture = search,
   pageSize,
   attributeType,
 }) {
   const queryClient = useQueryClient();
+  const normalizedSearchGesture = String(searchGesture || "").trim();
+  const valueSearchGestureStateRef = useRef({
+    scope: null,
+    previous: null,
+    pendingRetry: null,
+  });
   const queryKey = [
     ...DASHBOARD_KEYS.all,
     "filterValues",
@@ -513,6 +521,88 @@ export function useDashboardFilterValues({
     // global query handler from echoing a backend/ClickHouse error payload.
     meta: { errorHandled: true },
   });
+
+  useEffect(() => {
+    const scope = JSON.stringify([
+      metricName,
+      metricType,
+      projectIds,
+      source,
+      workflow,
+      pageSize,
+      attributeType,
+    ]);
+    const identity = JSON.stringify([scope, normalizedSearchGesture]);
+    const state = valueSearchGestureStateRef.current;
+    if (state.scope !== scope) {
+      state.scope = scope;
+      state.previous = null;
+      state.pendingRetry = null;
+    }
+    if (state.previous === identity) return;
+    state.previous = identity;
+    if (!enabled || !normalizedSearchGesture) {
+      state.pendingRetry = null;
+      return;
+    }
+    state.pendingRetry = identity;
+  }, [
+    attributeType,
+    enabled,
+    metricName,
+    metricType,
+    normalizedSearchGesture,
+    pageSize,
+    projectIds,
+    source,
+    workflow,
+  ]);
+
+  useEffect(() => {
+    const scope = JSON.stringify([
+      metricName,
+      metricType,
+      projectIds,
+      source,
+      workflow,
+      pageSize,
+      attributeType,
+    ]);
+    const identity = JSON.stringify([scope, normalizedSearchGesture]);
+    const state = valueSearchGestureStateRef.current;
+    if (
+      state.pendingRetry !== identity ||
+      !normalizedSearchGesture ||
+      String(search || "").trim() !== normalizedSearchGesture
+    ) {
+      return;
+    }
+    if (query.isFetching) {
+      state.pendingRetry = null;
+      return;
+    }
+    const continuationFailed = query.isFetchNextPageError && query.hasNextPage;
+    const cachedReadFailed = query.isError || query.isRefetchError;
+    if (!continuationFailed && !cachedReadFailed) {
+      state.pendingRetry = null;
+      return;
+    }
+
+    state.pendingRetry = null;
+    if (continuationFailed) void query.fetchNextPage();
+    else void query.refetch();
+  }, [
+    attributeType,
+    metricName,
+    metricType,
+    normalizedSearchGesture,
+    pageSize,
+    projectIds,
+    query,
+    search,
+    source,
+    workflow,
+  ]);
 
   const pages = query.data?.pages || [];
   const cursorChainStopped = isFilterValueCursorChainStopped(query.data);

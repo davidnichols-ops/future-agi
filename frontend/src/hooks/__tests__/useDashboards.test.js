@@ -711,6 +711,91 @@ describe("useDashboardFilterValues bounded-read state", () => {
     expect(mocks.get.mock.calls[1][1].params).not.toHaveProperty("cursor");
   });
 
+  it.each(["tracing", "voice"])(
+    "retries one cached failed %s value continuation after rapid re-entry",
+    async (surface) => {
+      let continuationAttempts = 0;
+      mocks.get.mockImplementation((_url, { params }) => {
+        if (!params.cursor) {
+          return Promise.resolve({
+            data: {
+              result: {
+                values: [{ value: "rejected-old", type: "string" }],
+                query_complete: true,
+                query_status: "complete",
+                browse_status: "continuation",
+                has_more: true,
+                next_cursor: "value-page-2",
+              },
+            },
+          });
+        }
+        continuationAttempts += 1;
+        if (continuationAttempts === 1) {
+          return Promise.reject(new Error("value continuation unavailable"));
+        }
+        return Promise.resolve({
+          data: {
+            result: {
+              values: [{ value: "rejected", type: "string" }],
+              query_complete: true,
+              query_status: "complete",
+              browse_status: "exhausted",
+              has_more: false,
+              next_cursor: null,
+            },
+          },
+        });
+      });
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      const { result, rerender } = renderHook(
+        ({ searchGesture }) =>
+          useDashboardFilterValues({
+            metricName: "prompt_slug",
+            metricType: "custom_attribute",
+            projectIds: [`project-${surface}`],
+            // Voice values and voice list filters are trace-root scoped too.
+            source: "traces",
+            search: "rejected",
+            searchGesture,
+            pageSize: 10,
+          }),
+        {
+          initialProps: { searchGesture: "rejected" },
+          wrapper: createQueryWrapper(queryClient),
+        },
+      );
+
+      await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+      await act(async () => result.current.fetchNextPage());
+      await waitFor(() =>
+        expect(result.current.isFetchNextPageError).toBe(true),
+      );
+      expect(continuationAttempts).toBe(1);
+
+      // The debounced transport key stays `rejected`; only the raw gesture
+      // changes. The cached failed c1 must receive one fresh bounded retry.
+      rerender({ searchGesture: "" });
+      rerender({ searchGesture: "rejected" });
+      await waitFor(() =>
+        expect(result.current.data).toEqual([
+          { value: "rejected-old", type: "string" },
+          { value: "rejected", type: "string" },
+        ]),
+      );
+
+      expect(continuationAttempts).toBe(2);
+      expect(
+        mocks.get.mock.calls.filter(
+          ([, options]) =>
+            options.params.search === "rejected" && !options.params.cursor,
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
   it("starts a new property value lookup from cursorless page one", async () => {
     mocks.get.mockResolvedValue({
       data: {

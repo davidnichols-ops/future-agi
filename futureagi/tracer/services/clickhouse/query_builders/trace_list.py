@@ -241,10 +241,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self.page_size = page_size
         self.filters = filters or []
         self.sort_params = sort_params or []
+        self._eval_config_ids_known = eval_config_ids is not None
         self.eval_config_ids = eval_config_ids or []
         self.project_version_id = project_version_id
         self.search = search.strip() if search else None
         self.columns = columns
+        self._annotation_label_set_known = annotation_label_ids is not None
         self.annotation_label_ids = annotation_label_ids or []
         self.annotation_label_ids_by_project = (
             {
@@ -499,6 +501,95 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return None
         return item
 
+    def _positive_relational_seed_filter(self) -> dict[str, Any] | None:
+        """Return the sole positive boolean relation eligible for root seeding.
+
+        ``has_eval`` and ``has_annotation`` have a positive row witness.  For a
+        one-project, unsorted request whose only public membership predicate is
+        one of those booleans, the exact relation can narrow root discovery
+        before the ordinary finite latest-state classifier runs.  Negative
+        predicates and conjunctions remain classifier-only: absence has no
+        positive witness, and combining this optimization with another leaf
+        would need a separate ordered-prefix proof.
+
+        Voice calls delegate to this trace builder with one private conversation
+        root invariant.  That marker is structural, not a public filter, so it
+        is ignored when deciding whether the relation is the sole user leaf.
+        """
+
+        if self.search or self.project_id is None or self.project_ids is not None:
+            return None
+        active_filters = [
+            item
+            for item in self._active_non_time_filters()
+            if not item.get("_eval_task_trace_root")
+        ]
+        if len(active_filters) != 1:
+            return None
+        item = active_filters[0]
+        key = item.get("column_id") or item.get("columnId")
+        if key not in {"has_eval", "has_annotation"}:
+            return None
+        if key == "has_eval" and not self._eval_config_ids_known:
+            # The eval table has no project id. Candidate-first membership is
+            # safe only when the endpoint supplied its authoritative active
+            # project config set; legacy/direct builders keep their established
+            # candidate-scoped classifier instead of admitting a colliding
+            # trace id from another project.
+            return None
+        if (
+            key == "has_annotation"
+            and self._annotation_label_set_known
+            and not self.annotation_label_ids
+        ):
+            # Completeness across a known empty label set is vacuously true;
+            # there is no positive Score witness with which to narrow roots.
+            return None
+        config = item.get("filter_config") or item.get("filterConfig") or {}
+        if not isinstance(config, dict):
+            return None
+        operation = normalize_filter_op(
+            config.get("filter_op") or config.get("filterOp")
+        )
+        value = config.get("filter_value", config.get("filterValue"))
+        wants_relation = value is True or (
+            isinstance(value, str) and value.strip().lower() == "true"
+        )
+        if operation != "equals" or not wants_relation:
+            return None
+        return item
+
+    def _positive_relational_seed(self) -> tuple[str, dict[str, Any]]:
+        """Compile the exact project-scoped relation used by root discovery.
+
+        The same filter compiler remains in the finite classifier below.  The
+        seed therefore only reduces candidate acquisition; it never publishes
+        a relation match by itself.  Relation time scoping is deliberately off:
+        evals and annotations may be written long after their visible root.
+        ``strict_trace_project_correlation`` binds eval membership to configs
+        owned by this project, matching the exact graph contract and preventing
+        a colliding trace id in another project from entering the seed.
+        """
+
+        filter_item = self._positive_relational_seed_filter()
+        if filter_item is None:
+            return "", {}
+        filter_builder = self._FILTER_BUILDER_CLS(
+            table=self.TABLE,
+            query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_TRACE,
+            annotation_label_ids=self.annotation_label_ids,
+            project_id=self.project_id,
+            score_date_scope=False,
+            span_date_scope=False,
+            strict_trace_project_correlation=True,
+            trace_project_eval_config_ids=(
+                self.eval_config_ids if self._eval_config_ids_known else None
+            ),
+            annotation_label_set_known=self._annotation_label_set_known,
+        )
+        predicate, params = filter_builder.translate([filter_item])
+        return predicate or "", params
+
     @staticmethod
     def _root_plan_runs_only_in_classifier(plan: LatestFilterPredicate) -> bool:
         """Return whether root discovery must avoid a provider JSON predicate.
@@ -575,7 +666,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._bounded_bulk_scan
             and not self._bounded_population_proof
             and not self.sort_params
-            and self._positive_exact_end_user_seed_filter() is not None
+            and (
+                self._positive_exact_end_user_seed_filter() is not None
+                or self._positive_relational_seed_filter() is not None
+            )
         )
 
     @staticmethod
@@ -1125,12 +1219,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._bounded_bulk_scan
             and not self._bounded_population_proof
             and request_width >= timedelta(minutes=5)
-            and self._positive_exact_end_user_seed_filter() is not None
+            and (
+                self._positive_exact_end_user_seed_filter() is not None
+                or self._positive_relational_seed_filter() is not None
+            )
         ):
-            # The root seed is constrained by an exact project-scoped end-user
-            # membership subquery. Read the requested window once
+            # The root seed is constrained by an exact project-scoped
+            # relational membership subquery. Read the requested window once
             # instead of serially proving empty two-day slices for a sparse
-            # relational value.
+            # relation.
             return request_width
         if (
             not self._bounded_identity_only
@@ -1183,7 +1280,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._bounded_bulk_scan
             and not self._bounded_population_proof
             and request_width >= timedelta(minutes=5)
-            and self._positive_exact_end_user_seed_filter() is not None
+            and (
+                self._positive_exact_end_user_seed_filter() is not None
+                or self._positive_relational_seed_filter() is not None
+            )
         ):
             return request_width
         if (
@@ -2440,6 +2540,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         before_id: Any = None,
         direction: str = "older",
         _positive_user_candidate_first: bool = False,
+        _positive_relation_candidate_first: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Return a root-ordered superset after a common anchor sentinel.
 
@@ -2459,6 +2560,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self.supports_filter_candidate_seed_page()
         ):
             raise ValueError("trace user candidate seed is unavailable")
+        if (
+            _positive_relation_candidate_first
+            and self._positive_relational_seed_filter() is None
+        ):
+            raise ValueError("trace relation candidate seed is unavailable")
+        if _positive_user_candidate_first and _positive_relation_candidate_first:
+            raise ValueError("trace candidate seed modes are mutually exclusive")
         request_start, request_end = self.parse_time_range(self.filters)
         if not request_start <= slice_start < slice_end <= request_end:
             raise ValueError("trace seed slice must stay inside the request window")
@@ -2521,8 +2629,21 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         params.update(end_user_seed_params)
         if end_user_seed_predicate and not _positive_user_candidate_first:
             root_seed_predicates.append(end_user_seed_predicate)
+        relation_seed_predicate = ""
+        if _positive_relation_candidate_first:
+            relation_seed_predicate, relation_seed_params = (
+                self._positive_relational_seed()
+            )
+            if not relation_seed_predicate:
+                raise ValueError("trace relation candidate predicate is unavailable")
+            params.update(relation_seed_params)
         root_predicate = " AND ".join(root_seed_predicates)
         predicate_fragment = f"AND {root_predicate}" if root_predicate else ""
+        relation_predicate_fragment = (
+            f"\n          AND ({relation_seed_predicate})"
+            if relation_seed_predicate
+            else ""
+        )
         trace_id_prewhere_predicate = " AND ".join(trace_id_prewhere_predicates)
         trace_id_prewhere_fragment = (
             f"AND {trace_id_prewhere_predicate}" if trace_id_prewhere_predicate else ""
@@ -2640,7 +2761,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
           AND start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)
           AND start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)
         WHERE 1 = 1
-          {predicate_fragment}{datetime_fragment}
+          {predicate_fragment}{relation_predicate_fragment}{datetime_fragment}
           {sampling_fragment}
           {keyset_fragment}
         ORDER BY start_time {order_direction}, {identity_order}
@@ -2661,7 +2782,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Seed ordered roots from an exact positive relational candidate."""
 
         positive_user = self._positive_exact_end_user_seed_filter() is not None
-        if not positive_user:
+        positive_relation = self._positive_relational_seed_filter() is not None
+        if not positive_user and not positive_relation:
             # Preserve the established domain error for unsupported callers.
             raise ValueError("trace user candidate seed is unavailable")
 
@@ -2673,6 +2795,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             before_start_time=before_start_time,
             before_id=before_id,
             _positive_user_candidate_first=positive_user,
+            _positive_relation_candidate_first=positive_relation,
         )
 
     def build_filter_navigation_seed_page(
@@ -3460,7 +3583,22 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     score_date_scope=scope_span_witnesses_to_request_window,
                     span_date_scope=scope_span_witnesses_to_request_window,
                     candidate_ids_param="candidate_trace_ids",
+                    strict_trace_project_correlation=bool(
+                        self._positive_relational_seed_filter() is not None
+                        and (
+                            not any(
+                                (item.get("column_id") or item.get("columnId"))
+                                == "has_eval"
+                                for item in residual_filters
+                            )
+                            or self._eval_config_ids_known
+                        )
+                    ),
+                    trace_project_eval_config_ids=(
+                        self.eval_config_ids if self._eval_config_ids_known else None
+                    ),
                     strict_enduser_project_correlation=True,
+                    annotation_label_set_known=self._annotation_label_set_known,
                 )
                 residual_predicate, residual_params = residual_builder.translate(
                     residual_filters

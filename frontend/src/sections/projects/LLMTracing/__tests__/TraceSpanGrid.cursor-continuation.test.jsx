@@ -166,8 +166,8 @@ const listResponse = ({
   },
 });
 
-const makeParams = () => ({
-  request: { startRow: 0, endRow: 25, sortModel: [] },
+const makeParams = (startRow = 0, endRow = startRow + 25) => ({
+  request: { startRow, endRow, sortModel: [] },
   api: {
     deselectAll: vi.fn(),
     forEachNode: vi.fn(),
@@ -413,6 +413,92 @@ describe.each(["trace", "span"])("%s grid loading lifecycle", (kind) => {
         "No traces found",
       );
     }
+  });
+});
+
+describe("trace custom-property request pagination", () => {
+  beforeEach(() => {
+    getMock.mockReset();
+    gridState.api = null;
+    gridState.props = null;
+    resetMetricIds.mockReset();
+  });
+
+  it("keeps the searched property filter on p1 and its opaque p2 cursor", async () => {
+    const propertyFilter = {
+      column_id: "prompt_slug",
+      filter_config: {
+        col_type: "SPAN_ATTRIBUTE",
+        filter_op: "equals",
+        filter_value: "rejected",
+      },
+    };
+    const firstRows = Array.from({ length: 25 }, (_, index) => ({
+      trace_id: `trace-${index + 1}`,
+      project_id: "project-whatfix",
+    }));
+    const secondRows = [
+      { trace_id: "trace-26", project_id: "project-whatfix" },
+    ];
+    getMock
+      .mockResolvedValueOnce(
+        listResponse({
+          rows: firstRows,
+          hasMore: true,
+          nextCursor: "signed-property-page-2",
+          totalRows: 26,
+          lowerBound: true,
+        }),
+      )
+      .mockResolvedValueOnce(listResponse({ rows: secondRows, totalRows: 26 }));
+
+    const ref = React.createRef();
+    render(
+      <TraceGrid
+        ref={ref}
+        {...baseProps()}
+        filters={[propertyFilter]}
+        projectId="project-whatfix"
+      />,
+    );
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const firstPage = makeParams(0, 25);
+    await getRows(firstPage);
+    const secondPage = makeParams(25, 50);
+    await getRows(secondPage);
+
+    const expectedFilters = JSON.stringify([propertyFilter]);
+    expect(getMock.mock.calls[0][1].params).toEqual(
+      expect.objectContaining({
+        project_id: "project-whatfix",
+        filters: expectedFilters,
+        cursor_mode: true,
+        page_number: 0,
+        page_size: 25,
+      }),
+    );
+    expect(getMock.mock.calls[1][1].params).toEqual(
+      expect.objectContaining({
+        project_id: "project-whatfix",
+        filters: expectedFilters,
+        cursor_mode: true,
+        cursor: "signed-property-page-2",
+        page_size: 25,
+      }),
+    );
+    expect(getMock.mock.calls[1][1].params).not.toHaveProperty("page_number");
+    expect(firstPage.success).toHaveBeenCalledWith(
+      expect.objectContaining({ rowData: firstRows }),
+    );
+    expect(secondPage.success).toHaveBeenCalledWith(
+      expect.objectContaining({ rowData: secondRows }),
+    );
+    expect(
+      new Set(firstRows.map(({ trace_id }) => trace_id)).has(
+        secondRows[0].trace_id,
+      ),
+    ).toBe(false);
   });
 });
 

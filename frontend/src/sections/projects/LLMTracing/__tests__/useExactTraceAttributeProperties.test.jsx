@@ -4,10 +4,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ get: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  get: vi.fn(),
+  debouncedValue: undefined,
+}));
 
 vi.mock("src/hooks/use-debounce", () => ({
-  useDebounce: (value) => value,
+  useDebounce: (value) =>
+    mocks.debouncedValue === undefined ? value : mocks.debouncedValue,
 }));
 
 vi.mock("src/utils/axios", () => ({
@@ -38,7 +42,10 @@ function createWrapper() {
 }
 
 describe("useExactTraceAttributeProperties", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.debouncedValue = undefined;
+  });
 
   it("loads ten retained keys first and de-duplicates cursor pages", async () => {
     mocks.get
@@ -579,6 +586,220 @@ describe("useExactTraceAttributeProperties", () => {
     );
     expect(result.current.exactSearchMatched).toBe(true);
     expect(result.current.hasNextPage).toBe(false);
+  });
+
+  it("keeps retained partial matches usable when supplemental exact search fails", async () => {
+    const exactFailure = new Error("exact search unavailable");
+    let exactShouldFail = true;
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (params.q) {
+        return exactShouldFail
+          ? Promise.reject(exactFailure)
+          : Promise.resolve({
+              data: {
+                result: [{ key: "prompt", type: "string", count: 1 }],
+                query_complete: true,
+                query_status: "complete",
+                browse_mode: "recent_suggestions",
+                browse_status: "exhausted",
+                lookup_mode: "exact",
+                exact_match: true,
+                has_more: false,
+                next_cursor: null,
+              },
+            });
+      }
+      return Promise.resolve({
+        data: {
+          result: [{ key: "prompt_slug_archive", type: "string", count: 1 }],
+          query_complete: true,
+          query_status: "complete",
+          browse_mode: "recent_suggestions",
+          browse_status: "exhausted",
+          has_more: false,
+          next_cursor: null,
+        },
+      });
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-whatfix",
+          search: "prompt",
+          source: "spans",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() =>
+      expect(result.current.exactSearchError).toBe(exactFailure),
+    );
+    expect(result.current.data.map(({ id }) => id)).toEqual([
+      "prompt_slug_archive",
+    ]);
+    expect(result.current.queryReadState).toBe("complete");
+    expect(result.current.isError).toBe(false);
+    expect(result.current.isSuccess).toBe(true);
+    expect(result.current.hasNextExactPage).toBe(true);
+    expect(result.current.isFetchNextPageError).toBe(true);
+
+    exactShouldFail = false;
+    await act(async () => result.current.fetchNextExactPage());
+    await waitFor(() => expect(result.current.exactSearchMatched).toBe(true));
+
+    expect(result.current.exactSearchError).toBeNull();
+    expect(result.current.data.map(({ id }) => id)).toEqual([
+      "prompt",
+      "prompt_slug_archive",
+    ]);
+  });
+
+  it.each([
+    ["tracing", "traces"],
+    ["voice", "spans"],
+  ])(
+    "retries one cached failed %s exact continuation after rapid re-entry",
+    async (_surface, source) => {
+      mocks.debouncedValue = "foo";
+      let continuationAttempts = 0;
+      mocks.get.mockImplementation((_url, { params }) => {
+        if (!params.q) {
+          return Promise.resolve({
+            data: {
+              result: [{ key: "foo_archive", type: "string" }],
+              browse_mode: "recent_suggestions",
+              browse_status: "exhausted",
+              has_more: false,
+              next_cursor: null,
+            },
+          });
+        }
+        if (!params.cursor) {
+          return Promise.resolve({
+            data: {
+              result: [{ key: "foo_archive", type: "string" }],
+              lookup_mode: "exact",
+              exact_match: false,
+              browse_status: "continuation",
+              has_more: true,
+              next_cursor: "foo-page-2",
+            },
+          });
+        }
+        continuationAttempts += 1;
+        if (continuationAttempts === 1) {
+          return Promise.reject(new Error("continuation unavailable"));
+        }
+        return Promise.resolve({
+          data: {
+            result: [{ key: "foo", type: "string" }],
+            lookup_mode: "exact",
+            exact_match: true,
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
+          },
+        });
+      });
+
+      const { result, rerender } = renderHook(
+        ({ search }) =>
+          useExactTraceAttributeProperties({
+            projectId: `project-${_surface}`,
+            search,
+            source,
+          }),
+        {
+          initialProps: { search: "foo" },
+          wrapper: createWrapper(),
+        },
+      );
+
+      await waitFor(() => expect(result.current.hasNextExactPage).toBe(true));
+      await act(async () => result.current.fetchNextExactPage());
+      await waitFor(() =>
+        expect(result.current.isFetchNextPageError).toBe(true),
+      );
+      expect(continuationAttempts).toBe(1);
+
+      // The settled query remains `foo`; this models clear+retype inside the
+      // 350 ms debounce window. Re-entry retries c1 once, not cursorless p1.
+      rerender({ search: "" });
+      rerender({ search: "foo" });
+      await waitFor(() => expect(result.current.exactSearchMatched).toBe(true));
+
+      expect(continuationAttempts).toBe(2);
+      expect(
+        mocks.get.mock.calls.filter(
+          ([, options]) => options.params.q === "foo" && !options.params.cursor,
+        ),
+      ).toHaveLength(1);
+      expect(result.current.data).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: "foo" })]),
+      );
+    },
+  );
+
+  it("gives a re-entered exact search one fresh stopped-cursor retry", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (!params.q) {
+        return Promise.resolve({
+          data: {
+            result: [{ key: "prompt_slug_archive", type: "string" }],
+            browse_mode: "recent_suggestions",
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
+          },
+        });
+      }
+      return Promise.resolve({
+        data: {
+          result: [],
+          lookup_mode: "exact",
+          exact_match: false,
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: `${params.q}-same-cursor`,
+        },
+      });
+    });
+    const cursorlessFooCalls = () =>
+      mocks.get.mock.calls.filter(
+        ([, options]) => options.params.q === "foo" && !options.params.cursor,
+      ).length;
+
+    const { result, rerender } = renderHook(
+      ({ search }) =>
+        useExactTraceAttributeProperties({
+          projectId: "project-coletia",
+          search,
+          source: "traces",
+        }),
+      {
+        initialProps: { search: "foo" },
+        wrapper: createWrapper(),
+      },
+    );
+
+    await waitFor(() => expect(result.current.hasNextExactPage).toBe(true));
+    expect(cursorlessFooCalls()).toBe(1);
+    await act(async () => result.current.fetchNextExactPage());
+    await waitFor(() => expect(result.current.cursorRetryExhausted).toBe(true));
+    expect(cursorlessFooCalls()).toBe(2);
+
+    rerender({ search: "bar" });
+    await waitFor(() => expect(result.current.debouncedSearch).toBe("bar"));
+    rerender({ search: "foo" });
+    await waitFor(() => {
+      expect(result.current.cursorRetryExhausted).toBe(false);
+      expect(result.current.hasNextExactPage).toBe(true);
+    });
+
+    await act(async () => result.current.fetchNextExactPage());
+    await waitFor(() => expect(cursorlessFooCalls()).toBe(3));
+    expect(result.current.cursorRetryExhausted).toBe(true);
   });
 
   it("advances only the exact prompt_slug cursor after one sparse bounded search", async () => {

@@ -920,7 +920,7 @@ def test_voice_annotator_and_turn_count_use_resumable_bounded_seed() -> None:
     )
     compact_sql = " ".join(sql.split())
 
-    assert not hasattr(builder, "supports_filter_candidate_seed_page")
+    assert builder.supports_filter_candidate_seed_page() is False
     assert builder.recommended_filter_query_timeout_ms() == 9_500
     assert "model_hub_score" not in compact_sql
     assert "observation_type" in compact_sql
@@ -945,7 +945,7 @@ def test_negative_voice_annotator_stays_on_exact_bounded_classifier() -> None:
         ],
     )
 
-    assert not hasattr(builder, "supports_filter_candidate_seed_page")
+    assert builder.supports_filter_candidate_seed_page() is False
 
 
 def test_raw_annotator_span_attribute_never_uses_score_candidate_seed() -> None:
@@ -965,7 +965,7 @@ def test_raw_annotator_span_attribute_never_uses_score_candidate_seed() -> None:
         ],
     )
 
-    assert not hasattr(builder, "supports_filter_candidate_seed_page")
+    assert builder.supports_filter_candidate_seed_page() is False
 
 
 @pytest.mark.parametrize("column_id", ["end_user_id", "user", "user_id"])
@@ -1004,6 +1004,245 @@ def test_raw_user_named_span_attribute_does_not_use_candidate_seed(
             slice_end=END,
             limit=26,
         )
+
+
+@override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
+def test_positive_has_eval_candidate_seed_is_project_safe_and_reclassified() -> None:
+    config_id = "00000000-0000-4000-8000-000000000088"
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _has_eval_filter(True)],
+        eval_config_ids=[config_id],
+    )
+
+    with mock.patch(
+        "tracer.models.custom_eval_config.CustomEvalConfig.objects"
+    ) as config_manager:
+        seed_sql, seed_params = builder.build_filter_candidate_seed_page(
+            slice_start=START,
+            slice_end=END,
+            limit=26,
+            before_start_time=END - timedelta(minutes=1),
+            before_id="trace-z",
+        )
+        match_sql, match_params = builder.build_filter_match_query(
+            ["trace-a", "trace-b"]
+        )
+
+    assert builder.supports_filter_candidate_seed_page() is True
+    assert builder.filter_candidate_seed_proves_result_order() is True
+    assert builder.recommended_filter_initial_slice_width() == END - START
+    assert builder.recommended_filter_max_slice_width() == END - START
+    assert config_manager.filter.call_count == 0
+
+    # Candidate discovery uses the complete latest/live relation with the
+    # endpoint's already-resolved project config set. There is no relation
+    # population LIMIT; only the semantic version collapse and ordered root
+    # page limit remain.
+    assert "FROM tracer_eval_logger_v2 AS eval_scan" in seed_sql
+    assert "eval_scan.custom_eval_config_id IN %(project_eval_cfg_1)s" in seed_sql
+    assert "ORDER BY eval_scan._version DESC" in seed_sql
+    assert "LIMIT 1 BY eval_scan.id" in seed_sql
+    assert "latest_eval.is_deleted = 0" in seed_sql
+    assert "sp.project_id = %(project_id)s" in seed_sql
+    assert "eval_scan.created_at >=" not in seed_sql
+    assert "candidate_trace_ids" not in seed_sql
+    assert "ORDER BY start_time DESC, trace_id DESC" in seed_sql
+    assert "LIMIT 1 BY trace_id" in seed_sql
+    assert "LIMIT %(filter_seed_limit)s" in seed_sql
+    assert "filter_before_start_us" in seed_sql
+    assert "trace_id < %(filter_before_id)s" in seed_sql
+    assert seed_params["project_eval_cfg_1"] == (config_id,)
+    assert seed_params["filter_seed_limit"] == 26
+    assert seed_params["filter_before_id"] == "trace-z"
+
+    # The seed is acquisition-only. The ordinary finite latest-state
+    # classifier repeats the same project-safe relation for publication.
+    assert "FROM tracer_eval_logger_v2 AS eval_scan" in match_sql
+    assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in match_sql
+    assert "LIMIT 1 BY eval_scan.id" in match_sql
+    assert "latest_eval.is_deleted = 0" in match_sql
+    assert match_params["project_eval_cfg_1"] == (config_id,)
+    assert match_params["candidate_trace_ids"] == ("trace-a", "trace-b")
+
+
+def test_positive_has_annotation_candidate_seed_preserves_all_label_completeness() -> (
+    None
+):
+    label_a = "00000000-0000-4000-8000-000000000091"
+    label_b = "00000000-0000-4000-8000-000000000092"
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _has_annotation_filter(True)],
+        annotation_label_ids=[label_a, label_b],
+    )
+
+    seed_sql, seed_params = builder.build_filter_candidate_seed_page(
+        slice_start=START,
+        slice_end=END,
+        limit=26,
+        before_start_time=END - timedelta(minutes=1),
+        before_id="trace-z",
+    )
+    match_sql, match_params = builder.build_filter_match_query(["trace-a", "trace-b"])
+
+    assert builder.supports_filter_candidate_seed_page() is True
+    assert builder.recommended_filter_initial_slice_width() == END - START
+    assert builder.recommended_filter_max_slice_width() == END - START
+    for sql in (seed_sql, match_sql):
+        assert "FROM model_hub_score AS s FINAL" in sql
+        assert "s.deleted = false AND s._peerdb_is_deleted = 0" in sql
+        assert "s.tracer_project_id = toUUID(%(project_id)s)" in sql
+        assert "sp.trace_id, toString(s.trace_id)" in sql
+        assert "s.label_id IN (toUUID(%(lbl_1)s), toUUID(%(lbl_2)s))" in sql
+        assert "GROUP BY entity_id HAVING uniqExact(s.label_id) >= 2" in sql
+        # Annotation writes may postdate their root; relation membership is
+        # exact and intentionally has no request-time or result-count cap.
+        assert "s.created_at >=" not in sql
+
+    assert "candidate_trace_ids" not in seed_sql
+    assert "toString(trace_id) IN %(candidate_trace_ids)s" in match_sql
+    assert seed_sql.count("LIMIT") == 2
+    assert "ORDER BY start_time DESC, trace_id DESC" in seed_sql
+    assert "LIMIT 1 BY trace_id" in seed_sql
+    assert "LIMIT %(filter_seed_limit)s" in seed_sql
+    assert seed_params["lbl_1"] == label_a
+    assert seed_params["lbl_2"] == label_b
+    assert match_params["lbl_1"] == label_a
+    assert match_params["lbl_2"] == label_b
+
+
+def test_known_empty_annotation_label_set_keeps_vacuous_exact_semantics() -> None:
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _has_annotation_filter(True)],
+        annotation_label_ids=[],
+    )
+
+    match_sql, _ = builder.build_filter_match_query(["trace-a"])
+
+    assert builder.supports_filter_candidate_seed_page() is False
+    assert builder.recommended_filter_initial_slice_width() is None
+    assert builder.recommended_filter_max_slice_width() is None
+    assert "model_hub_score" not in match_sql
+
+
+def test_has_eval_candidate_seed_requires_authoritative_project_config_metadata() -> (
+    None
+):
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _has_eval_filter(True)],
+    )
+
+    assert builder.supports_filter_candidate_seed_page() is False
+    assert builder.recommended_filter_initial_slice_width() is None
+    with pytest.raises(ValueError, match="trace user candidate seed is unavailable"):
+        builder.build_filter_candidate_seed_page(
+            slice_start=START,
+            slice_end=END,
+            limit=26,
+        )
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        [_time_filter(), _has_eval_filter(False)],
+        [_time_filter(), _has_annotation_filter("false")],
+        [
+            _time_filter(),
+            _has_eval_filter(True),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+    ],
+)
+def test_non_positive_or_conjoined_relation_does_not_use_candidate_seed(
+    filters: list[dict[str, Any]],
+) -> None:
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=filters,
+        eval_config_ids=["00000000-0000-4000-8000-000000000088"],
+        annotation_label_ids=["00000000-0000-4000-8000-000000000091"],
+    )
+
+    assert builder.supports_filter_candidate_seed_page() is False
+    assert builder.recommended_filter_initial_slice_width() != END - START
+    with pytest.raises(ValueError, match="trace user candidate seed is unavailable"):
+        builder.build_filter_candidate_seed_page(
+            slice_start=START,
+            slice_end=END,
+            limit=26,
+        )
+
+
+@pytest.mark.parametrize(
+    ("relation_filter", "eval_config_ids", "annotation_label_ids", "relation_table"),
+    [
+        (
+            _has_eval_filter(True),
+            ["00000000-0000-4000-8000-000000000088"],
+            [],
+            "tracer_eval_logger_v2 AS eval_scan",
+        ),
+        (
+            _has_annotation_filter(True),
+            [],
+            ["00000000-0000-4000-8000-000000000091"],
+            "model_hub_score AS s FINAL",
+        ),
+    ],
+)
+@override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
+def test_voice_positive_relation_candidate_seed_keeps_conversation_and_cursor_order(
+    relation_filter: dict[str, Any],
+    eval_config_ids: list[str],
+    annotation_label_ids: list[str],
+    relation_table: str,
+) -> None:
+    builder = VoiceCallListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), relation_filter],
+        eval_config_ids=eval_config_ids,
+        annotation_label_ids=annotation_label_ids,
+    )
+
+    seed_sql, seed_params = builder.build_filter_candidate_seed_page(
+        slice_start=START,
+        slice_end=END,
+        limit=26,
+        before_start_time=END - timedelta(minutes=1),
+        before_id="trace-z",
+    )
+    match_sql, _ = builder.build_filter_match_query(["trace-a"])
+
+    assert builder.supports_filter_candidate_seed_page() is True
+    assert builder.filter_candidate_seed_proves_result_order() is True
+    assert builder.recommended_filter_initial_slice_width() == END - START
+    assert builder.recommended_filter_max_slice_width() == END - START
+    assert relation_table in seed_sql
+    assert relation_table in match_sql
+    assert "lowerUTF8(toString(observation_type))" in seed_sql
+    assert seed_params["latest_filter_param_0"] == "conversation"
+    assert "ORDER BY start_time DESC, trace_id DESC" in seed_sql
+    assert "LIMIT 1 BY trace_id" in seed_sql
+    assert "LIMIT %(filter_seed_limit)s" in seed_sql
+    assert "filter_before_start_us" in seed_sql
+    assert seed_params["filter_before_id"] == "trace-z"
+    assert "candidate_trace_ids" not in seed_sql
+    assert "candidate_trace_ids" in match_sql
+
+    internal_builder = VoiceCallListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), relation_filter],
+        eval_config_ids=eval_config_ids,
+        annotation_label_ids=annotation_label_ids,
+        bounded_internal_scan=True,
+    )
+    assert internal_builder.supports_filter_candidate_seed_page() is False
+    assert internal_builder.recommended_filter_initial_slice_width() is None
+    assert internal_builder.recommended_filter_max_slice_width() is None
 
 
 def test_negated_user_trace_filter_does_not_use_positive_root_seed() -> None:

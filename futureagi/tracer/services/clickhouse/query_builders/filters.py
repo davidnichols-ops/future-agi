@@ -409,6 +409,7 @@ class ClickHouseFilterBuilder:
         candidate_ids_param: str | None = None,
         candidate_entities_param: str | None = None,
         strict_trace_project_correlation: bool = False,
+        trace_project_eval_config_ids: list[str] | tuple[str, ...] | None = None,
         strict_enduser_project_correlation: bool = False,
         annotation_label_set_known: bool = False,
     ) -> None:
@@ -465,6 +466,24 @@ class ClickHouseFilterBuilder:
         # trace/span identity.  Keep the default off: existing single-project
         # callers retain byte-for-byte SQL and behaviour.
         self.strict_trace_project_correlation = bool(strict_trace_project_correlation)
+        # Public list builders already resolve the project's active eval
+        # configs for page hydration.  Reuse that authoritative finite set
+        # when strict trace correlation is enabled so every candidate
+        # classifier batch does not repeat the same PostgreSQL metadata read.
+        # ``None`` preserves the legacy fallback for strict callers that do
+        # not have the metadata available; an explicit empty tuple is a known
+        # empty project set and therefore fails positive membership closed.
+        self.trace_project_eval_config_ids = (
+            tuple(
+                dict.fromkeys(
+                    str(config_id)
+                    for config_id in trace_project_eval_config_ids
+                    if config_id
+                )
+            )
+            if trace_project_eval_config_ids is not None
+            else None
+        )
         # End-user membership can be project-scoped independently of eval
         # metadata.  User seeds need this fence without triggering the strict
         # eval-config discovery used by organization residual branches.
@@ -2501,15 +2520,17 @@ class ClickHouseFilterBuilder:
         )
         eval_project_clause = ""
         if self.strict_trace_project_correlation:
-            from tracer.models.custom_eval_config import CustomEvalConfig
+            scoped_config_ids = self.trace_project_eval_config_ids
+            if scoped_config_ids is None:
+                from tracer.models.custom_eval_config import CustomEvalConfig
 
-            scoped_config_ids = tuple(
-                str(config_id)
-                for config_id in CustomEvalConfig.objects.filter(
-                    project_id__in=self.project_ids or (),
-                    deleted=False,
-                ).values_list("id", flat=True)
-            )
+                scoped_config_ids = tuple(
+                    str(config_id)
+                    for config_id in CustomEvalConfig.objects.filter(
+                        project_id__in=self.project_ids or (),
+                        deleted=False,
+                    ).values_list("id", flat=True)
+                )
             if not scoped_config_ids:
                 return (
                     f"trace_id {membership_op} (SELECT "
