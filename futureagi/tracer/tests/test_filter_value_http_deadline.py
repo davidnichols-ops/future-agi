@@ -94,5 +94,5 @@ def test_system_filter_value_cursor_receives_view_owned_deadline(monkeypatch):
     deadline_start.assert_called_once_with(
         dashboard_view._FILTER_VALUES_INTERACTIVE_TIMEOUT_MS
     )
-    assert dashboard_view._FILTER_VALUES_INTERACTIVE_TIMEOUT_MS == 7_000
+    assert dashboard_view._FILTER_VALUES_INTERACTIVE_TIMEOUT_MS == 6_000
     assert events == ["deadline", "project_scope", "selector"]

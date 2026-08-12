@@ -233,9 +233,11 @@ _DASHBOARD_TRACE_READ_SETTINGS = {
 _DASHBOARD_TRACE_MAX_CONCURRENT_METRICS = 2
 _DASHBOARD_EXACT_QUERY_TIMEOUT_MS = 9_500
 
-# Begin this wall before project/cursor preparation and leave three seconds of
-# the public ten-second SLA for response construction and transport.
-_FILTER_VALUES_INTERACTIVE_TIMEOUT_MS = 7_000
+# Begin this wall before project/cursor preparation and leave four seconds of
+# the public ten-second SLA for response construction, transport, and scheduler
+# jitter. Exhaustion returns an advancing cursor over the same unconsumed
+# interval, so the smaller wall changes latency/page density, never exactness.
+_FILTER_VALUES_INTERACTIVE_TIMEOUT_MS = 6_000
 
 # Public dashboard misses must return in the same wall budget as the rest of
 # the interactive analytics surface. The rollup route issues at most two

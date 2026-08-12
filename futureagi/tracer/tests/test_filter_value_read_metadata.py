@@ -331,7 +331,7 @@ def test_system_value_cursor_inherits_elapsed_request_deadline(monkeypatch):
         "tracer.services.clickhouse.read_budget.time.monotonic",
         lambda: clock["now"],
     )
-    deadline = ReadDeadline.start(7_000)
+    deadline = ReadDeadline.start(6_000)
     clock["now"] += 1.25
 
     class Analytics:
@@ -353,5 +353,5 @@ def test_system_value_cursor_inherits_elapsed_request_deadline(monkeypatch):
     )
 
     assert len(analytics.calls) == 1
-    assert analytics.calls[0]["timeout_ms"] == 5_750
+    assert analytics.calls[0]["timeout_ms"] == 4_750
     assert read.has_more is False
