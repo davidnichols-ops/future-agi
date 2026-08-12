@@ -15,11 +15,13 @@ from tracer.services.clickhouse.query_builders.user_list import (
     UserListQueryBuilder,
 )
 from tracer.services.clickhouse.query_service import AnalyticsQueryService
+from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 from tracer.services.users_list_manager import (
-    MAX_EXPORT_ROWS,
+    USER_EXPORT_PAGE_SIZE,
     USER_LIST_QUERY_TIMEOUT_MS,
     USER_LIST_WALL_DEADLINE_MS,
     USERS_EXPORT_COLUMNS,
+    UserCursorRead,
     UsersListManager,
 )
 
@@ -108,11 +110,17 @@ class TestUsersExport:
     def test_export_preserves_the_bounded_streaming_csv_contract(
         self, auth_client, organization, workspace, observe_project
     ):
+        cursor_read = MagicMock(spec=UserCursorRead)
+        cursor_read.payload = {"table": [{"user_id": "user-1"}]}
         with patch.object(
             UsersListManager,
             "iter_export_csv",
             return_value=iter(["User ID\r\n", "user-1\r\n"]),
-        ) as export_csv:
+        ) as export_csv, patch.object(
+            UsersListManager,
+            "list_cursor_payload",
+            return_value=cursor_read,
+        ) as cursor_page:
             response = auth_client.get(
                 "/tracer/users/",
                 {
@@ -127,7 +135,53 @@ class TestUsersExport:
         assert response["Content-Type"].startswith("text/csv")
         assert response["Content-Disposition"] == "attachment"
         assert body == "User ID\r\nuser-1\r\n"
-        export_csv.assert_called_once_with()
+        cursor_page.assert_called_once_with(
+            page_size=USER_EXPORT_PAGE_SIZE,
+            cursor=None,
+        )
+        export_csv.assert_called_once_with(cursor_read=cursor_read)
+
+    def test_export_read_failure_is_a_typed_503_before_csv_starts(
+        self, auth_client, organization, workspace, observe_project
+    ):
+        with patch.object(
+            UsersListManager,
+            "list_cursor_payload",
+            side_effect=ReadDeadlineExceeded("read deadline exceeded"),
+        ), patch.object(UsersListManager, "iter_export_csv") as export_csv:
+            response = auth_client.get(
+                "/tracer/users/",
+                {
+                    "project_id": str(observe_project.id),
+                    "export": "true",
+                },
+            )
+
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response["Content-Type"].startswith("application/json")
+        assert response.json()["code"] == "service_unavailable"
+        export_csv.assert_not_called()
+
+    def test_sorted_export_is_rejected_before_cursor_read(
+        self, auth_client, organization, workspace, observe_project
+    ):
+        sort_params = [{"column_id": "num_traces", "direction": "desc"}]
+        with patch.object(
+            UsersListManager,
+            "list_cursor_payload",
+        ) as cursor_page:
+            response = auth_client.get(
+                "/tracer/users/",
+                {
+                    "project_id": str(observe_project.id),
+                    "export": "true",
+                    "sort_params": json.dumps(sort_params),
+                },
+            )
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert response.json()["code"] == "cursor_sort_unsupported"
+        cursor_page.assert_not_called()
 
     def test_export_requires_authentication(self, api_client, observe_project):
         response = api_client.get(
@@ -246,7 +300,7 @@ class TestUserListQueryBuilderUnpaginated:
         assert "count() OVER() AS total_count" in query
         assert "LIMIT %(limit)s OFFSET %(offset)s" in query
 
-    def test_export_cap_limits_without_window_count(self):
+    def test_explicit_scan_cap_limits_without_window_count(self):
         from tracer.services.clickhouse.query_builders.user_list import (
             UserListQueryBuilder,
         )
@@ -259,15 +313,15 @@ class TestUserListQueryBuilderUnpaginated:
             max_rows=10_000,
         )
         query, params = builder.build()
-        # The export cap applies a LIMIT but NOT the window count, so CH streams
-        # the ordered scan up to the cap instead of materializing a worktable.
+        # A caller-owned scan cap applies LIMIT without materializing a window
+        # count. The synchronous Users export no longer uses this broad path.
         assert "LIMIT %(max_rows)s" in query
         assert "count() OVER()" not in query
         assert params["max_rows"] == 10_000
 
 
 class TestUsersExportStreaming:
-    """Manager-level streaming behaviour (no HTTP / no ClickHouse)."""
+    """Manager-level serialization behaviour (no HTTP / no ClickHouse)."""
 
     @staticmethod
     def _manager(*, requested_columns=None, attribute_keys=None):
@@ -280,57 +334,83 @@ class TestUsersExportStreaming:
             attribute_keys=attribute_keys or [],
         )
 
-    def test_export_yields_header_before_fetch(self):
-        # The header row must be produced BEFORE the (slow) CH fetch, so the
-        # socket starts streaming immediately instead of idling past the LB
-        # read timeout.
+    @staticmethod
+    def _cursor_read(*, rows, **metadata):
+        payload = {
+            "table": rows,
+            "has_more": False,
+            "count_is_lower_bound": False,
+            "query_complete": True,
+            "query_exact": True,
+            "ordering_exact": True,
+            "approximate_fields": [],
+            **metadata,
+        }
+        return UserCursorRead(
+            payload=payload,
+            window_start=datetime.utcnow(),
+            window_end=datetime.utcnow(),
+            checkpoint_order=None,
+            seen_rows=len(rows),
+            has_more=bool(payload["has_more"]),
+            unseen_row_proven=False,
+        )
+
+    def test_export_serializes_only_the_pre_materialized_cursor_page(self):
         manager = self._manager()
-        with patch.object(
-            UsersListManager, "_fetch_rows", return_value=([], 0, MagicMock())
-        ) as fetch:
-            gen = manager.iter_export_csv()
-            first_chunk = next(gen)
-            assert fetch.call_count == 0  # header emitted before any fetch
-            list(gen)  # drain the rest
-            assert fetch.call_count == 1
-
-        header = next(csv.reader(io.StringIO(first_chunk)))
-        assert header == [h for h, _ in USERS_EXPORT_COLUMNS]
-
-    def test_export_signals_failure_mid_stream(self):
-        # A failure after headers are sent can't change the 200 status, so it
-        # must be signalled in-band rather than read as a clean partial download.
-        manager = self._manager()
-        with patch.object(
-            UsersListManager, "_fetch_rows", side_effect=RuntimeError("ch down")
-        ):
-            body = "".join(manager.iter_export_csv())
-
-        rows = [r for r in csv.reader(io.StringIO(body)) if r]
-        assert rows[0] == [h for h, _ in USERS_EXPORT_COLUMNS]
-        assert any("export failed" in r[0] for r in rows[1:])
-
-    def test_export_caps_rows_and_signals_truncation(self):
-        manager = self._manager()
-        oversized = [
-            {"user_id": f"u{i}", "end_user_id": uuid.uuid4()}
-            for i in range(MAX_EXPORT_ROWS + 5)
-        ]
+        cursor_read = self._cursor_read(rows=[{"user_id": "user-1"}])
         with (
-            patch.object(
-                UsersListManager,
-                "_fetch_rows",
-                return_value=(oversized, 0, MagicMock()),
-            ),
-            patch.object(UsersListManager, "_read_page_metrics", return_value={}),
+            patch.object(UsersListManager, "_fetch_rows") as broad_fetch,
+            patch.object(UsersListManager, "list_cursor_payload") as cursor_fetch,
         ):
-            body = "".join(manager.iter_export_csv())
+            body = "".join(manager.iter_export_csv(cursor_read=cursor_read))
+
+        rows = [row for row in csv.reader(io.StringIO(body)) if row]
+        assert rows[0] == [header for header, _ in USERS_EXPORT_COLUMNS]
+        assert rows[1][0] == "user-1"
+        assert len(rows) == 2
+        broad_fetch.assert_not_called()
+        cursor_fetch.assert_not_called()
+
+    def test_export_marks_bounded_inexact_and_approximate_page(self):
+        manager = self._manager()
+        page_rows = [
+            {"user_id": f"u{i}", "end_user_id": uuid.uuid4()}
+            for i in range(USER_EXPORT_PAGE_SIZE)
+        ]
+        cursor_read = self._cursor_read(
+            rows=page_rows,
+            has_more=True,
+            count_is_lower_bound=True,
+            query_exact=False,
+            ordering_exact=False,
+            approximate_fields=["num_sessions"],
+        )
+        body = "".join(manager.iter_export_csv(cursor_read=cursor_read))
 
         rows = [r for r in csv.reader(io.StringIO(body)) if r]
         data_rows = rows[1:]  # drop header
         marker = data_rows[-1]
-        assert "truncated" in marker[0]
-        assert len(data_rows[:-1]) == MAX_EXPORT_ROWS
+        assert marker == [
+            f"# export truncated after {USER_EXPORT_PAGE_SIZE} rows; "
+            "refine filters to export a complete bounded page; "
+            "candidate membership or ordering is inexact; "
+            "approximate fields: num_sessions"
+        ]
+        assert len(data_rows[:-1]) == USER_EXPORT_PAGE_SIZE
+
+    def test_export_keeps_formula_guard_and_fixed_columns(self):
+        manager = self._manager()
+        cursor_read = self._cursor_read(
+            rows=[{"user_id": "=HYPERLINK(\"https://invalid\")"}]
+        )
+
+        body = "".join(manager.iter_export_csv(cursor_read=cursor_read))
+        rows = list(csv.reader(io.StringIO(body)))
+
+        assert rows[0] == [header for header, _ in USERS_EXPORT_COLUMNS]
+        assert rows[1][0] == "'=HYPERLINK(\"https://invalid\")"
+        assert len(rows[1]) == len(USERS_EXPORT_COLUMNS)
 
     def test_list_enrichment_programming_defect_is_not_hidden(self):
         # Arbitrary runtime defects must reach the sanitized HTTP boundary,

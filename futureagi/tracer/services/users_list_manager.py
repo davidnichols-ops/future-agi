@@ -66,7 +66,11 @@ USER_LIST_WALL_DEADLINE_MS = 8_000
 USER_LIST_PRESENCE_TIMEOUT_MS = 8_000
 USER_LIST_QUERY_TIMEOUT_MS = 8_000
 USER_LIST_ENRICHMENT_TIMEOUT_MS = 8_000
-USER_EXPORT_WALL_DEADLINE_MS = 8_000
+# Users CSV is a synchronous bounded-page contract.  Reuse the cursor reader's
+# finite candidate/hydration pipeline instead of starting a separate broad
+# export scan.  Twenty rows leaves the same transport margin as the other
+# cursor-backed exports whose selectors may need several finite statements.
+USER_EXPORT_PAGE_SIZE = 20
 # Keep the unfiltered first replay aligned with the default grid page. Optional
 # session metrics run as their own finite statement, so this exact usage replay
 # no longer carries session remap/aggregation state over the full span scan.
@@ -112,12 +116,6 @@ _USER_LIST_EVAL_FIELDS = frozenset(
 _USER_LIST_OMITTED_PROJECTION_FIELDS = (
     _USER_LIST_EXTRA_METRIC_FIELDS | _USER_LIST_EVAL_FIELDS
 )
-
-# Hard cap on export rows. Bounds worker memory + latency for the large-workspace
-# case this feature targets (matches agentcc's MAX_EXPORT_ROWS); a hit is logged
-# and signalled in-band rather than silently truncating the download.
-MAX_EXPORT_ROWS = 10_000
-
 
 @dataclass(frozen=True)
 class UserCursorRead:
@@ -1650,15 +1648,13 @@ class UsersListManager:
             return "'" + value
         return value
 
-    def iter_export_csv(self) -> Iterator[str]:
-        """Stream the export as CSV text, header row first.
+    def iter_export_csv(self, *, cursor_read: UserCursorRead) -> Iterator[str]:
+        """Serialize one already-materialized bounded Users cursor page.
 
-        The header is yielded BEFORE the ClickHouse fetch so the socket stays
-        warm while the (slow) query runs — a buffered response would leave it
-        idle past the LB read timeout. Rows are hard-capped at
-        ``MAX_EXPORT_ROWS``; a cap hit or a mid-stream failure is logged and
-        signalled in-band, since headers are already sent and the status can no
-        longer change (otherwise a partial body reads as a clean 200).
+        The HTTP boundary completes the cursor read before constructing its
+        streaming response.  A read timeout can therefore remain a typed 503
+        instead of becoming a misleading HTTP 200 containing only a header and
+        an in-band failure row.  This method performs no database reads.
         """
         buffer = io.StringIO()
         writer = csv.writer(buffer)
@@ -1672,45 +1668,8 @@ class UsersListManager:
         writer.writerow([header for header, _ in USERS_EXPORT_COLUMNS])
         yield _drain()
 
-        try:
-            # Fetch cap + 1 so a full page can be distinguished from a truncation.
-            deadline = ReadDeadline.start(USER_EXPORT_WALL_DEADLINE_MS)
-            rows, _, builder = self._fetch_rows(
-                limit=None,
-                offset=None,
-                max_rows=MAX_EXPORT_ROWS + 1,
-                deadline=deadline,
-            )
-            if rows:
-                metrics = self._read_page_metrics(
-                    rows,
-                    builder,
-                    deadline,
-                    timeout_cap_ms=None,
-                )
-                self._apply_page_metrics(rows, metrics)
-        except Exception as exc:
-            _log_user_read_failure(
-                "users_export_failed",
-                exc,
-                organization_id=self.organization_id,
-                project_id=self.project_id,
-            )
-            writer.writerow(
-                ["# export failed before completion; data may be incomplete"]
-            )
-            yield _drain()
-            return
-
-        truncated = len(rows) > MAX_EXPORT_ROWS
-        if truncated:
-            rows = rows[:MAX_EXPORT_ROWS]
-            logger.warning(
-                "users_export_truncated",
-                organization_id=self.organization_id,
-                project_id=self.project_id,
-                max_rows=MAX_EXPORT_ROWS,
-            )
+        payload = cursor_read.payload
+        rows = list(payload.get("table") or ())
 
         for row in rows:
             writer.writerow(
@@ -1721,6 +1680,38 @@ class UsersListManager:
             )
             yield _drain()
 
+        truncated = bool(
+            payload.get("has_more")
+            or payload.get("count_is_lower_bound")
+            or payload.get("query_complete") is False
+        )
+        inexact_candidates = bool(
+            payload.get("query_exact") is False
+            or payload.get("ordering_exact") is False
+        )
+        raw_approximate_fields = payload.get("approximate_fields") or ()
+        if isinstance(raw_approximate_fields, str):
+            raw_approximate_fields = (raw_approximate_fields,)
+        approximate_fields = tuple(
+            dict.fromkeys(str(field) for field in raw_approximate_fields if field)
+        )
+
+        marker = ""
         if truncated:
-            writer.writerow([f"# export truncated at {MAX_EXPORT_ROWS} rows"])
+            marker = (
+                f"# export truncated after {len(rows)} rows; "
+                "refine filters to export a complete bounded page"
+            )
+            if inexact_candidates:
+                marker += "; candidate membership or ordering is inexact"
+        elif inexact_candidates:
+            marker = (
+                "# export candidate membership or ordering is inexact; "
+                "results are not an exact ordered population"
+            )
+        if approximate_fields:
+            approximation = "approximate fields: " + ", ".join(approximate_fields)
+            marker = f"{marker}; {approximation}" if marker else f"# {approximation}"
+        if marker:
+            writer.writerow([marker])
             yield _drain()

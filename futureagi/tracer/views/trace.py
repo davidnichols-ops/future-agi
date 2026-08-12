@@ -140,7 +140,7 @@ from tracer.services.filter_principal_context import (
     bind_request_my_annotations_principal,
 )
 from tracer.services.observability_providers import ObservabilityService
-from tracer.services.users_list_manager import UsersListManager
+from tracer.services.users_list_manager import USER_EXPORT_PAGE_SIZE, UsersListManager
 from tracer.utils.annotations import (
     build_annotation_subqueries as _build_annotation_subqueries_impl,
 )
@@ -6706,6 +6706,19 @@ class UsersView(APIView):
                 page_size = 10
                 current_page = 0
 
+            cursor_token = query_data.get("cursor")
+            cursor_requested = bool(cursor_token or query_data.get("cursor_mode"))
+            if (export or cursor_requested) and query_data.get("sort_params"):
+                return self._gm.custom_error_response(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    (
+                        "Sorted user exports are unavailable; clear the sort and retry."
+                        if export
+                        else "Sorted user pages require numbered pagination."
+                    ),
+                    code="cursor_sort_unsupported",
+                )
+
             # Workspace isolation is request-bound, so resolve the allowed
             # projects here and pass the plain list to the manager (CH25: the
             # curated source has no workspace_id column to filter on).
@@ -6732,21 +6745,20 @@ class UsersView(APIView):
             )
 
             if export:
+                # Finish the finite cursor read before publishing HTTP 200.
+                # Read-budget/ClickHouse failures can then remain sanitized
+                # retryable responses instead of header-only CSV downloads.
+                cursor_read = manager.list_cursor_payload(
+                    page_size=USER_EXPORT_PAGE_SIZE,
+                    cursor=None,
+                )
                 response = StreamingHttpResponse(
-                    manager.iter_export_csv(),
+                    manager.iter_export_csv(cursor_read=cursor_read),
                     content_type="text/csv",
                 )
                 response["Content-Disposition"] = "attachment"
                 return response
 
-            cursor_token = query_data.get("cursor")
-            cursor_requested = bool(cursor_token or query_data.get("cursor_mode"))
-            if cursor_requested and query_data.get("sort_params"):
-                return self._gm.custom_error_response(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    "Sorted user pages require numbered pagination.",
-                    code="cursor_sort_unsupported",
-                )
             if cursor_requested:
                 cursor_scope = cursor_scope_for_request(
                     request,
