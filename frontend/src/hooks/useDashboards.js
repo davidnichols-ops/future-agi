@@ -33,6 +33,7 @@ const DASHBOARD_KEYS = {
 const FILTER_VALUE_TERMINAL_BROWSE_STATUSES = new Set(["exhausted"]);
 const FILTER_VALUE_FOLLOWED_CURSORS_KEY = "__filterValueFollowedCursors";
 const FILTER_VALUE_CURSOR_STOPPED_KEY = "__filterValueCursorStopped";
+const DASHBOARD_QUERY_REFRESH_PARAMS = Object.freeze({ refresh: true });
 
 const hasOwn = (value, key) =>
   Object.prototype.hasOwnProperty.call(value || {}, key);
@@ -369,7 +370,7 @@ export function useDashboardQuery() {
 
       if (refresh) {
         return axios.post(endpoints.dashboard.query, body, {
-          params: { refresh: true },
+          params: DASHBOARD_QUERY_REFRESH_PARAMS,
           ...(signal ? { signal } : {}),
         });
       }

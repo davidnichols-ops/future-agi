@@ -767,6 +767,27 @@ describe("useDashboardQuery error boundary", () => {
     );
   });
 
+  it("does not bypass the exact snapshot cache while polling", async () => {
+    mocks.post.mockResolvedValue({ data: { result: { metrics: [] } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const { result } = renderHook(() => useDashboardQuery(), {
+      wrapper: createQueryWrapper(queryClient),
+    });
+
+    result.current.mutate({
+      queryConfig: { metrics: [{ name: "Latency" }] },
+      refresh: false,
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mocks.post).toHaveBeenCalledWith("/tracer/dashboard/query/", {
+      metrics: [{ name: "Latency" }],
+      allow_sampled: false,
+    });
+  });
+
   it("forwards saved-widget cancellation to the dashboard transport", async () => {
     mocks.post.mockResolvedValue({ data: { result: { metrics: [] } } });
     const queryClient = new QueryClient({

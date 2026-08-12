@@ -104,6 +104,15 @@ import {
   PERCENTILE_OPTIONS,
   DATE_PRESETS,
 } from "./constants";
+import {
+  WidgetEditorLoadFailure,
+  WidgetPreviewStatus,
+} from "./widgetEditorStatus";
+import {
+  getWidgetEditorLoadState,
+  getWidgetPreviewState,
+  WIDGET_PREVIEW_MAX_WAIT_MS,
+} from "./widgetEditorState";
 
 const escapeCsvField = (field) => {
   const str = String(field ?? "");
@@ -1125,10 +1134,16 @@ export default function WidgetEditorView() {
   const [createdWidgetId, setCreatedWidgetId] = useState(null);
   const effectiveWidgetId = createdWidgetId || widgetId;
   const isEditing = effectiveWidgetId && effectiveWidgetId !== "new";
+  const isRouteEditing = Boolean(widgetId && widgetId !== "new");
 
   const { canDelete, isReadOnly } = useCanEditDashboard();
 
-  const { data: dashboard } = useDashboardDetail(dashboardId);
+  const {
+    data: dashboard,
+    isLoading: isDashboardLoading,
+    isError: isDashboardError,
+    refetch: refetchDashboard,
+  } = useDashboardDetail(dashboardId);
   const createMutation = useCreateWidget();
   const updateMutation = useUpdateWidget();
   const deleteMutation = useDeleteWidget();
@@ -1141,6 +1156,7 @@ export default function WidgetEditorView() {
   const previewPollTimerRef = useRef(null);
   const previewGenerationRef = useRef(0);
   const [isPreviewRefreshing, setIsPreviewRefreshing] = useState(false);
+  const [previewFailed, setPreviewFailed] = useState(false);
 
   // Build a map: agent_definition_id → observability project for cross-source correlation
   const simAgentObsMap = useMemo(() => {
@@ -1885,6 +1901,7 @@ export default function WidgetEditorView() {
     clearTimeout(previewPollTimerRef.current);
     previewPollTimerRef.current = null;
     setIsPreviewRefreshing(false);
+    setPreviewFailed(false);
   }, [previewQuerySignature]);
 
   useEffect(
@@ -1904,6 +1921,7 @@ export default function WidgetEditorView() {
       previewPollTimerRef.current = null;
       const pollingController = createAggregationPollController();
       let refreshWasQueued = false;
+      setPreviewFailed(false);
 
       const isCurrent = () =>
         previewGenerationRef.current === generation &&
@@ -1915,6 +1933,7 @@ export default function WidgetEditorView() {
         const delay = pollingController.nextDelay();
         if (delay === false) {
           setIsPreviewRefreshing(false);
+          setPreviewFailed(true);
           return;
         }
         previewPollTimerRef.current = window.setTimeout(() => {
@@ -1935,9 +1954,14 @@ export default function WidgetEditorView() {
               const { isRefreshing, refreshFailed } =
                 getAggregationRefreshState(response);
               const readState = getExactAggregationReadState(response);
+              const responsePreviewState = getWidgetPreviewState(
+                response?.data?.result,
+                { isSuccess: true },
+              );
               pollingController.recordSuccess();
               if (exactResult) {
                 setLastExactPreview({ signature, result: exactResult });
+                setPreviewFailed(false);
               }
               if (
                 isRefreshing &&
@@ -1949,7 +1973,25 @@ export default function WidgetEditorView() {
                 schedulePoll();
                 return;
               }
+              if (
+                !refreshFailed &&
+                !exactResult &&
+                responsePreviewState === "preparing"
+              ) {
+                refreshWasQueued = true;
+                setIsPreviewRefreshing(true);
+                schedulePoll();
+                return;
+              }
               setIsPreviewRefreshing(false);
+              if (
+                !exactResult &&
+                (refreshFailed ||
+                  responsePreviewState === "failed" ||
+                  readState !== "complete")
+              ) {
+                setPreviewFailed(true);
+              }
             },
             onError: () => {
               if (!isCurrent()) return;
@@ -1958,6 +2000,7 @@ export default function WidgetEditorView() {
                 return;
               }
               setIsPreviewRefreshing(false);
+              setPreviewFailed(true);
             },
           },
         );
@@ -3004,15 +3047,48 @@ export default function WidgetEditorView() {
   const canPreview =
     metrics.length > 0 && !(timePreset === "custom" && !customDateRange);
 
+  const serverPreviewState = getWidgetPreviewState(
+    queryMutation.data?.data?.result,
+    queryMutation,
+  );
+  const previewPreparing =
+    !previewFailed &&
+    canPreview &&
+    !activeExactPreview &&
+    (queryMutation.isPending ||
+      isPreviewRefreshing ||
+      serverPreviewState === "preparing");
+  const previewActivity = previewPreparing && !activeExactPreview;
+
+  useEffect(() => {
+    if (!previewActivity) return undefined;
+    const timer = setTimeout(() => {
+      previewGenerationRef.current += 1;
+      clearTimeout(previewPollTimerRef.current);
+      previewPollTimerRef.current = null;
+      setIsPreviewRefreshing(false);
+      setPreviewFailed(true);
+    }, WIDGET_PREVIEW_MAX_WAIT_MS);
+    return () => clearTimeout(timer);
+  }, [previewActivity]);
+
+  const retryPreview = useCallback(() => {
+    setPreviewFailed(false);
+    runPreviewQuery(buildQueryConfig(), { refresh: true });
+  }, [buildQueryConfig, runPreviewQuery]);
+
   const previewLoading =
-    (queryMutation.isPending && !activeExactPreview) ||
-    (isEditing && !initialized) ||
-    (canPreview && queryMutation.isIdle && !activeExactPreview);
+    !previewFailed &&
+    ((queryMutation.isPending && !activeExactPreview) ||
+      (isEditing && isDashboardLoading) ||
+      (canPreview && queryMutation.isIdle && !activeExactPreview));
 
   const emptyPreviewMessage = canPreview
     ? activeExactPreview
       ? "No data for this selection"
-      : AGGREGATION_PREPARING_MESSAGE
+      : previewPreparing
+        ? AGGREGATION_PREPARING_MESSAGE
+        : "No data for this selection"
     : "Fill in the required fields to see preview";
 
   const cleanupDragRef = useRef(null);
@@ -3057,6 +3133,31 @@ export default function WidgetEditorView() {
       if (cleanupDragRef.current) cleanupDragRef.current();
     };
   }, []);
+
+  const editorLoadState = getWidgetEditorLoadState({
+    isEditing: isRouteEditing,
+    isLoading: isDashboardLoading,
+    isError: isDashboardError,
+    dashboard,
+    widgetId,
+  });
+  if (editorLoadState === "error") {
+    return (
+      <WidgetEditorLoadFailure
+        kind="error"
+        onRetry={() => refetchDashboard()}
+        onBack={() => navigate(dashboardDetailUrl)}
+      />
+    );
+  }
+  if (editorLoadState === "missing") {
+    return (
+      <WidgetEditorLoadFailure
+        kind="missing"
+        onBack={() => navigate(dashboardDetailUrl)}
+      />
+    );
+  }
 
   return (
     <Box
@@ -3566,7 +3667,7 @@ export default function WidgetEditorView() {
             }}
           >
             {/* Bar chart — horizontal bars (left) + search/checkboxes (right) */}
-            {isHorizontal && previewLoading && (
+            {isHorizontal && (previewLoading || previewPreparing) && (
               <Box
                 sx={{
                   flex: 1,
@@ -3575,24 +3676,39 @@ export default function WidgetEditorView() {
                   alignItems: "center",
                 }}
               >
-                <CircularProgress size={24} />
+                <WidgetPreviewStatus
+                  state={previewPreparing ? "preparing" : "loading"}
+                />
               </Box>
             )}
-            {isHorizontal && !previewLoading && previewSeries.length === 0 && (
-              <Box
-                sx={{
-                  flex: 1,
-                  display: "flex",
-                  justifyContent: "center",
-                  alignItems: "center",
-                }}
-              >
-                <Typography variant="body2" color="text.secondary">
-                  {emptyPreviewMessage}
-                </Typography>
+            {isHorizontal && previewFailed && (
+              <Box sx={{ p: 2 }}>
+                <WidgetPreviewStatus state="failed" onRetry={retryPreview} />
               </Box>
             )}
-            {isHorizontal && previewSeries.length > 0 && !previewLoading
+            {isHorizontal &&
+              !previewLoading &&
+              !previewPreparing &&
+              !previewFailed &&
+              previewSeries.length === 0 && (
+                <Box
+                  sx={{
+                    flex: 1,
+                    display: "flex",
+                    justifyContent: "center",
+                    alignItems: "center",
+                  }}
+                >
+                  <Typography variant="body2" color="text.secondary">
+                    {emptyPreviewMessage}
+                  </Typography>
+                </Box>
+              )}
+            {isHorizontal &&
+            previewSeries.length > 0 &&
+            !previewLoading &&
+            !previewPreparing &&
+            !previewFailed
               ? (() => {
                   const maxVal = Math.max(
                     ...barData.series[0].data.map(Math.abs),
@@ -3963,8 +4079,12 @@ export default function WidgetEditorView() {
                   overflow: "hidden",
                 }}
               >
-                {previewLoading ? (
-                  <CircularProgress size={24} />
+                {previewLoading || previewPreparing ? (
+                  <WidgetPreviewStatus
+                    state={previewPreparing ? "preparing" : "loading"}
+                  />
+                ) : previewFailed ? (
+                  <WidgetPreviewStatus state="failed" onRetry={retryPreview} />
                 ) : previewSeries.length > 0 ? (
                   <Box sx={{ width: "100%", height: "100%" }}>
                     {isMetricCard ? (
