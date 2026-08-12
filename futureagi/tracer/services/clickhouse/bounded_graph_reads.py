@@ -100,6 +100,13 @@ GRAPH_UNINDEXED_SAMPLE_SLICE = timedelta(minutes=5)
 # The graph remains explicitly sampled; a second failure is never counted as
 # temporal coverage and therefore cannot become a renderable partial graph.
 GRAPH_UNINDEXED_SAMPLE_RETRY_SLICE = timedelta(minutes=1)
+# A typed-Map key witness is optional discovery, not graph membership. Share a
+# 100 ms wall across every long-window stratum so an old unindexed part cannot
+# consume the 9.5-second request before the deterministic five-minute sample
+# and exact finite classifier run. Fast indexed parts can still improve the
+# sample; every timeout falls back to the established temporal lane.
+GRAPH_TRACE_KEY_WITNESS_TOTAL_TIMEOUT_MS = 100
+GRAPH_TRACE_KEY_WITNESS_QUERY_TIMEOUT_MS = 100
 
 # Keep every graph-union classifier inside the same finite resource envelope as
 # the shared bounded selector. Production readback under the retired 512 MiB
@@ -107,14 +114,27 @@ GRAPH_UNINDEXED_SAMPLE_RETRY_SLICE = timedelta(minutes=1)
 # chunk that crossed that old ceiling. The approved 36 GiB envelope removes
 # the obsolete cap; five-ID chunks still bound per-query result work. Together with
 # the six-candidate per-stratum sentinel above, one failed wide probe, eight
-# seeds, eight possible narrow retries, ten classifiers, and five decoration
-# reads fit the 32-query endpoint ceiling.
+# seeds, eight possible narrow retries, and five decoration reads fit the
+# 32-query endpoint ceiling. Four-stratum indexed acquisition keeps its four
+# classifiers so every finite 16-candidate sentinel can be checked. The
+# expensive eight-stratum unindexed lane crosses a stricter two-classifier,
+# deterministic 10-ID boundary; ten retains at least one candidate from every
+# one of its eight non-empty strata.
 # Relational classifiers can include one candidate-scoped ``Score FINAL``
 # read. Give that finite <=5-trace batch enough time to finish while the shared
 # request deadline below still clamps every later batch and remains the
 # authoritative wall for the complete graph.
 GRAPH_TRACE_UNION_QUERY_TIMEOUT_MS = 1_500
 GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE = 5
+GRAPH_TRACE_UNION_CLASSIFY_QUERY_BUDGET = 4
+GRAPH_TRACE_UNION_CANDIDATE_LIMIT = (
+    GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE * GRAPH_TRACE_UNION_CLASSIFY_QUERY_BUDGET
+)
+GRAPH_TRACE_UNINDEXED_UNION_CLASSIFY_QUERY_BUDGET = 2
+GRAPH_TRACE_UNINDEXED_UNION_CANDIDATE_LIMIT = (
+    GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE
+    * GRAPH_TRACE_UNINDEXED_UNION_CLASSIFY_QUERY_BUDGET
+)
 GRAPH_TRACE_UNION_MAX_QUERY_COUNT = 32
 GRAPH_TRACE_UNION_READ_SETTINGS = {
     "max_threads": 1,
@@ -288,7 +308,7 @@ def _classify_deferred_trace_strata(
     acquisition_query_count: int,
     candidate_rows_per_stratum: int,
     visible_rows_per_stratum: int,
-) -> tuple[dict[Hashable, dict[str, Any]], float, int, int, int, int]:
+) -> tuple[dict[Hashable, dict[str, Any]], float, int, int, int, int, bool]:
     """Classify a de-duplicated trace union in bounded full-window chunks.
 
     Every input row is still only an untrusted anchor/root seed. This helper is
@@ -305,16 +325,69 @@ def _classify_deferred_trace_strata(
             if trace_id:
                 union_by_id.setdefault(trace_id, row)
     if not union_by_id:
-        return {}, 0.0, 0, 0, 0, 0
+        return {}, 0.0, 0, 0, 0, 0, False
 
     absolute_ceiling = len(strata) * (candidate_rows_per_stratum + 1)
     if len(union_by_id) > absolute_ceiling:
         raise AssertionError("trace graph union exceeds its finite identity ceiling")
 
+    unindexed_temporal_union = len(strata) >= GRAPH_ANY_SPAN_STRATA
+    classifier_query_budget = (
+        GRAPH_TRACE_UNINDEXED_UNION_CLASSIFY_QUERY_BUDGET
+        if unindexed_temporal_union
+        else GRAPH_TRACE_UNION_CLASSIFY_QUERY_BUDGET
+    )
+    classifier_candidate_limit = (
+        GRAPH_TRACE_UNINDEXED_UNION_CANDIDATE_LIMIT
+        if unindexed_temporal_union
+        else GRAPH_TRACE_UNION_CANDIDATE_LIMIT
+    )
+    union_sampled = len(union_by_id) > classifier_candidate_limit
+    if union_sampled:
+        # The surrounding graph is already an explicitly incomplete temporal
+        # sample. Interleave newest candidates from every non-empty stratum so
+        # the full-window classifier has a fixed lane-specific ceiling without
+        # collapsing the result onto the newest part of the request window.
+        ordered_strata: list[list[dict[str, Any]]] = []
+        for stratum in strata:
+            stratum_by_id: dict[str, dict[str, Any]] = {}
+            for row in stratum.candidate_rows:
+                trace_id = str(row.get("trace_id") or "")
+                if trace_id:
+                    stratum_by_id.setdefault(trace_id, row)
+            ordered_strata.append(
+                sorted(
+                    stratum_by_id.values(),
+                    key=lambda row: _candidate_row_key(
+                        row,
+                        key_field="trace_id",
+                    ),
+                    reverse=True,
+                )
+            )
+
+        bounded_union_by_id: dict[str, dict[str, Any]] = {}
+        max_stratum_depth = max((len(rows) for rows in ordered_strata), default=0)
+        for depth in range(max_stratum_depth):
+            for stratum_rows in ordered_strata:
+                if depth >= len(stratum_rows):
+                    continue
+                row = stratum_rows[depth]
+                trace_id = str(row.get("trace_id") or "")
+                if trace_id:
+                    bounded_union_by_id.setdefault(trace_id, row)
+                if len(bounded_union_by_id) >= classifier_candidate_limit:
+                    break
+            if len(bounded_union_by_id) >= classifier_candidate_limit:
+                break
+        union_by_id = bounded_union_by_id
+
     union_rows = list(union_by_id.values())
     classifier_query_count = (
         len(union_rows) + GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE - 1
     ) // GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE
+    if classifier_query_count > classifier_query_budget:
+        raise AssertionError("trace graph union exceeds its classifier budget")
     if (
         acquisition_query_count + classifier_query_count
         > GRAPH_TRACE_UNION_MAX_QUERY_COUNT
@@ -422,6 +495,7 @@ def _classify_deferred_trace_strata(
         classifier_rows_returned,
         classifier_payload_bytes,
         total_rows_lower_bound,
+        union_sampled,
     )
 
 
@@ -499,6 +573,7 @@ def _read_time_distributed_candidates(
         window_end=window_end,
     )
     force_temporal_sample = False
+    graph_key_witness_elapsed_ms = 0.0
     # Every trace path acquires all disjoint strata first, then replays the
     # de-duplicated finite union in <=5-ID full-window chunks. This includes
     # the locked-executor five-minute/one-minute temporal lane: classifying 50
@@ -577,11 +652,27 @@ def _read_time_distributed_candidates(
         # value comparison and the false-empty five-minute tail observed in
         # production. The finite sentinel/classifier contract remains graph-
         # only; resource failure falls back to the existing temporal sample.
+        graph_key_witness_remaining_ms = GRAPH_TRACE_KEY_WITNESS_TOTAL_TIMEOUT_MS - int(
+            graph_key_witness_elapsed_ms
+        )
+        graph_key_witness_budget_available = graph_key_witness_remaining_ms >= 25
+        if (
+            not force_temporal_sample
+            and requires_temporal_sample
+            and graph_key_supported
+            and probe_limits_enforced
+            and not graph_key_witness_budget_available
+        ):
+            # The optional witness has spent its complete shared allowance.
+            # Route this and every older stratum directly to the intentional
+            # temporal sample instead of launching another broad statement.
+            force_temporal_sample = True
         use_graph_key_witness = bool(
             not force_temporal_sample
             and requires_temporal_sample
             and graph_key_supported
             and probe_limits_enforced
+            and graph_key_witness_budget_available
         )
         if mode == "trace" and (use_stratum_anchor or use_graph_key_witness):
             defer_trace_classification = True
@@ -633,6 +724,7 @@ def _read_time_distributed_candidates(
             classify_size: int,
             defer_classify: bool,
             graph_key_witness: bool = False,
+            query_timeout_ms: int | None = None,
         ):
             return read_bounded_filter_page(
                 builder=active_builder,
@@ -663,6 +755,7 @@ def _read_time_distributed_candidates(
                 anchor_probe_limit=(candidate_count if use_anchor else None),
                 defer_classification=defer_classify,
                 graph_key_witness_probe=graph_key_witness,
+                query_timeout_ms=query_timeout_ms,
             )
 
         page = None
@@ -680,6 +773,14 @@ def _read_time_distributed_candidates(
                 classify_size=bounded_classify_batch_size,
                 defer_classify=defer_trace_classification,
                 graph_key_witness=use_graph_key_witness,
+                query_timeout_ms=(
+                    min(
+                        GRAPH_TRACE_KEY_WITNESS_QUERY_TIMEOUT_MS,
+                        graph_key_witness_remaining_ms,
+                    )
+                    if use_graph_key_witness
+                    else None
+                ),
             )
         except Exception as exc:
             if use_stratum_anchor and is_read_budget_error(exc):
@@ -705,6 +806,9 @@ def _read_time_distributed_candidates(
                     else "query_failed"
                 )
                 raise BoundedGraphReadError(public_code, retryable=True) from None
+
+        if use_graph_key_witness and page is not None:
+            graph_key_witness_elapsed_ms += page.elapsed_ms
 
         if (
             page is not None
@@ -1059,6 +1163,7 @@ def _read_time_distributed_candidates(
             classifier_rows_returned,
             classifier_payload_bytes,
             classifier_total_rows_lower_bound,
+            classifier_union_sampled,
         ) = _classify_deferred_trace_strata(
             analytics=analytics,
             strata=deferred_trace_strata,
@@ -1074,6 +1179,10 @@ def _read_time_distributed_candidates(
         rows_returned += classifier_rows_returned
         result_payload_bytes += classifier_payload_bytes
         total_rows_lower_bound += classifier_total_rows_lower_bound
+        if classifier_union_sampled:
+            complete = False
+            if sampling_error_code is None:
+                sampling_error_code = "sample_limit"
 
     rows = sorted(
         rows_by_id.values(),

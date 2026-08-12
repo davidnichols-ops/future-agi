@@ -2253,6 +2253,10 @@ def test_text_trace_graph_uses_wide_key_witness_strata(monkeypatch) -> None:
     assert len(calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
     assert all(call["graph_key_witness_probe"] is True for call in calls)
     assert all(call["anchor_probe_only"] is True for call in calls)
+    assert [call["query_timeout_ms"] for call in calls] == [
+        bounded_graph_reads.GRAPH_TRACE_KEY_WITNESS_TOTAL_TIMEOUT_MS - index
+        for index in range(bounded_graph_reads.GRAPH_ANY_SPAN_STRATA)
+    ]
     assert all(
         call["builder"].parse_time_range(call["filters"])[1]
         - call["builder"].parse_time_range(call["filters"])[0]
@@ -2262,7 +2266,7 @@ def test_text_trace_graph_uses_wide_key_witness_strata(monkeypatch) -> None:
 
 
 @pytest.mark.unit
-def test_text_trace_key_witness_keeps_five_exact_matches_per_stratum() -> None:
+def test_text_trace_key_witness_bounds_union_and_preserves_every_stratum() -> None:
     window_end = datetime(2026, 7, 31, 7)
     window_start = window_end - timedelta(days=14)
     window_width = window_end - window_start
@@ -2291,7 +2295,10 @@ def test_text_trace_key_witness_keeps_five_exact_matches_per_stratum() -> None:
         observe_type="trace",
     )
 
-    assert len(sample.rows) == bounded_graph_reads.GRAPH_TRACE_DISTRIBUTED_RESULT_LIMIT
+    assert (
+        len(sample.rows)
+        == bounded_graph_reads.GRAPH_TRACE_UNINDEXED_UNION_CANDIDATE_LIMIT
+    )
     assert sample.sampling_strata_completed == sample.sampling_strata == 8
     assert graph_dispatch._bounded_trace_decoration_sample(sample) is sample
     represented_strata = {
@@ -2342,6 +2349,10 @@ def test_wide_graph_key_budget_failure_falls_back_to_temporal_sample(
     assert sample.query_status == "sampled"
     assert calls[0]["graph_key_witness_probe"] is True
     assert calls[0]["anchor_probe_only"] is True
+    assert (
+        calls[0]["query_timeout_ms"]
+        == bounded_graph_reads.GRAPH_TRACE_KEY_WITNESS_QUERY_TIMEOUT_MS
+    )
     assert calls[1]["graph_key_witness_probe"] is False
     assert calls[1]["anchor_probe_only"] is False
     assert (
@@ -2349,6 +2360,74 @@ def test_wide_graph_key_budget_failure_falls_back_to_temporal_sample(
         - calls[1]["builder"].parse_time_range(calls[1]["filters"])[0]
         == bounded_graph_reads.GRAPH_UNINDEXED_SAMPLE_SLICE
     )
+
+
+@pytest.mark.unit
+def test_graph_key_witness_uses_one_shared_wall_then_samples_remaining_strata(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def _page(**kwargs):
+        calls.append(kwargs)
+        is_witness = kwargs.get("graph_key_witness_probe") is True
+        witness_number = sum(
+            call.get("graph_key_witness_probe") is True for call in calls
+        )
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=0,
+            # The first optional probe spends 60 ms; the second is clamped to
+            # the remaining 40 ms. The other six strata must not launch one.
+            elapsed_ms=(
+                60
+                if is_witness and witness_number == 1
+                else kwargs["query_timeout_ms"]
+                if is_witness
+                else 1
+            ),
+            query_count=1,
+            rows_returned=0,
+            result_payload_bytes=0,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(bounded_graph_reads, "read_bounded_filter_page", _page)
+
+    sample = read_graph_candidates(
+        analytics=SimpleNamespace(supports_per_query_read_settings=True),
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(START, START + timedelta(days=365)),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="trace",
+    )
+
+    assert len(calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert [call["graph_key_witness_probe"] for call in calls[:2]] == [True, True]
+    assert all(call["graph_key_witness_probe"] is False for call in calls[2:])
+    assert (
+        calls[0]["query_timeout_ms"]
+        == bounded_graph_reads.GRAPH_TRACE_KEY_WITNESS_TOTAL_TIMEOUT_MS
+    )
+    assert (
+        calls[1]["query_timeout_ms"]
+        == bounded_graph_reads.GRAPH_TRACE_KEY_WITNESS_TOTAL_TIMEOUT_MS - 60
+    )
+    assert all(call["query_timeout_ms"] is None for call in calls[2:])
+    assert all(
+        call["builder"].parse_time_range(call["filters"])[1]
+        - call["builder"].parse_time_range(call["filters"])[0]
+        == bounded_graph_reads.GRAPH_UNINDEXED_SAMPLE_SLICE
+        for call in calls[2:]
+    )
+    assert sample.query_status == "sampled"
+    assert sample.sampling_strata_completed == sample.sampling_strata == 8
 
 
 @pytest.mark.unit
@@ -3343,17 +3422,23 @@ def test_trace_graph_worst_case_acquisition_and_retries_fit_query_ceiling(
         call for call in analytics.calls if "candidate_trace_ids" in call[1]
     ]
     assert len(calls) == 1 + (bounded_graph_reads.GRAPH_ANY_SPAN_STRATA * 2)
-    assert len(classifier_calls) == 10
+    assert (
+        len(classifier_calls)
+        == bounded_graph_reads.GRAPH_TRACE_UNINDEXED_UNION_CLASSIFY_QUERY_BUDGET
+    )
     assert all(
         len(params["candidate_trace_ids"])
         <= bounded_graph_reads.GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE
         for _, params, *_ in classifier_calls
     )
-    assert sample.query_count == 27
+    assert sample.query_count == len(calls) + len(classifier_calls)
     assert sample.query_count <= bounded_graph_reads.GRAPH_TRACE_UNION_MAX_QUERY_COUNT
     assert sample.query_status == "sampled"
     assert sample.sampling_strata_completed == sample.sampling_strata == 8
-    assert len(sample.rows) == bounded_graph_reads.GRAPH_TRACE_DISTRIBUTED_RESULT_LIMIT
+    assert (
+        len(sample.rows)
+        == bounded_graph_reads.GRAPH_TRACE_UNINDEXED_UNION_CANDIDATE_LIMIT
+    )
     graph_dispatch._require_renderable_sample(sample)
 
 
@@ -3501,7 +3586,10 @@ def test_locked_trace_temporal_candidates_use_resource_safe_union_batches() -> N
         "filter_witness_" not in query and "argMinIf(" not in query
         for query, *_ in classifier_calls
     )
-    assert len(sample.rows) == bounded_graph_reads.GRAPH_TRACE_DISTRIBUTED_RESULT_LIMIT
+    assert (
+        len(sample.rows)
+        == bounded_graph_reads.GRAPH_TRACE_UNINDEXED_UNION_CANDIDATE_LIMIT
+    )
     assert sample.query_status == "sampled"
     assert sample.sampling_strata_completed == sample.sampling_strata == 8
     assert sample.query_count <= bounded_graph_reads.GRAPH_TRACE_UNION_MAX_QUERY_COUNT
