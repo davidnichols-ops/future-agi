@@ -542,7 +542,7 @@ describe("voice-call property search aliases", () => {
     document.body.removeChild(anchorEl);
   });
 
-  it("keeps loading for the Call ID label until an older raw Call ID key is certified", () => {
+  it("keeps retained Call ID siblings pageable after the raw key is certified", () => {
     const fetchNextPage = vi.fn();
     let exactSearchMatched = false;
     let data = [
@@ -600,10 +600,10 @@ describe("voice-call property search aliases", () => {
     ).toBeInTheDocument();
     expect(
       document.querySelector('[data-filter-property-option="call_id"]'),
-    ).not.toBeInTheDocument();
+    ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Load more attributes" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "Load more attributes" }),
+    ).toBeInTheDocument();
     document.body.removeChild(anchorEl);
   });
 
@@ -651,7 +651,7 @@ describe("voice-call property search aliases", () => {
     document.body.removeChild(anchorEl);
   });
 
-  it("terminates only after the backend certifies the exact raw trace.id key", () => {
+  it("keeps punctuation-normalized trace siblings visible and pageable after an exact match", () => {
     const fetchNextPage = vi.fn();
     exactAttributePropertiesMock.mockReturnValue({
       data: [
@@ -665,8 +665,8 @@ describe("voice-call property search aliases", () => {
       ],
       isFetching: false,
       fetchNextPage,
-      // Deliberately adversarial: the UI must use backend certification rather
-      // than punctuation-normalized display matching to suppress this flag.
+      // Exact certification stops the supplemental lookup, but this retained
+      // continuation must remain independently reachable.
       hasNextPage: true,
       isFetchingNextPage: false,
       isFetchNextPageError: false,
@@ -692,13 +692,118 @@ describe("voice-call property search aliases", () => {
     ).toBeInTheDocument();
     expect(
       document.querySelector('[data-filter-property-option="trace_id"]'),
-    ).not.toBeInTheDocument();
+    ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Load more attributes" }),
-    ).not.toBeInTheDocument();
-    expect(fetchNextPage).not.toHaveBeenCalled();
+      screen.getByRole("button", { name: "Load more attributes" }),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Load more attributes" }),
+    );
+    expect(fetchNextPage).toHaveBeenCalledOnce();
     document.body.removeChild(anchorEl);
   });
+
+  it.each([
+    ["tracing", "trace", "traces"],
+    ["voice", "voiceCalls", "spans"],
+  ])(
+    "shows the exact %s property first while explicitly paging prefix siblings",
+    (surface, tab, expectedAttributeSource) => {
+      const fetchNextPage = vi.fn();
+      let hasNextPage = true;
+      let data = [
+        {
+          id: "foo",
+          name: "foo",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+        {
+          id: "foo_archive",
+          name: "foo_archive",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ];
+      exactAttributePropertiesMock.mockImplementation(({ search, source }) => ({
+        data,
+        isFetching: false,
+        fetchNextPage,
+        hasNextPage,
+        isFetchingNextPage: false,
+        fetchNextExactPage: vi.fn(),
+        hasNextExactPage: false,
+        isFetchingExactSearch: false,
+        isFetchingNextExactPage: false,
+        isFetchNextPageError: false,
+        exactSearchError: null,
+        queryReadState: "complete",
+        browseStatus: hasNextPage ? "continuation" : "exhausted",
+        pageCount: hasNextPage ? 1 : 2,
+        exactSearchMatched: search === "foo",
+        cursorRetryExhausted: false,
+        debouncedSearch: search.trim(),
+        refetch: vi.fn(),
+        source,
+      }));
+      const traceProperties = getTraceFilterFields(tab).map((field) =>
+        toStaticFilterProperty(field),
+      );
+      const { anchorEl, rerenderPanel } = renderPanel({
+        properties: traceProperties,
+        projectId: `project-${surface}`,
+        source: "traces",
+        tab,
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "Property" }));
+      fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+        target: { value: "foo" },
+      });
+
+      expect(
+        Array.from(
+          document.querySelectorAll("[data-filter-property-option]"),
+        ).map((option) => option.dataset.filterPropertyOption),
+      ).toEqual(["foo", "foo_archive"]);
+      expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: `project-${surface}`,
+          search: "foo",
+          source: expectedAttributeSource,
+        }),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Load more attributes" }),
+      );
+      expect(fetchNextPage).toHaveBeenCalledOnce();
+
+      data = [
+        ...data,
+        {
+          id: "foo.bar",
+          name: "foo.bar",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ];
+      hasNextPage = false;
+      rerenderPanel();
+
+      expect(
+        Array.from(
+          document.querySelectorAll("[data-filter-property-option]"),
+        ).map((option) => option.dataset.filterPropertyOption),
+      ).toEqual(["foo", "foo_archive", "foo.bar"]);
+      expect(
+        screen.queryByRole("button", { name: "Load more attributes" }),
+      ).not.toBeInTheDocument();
+      document.body.removeChild(anchorEl);
+    },
+  );
 
   it("resets a browsed category when property search starts", () => {
     const { anchorEl } = renderPanel({
@@ -2825,6 +2930,98 @@ describe("filter-value picker bounded-read UX", () => {
 
     document.body.removeChild(anchorEl);
   });
+
+  it.each([
+    ["tracing", undefined, "traces"],
+    ["voice", "voiceCalls", "spans"],
+  ])(
+    "keeps %s Query-field pagination explicit after an exact-prefix match",
+    async (surface, tab, expectedAttributeSource) => {
+      let hasNextPage = true;
+      let data = [
+        {
+          id: "foo",
+          name: "foo",
+          category: "attribute",
+          rawCategory: "custom_attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+        {
+          id: "foo_archive",
+          name: "foo_archive",
+          category: "attribute",
+          rawCategory: "custom_attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ];
+      const fetchNextPage = vi.fn(async () => {
+        data = [
+          ...data,
+          {
+            id: "foo.bar",
+            name: "foo.bar",
+            category: "attribute",
+            rawCategory: "custom_attribute",
+            type: "string",
+            apiColType: "SPAN_ATTRIBUTE",
+          },
+        ];
+        hasNextPage = false;
+      });
+      exactAttributePropertiesMock.mockImplementation(({ search, source }) => ({
+        data,
+        isFetching: false,
+        fetchNextPage,
+        hasNextPage,
+        isFetchingNextPage: false,
+        fetchNextExactPage: vi.fn(),
+        hasNextExactPage: false,
+        isFetchingExactSearch: false,
+        isFetchingNextExactPage: false,
+        isFetchNextPageError: false,
+        exactSearchError: null,
+        queryReadState: "complete",
+        browseStatus: hasNextPage ? "continuation" : "exhausted",
+        pageCount: hasNextPage ? 1 : 2,
+        exactSearchMatched: search === "foo",
+        cursorRetryExhausted: false,
+        debouncedSearch: search.trim(),
+        refetch: vi.fn(),
+        source,
+      }));
+      const { anchorEl, rerenderPanel } = renderPanel({
+        properties: [],
+        projectId: `project-query-${surface}`,
+        source: "traces",
+        tab,
+        showQueryTab: true,
+      });
+
+      fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+      const input = screen.getByRole("combobox");
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "foo" } });
+
+      expect(await screen.findByText("foo")).toBeInTheDocument();
+      expect(screen.getByText("foo_archive")).toBeInTheDocument();
+      expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: `project-query-${surface}`,
+          search: "foo",
+          source: expectedAttributeSource,
+        }),
+      );
+      fireEvent.click(screen.getByText("Load more fields"));
+      expect(fetchNextPage).toHaveBeenCalledOnce();
+      rerenderPanel();
+
+      expect(await screen.findByText("foo.bar")).toBeInTheDocument();
+      expect(screen.queryByText("Load more fields")).not.toBeInTheDocument();
+      document.body.removeChild(anchorEl);
+    },
+  );
 
   it.each([
     ["tracing", undefined],

@@ -575,6 +575,146 @@ def _continuous_trace_task_for_filter(filter_item: dict) -> SimpleNamespace:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("row_type", [RowType.TRACES, RowType.VOICE_CALLS])
+@pytest.mark.parametrize(
+    "config_ids",
+    [
+        ("00000000-0000-4000-8000-000000000088",),
+        (),
+    ],
+    ids=["configured", "known-empty"],
+)
+def test_continuous_eval_filter_resolves_project_configs_once_for_all_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    row_type: str,
+    config_ids: tuple[str, ...],
+) -> None:
+    has_eval_filter = {
+        "column_id": "has_eval",
+        "filter_config": {
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": True,
+        },
+    }
+    task = _continuous_trace_task_for_filter(has_eval_filter)
+    task.row_type = row_type
+    classifier_ids = ("trace-a", "trace-b")
+    public_ids = (
+        ("root-a", "root-b")
+        if row_type == RowType.VOICE_CALLS
+        else classifier_ids
+    )
+    candidates = continuous_candidates.ContinuousCandidates(
+        classifier_ids,
+        public_ids,
+    )
+    builder_kwargs: dict = {}
+    config_reads: list[tuple[str, tuple[dict, ...]]] = []
+    classified_batches: list[tuple[str, ...]] = []
+
+    class Builder:
+        def __init__(self, **kwargs):
+            builder_kwargs.update(kwargs)
+
+        @staticmethod
+        def supports_bounded_filter_scan() -> bool:
+            return True
+
+        @staticmethod
+        def recommended_filter_classify_batch_size() -> int:
+            return 1
+
+        @staticmethod
+        def recommended_filter_classify_read_settings():
+            return None
+
+        @staticmethod
+        def build_filter_match_query(batch, *, candidate_full_state):
+            assert candidate_full_state is True
+            classified_batches.append(tuple(batch))
+            return "continuous_eval_classifier", {"candidate_ids": tuple(batch)}
+
+    class Analytics:
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            assert query == "continuous_eval_classifier"
+            trace_id = params["candidate_ids"][0]
+            row = {"trace_id": trace_id}
+            if row_type == RowType.VOICE_CALLS:
+                row["root_span_id"] = trace_id.replace("trace-", "root-")
+            return _FakeQueryResult([row])
+
+    def resolve_configs(project_id, filters):
+        config_reads.append((project_id, tuple(filters)))
+        return config_ids
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        Analytics,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.dispatch.get_v2_class",
+        lambda _query_type: Builder,
+    )
+    monkeypatch.setattr(
+        row_resolver,
+        "_eval_config_ids_for_filters",
+        resolve_configs,
+    )
+    monkeypatch.setattr(
+        continuous_candidates,
+        "sample_public_ids",
+        lambda _analytics, ids, **_kwargs: tuple(ids),
+    )
+
+    resolved = row_resolver._resolve_continuous_rows(
+        task,
+        ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        sampling_rate=100.0,
+    )
+
+    assert len(config_reads) == 1
+    assert builder_kwargs["eval_config_ids"] == list(config_ids)
+    assert classified_batches == [("trace-a",), ("trace-b",)]
+    assert resolved.candidate_ids == public_ids
+    assert resolved.matched_ids == public_ids
+
+
+@pytest.mark.unit
+def test_eval_config_metadata_failure_is_sanitized() -> None:
+    from unittest import mock
+
+    from django.db import DatabaseError
+
+    with mock.patch(
+        "tracer.models.custom_eval_config.CustomEvalConfig.objects"
+    ) as config_manager:
+        config_manager.filter.side_effect = DatabaseError("metadata unavailable")
+        with pytest.raises(
+            row_resolver.EvalTaskReadBudgetExceeded,
+            match="evaluation metadata is temporarily unavailable",
+        ):
+            row_resolver._eval_config_ids_for_filters(
+                str(uuid.uuid4()),
+                [
+                    {
+                        "column_id": "has_eval",
+                        "filter_config": {
+                            "filter_type": "boolean",
+                            "filter_op": "equals",
+                            "filter_value": True,
+                        },
+                    }
+                ],
+            )
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("filter_item", "recommended_read_settings"),
     [

@@ -97,6 +97,7 @@ def test_historical_voice_classifier_samples_exact_root_after_eval_filter(
     builder = VoiceCallListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[_time_filter(), _has_eval_filter(value)],
+        eval_config_ids=["00000000-0000-4000-8000-000000000088"],
         bounded_internal_scan=True,
         bounded_identity_only=True,
         bounded_sampling_salt="task-salt",
@@ -617,6 +618,13 @@ def test_bounded_historical_voice_returns_canonical_root_span_ids(
     monkeypatch.setattr(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
     )
+    monkeypatch.setattr(
+        row_resolver,
+        "_eval_config_ids_for_filters",
+        lambda _project_id, _filters: (
+            "00000000-0000-4000-8000-000000000088",
+        ),
+    )
 
     ids = row_resolver._resolve_bounded_historical_span_ids(
         object(),
@@ -641,6 +649,9 @@ def test_bounded_historical_voice_returns_canonical_root_span_ids(
     assert captured["builder"]._bounded_identity_only is True
     assert captured["builder"]._bounded_sampling_salt == "task-salt"
     assert captured["builder"]._bounded_sampling_rate == 25.0
+    assert captured["builder"].eval_config_ids == [
+        "00000000-0000-4000-8000-000000000088"
+    ]
     match_sql, match_params = captured["builder"].build_filter_match_query(["trace-a"])
     assert "trace_id NOT IN" in match_sql
     assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in match_sql

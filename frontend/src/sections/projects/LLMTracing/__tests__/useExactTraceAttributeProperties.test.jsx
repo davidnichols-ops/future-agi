@@ -464,129 +464,92 @@ describe("useExactTraceAttributeProperties", () => {
     );
   });
 
-  it("stops unrelated catalog continuation once supplemental exact search succeeds", async () => {
-    mocks.get.mockImplementation((_url, { params }) => {
-      if (!params.q) {
-        if (params.cursor === "catalog-page-2") {
+  it.each([
+    ["tracing", "traces"],
+    ["voice", "spans"],
+  ])(
+    "keeps the %s retained catalog explicitly pageable after an exact-prefix collision",
+    async (surface, source) => {
+      mocks.get.mockImplementation((_url, { params }) => {
+        if (!params.q) {
+          if (params.cursor === "catalog-page-2") {
+            return Promise.resolve({
+              data: {
+                result: [{ key: "foo.bar", type: "string", count: 1 }],
+                query_complete: true,
+                query_status: "complete",
+                browse_mode: "recent_suggestions",
+                browse_status: "exhausted",
+                has_more: false,
+                next_cursor: null,
+              },
+            });
+          }
           return Promise.resolve({
             data: {
-              result: [{ key: "final_archive", type: "string", count: 1 }],
+              result: [{ key: "foo_archive", type: "string", count: 1 }],
               query_complete: true,
               query_status: "complete",
               browse_mode: "recent_suggestions",
-              browse_status: "exhausted",
-              has_more: false,
-              next_cursor: null,
+              browse_status: "continuation",
+              has_more: true,
+              next_cursor: "catalog-page-2",
             },
           });
         }
         return Promise.resolve({
           data: {
-            result: [{ key: "final_category", type: "string", count: 1 }],
+            result: [{ key: "foo", type: "string", count: 1 }],
             query_complete: true,
             query_status: "complete",
             browse_mode: "recent_suggestions",
-            browse_status: "continuation",
-            has_more: true,
-            next_cursor: "catalog-page-2",
-          },
-        });
-      }
-      if (!params.cursor) {
-        return Promise.resolve({
-          data: {
-            result: [],
-            query_complete: true,
-            query_status: "complete",
-            browse_mode: "recent_suggestions",
-            browse_status: "continuation",
-            has_more: true,
-            next_cursor: "search-page-2",
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
             lookup_mode: "exact",
-            exact_match: false,
+            exact_match: true,
           },
         });
-      }
-      return Promise.resolve({
-        data: {
-          result: [{ key: "final_status", type: "string", count: 1 }],
-          query_complete: true,
-          query_status: "complete",
-          browse_mode: "recent_suggestions",
-          browse_status: "exhausted",
-          has_more: false,
-          next_cursor: null,
-          lookup_mode: "exact",
-          exact_match: true,
-        },
       });
-    });
 
-    const { result } = renderHook(
-      () =>
-        useExactTraceAttributeProperties({
-          projectId: "project-synthetic",
-          search: "final_status",
-          source: "traces",
-        }),
-      { wrapper: createWrapper() },
-    );
+      const { result } = renderHook(
+        () =>
+          useExactTraceAttributeProperties({
+            projectId: `project-${surface}`,
+            search: "foo",
+            source,
+          }),
+        { wrapper: createWrapper() },
+      );
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data.map((item) => item.id)).toEqual([
-      "final_status",
-      "final_category",
-    ]);
-    expect(result.current.hasNextPage).toBe(false);
-    const completedRequestCount = mocks.get.mock.calls.length;
-    await act(async () => result.current.fetchNextPage());
-    expect(mocks.get).toHaveBeenCalledTimes(completedRequestCount);
+      await waitFor(() => expect(result.current.exactSearchMatched).toBe(true));
+      expect(result.current.data.map((item) => item.id)).toEqual([
+        "foo",
+        "foo_archive",
+      ]);
+      expect(result.current.hasNextExactPage).toBe(false);
+      expect(result.current.hasNextPage).toBe(true);
+      expect(
+        mocks.get.mock.calls.some(
+          ([, options]) => options.params.cursor === "catalog-page-2",
+        ),
+      ).toBe(false);
 
-    expect(
-      mocks.get.mock.calls.some(
-        ([, options]) => options.params.cursor === "catalog-page-2",
-      ),
-    ).toBe(false);
-    expect(mocks.get).toHaveBeenCalledWith(
-      "/api/traces/span-attribute-keys/",
-      expect.objectContaining({
-        params: {
-          project_id: "project-synthetic",
-          page_size: 10,
-        },
-      }),
-    );
-    expect(mocks.get).toHaveBeenCalledWith(
-      "/api/traces/span-attribute-keys/",
-      expect.objectContaining({
-        params: {
-          project_id: "project-synthetic",
-          page_size: 10,
-          q: "final_status",
-        },
-      }),
-    );
-    expect(mocks.get).toHaveBeenCalledWith(
-      "/api/traces/span-attribute-keys/",
-      expect.objectContaining({
-        params: {
-          project_id: "project-synthetic",
-          page_size: 10,
-          q: "final_status",
-          cursor: "search-page-2",
-        },
-      }),
-    );
-    expect(result.current.data.map((item) => item.id)).toEqual([
-      "final_status",
-      "final_category",
-    ]);
-    expect(result.current.data[0]).toEqual(
-      expect.objectContaining({ id: "final_status", type: "string" }),
-    );
-    expect(result.current.exactSearchMatched).toBe(true);
-    expect(result.current.hasNextPage).toBe(false);
-  });
+      await act(async () => result.current.fetchNextPage());
+      await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+      expect(
+        mocks.get.mock.calls.filter(
+          ([, options]) => options.params.cursor === "catalog-page-2",
+        ),
+      ).toHaveLength(1);
+      expect(result.current.data.map((item) => item.id)).toEqual([
+        "foo",
+        "foo_archive",
+        "foo.bar",
+      ]);
+    },
+  );
 
   it("keeps retained partial matches usable when supplemental exact search fails", async () => {
     const exactFailure = new Error("exact search unavailable");
@@ -883,7 +846,9 @@ describe("useExactTraceAttributeProperties", () => {
         attributeTypesExact: false,
       }),
     );
-    expect(result.current.hasNextPage).toBe(false);
+    // Exact discovery is complete, but the retained catalog still advertises
+    // an independent explicit continuation.
+    expect(result.current.hasNextPage).toBe(true);
   });
 
   it("resumes only the retained cursor after an absent exact search is exhausted", async () => {
@@ -1007,7 +972,7 @@ describe("useExactTraceAttributeProperties", () => {
         attributeTypesExact: true,
       }),
     ]);
-    expect(result.current.hasNextPage).toBe(false);
+    expect(result.current.hasNextPage).toBe(true);
   });
 
   it("does not query without a project or for an unsupported source", () => {

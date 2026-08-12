@@ -719,10 +719,13 @@ export function filterPropertiesForPicker({
   const rawIdMatches = list.filter((property) =>
     propertyMatchesRawId(property, rawQuery),
   );
-  // A backend key that is already present wins by its raw identity. Do not use
-  // punctuation-normalized equality here: that previously let `trace_id`
-  // conceal the distinct `trace.id` key and its remaining cursor pages.
-  if (rawIdMatches.length > 0) return rawIdMatches;
+  const hasRawAttributeMatch = rawIdMatches.some(
+    (property) => property.category === "attribute",
+  );
+  // Preserve canonical System-field selection. The merge below is for raw
+  // retained attribute identities; a system response key such as `call_id`
+  // must not suddenly expose unrelated nested aliases.
+  if (rawIdMatches.length > 0 && !hasRawAttributeMatch) return rawIdMatches;
   const canonicalSystemMatches = getUnambiguousCanonicalSystemMatches(
     list,
     rawQuery,
@@ -731,7 +734,7 @@ export function filterPropertiesForPicker({
   // Aliases and fuzzy punctuation matches stay discoverable below but cannot
   // claim identity or terminate backend attribute discovery.
   if (canonicalSystemMatches.length > 0) return canonicalSystemMatches;
-  return list.filter((property) => {
+  const fuzzyMatches = list.filter((property) => {
     const name = normalizePropertySearchText(property.name);
     const id = normalizePropertySearchText(property.id);
     const aliases = (property.searchAliases || []).some((alias) =>
@@ -739,6 +742,16 @@ export function filterPropertiesForPicker({
     );
     return name.includes(query) || id.includes(query) || aliases;
   });
+  // Show an exact backend key first, but keep locally retained substring
+  // matches beside it. Exact identity and fuzzy visibility are separate: a
+  // search for `foo` must not conceal `foo_archive` or `foo.bar` that are
+  // already loaded (or arrive on a later explicit catalog page).
+  if (rawIdMatches.length === 0) return fuzzyMatches;
+  const exactMatches = new Set(rawIdMatches);
+  return [
+    ...rawIdMatches,
+    ...fuzzyMatches.filter((property) => !exactMatches.has(property)),
+  ];
 }
 
 // Attribute discovery is deliberately bounded. If the exact lookup cannot
@@ -1168,11 +1181,10 @@ function PropertyPicker({
   }, [propertiesWithExactAttribute]);
   const visibleProperties = filtered.slice(0, visiblePropertyLimit);
   const hiddenCount = Math.max(filtered.length - visiblePropertyLimit, 0);
-  // Only a backend-certified raw attribute identity is terminal. A matching
-  // system raw id cannot stop discovery because a raw attribute may
-  // legitimately use the same spelling.
-  const canLoadNextAttributePage =
-    hasNextAttributePage && !exactAttributeSearchMatched;
+  // A successful exact probe stops only that supplemental chain. The retained
+  // catalog remains explicitly pageable so sibling substring matches can be
+  // discovered without automatically draining it.
+  const canLoadNextAttributePage = hasNextAttributePage;
   const exactAttributeDiscoveryTerminal =
     exactAttributeCursorRetryExhausted ||
     exactAttributeBrowseStatus === "exhausted" ||

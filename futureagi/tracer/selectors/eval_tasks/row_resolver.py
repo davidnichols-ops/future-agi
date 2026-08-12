@@ -122,6 +122,9 @@ _SAFE_UNSUPPORTED_FILTER_MESSAGE = (
 _SAFE_ANNOTATION_METADATA_MESSAGE = (
     "Evaluation task annotation metadata is temporarily unavailable. Retry."
 )
+_SAFE_EVAL_METADATA_MESSAGE = (
+    "Evaluation task evaluation metadata is temporarily unavailable. Retry."
+)
 
 
 class EvalTaskReadBudgetExceeded(RuntimeError):
@@ -165,6 +168,43 @@ def _annotation_label_ids_for_filters(
         )
     except (AnnotationScoreReadUnavailable, DatabaseError):
         raise EvalTaskReadBudgetExceeded(_SAFE_ANNOTATION_METADATA_MESSAGE) from None
+
+
+def _eval_config_ids_for_filters(
+    project_id: str,
+    ui_filters: list[dict[str, Any]],
+) -> tuple[str, ...] | None:
+    """Resolve one authoritative project config set for eval membership.
+
+    Trace and voice classifiers may execute many finite candidate batches.
+    Resolve their project fence once per task selection instead of making the
+    filter compiler repeat the same PostgreSQL lookup for every batch. ``None``
+    means no has-eval predicate is present; an explicit empty tuple is a known
+    empty project set and preserves positive-false/negative-true semantics.
+    """
+
+    needs_eval_membership = any(
+        (item.get("column_id") or item.get("columnId")) == "has_eval"
+        for item in ui_filters
+        if isinstance(item, dict)
+    )
+    if not needs_eval_membership:
+        return None
+
+    from django.db import DatabaseError
+
+    from tracer.models.custom_eval_config import CustomEvalConfig
+
+    try:
+        return tuple(
+            str(config_id)
+            for config_id in CustomEvalConfig.objects.filter(
+                project_id=project_id,
+                deleted=False,
+            ).values_list("id", flat=True)
+        )
+    except DatabaseError:
+        raise EvalTaskReadBudgetExceeded(_SAFE_EVAL_METADATA_MESSAGE) from None
 
 
 @dataclass(frozen=True)
@@ -700,6 +740,19 @@ def _resolve_continuous_rows(
             "filters": ui_filters,
             "bounded_internal_scan": True,
         }
+        eval_config_ids = _eval_config_ids_for_filters(
+            str(task.project_id), ui_filters
+        )
+        if eval_config_ids is not None and task.row_type in {
+            RowType.SPANS,
+            RowType.TRACES,
+            RowType.VOICE_CALLS,
+        }:
+            # Continuous reconciliation may classify hundreds of finite
+            # batches. Resolve the project fence once for the operation and
+            # reuse it instead of falling back to PostgreSQL during every SQL
+            # compilation. An explicit empty list remains authoritative.
+            builder_kwargs["eval_config_ids"] = list(eval_config_ids)
         if task.row_type in (RowType.SPANS, RowType.TRACES):
             builder_kwargs["bounded_identity_only"] = True
         if task.row_type == RowType.TRACES:
@@ -893,6 +946,7 @@ def _resolve_bounded_historical_span_ids(
     annotation_label_ids = _annotation_label_ids_for_filters(
         str(project_id), ui_filters
     )
+    eval_config_ids = _eval_config_ids_for_filters(str(project_id), ui_filters)
     # Exactly 10k already exceeds the interactive 128-query proof for the
     # shape-specific classifiers (and for trace witness replay). Route the
     # boundary value through the background-workflow contract as well.
@@ -921,6 +975,12 @@ def _resolve_bounded_historical_span_ids(
         "bounded_sampling_rate": float(sampling_rate),
         "annotation_label_ids": list(annotation_label_ids),
     }
+    if eval_config_ids is not None and row_type in {
+        RowType.SPANS,
+        RowType.TRACES,
+        RowType.VOICE_CALLS,
+    }:
+        builder_kwargs["eval_config_ids"] = list(eval_config_ids)
     if row_type == RowType.TRACES:
         # Interactive trace tasks first prove membership/order without the
         # expensive child-witness projection, then replay only their selected

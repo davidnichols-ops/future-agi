@@ -312,14 +312,12 @@ export function useExactTraceAttributeProperties({
       exactStoppedRetryAvailable ||
       exactInitialError ||
       exactRefetchError);
-  // Give the exact-q chain first priority, but do not turn an absent exact key
-  // into a hidden retained-catalog ceiling. Once exact search is exhausted, a
-  // later deliberate gesture resumes the cached retained cursor so partial
-  // local matches remain eventually reachable. These predicates are mutually
-  // exclusive: one gesture can issue an exact request or a retained request,
-  // never both. A certified positive exact identity remains terminal.
-  const shouldAdvanceRetained =
-    !exactSearchMatched && (!debouncedSearch || !exactHasNextPage);
+  // Give the exact-q chain first priority, then let a later deliberate gesture
+  // resume the cached retained cursor. A positive exact identity is terminal
+  // only for the supplemental exact chain: it must not hide sibling retained
+  // keys such as `foo_archive` from a search for `foo`. These predicates are
+  // mutually exclusive, so one gesture still issues only one request.
+  const shouldAdvanceRetained = !debouncedSearch || !exactHasNextPage;
   const hasNextPage =
     exactHasNextPage || (shouldAdvanceRetained && retainedHasNextPage);
   const fetchNextPage = (...args) => {
@@ -384,8 +382,8 @@ export function useExactTraceAttributeProperties({
     browseLimit: retainedLastPage?.browse_limit,
     browseLimitReached: browseStatus === "limit_reached" && !hasNextPage,
     // This is intentionally raw-key/backend identity, not the picker's fuzzy
-    // punctuation-normalized match. Consumers may use it to terminate search
-    // pagination without conflating keys such as `trace_id` and `trace.id`.
+    // punctuation-normalized match. It terminates only the supplemental exact
+    // chain; the retained catalog may still contain distinct sibling keys.
     exactSearchMatched,
     debouncedSearch,
     isFetching:
