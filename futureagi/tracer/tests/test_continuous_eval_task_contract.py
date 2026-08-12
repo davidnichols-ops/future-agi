@@ -44,6 +44,10 @@ from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
 )
 from tracer.services.eval_tasks.ch_guardrails import EVAL_CH_GUARDRAILS
 from tracer.services.eval_tasks.config_hash import resolved_config_hash
+from tracer.services.eval_tasks.cursor_policy import (
+    CONTINUOUS_CURSOR_OVERLAP,
+    CONTINUOUS_MIN_PROOF_WINDOW,
+)
 
 
 @pytest.mark.unit
@@ -730,6 +734,278 @@ def test_continuous_discovery_restores_background_two_minute_wall(
     # caps, but its shared discovery proof gets the former two-minute envelope.
     assert observed == {"deadline_seconds": 120.0}
     assert resolved == row_resolver.ResolvedRowSet((), (), False)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("row_type", [RowType.TRACES, RowType.VOICE_CALLS])
+def test_continuous_candidate_overflow_proves_bounded_prefix_in_shared_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    row_type: str,
+) -> None:
+    floor = datetime(2026, 8, 8, 10, 0, tzinfo=UTC)
+    requested_ceiling = floor + timedelta(minutes=40)
+    minimum_ceiling = floor + CONTINUOUS_MIN_PROOF_WINDOW
+    attempted: list[datetime] = []
+    budgets: list[continuous_candidates._ReadBudget] = []
+
+    def prove_window(*_args, ceiling, budget, **_kwargs):
+        attempted.append(ceiling)
+        budgets.append(budget)
+        if ceiling - floor > timedelta(minutes=10):
+            raise continuous_candidates.ContinuousCandidateOverflow("too dense")
+        return continuous_candidates.ContinuousCandidates(
+            ("trace-a",),
+            ("root-a" if row_type == RowType.VOICE_CALLS else "trace-a",),
+        )
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "_discover_continuous_candidate_window",
+        prove_window,
+    )
+
+    result = continuous_candidates.discover_continuous_candidates(
+        object(),
+        project_id=str(uuid.uuid4()),
+        row_type=row_type,
+        filters=[],
+        floor=floor,
+        ceiling=requested_ceiling,
+        salt="task",
+        sampling_rate=100.0,
+        deadline_seconds=120.0,
+        minimum_ceiling=minimum_ceiling,
+    )
+
+    assert attempted == [
+        floor + timedelta(minutes=40),
+        floor + timedelta(minutes=20),
+        floor + timedelta(minutes=10),
+    ]
+    assert len({id(budget) for budget in budgets}) == 1
+    assert result.covered_through == floor + timedelta(minutes=10)
+    assert result.classifier_ids == ("trace-a",)
+    assert result.covered_through - CONTINUOUS_CURSOR_OVERLAP > floor
+
+
+@pytest.mark.unit
+def test_continuous_candidate_overflow_below_progress_floor_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    floor = datetime(2026, 8, 8, 10, 0, tzinfo=UTC)
+    requested_ceiling = floor + timedelta(minutes=40)
+    minimum_ceiling = floor + CONTINUOUS_MIN_PROOF_WINDOW
+    attempted: list[datetime] = []
+
+    def always_overflow(*_args, ceiling, **_kwargs):
+        attempted.append(ceiling)
+        raise continuous_candidates.ContinuousCandidateOverflow("too dense")
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "_discover_continuous_candidate_window",
+        always_overflow,
+    )
+
+    with pytest.raises(
+        continuous_candidates.ContinuousCandidateOverflow,
+        match="too dense",
+    ):
+        continuous_candidates.discover_continuous_candidates(
+            object(),
+            project_id=str(uuid.uuid4()),
+            row_type=RowType.TRACES,
+            filters=[],
+            floor=floor,
+            ceiling=requested_ceiling,
+            salt="task",
+            sampling_rate=100.0,
+            deadline_seconds=120.0,
+            minimum_ceiling=minimum_ceiling,
+        )
+
+    assert attempted[-1] == minimum_ceiling
+    assert all(
+        attempted[index + 1] < attempted[index] for index in range(len(attempted) - 1)
+    )
+
+
+@pytest.mark.unit
+def test_repeated_overflow_slices_catch_up_monotonically_without_gaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_floor = datetime(2026, 8, 8, 10, 0, tzinfo=UTC)
+    requested_ceiling = initial_floor + timedelta(hours=1)
+    cursor = initial_floor
+    proven_windows: list[tuple[datetime, datetime]] = []
+
+    def prove_at_most_ten_minutes(*_args, floor, ceiling, **_kwargs):
+        if ceiling - floor > timedelta(minutes=10):
+            raise continuous_candidates.ContinuousCandidateOverflow("too dense")
+        return continuous_candidates.ContinuousCandidates(("trace-a",), ("trace-a",))
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "_discover_continuous_candidate_window",
+        prove_at_most_ten_minutes,
+    )
+
+    for _ in range(100):
+        result = continuous_candidates.discover_continuous_candidates(
+            object(),
+            project_id=str(uuid.uuid4()),
+            row_type=RowType.TRACES,
+            filters=[],
+            floor=cursor,
+            ceiling=requested_ceiling,
+            salt="task",
+            sampling_rate=100.0,
+            deadline_seconds=120.0,
+            minimum_ceiling=cursor + CONTINUOUS_MIN_PROOF_WINDOW,
+        )
+        assert result.covered_through is not None
+        proven_windows.append((cursor, result.covered_through))
+        if result.covered_through == requested_ceiling:
+            break
+        next_cursor = result.covered_through - CONTINUOUS_CURSOR_OVERLAP
+        assert next_cursor > cursor
+        cursor = next_cursor
+    else:
+        pytest.fail("bounded catch-up did not reach the requested ceiling")
+
+    assert proven_windows[-1][1] == requested_ceiling
+    assert all(
+        later_floor <= earlier_ceiling
+        for (_, earlier_ceiling), (later_floor, _) in zip(
+            proven_windows,
+            proven_windows[1:],
+            strict=False,
+        )
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("row_type", [RowType.TRACES, RowType.VOICE_CALLS])
+def test_continuous_resolver_publishes_exact_candidate_proof_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+    row_type: str,
+) -> None:
+    task = _continuous_trace_task_for_filter(_attribute_filter())
+    task.row_type = row_type
+    requested_ceiling = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    proven_ceiling = requested_ceiling - timedelta(minutes=2)
+    observed: dict[str, datetime | None] = {}
+
+    def discover(*_args, **kwargs):
+        observed["minimum_ceiling"] = kwargs["minimum_ceiling"]
+        return continuous_candidates.ContinuousCandidates(
+            (),
+            (),
+            proven_ceiling,
+        )
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        discover,
+    )
+
+    resolved = row_resolver._resolve_continuous_rows(
+        task,
+        ceiling=requested_ceiling,
+        sampling_rate=100.0,
+    )
+
+    assert observed["minimum_ceiling"] == (
+        task.continuous_cursor + CONTINUOUS_MIN_PROOF_WINDOW
+    )
+    assert resolved.covered_through == proven_ceiling
+    assert resolved.full_state is False
+
+
+@pytest.mark.unit
+def test_cursor_null_continuous_proof_cannot_be_sliced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _continuous_trace_task_for_filter(_attribute_filter())
+    task.continuous_cursor = None
+    observed: dict[str, datetime | None] = {}
+
+    def discover(*_args, **kwargs):
+        observed["minimum_ceiling"] = kwargs["minimum_ceiling"]
+        return continuous_candidates.ContinuousCandidates((), ())
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        discover,
+    )
+
+    resolved = row_resolver._resolve_continuous_rows(
+        task,
+        ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        sampling_rate=100.0,
+    )
+
+    assert observed == {"minimum_ceiling": None}
+    assert resolved.full_state is True
+
+
+@pytest.mark.unit
+def test_irreducibly_dense_candidate_window_remains_deterministic_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def overflow(*_args, **_kwargs):
+        raise continuous_candidates.ContinuousCandidateOverflow("too dense")
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        overflow,
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskSelectionRejected,
+        match="too large for safe row selection",
+    ):
+        row_resolver._resolve_continuous_rows(
+            _continuous_trace_task_for_filter(_attribute_filter()),
+            ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+            sampling_rate=100.0,
+        )
+
+
+@pytest.mark.unit
+def test_adaptive_overflow_probe_pressure_remains_transient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _continuous_trace_task_for_filter(_attribute_filter())
+    ceiling = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    task.continuous_cursor = ceiling - timedelta(minutes=40)
+    calls = 0
+
+    def fail_after_overflow(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise continuous_candidates.ContinuousCandidateOverflow("too dense")
+        raise continuous_candidates.ContinuousCandidateReadError("temporary pressure")
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "_discover_continuous_candidate_window",
+        fail_after_overflow,
+    )
+
+    with pytest.raises(row_resolver.EvalTaskReadBudgetExceeded) as captured:
+        row_resolver._resolve_continuous_rows(
+            task,
+            ceiling=ceiling,
+            sampling_rate=100.0,
+        )
+
+    assert type(captured.value) is row_resolver.EvalTaskReadBudgetExceeded
+    assert calls == 2
 
 
 @pytest.mark.unit

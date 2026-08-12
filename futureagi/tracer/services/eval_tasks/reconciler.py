@@ -9,7 +9,7 @@ import json
 from collections import defaultdict
 from copy import copy
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from itertools import chain
 
 from django.db import transaction
@@ -23,6 +23,7 @@ from tracer.selectors.eval_tasks.row_resolver import (
     resolve_desired_rows,
 )
 from tracer.services.eval_tasks.config_hash import resolved_config_hash
+from tracer.services.eval_tasks.cursor_policy import CONTINUOUS_CURSOR_OVERLAP
 from tracer.services.eval_tasks.entries import materialize_pending
 
 # How far behind "now" the continuous cursor is parked after each pass: the
@@ -30,7 +31,7 @@ from tracer.services.eval_tasks.entries import materialize_pending
 # The unique index makes the re-scan free of duplicates; this only
 # needs to exceed normal ingestion lag (pause/downtime gaps are covered by the
 # persisted cursor, not this overlap).
-_CONTINUOUS_CURSOR_OVERLAP = timedelta(minutes=5)
+_CONTINUOUS_CURSOR_OVERLAP = CONTINUOUS_CURSOR_OVERLAP
 
 # Max entry ids per requeue UPDATE — bounds the WHERE id IN (...) list size.
 _REQUEUE_CHUNK = 10_000
@@ -112,7 +113,10 @@ def _apply_resolved(
     else:
         requeued, dropped = _requeue_and_drop(task, resolved=resolved)
         result = ReconcileResult(created=created, requeued=requeued, dropped=dropped)
-    _advance_continuous_cursor(task, now)
+    # Candidate overflow catch-up may prove only a strict prefix of the frozen
+    # arrival window. Advance from that exact proof ceiling, in this same DB
+    # transaction, never from the later wall-clock ceiling the pass requested.
+    _advance_continuous_cursor(task, resolved.covered_through or now)
     return result
 
 

@@ -28,6 +28,7 @@ from tracer.services.clickhouse.read_budget import (
     is_read_budget_error,
 )
 from tracer.services.clickhouse.v2 import get_reader
+from tracer.services.eval_tasks.cursor_policy import CONTINUOUS_MIN_PROOF_WINDOW
 
 if TYPE_CHECKING:
     from tracer.models.eval_task import EvalTask
@@ -187,12 +188,16 @@ class ResolvedRowSet:
     window); ``matched_ids`` is M (the sampled subset of C matching latest full
     state). Historical and cursor-null passes are full-state proofs. Normal
     continuous passes are deltas, where only C may be removed/requeued.
+    ``covered_through`` is the exclusive arrival ceiling actually proven by a
+    continuous delta. It may precede the requested wall-clock ceiling when a
+    stale cursor is caught up through bounded subwindows.
     """
 
     candidate_ids: tuple[str, ...]
     matched_ids: tuple[str, ...]
     full_state: bool
     trace_filter_witnesses: tuple[TraceFilterWitness, ...] = ()
+    covered_through: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -677,9 +682,17 @@ def _resolve_continuous_rows(
             salt=str(task.id),
             sampling_rate=sampling_rate,
             deadline_seconds=_EVAL_TASK_CONTINUOUS_DISCOVERY_SECONDS,
+            minimum_ceiling=(
+                floor + CONTINUOUS_MIN_PROOF_WINDOW if not full_state else None
+            ),
         )
         if not candidates.classifier_ids:
-            return ResolvedRowSet(candidates.public_ids, (), full_state)
+            return ResolvedRowSet(
+                candidates.public_ids,
+                (),
+                full_state,
+                covered_through=candidates.covered_through,
+            )
 
         query_type, key_field = _BUILDER_BY_ROW_TYPE[task.row_type]
         builder_kwargs: dict[str, Any] = {
@@ -791,6 +804,7 @@ def _resolve_continuous_rows(
             matched_ids,
             full_state,
             witnesses,
+            covered_through=candidates.covered_through,
         )
     except EvalTaskReadBudgetExceeded:
         raise

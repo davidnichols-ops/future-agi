@@ -145,6 +145,7 @@ def _mark(task, status, **f):
 @pytest.mark.unit
 def test_reconcile_reuses_frozen_ceiling_for_requeue(monkeypatch):
     frozen = timezone.now()
+    proven = frozen - timedelta(minutes=20)
     task = object()
     observed: dict[str, object] = {}
 
@@ -153,7 +154,7 @@ def test_reconcile_reuses_frozen_ceiling_for_requeue(monkeypatch):
 
     def fake_resolve(_task, *, ceiling):
         observed["resolve"] = ceiling
-        return ResolvedRowSet((), (), False)
+        return ResolvedRowSet((), (), False, covered_through=proven)
 
     monkeypatch.setattr(
         reconciler_module,
@@ -176,7 +177,7 @@ def test_reconcile_reuses_frozen_ceiling_for_requeue(monkeypatch):
     assert observed == {
         "resolve": frozen,
         "materialize": (),
-        "cursor": frozen,
+        "cursor": proven,
     }
 
 

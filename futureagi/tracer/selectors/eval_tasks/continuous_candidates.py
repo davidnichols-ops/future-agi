@@ -68,6 +68,7 @@ class ContinuousCandidates:
 
     classifier_ids: tuple[str, ...]
     public_ids: tuple[str, ...]
+    covered_through: datetime | None = None
 
 
 @dataclass
@@ -96,17 +97,25 @@ def discover_continuous_candidates(
     salt: str,
     sampling_rate: float,
     deadline_seconds: float,
+    minimum_ceiling: datetime | None = None,
 ) -> ContinuousCandidates:
-    """Return a complete, sampled candidate set for ``[floor, ceiling)``.
+    """Return a complete, sampled candidate set for a proven arrival window.
 
     Span versions are the base trigger.  Eval and annotation tables are read
     only when the active selection depends on those domains.  Their foreign
     references are always projected back through project-scoped spans, because
     score/eval project identifiers are not a reliable tracer tenant boundary.
+
+    A stale continuous cursor can cover more identities than fit in one
+    buffered proof. When ``minimum_ceiling`` is supplied, overflow halves the
+    requested window until one complete prefix fits. Every probe shares the
+    original deadline/query budget. The caller chooses the minimum so accepting
+    a prefix can still move its durable watermark; no safe prefix means the
+    original deterministic overflow escapes without returning partial state.
     """
 
     if floor >= ceiling or sampling_rate <= 0:
-        return ContinuousCandidates((), ())
+        return ContinuousCandidates((), (), ceiling)
     if row_type not in {
         RowType.SPANS,
         RowType.TRACES,
@@ -116,6 +125,66 @@ def discover_continuous_candidates(
         raise ValueError(f"Unsupported row_type: {row_type!r}")
 
     budget = _ReadBudget(time.monotonic() + deadline_seconds)
+    attempted_ceiling = ceiling
+    while True:
+        try:
+            candidates = _discover_continuous_candidate_window(
+                analytics,
+                project_id=project_id,
+                row_type=row_type,
+                filters=filters,
+                floor=floor,
+                ceiling=attempted_ceiling,
+                salt=salt,
+                sampling_rate=sampling_rate,
+                budget=budget,
+            )
+        except ContinuousCandidateOverflow:
+            next_ceiling = _smaller_candidate_ceiling(
+                floor=floor,
+                attempted_ceiling=attempted_ceiling,
+                minimum_ceiling=minimum_ceiling,
+            )
+            if next_ceiling is None:
+                raise
+            attempted_ceiling = next_ceiling
+            continue
+        return ContinuousCandidates(
+            candidates.classifier_ids,
+            candidates.public_ids,
+            attempted_ceiling,
+        )
+
+
+def _smaller_candidate_ceiling(
+    *,
+    floor: datetime,
+    attempted_ceiling: datetime,
+    minimum_ceiling: datetime | None,
+) -> datetime | None:
+    """Return a strictly smaller viable ceiling, or ``None`` to fail closed."""
+
+    if minimum_ceiling is None or attempted_ceiling <= minimum_ceiling:
+        return None
+    midpoint = floor + (attempted_ceiling - floor) / 2
+    next_ceiling = max(midpoint, minimum_ceiling)
+    return next_ceiling if next_ceiling < attempted_ceiling else None
+
+
+def _discover_continuous_candidate_window(
+    analytics: Any,
+    *,
+    project_id: str,
+    row_type: str,
+    filters: list[dict[str, Any]],
+    floor: datetime,
+    ceiling: datetime,
+    salt: str,
+    sampling_rate: float,
+    budget: _ReadBudget,
+) -> ContinuousCandidates:
+    """Prove one fixed window without exposing any partial buffered result."""
+
     changed_identities = _read_changed_span_identities(
         analytics,
         project_id=project_id,
