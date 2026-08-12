@@ -31,6 +31,7 @@ import { useLLMTracingFilters } from "../LLMTracing/useLLMTracingFilters";
 import { buildAddEvalsDraft } from "../LLMTracing/buildAddEvalsDraft";
 import SelectAllBanner from "../LLMTracing/SelectAllBanner";
 import { getSelectionCountState } from "../LLMTracing/listTotalMetadata";
+import { singleProjectIdFromFilters } from "../LLMTracing/GraphSection/graphFilterUtils";
 
 // Lazy-load graph
 const PrimaryGraph = lazy(
@@ -208,6 +209,12 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
   const [externalFilterAnchor, setExternalFilterAnchor] = useState(null);
 
   const hasActiveFilter = extraFilters.length > 0;
+  const toolbarProjectId = useMemo(
+    () =>
+      observeId ||
+      (isUserMode ? singleProjectIdFromFilters(extraFilters) : null),
+    [extraFilters, isUserMode, observeId],
+  );
 
   const handleAddEvals = useCallback(() => {
     const url = buildAddEvalsDraft({
@@ -984,6 +991,7 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
       {/* ObserveToolbar — portals into tab bar */}
       <ObserveToolbar
         mode="sessions"
+        projectId={toolbarProjectId}
         // Date
         dateLabel={getDateLabel(dateFilter)}
         dateFilter={dateFilter}

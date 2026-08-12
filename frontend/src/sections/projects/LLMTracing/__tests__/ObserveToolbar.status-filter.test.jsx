@@ -59,4 +59,12 @@ describe("ObserveToolbar status filter registry", () => {
       );
     },
   );
+
+  it("forwards an explicit project scope for routes without observeId", () => {
+    renderToolbar({ projectId: "project-from-query-string" });
+
+    expect(traceFilterPanelPropsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ projectId: "project-from-query-string" }),
+    );
+  });
 });

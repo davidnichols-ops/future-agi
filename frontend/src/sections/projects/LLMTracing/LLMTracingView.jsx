@@ -177,7 +177,10 @@ import {
 } from "./defaultColumns";
 import TracingControls from "./TracingControls";
 import ObserveToolbar from "./ObserveToolbar";
-import { selectPanelGraphFilters } from "./GraphSection/graphFilterUtils";
+import {
+  selectPanelGraphFilters,
+  singleProjectIdFromFilters,
+} from "./GraphSection/graphFilterUtils";
 import { buildAddEvalsDraft } from "./buildAddEvalsDraft";
 import SelectAllBanner from "./SelectAllBanner";
 import { getSelectionCountState } from "./listTotalMetadata";
@@ -718,6 +721,13 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   // In user mode there is no project context — observeId is null and all
   // grids/queries omit project_id so the backend scopes by org.
   const observeId = isUserMode ? null : routeObserveId;
+  const toolbarProjectId = useMemo(() => {
+    if (observeId) return observeId;
+    if (!isUserMode) return null;
+    return singleProjectIdFromFilters(
+      selectPanelGraphFilters(filterTarget, extraFilters, compareExtraFilters),
+    );
+  }, [compareExtraFilters, extraFilters, filterTarget, isUserMode, observeId]);
 
   // User mode: sessions routes back out to /dashboard/users/:id — users
   // self-nav is suppressed (we're already on the user). Project mode:
@@ -3796,7 +3806,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
               isCompareActive={showCompare}
               onResetView={handleResetView}
               onSetDefaultView={handleSetDefaultView}
-              projectId={observeId}
+              projectId={toolbarProjectId}
               bulkActions={(() => {
                 if (projectSource === PROJECT_SOURCE.SIMULATOR) {
                   return [

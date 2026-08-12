@@ -28,6 +28,11 @@ const DATE_OPTIONS = [
 const ObserveToolbar = ({
   // Mode: "traces" (default) | "sessions" | "users"
   mode = "traces",
+  // Explicit project scope for mounts whose route has no `observeId` (for
+  // example a cross-project Users detail page after its Project filter is
+  // selected). TraceFilterPanel otherwise cannot load either its property
+  // catalog or retained attribute-key catalog on those mounts.
+  projectId,
   // When true, always render inline (skip the #observe-toolbar-slot portal).
   // Used by pages that mount their own toolbar outside the main ObserveTabBar,
   // e.g., the User Detail Page.
@@ -431,6 +436,7 @@ const ObserveToolbar = ({
                   ? "users"
                   : "traces"
             }
+            projectId={projectId}
             onApply={(newFilters) => {
               setPanelFilters(newFilters);
               if (!newFilters || newFilters.length === 0) {
@@ -566,6 +572,7 @@ const ObserveToolbar = ({
 
 ObserveToolbar.propTypes = {
   mode: PropTypes.oneOf(["traces", "sessions", "users"]),
+  projectId: PropTypes.string,
   inline: PropTypes.bool,
   dateLabel: PropTypes.string,
   dateFilter: PropTypes.object,
