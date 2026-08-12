@@ -147,7 +147,7 @@ from tracer.services.filter_principal_context import (
 )
 from tracer.utils.annotations import build_annotation_subqueries
 from tracer.utils.bounded_csv import (
-    BOUNDED_EXPORT_PAGE_SIZE,
+    BOUNDED_SPAN_EXPORT_PAGE_SIZE,
     bounded_page_csv_response,
 )
 from tracer.utils.create_otel_span import create_single_otel_span
@@ -1611,8 +1611,8 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             if kwargs.get("bounded_export"):
                 validated_data.update(
                     page_number=0,
-                    page_size=BOUNDED_EXPORT_PAGE_SIZE,
-                    cursor_mode=False,
+                    page_size=BOUNDED_SPAN_EXPORT_PAGE_SIZE,
+                    cursor_mode=True,
                 )
             validated_data["filters"] = bind_request_my_annotations_principal(
                 request,

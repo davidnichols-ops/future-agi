@@ -122,15 +122,17 @@ def test_trace_list_forces_export_bound_after_request_revalidation():
     internal_data = internal_list.call_args.args[2]
     assert internal_data["page_number"] == 0
     assert internal_data["page_size"] == 100
+    assert internal_data["cursor_mode"] is False
 
 
-def test_span_list_forces_shared_export_bound_after_request_revalidation():
+def test_span_list_forces_cursor_export_bound_after_request_revalidation():
     request = _request({})
     request.validated_query_data = {
         "project_id": "00000000-0000-0000-0000-000000000001",
         "filters": [],
         "page_number": 9,
         "page_size": 1,
+        "cursor_mode": False,
     }
     view = ObservationSpanView()
     view.request = request
@@ -152,7 +154,8 @@ def test_span_list_forces_shared_export_bound_after_request_revalidation():
     assert response is sentinel
     internal_data = internal_list.call_args.args[2]
     assert internal_data["page_number"] == 0
-    assert internal_data["page_size"] == 100
+    assert internal_data["page_size"] == 20
+    assert internal_data["cursor_mode"] is True
 
 
 def test_session_list_forces_shared_export_bound_after_request_revalidation():
@@ -191,6 +194,7 @@ def test_session_list_forces_shared_export_bound_after_request_revalidation():
     internal_data = internal_list.call_args.args[4]
     assert internal_data["page_number"] == 0
     assert internal_data["page_size"] == 100
+    assert internal_data["cursor_mode"] is False
 
 
 def test_span_export_propagates_list_failure_before_starting_csv():
@@ -208,6 +212,53 @@ def test_span_export_propagates_list_failure_before_starting_csv():
         response = ObservationSpanView().get_spans_export_data(request)
 
     assert response is failure
+    assert listing.call_args.kwargs == {"bounded_export": True}
+
+
+def test_span_export_preserves_partial_hydrated_rows_and_marks_truncation():
+    request = _request({"project_id": "00000000-0000-0000-0000-000000000001"})
+    project = SimpleNamespace(name="Observe")
+    page = SimpleNamespace(
+        status_code=status.HTTP_200_OK,
+        data={
+            "result": {
+                "table": [
+                    {
+                        "span_id": "span-1",
+                        "input": {"prompt": "classified"},
+                        "output": {"answer": "hydrated"},
+                    }
+                ],
+                "metadata": {
+                    "has_more": True,
+                    "query_complete": True,
+                    "total_rows_is_lower_bound": True,
+                },
+            }
+        },
+    )
+
+    with (
+        patch("tracer.views.observation_span.Project.objects.filter") as projects,
+        patch.object(
+            ObservationSpanView, "list_spans_observe", return_value=page
+        ) as listing,
+    ):
+        projects.return_value.first.return_value = project
+        response = ObservationSpanView().get_spans_export_data(request)
+
+    assert response.status_code == status.HTTP_200_OK
+    assert _rows(response) == [
+        ["span_id", "input", "output"],
+        [
+            "span-1",
+            '{"prompt":"classified"}',
+            '{"answer":"hydrated"}',
+        ],
+        [
+            "# export truncated after 1 rows; refine filters to export a complete bounded page"
+        ],
+    ]
     assert listing.call_args.kwargs == {"bounded_export": True}
 
 

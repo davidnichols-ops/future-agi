@@ -8,10 +8,13 @@ from typing import Any
 from django.http import HttpResponse
 
 _CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
-# Keep synchronous CSV work to one already-qualified list hydration chunk.
-# This is a bounded page contract, not an all-row export; callers disclose the
+# Keep synchronous trace/session CSV work to one already-qualified list
+# hydration chunk. Span export has a smaller cursor-bounded cap because its
+# filtered selector may need several classify reads before page hydration.
+# These are bounded-page contracts, not all-row exports; callers disclose the
 # remaining population with the terminal truncation row below.
 BOUNDED_EXPORT_PAGE_SIZE = 100
+BOUNDED_SPAN_EXPORT_PAGE_SIZE = 20
 
 
 def _format_csv_cell(value: Any) -> Any:
