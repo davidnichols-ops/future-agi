@@ -880,10 +880,12 @@ def test_authoritative_anchor_orchestrator_exhausts_trace_id_cursor(monkeypatch)
 
 
 @pytest.mark.unit
-def test_authoritative_anchor_orchestrator_covers_contiguous_full_partitions():
-    from tracer.services.clickhouse.exact_graph_reads import (
-        _enumerate_authoritative_anchor_trace_ids,
-    )
+def test_authoritative_anchor_orchestrator_covers_contiguous_full_partitions(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_ANCHOR_MAX_WORKERS", 1)
 
     builder = _AuthoritativeAnchorBuilderFake()
 
@@ -923,7 +925,7 @@ def test_authoritative_anchor_orchestrator_covers_contiguous_full_partitions():
                 )
             raise AssertionError(f"unexpected fake query: {query}")
 
-    result = _enumerate_authoritative_anchor_trace_ids(
+    result = exact_module._enumerate_authoritative_anchor_trace_ids(
         analytics=Analytics(),
         builder=builder,
         request_start=WINDOW_START,

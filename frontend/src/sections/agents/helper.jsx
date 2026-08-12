@@ -817,7 +817,7 @@ export const getCallLogsColumnDefs = (
 export const useAgentsList = () => {
   const { data, isLoading, error } = useQuery({
     queryKey: ["agents"],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       let allAgents = [];
       let page = 1;
       let totalPages = null;
@@ -870,7 +870,7 @@ export const useCallLogs = ({
       : endpoints.agentDefinitions.getCallLogs(id, version);
   const { data, isLoading, error } = useQuery({
     queryKey: queryKey,
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const baseParams = {
         page,
         page_size: pageLimit,
@@ -882,16 +882,19 @@ export const useCallLogs = ({
           pagination: cursorPagination,
           pageNumber: page - 1,
           targetRowCount: pageLimit,
-          loadResponse: () =>
+          cancellationSignal: signal,
+          loadResponse: (requestSignal) =>
             axios.get(getEndpoint(), {
               params: cursorPagination.requestParams(
                 page - 1,
                 cursorBaseParams,
               ),
+              signal: requestSignal,
             }),
-          nextResponse: (cursor) =>
+          nextResponse: (cursor, requestSignal) =>
             axios.get(getEndpoint(), {
               params: listContinuationParams(cursorBaseParams, cursor),
+              signal: requestSignal,
             }),
           rowsFromResponse: (response) => {
             const result = response?.data?.result || response?.data || {};
@@ -973,7 +976,7 @@ export const prefetchCallLogs = (
     : ["callLogs", module, id, version, pageLimit, params, page];
   queryClient.prefetchQuery({
     queryKey,
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const baseParams = { page, page_size: pageLimit, ...params };
       if (isProjectModule && cursorPagination) {
         const cursorBaseParams = { page_size: pageLimit, ...params };
@@ -981,16 +984,19 @@ export const prefetchCallLogs = (
           pagination: cursorPagination,
           pageNumber: page - 1,
           targetRowCount: pageLimit,
-          loadResponse: () =>
+          cancellationSignal: signal,
+          loadResponse: (requestSignal) =>
             axios.get(endpoint, {
               params: cursorPagination.requestParams(
                 page - 1,
                 cursorBaseParams,
               ),
+              signal: requestSignal,
             }),
-          nextResponse: (cursor) =>
+          nextResponse: (cursor, requestSignal) =>
             axios.get(endpoint, {
               params: listContinuationParams(cursorBaseParams, cursor),
+              signal: requestSignal,
             }),
           rowsFromResponse: (response) => {
             const result = response?.data?.result || response?.data || {};

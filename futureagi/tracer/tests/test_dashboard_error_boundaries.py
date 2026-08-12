@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,7 @@ from tracer.services.clickhouse.v2.query_builders.dashboard import (
     DashboardQueryBuilderV2,
 )
 from tracer.views.dashboard import (
+    DashboardExactReadError,
     DashboardReadQuerySerializer,
     DashboardViewSet,
     DashboardWidgetViewSet,
@@ -338,9 +340,13 @@ def test_widget_query_accepts_old_and_current_persisted_filter_shapes_without_wr
     captured = {}
     workspace = SimpleNamespace(id=uuid.uuid4(), organization_id=uuid.uuid4())
 
-    def _pending(namespace, identity, **kwargs):
-        captured.update(namespace=namespace, identity=identity)
-        return kwargs["pending_payload"]
+    def _degraded(_query_config, *, cache_identity, **_kwargs):
+        captured["identity"] = cache_identity
+        return {
+            "metrics": [],
+            "query_status": "degraded",
+            "query_error_code": "read_budget_exceeded",
+        }
 
     with (
         patch(
@@ -349,9 +355,24 @@ def test_widget_query_accepts_old_and_current_persisted_filter_shapes_without_wr
         ),
         patch(
             "tracer.views.dashboard.read_or_schedule_exact_snapshot",
-            side_effect=_pending,
+            side_effect=AssertionError(
+                "the post-synchronous fallback must not dispatch new work"
+            ),
         ),
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard._read_public_dashboard_query",
+            side_effect=_degraded,
+        ),
+        patch(
+            "tracer.views.dashboard._project_queryset_for_dashboard_scope",
+            return_value=MagicMock(
+                filter=MagicMock(return_value=MagicMock(count=lambda: 1))
+            ),
+        ),
+        patch(
+            "tracer.views.dashboard._fetch_exact_dashboard_rows",
+            side_effect=DashboardExactReadError("bounded test read"),
+        ),
     ):
         response = DashboardWidgetViewSet()._execute_ch_query_config(
             stored_query,
@@ -359,10 +380,13 @@ def test_widget_query_accepts_old_and_current_persisted_filter_shapes_without_wr
         )
 
     assert response.status_code == 200
-    assert response.data["result"]["query_status"] == "pending"
-    assert captured["namespace"] == "dashboard-query"
+    assert response.data["result"]["query_status"] == "degraded"
+    assert response.data["result"]["query_error_code"] == "read_budget_exceeded"
     normalized = captured["identity"]["query_config"]
-    assert normalized["filters"] == [
+    assert [
+        {key: value for key, value in item.items() if key != "canonical_filter"}
+        for item in normalized["filters"]
+    ] == [
         {
             "metric_type": "system_metric",
             "metric_name": "error_rate",
@@ -371,7 +395,10 @@ def test_widget_query_accepts_old_and_current_persisted_filter_shapes_without_wr
             "source": "traces",
         }
     ]
-    assert normalized["metrics"][0]["filters"] == [
+    assert [
+        {key: value for key, value in item.items() if key != "canonical_filter"}
+        for item in normalized["metrics"][0]["filters"]
+    ] == [
         {
             "metric_type": "system_metric",
             "metric_name": "input_tokens",
@@ -392,9 +419,13 @@ def test_legacy_numeric_operators_match_current_widget_cache_identity_without_wr
     ]
     captured_identities = []
 
-    def _pending(_namespace, identity, **kwargs):
-        captured_identities.append(identity)
-        return kwargs["pending_payload"]
+    def _degraded(_query_config, *, cache_identity, **_kwargs):
+        captured_identities.append(cache_identity)
+        return {
+            "metrics": [],
+            "query_status": "degraded",
+            "query_error_code": "read_budget_exceeded",
+        }
 
     with (
         patch(
@@ -403,9 +434,24 @@ def test_legacy_numeric_operators_match_current_widget_cache_identity_without_wr
         ),
         patch(
             "tracer.views.dashboard.read_or_schedule_exact_snapshot",
-            side_effect=_pending,
+            side_effect=AssertionError(
+                "the post-synchronous fallback must not dispatch new work"
+            ),
         ),
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard._read_public_dashboard_query",
+            side_effect=_degraded,
+        ),
+        patch(
+            "tracer.views.dashboard._project_queryset_for_dashboard_scope",
+            return_value=MagicMock(
+                filter=MagicMock(return_value=MagicMock(count=lambda: 1))
+            ),
+        ),
+        patch(
+            "tracer.views.dashboard._fetch_exact_dashboard_rows",
+            side_effect=DashboardExactReadError("bounded test read"),
+        ),
     ):
         responses = [
             DashboardWidgetViewSet()._execute_ch_query_config(query, workspace)
@@ -415,14 +461,22 @@ def test_legacy_numeric_operators_match_current_widget_cache_identity_without_wr
     assert [response.status_code for response in responses] == [200, 200]
     assert captured_identities[0] == captured_identities[1]
     normalized = captured_identities[0]["query_config"]
-    assert normalized["filters"][0] == {
+    assert {
+        key: value
+        for key, value in normalized["filters"][0].items()
+        if key != "canonical_filter"
+    } == {
         "metric_type": "system_metric",
         "metric_name": "error_rate",
         "operator": "not_equal_to",
         "value": 0,
         "source": "traces",
     }
-    assert normalized["metrics"][0]["filters"][0] == {
+    assert {
+        key: value
+        for key, value in normalized["metrics"][0]["filters"][0].items()
+        if key != "canonical_filter"
+    } == {
         "metric_type": "system_metric",
         "metric_name": "input_tokens",
         "operator": "equal_to",
@@ -478,7 +532,11 @@ def test_dashboard_query_uses_direct_write_backend_independent_of_routing(
 ):
     settings.CLICKHOUSE_V2 = routing_config
     v2_client = MagicMock()
-    v2_client.execute_read.return_value = ([], [], 1.0)
+    v2_client.execute_read.return_value = (
+        [(datetime(2026, 8, 1, tzinfo=UTC), 123.0)],
+        [("time_bucket", "DateTime('UTC')"), ("metric_0", "Float64")],
+        1.0,
+    )
 
     with (
         patch(
@@ -511,9 +569,10 @@ def test_dashboard_query_uses_direct_write_backend_independent_of_routing(
         )
 
     assert response.status_code == 200
-    assert response.json()["result"]["query_status"] == "pending"
-    assert not v2_client.execute_read.called
-    v2_builder.assert_not_called()
+    assert response.json()["result"]["query_status"] == "complete"
+    assert response.json()["result"]["query_provenance"] == "materialized_rollup"
+    assert v2_client.execute_read.call_count == 1
+    v2_builder.assert_called_once()
     exact_snapshot.assert_called_once()
     dispatch.assert_not_called()
     legacy_analytics.assert_not_called()
@@ -537,7 +596,11 @@ def test_widget_trace_queries_use_direct_write_backend_independent_of_routing(
     dashboard_widget.save(update_fields=["query_config"])
 
     v2_client = MagicMock()
-    v2_client.execute_read.return_value = ([], [], 1.0)
+    v2_client.execute_read.return_value = (
+        [(datetime(2026, 8, 1, tzinfo=UTC), 123.0)],
+        [("time_bucket", "DateTime('UTC')"), ("metric_0", "Float64")],
+        1.0,
+    )
 
     with (
         patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True),
@@ -567,7 +630,6 @@ def test_widget_trace_queries_use_direct_write_backend_independent_of_routing(
                 "pending_payload"
             ],
         ) as exact_snapshot,
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
     ):
         if action == "execute":
             response = auth_client.post(
@@ -581,9 +643,10 @@ def test_widget_trace_queries_use_direct_write_backend_independent_of_routing(
             )
 
     assert response.status_code == 200
-    assert response.json()["result"]["query_status"] == "pending"
-    assert not v2_client.execute_read.called
-    v2_builder.assert_not_called()
+    assert response.json()["result"]["query_status"] == "complete"
+    assert response.json()["result"]["query_provenance"] == "materialized_rollup"
+    assert v2_client.execute_read.call_count == 1
+    v2_builder.assert_called_once()
     exact_snapshot.assert_called_once()
     dispatch.assert_not_called()
     legacy_analytics.assert_not_called()
@@ -658,7 +721,7 @@ def test_system_filter_values_read_budget_is_sanitized_503(
     ],
 )
 @patch("tracer.views.dashboard.V2AnalyticsQueryService")
-def test_dashboard_poll_defers_clickhouse_failures_to_exact_worker(
+def test_dashboard_poll_degrades_fast_path_clickhouse_failures(
     mock_analytics_cls,
     failure,
     auth_client,
@@ -677,8 +740,9 @@ def test_dashboard_poll_defers_clickhouse_failures_to_exact_worker(
         )
 
     assert response.status_code == 200
-    assert response.json()["result"]["query_status"] == "pending"
-    mock_analytics_cls.assert_not_called()
+    assert response.json()["result"]["query_status"] == "degraded"
+    assert response.json()["result"]["query_provenance"] == "bounded_unavailable"
+    mock_analytics_cls.assert_called_once()
     payload = json.dumps(response.json())
     assert "private" not in payload
     assert "missing-column" not in payload

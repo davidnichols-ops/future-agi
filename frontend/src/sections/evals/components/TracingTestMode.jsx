@@ -570,6 +570,7 @@ const TracingTestMode = React.forwardRef(
       setTotalRowsIsLowerBound(false);
       setListContinuationPending(false);
       let cancelled = false;
+      const requestController = new AbortController();
       const fetchKey = `${selectedProjectId}:${rowType}:${effectiveFilterKey}`;
       if (listContinuationRef.current.signature !== fetchKey) {
         listContinuationRef.current = {
@@ -623,11 +624,11 @@ const TracingTestMode = React.forwardRef(
           const requestList = (
             endpoint,
             params,
-            { voice = false, parser } = {},
+            { voice = false, parser, signal = requestController.signal } = {},
           ) =>
             requestListWithLegacyCursorFallback({
               request: (nextParams) =>
-                axios.get(endpoint, { params: nextParams }),
+                axios.get(endpoint, { params: nextParams, signal }),
               params,
               pageParam: voice ? "page" : "page_number",
               firstPage: voice ? 1 : 0,
@@ -651,11 +652,16 @@ const TracingTestMode = React.forwardRef(
               targetRowCount: requestParams.page_size,
               rowsFromResponse: (nextResponse) => nextResponse.data.results,
               metadataFromResponse: (nextResponse) => nextResponse.data,
-              nextResponse: (cursor) =>
+              cancellationSignal: requestController.signal,
+              nextResponse: (cursor, signal) =>
                 requestList(
                   endpoints.project.getCallLogs,
                   listContinuationParams(requestParams, cursor),
-                  { voice: true, parser: parseVoiceCallListResponse },
+                  {
+                    voice: true,
+                    parser: parseVoiceCallListResponse,
+                    signal,
+                  },
                 ),
               rowIdentity: (row) => tracingPreviewRowIdentity(rowType, row),
               onContinuation: recordContinuation,
@@ -731,9 +737,11 @@ const TracingTestMode = React.forwardRef(
             targetRowCount: params.page_size,
             rowsFromResponse: (nextResponse) => nextResponse.data.table,
             metadataFromResponse: (nextResponse) => nextResponse.data.metadata,
-            nextResponse: (cursor) =>
+            cancellationSignal: requestController.signal,
+            nextResponse: (cursor, signal) =>
               requestList(endpoint, listContinuationParams(params, cursor), {
                 parser: responseParser,
+                signal,
               }),
             rowIdentity: (row) => tracingPreviewRowIdentity(rowType, row),
             onContinuation: recordContinuation,
@@ -829,6 +837,7 @@ const TracingTestMode = React.forwardRef(
       fetchData();
       return () => {
         cancelled = true;
+        requestController.abort();
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [selectedProjectId, rowType, effectiveFilterKey, listCursorRevision]);

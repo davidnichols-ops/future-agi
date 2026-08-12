@@ -11,7 +11,7 @@ ID) into every span row, we can compute per-session aggregates in a single
 """
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from tracer.services.clickhouse.eval_logger_table import (
@@ -43,7 +43,8 @@ _SESSION_FILTER_ANCHOR_SENTINEL = 64
 _SESSION_FILTER_ANCHOR_TIMEOUT_MS = 900
 _SESSION_FILTER_ANCHOR_STRATA = 4
 _SESSION_FILTER_ANCHOR_MAX_BYTES = 192 * 1024 * 1024
-_USER_DETAIL_FILTER_TIMEOUT_MS = 30_000
+_USER_DETAIL_FILTER_TIMEOUT_MS = 9_500
+_SESSION_ROLLUP_TABLE = "spans_per_session"
 
 
 class SessionListQueryBuilder(BaseQueryBuilder):
@@ -617,6 +618,152 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         """
 
         return True
+
+    def supports_filter_candidate_seed_page(self) -> bool:
+        """Use the per-session rollup for the ordinary newest-session cursor.
+
+        The prior default selector replayed every physical root version in the
+        requested window before applying ``LIMIT``. On dense tenants that made
+        even page one proportional to the full span population. The rollup is
+        already keyed at session grain and carries a mergeable first-seen
+        state, so it can acquire a small ordered candidate page before the
+        existing finite latest-state classifier validates membership.
+
+        Keep aggregate/message/user/custom filters and custom sorts on their
+        existing exact bounded paths; this seed is only the unfiltered/date-
+        filtered default list.
+        """
+
+        if self.sort_params or self._bounded_sampling_rate is not None:
+            return False
+        return all(
+            (item.get("column_id") or item.get("columnId"))
+            in {"created_at", "start_time"}
+            for item in self.filters
+        )
+
+    @staticmethod
+    def filter_candidate_seed_proves_result_order() -> bool:
+        """The rollup first-seen state orders the candidate session stream.
+
+        The public sampled lane deliberately keeps this insert-only order after
+        exact classification. Historical live versions can add false-positive/
+        older candidates, but cannot hide a current live session; the
+        authoritative finite classifier removes tombstones and resolves remaps
+        before publication without replacing the seed's cursor tuple.
+        """
+
+        return True
+
+    @staticmethod
+    def bounded_filter_row_order_token(row: dict[str, Any]) -> str:
+        """Keep rollup-seeded pages on their raw, insert-only cursor order.
+
+        Exact latest-state replay may move a session's physical ``start_time``
+        forward (for example after a historical root is tombstoned) and may
+        remap its raw UUID to a canonical UUID. Neither correction may rewrite
+        the signed rollup cursor: doing so can reject an older seed as being
+        newer than the previous page and skip that live session forever.
+        Non-rollup classifiers do not carry the hidden token and retain their
+        existing canonical-ID order.
+        """
+
+        return str(row.get("_seed_order_id") or row.get("session_id") or "")
+
+    def recommended_filter_initial_slice_width(self) -> timedelta | None:
+        if not self.supports_filter_candidate_seed_page():
+            return None
+        start, end = self._bounded_request_window
+        return end - start
+
+    def recommended_filter_cursor_seed_batch_size(self) -> int | None:
+        """Oversample the cheap rollup before exact latest-state replay."""
+
+        return 101 if self.supports_filter_candidate_seed_page() else None
+
+    def recommended_filter_max_slice_width(self) -> timedelta | None:
+        return self.recommended_filter_initial_slice_width()
+
+    def filter_candidate_seed_is_sampled(self) -> bool:
+        """Expose that an insert-only rollup supplied candidate ordering."""
+
+        return self.supports_filter_candidate_seed_page()
+
+    def build_filter_candidate_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+        before_start_time: datetime | None = None,
+        before_id: Any = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return one ordered, session-grain rollup candidate page."""
+
+        if not self.supports_filter_candidate_seed_page():
+            raise ValueError("session rollup candidate seed is unavailable")
+        if limit <= 0 or limit > 512:
+            raise ValueError("session rollup seed limit must be between 1 and 512")
+        if (before_start_time is None) != (before_id is None):
+            raise ValueError("session rollup keyset values must be provided together")
+        request_start, request_end = self._bounded_request_window
+        if not request_start <= slice_start < slice_end <= request_end:
+            raise ValueError("session rollup slice must stay inside request window")
+
+        params: dict[str, Any] = {
+            **self.params,
+            "filter_slice_start_us": _unix_microseconds(slice_start),
+            "filter_slice_end_us": _unix_microseconds(slice_end),
+            "filter_seed_limit": int(limit),
+        }
+        keyset_clause = ""
+        if before_start_time is not None:
+            params["filter_before_start_time_us"] = _unix_microseconds(
+                before_start_time
+            )
+            params["filter_before_session_id"] = str(before_id)
+            keyset_clause = """
+          AND (
+              start_time < fromUnixTimestamp64Micro(
+                  %(filter_before_start_time_us)s, 'UTC'
+              )
+              OR (
+                  start_time = fromUnixTimestamp64Micro(
+                      %(filter_before_start_time_us)s, 'UTC'
+                  )
+                  AND toString(session_id) < %(filter_before_session_id)s
+              )
+          )
+            """
+
+        query = f"""
+        WITH rollup_sessions AS (
+            SELECT
+                trace_session_id AS session_id,
+                minMerge(first_seen) AS start_time
+            FROM {_SESSION_ROLLUP_TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND hour_first_seen >= toStartOfHour(
+                  fromUnixTimestamp64Micro(%(filter_slice_start_us)s, 'UTC')
+              )
+              AND hour_first_seen < toStartOfHour(
+                  fromUnixTimestamp64Micro(%(filter_slice_end_us)s, 'UTC')
+              ) + INTERVAL 1 HOUR
+            GROUP BY trace_session_id
+        )
+        SELECT session_id, start_time
+        FROM rollup_sessions
+        WHERE start_time >= fromUnixTimestamp64Micro(
+                  %(filter_slice_start_us)s, 'UTC'
+              )
+          AND start_time < fromUnixTimestamp64Micro(
+                  %(filter_slice_end_us)s, 'UTC'
+              )
+          {keyset_clause}
+        ORDER BY start_time DESC, toString(session_id) DESC
+        LIMIT %(filter_seed_limit)s
+        """
+        return query, params
 
     def supports_filter_anchor_probe(self) -> bool:
         """Use one positive any-span leaf only as an optional sparse probe.
@@ -1774,6 +1921,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         candidate_ids: list[str],
         *,
         candidate_full_state: bool = False,
+        _candidate_seed_rows: list[dict[str, Any]] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Classify at most 200 session IDs against exact latest root state."""
 
@@ -1837,16 +1985,136 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 *relational_predicates,
             ),
         )
+
+        seed_order_ctes = ""
+        seed_order_join = ""
+        seed_order_select = "session_start AS start_time"
+        seed_order_clause = "ORDER BY start_time DESC, toString(session_id) DESC"
+        if _candidate_seed_rows is not None:
+            seed_rows_by_id: dict[str, datetime] = {}
+            for row in _candidate_seed_rows:
+                raw_session_id = str(row.get("session_id") or "")
+                seed_start = row.get("start_time")
+                if not raw_session_id or not isinstance(seed_start, datetime):
+                    raise ValueError(
+                        "session rollup classifier requires UUID/time seed rows"
+                    )
+                previous = seed_rows_by_id.get(raw_session_id)
+                if previous is None or seed_start > previous:
+                    seed_rows_by_id[raw_session_id] = seed_start
+            if tuple(seed_rows_by_id) != session_ids:
+                raise ValueError("session rollup seed identities changed during replay")
+
+            params["candidate_seed_order_ids"] = list(seed_rows_by_id)
+            params["candidate_seed_order_start_us"] = [
+                _unix_microseconds(value) for value in seed_rows_by_id.values()
+            ]
+            resolved_seed_session = resolved_id_expr("raw_session_id", "seed_ts_remap")
+            seed_order_ctes = f""",
+        candidate_seed_order_rows AS (
+            SELECT
+                toUUID(tupleElement(seed_pair, 1)) AS raw_session_id,
+                fromUnixTimestamp64Micro(
+                    toInt64(tupleElement(seed_pair, 2)), 'UTC'
+                ) AS seed_start_time
+            FROM (
+                SELECT arrayJoin(arrayZip(
+                    %(candidate_seed_order_ids)s,
+                    %(candidate_seed_order_start_us)s
+                )) AS seed_pair
+            )
+        ),
+        candidate_group_rollup_order_rows AS (
+            SELECT
+                trace_session_id AS raw_session_id,
+                minMerge(first_seen) AS seed_start_time
+            FROM {_SESSION_ROLLUP_TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND hour_first_seen >= toStartOfHour(
+                  fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+              )
+              AND hour_first_seen < toStartOfHour(
+                  fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')
+              ) + INTERVAL 1 HOUR
+            WHERE trace_session_id IN (
+                SELECT any_id FROM ts_survivor_map
+            )
+            GROUP BY trace_session_id
+            HAVING seed_start_time >= fromUnixTimestamp64Micro(
+                       %(start_date_us)s, 'UTC'
+                   )
+               AND seed_start_time < fromUnixTimestamp64Micro(
+                       %(end_date_us)s, 'UTC'
+                   )
+        ),
+        candidate_seed_order_sources AS (
+            SELECT raw_session_id, seed_start_time
+            FROM candidate_seed_order_rows
+            UNION ALL
+            SELECT raw_session_id, seed_start_time
+            FROM candidate_group_rollup_order_rows
+        ),
+        resolved_candidate_seed_order AS (
+            SELECT
+                {resolved_seed_session} AS session_id,
+                seed_start_time,
+                raw_session_id
+            FROM candidate_seed_order_sources
+            LEFT JOIN ts_survivor_map AS seed_ts_remap
+                ON raw_session_id = seed_ts_remap.any_id
+        ),
+        candidate_seed_order AS (
+            SELECT
+                session_id,
+                argMax(
+                    tuple(seed_start_time, raw_session_id),
+                    tuple(seed_start_time, toString(raw_session_id))
+                ) AS seed_order
+            FROM resolved_candidate_seed_order
+            GROUP BY session_id
+        )"""
+            seed_order_join = "INNER JOIN candidate_seed_order USING (session_id)"
+            seed_order_select = """
+            tupleElement(seed_order, 1) AS start_time,
+            tupleElement(seed_order, 1) AS _seed_order_start,
+            toString(tupleElement(seed_order, 2)) AS _seed_order_id"""
+            seed_order_clause = "ORDER BY _seed_order_start DESC, _seed_order_id DESC"
         query = f"""
         WITH
         {candidate_ctes}
-        SELECT session_id, session_start AS start_time
+        {seed_order_ctes}
+        SELECT session_id, {seed_order_select}
             {", project_count" if self.project_ids is not None else ""}
         FROM sessions
-        ORDER BY start_time DESC, toString(session_id) DESC
+        {seed_order_join}
+        {seed_order_clause}
         LIMIT %(bounded_match_limit)s
         """
         return query, params
+
+    def build_filter_match_query_from_seed_rows(
+        self,
+        candidate_rows: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        """Classify rollup seeds while preserving their signed raw order.
+
+        The exact classifier still decides current membership and canonical
+        identity. Only the public pagination tuple comes from the insert-only
+        rollup seed. The existing candidate survivor map is finite and expands
+        only remap groups touched by this at-most-200-row batch.
+        """
+
+        candidate_ids = [
+            str(row.get("session_id") or "")
+            for row in candidate_rows
+            if row.get("session_id")
+        ]
+        if not self.supports_filter_candidate_seed_page():
+            return self.build_filter_match_query(candidate_ids)
+        return self.build_filter_match_query(
+            candidate_ids,
+            _candidate_seed_rows=candidate_rows,
+        )
 
     def build_candidate_page_query(self) -> tuple[str, dict[str, Any]]:
         """Select only the exact session page from physical latest root spans.

@@ -446,8 +446,12 @@ class TestUsersViewAPI(APITestCase):
         )  # 23/10 = 2 + 1 for remainder
 
     @patch(_EXECUTE_CH_PATH)
-    def test_users_list_invalid_column_in_sort_fails_closed(self, mock_get_spans):
-        """Any synchronous sort must fail before the unbounded user scan."""
+    def test_users_list_invalid_column_in_sort_uses_default_order(self, mock_get_spans):
+        """Unknown legacy sort columns remain ignored for wire compatibility."""
+        mock_get_spans.side_effect = [
+            _dimension_exists_result(),
+            _make_user_list_result([]),
+        ]
         data = {
             "project_id": self.test_project_id,
             "sort_params": json.dumps(
@@ -457,9 +461,8 @@ class TestUsersViewAPI(APITestCase):
 
         response = self.client.get(self.url, data)
 
-        self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
-        self.assertEqual(response.data["code"], "user_sort_unavailable")
-        mock_get_spans.assert_not_called()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(mock_get_spans.call_count, 2)
 
 
 @pytest.mark.integration

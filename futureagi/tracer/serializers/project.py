@@ -97,6 +97,24 @@ class ProjectGraphDataQuerySerializer(StrictInputSerializer):
     )
 
 
+class ProjectGraphDataResultSerializer(serializers.Serializer):
+    """Legacy primary-graph envelope returned by ``get_graph_data``.
+
+    ``system_metrics`` contains four named time-series plus the additive
+    bounded-read metadata emitted by the shared graph dispatcher. The metric
+    point fields differ by series, so keep that nested object recursive JSON
+    while still documenting the real GeneralMethods envelope.
+    """
+
+    system_metrics = JsonValueField()
+    evaluations = JsonValueField()
+
+
+class ProjectGraphDataResponseSerializer(serializers.Serializer):
+    status = serializers.BooleanField(default=True)
+    result = ProjectGraphDataResultSerializer()
+
+
 class ProjectUserMetricsRequestSerializer(StrictInputSerializer):
     end_user_id = serializers.UUIDField()
     project_id = serializers.UUIDField()
@@ -122,3 +140,28 @@ class ProjectUserGraphDataQuerySerializer(StrictInputSerializer):
 class ProjectUserGraphDataRequestSerializer(StrictInputSerializer):
     interval = serializers.CharField(required=False, default="hour", allow_blank=False)
     filters = filter_list_field(required=False, default=list)
+
+
+class ProjectUserGraphDataResultSerializer(serializers.Serializer):
+    """Five exact per-user time-series returned by the detail graph API."""
+
+    session = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True))
+    )
+    trace = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True))
+    )
+    cost = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True))
+    )
+    input_tokens = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True))
+    )
+    output_tokens = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True))
+    )
+
+
+class ProjectUserGraphDataResponseSerializer(serializers.Serializer):
+    status = serializers.BooleanField(default=True)
+    result = ProjectUserGraphDataResultSerializer()

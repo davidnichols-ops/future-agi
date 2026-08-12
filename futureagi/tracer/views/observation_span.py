@@ -26,6 +26,7 @@ from django.db.models import (
 )
 from django.db.models.functions import JSONObject, Round
 from django.utils import timezone
+from drf_yasg import openapi
 from rest_framework import serializers, status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -145,6 +146,7 @@ from tracer.services.filter_principal_context import (
     bind_request_my_annotations_principal,
 )
 from tracer.utils.annotations import build_annotation_subqueries
+from tracer.utils.bounded_csv import bounded_page_csv_response
 from tracer.utils.create_otel_span import create_single_otel_span
 from tracer.utils.eval import (
     evaluate_observation_span,
@@ -167,14 +169,16 @@ from tracer.utils.sql_queries import SQL_query_handler
 
 logger = structlog.get_logger(__name__)
 
-SPAN_LIST_WALL_DEADLINE_MS = 30_000
-SPAN_LIST_CANDIDATE_DEADLINE_MS = 30_000
-SPAN_LIST_ENRICHMENT_TIMEOUT_MS = 30_000
+EXPORT_PAGE_SIZE = 500
+
+SPAN_LIST_WALL_DEADLINE_MS = 9_500
+SPAN_LIST_CANDIDATE_DEADLINE_MS = 9_500
+SPAN_LIST_ENRICHMENT_TIMEOUT_MS = 9_500
 SPAN_LIST_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
-    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "max_result_rows": 5_001,
     "read_overflow_mode": "throw",
     "result_overflow_mode": "throw",
@@ -210,7 +214,7 @@ def _span_filtered_page_depth_exceeded(
 SPAN_NAVIGATION_CANDIDATE_LIMIT = 4_095
 SPAN_NAVIGATION_SCAN_PAGE_SIZE = 200
 SPAN_NAVIGATION_MAX_QUERIES = 128
-SPAN_NAVIGATION_WALL_DEADLINE_MS = 30_000
+SPAN_NAVIGATION_WALL_DEADLINE_MS = 9_500
 
 
 class SpanNavigationReadUnavailable(RuntimeError):
@@ -1602,6 +1606,12 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
     def list_spans_observe(self, request, *args, **kwargs):
         try:
             validated_data = dict(request.validated_query_data)
+            if kwargs.get("bounded_export"):
+                validated_data.update(
+                    page_number=0,
+                    page_size=EXPORT_PAGE_SIZE,
+                    cursor_mode=False,
+                )
             validated_data["filters"] = bind_request_my_annotations_principal(
                 request,
                 validated_data.get("filters", []),
@@ -2618,6 +2628,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         page_size = validated_data.get("page_size", 30)
 
         project_id = str(project_version.project_id)
+        read_deadline = ReadDeadline.start(SPAN_LIST_WALL_DEADLINE_MS)
 
         if _span_filtered_page_depth_exceeded(filters, page_number, page_size):
             logger.info(
@@ -2663,7 +2674,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 ids_with_data = set(
                     analytics.get_eval_config_ids_with_data_ch(
                         project_id,
-                        timeout_ms=30000,
+                        timeout_ms=read_deadline.remaining_ms(
+                            SPAN_LIST_ENRICHMENT_TIMEOUT_MS
+                        ),
                         candidate_config_ids=candidate_ids,
                         window_days=window_days,
                     )
@@ -2712,7 +2725,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 key_field="id",
                 page_number=page_number,
                 page_size=page_size,
-                deadline_ms=4500,
+                deadline_ms=read_deadline.remaining_ms(4_500),
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -2747,7 +2760,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             )
         elif not bounded_error_code:
             query, params = builder.build()
-            result = analytics.execute_ch_query(query, params, timeout_ms=10000)
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=read_deadline.remaining_ms(SPAN_LIST_CANDIDATE_DEADLINE_MS),
+            )
         else:
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -2782,7 +2799,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             )
             if content_query:
                 content_result = analytics.execute_ch_query(
-                    content_query, content_params, timeout_ms=10000
+                    content_query,
+                    content_params,
+                    timeout_ms=read_deadline.remaining_ms(
+                        SPAN_LIST_ENRICHMENT_TIMEOUT_MS
+                    ),
                 )
                 merge_content_rows(
                     result.data,
@@ -2799,7 +2820,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         else:
             count_query, count_params = builder.build_count_query()
             count_result = analytics.execute_ch_query(
-                count_query, count_params, timeout_ms=10000
+                count_query,
+                count_params,
+                timeout_ms=read_deadline.remaining_ms(SPAN_LIST_ENRICHMENT_TIMEOUT_MS),
             )
             total_count = (
                 count_result.data[0].get("total", 0) if count_result.data else 0
@@ -2813,7 +2836,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             )
             if eval_query:
                 eval_result = analytics.execute_ch_query(
-                    eval_query, eval_params, timeout_ms=5000
+                    eval_query,
+                    eval_params,
+                    timeout_ms=read_deadline.remaining_ms(5_000),
                 )
                 external_map = SpanListQueryBuilder.pivot_eval_results(
                     eval_result.data, key_by_trace=True
@@ -2832,7 +2857,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             )
             if ann_query:
                 ann_result = analytics.execute_ch_query(
-                    ann_query, ann_params, timeout_ms=5000
+                    ann_query,
+                    ann_params,
+                    timeout_ms=read_deadline.remaining_ms(5_000),
                 )
                 external_map = SpanListQueryBuilder.pivot_annotation_results(
                     ann_result.data, label_types, key_by_trace=True
@@ -3684,21 +3711,40 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 code="server_error",
             )
 
+    @validated_request(
+        query_serializer=SpanExportQuerySerializer,
+        responses={
+            200: openapi.Response(
+                "Bounded CSV export; a terminal comment row discloses truncation.",
+                schema=openapi.Schema(type=openapi.TYPE_STRING),
+            ),
+            400: ApiErrorResponseSerializer,
+            500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        },
+        produces=["text/csv"],
+    )
     @action(detail=False, methods=["get"])
     def get_spans_export_data(self, request, *args, **kwargs):
         try:
-            serializer = SpanExportQuerySerializer(data=request.query_params)
-            if not serializer.is_valid():
-                return self._gm.bad_request(serializer.errors)
+            validated_data = request.validated_query_data
+            project_id = str(validated_data["project_id"])
+            project = Project.objects.filter(
+                _project_workspace_scope_q(request, project_prefix=""),
+                id=project_id,
+                organization=_get_request_organization(request),
+            ).first()
+            if not project:
+                return self._gm.bad_request("Project not found")
 
-            # Span reads are intentionally bounded and paginated. Until an exact
-            # ClickHouse export collector exists, exporting a list page would
-            # silently produce an incomplete CSV. The retired PostgreSQL export
-            # path must not be used because direct-write CH25 owns telemetry.
-            return self._gm.custom_error_response(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "A complete span export is temporarily unavailable. Please retry later.",
-                code="service_unavailable",
+            page_response = self.list_spans_observe(request, bounded_export=True)
+            if page_response.status_code != status.HTTP_200_OK:
+                return page_response
+            result = page_response.data.get("result", {})
+            return bounded_page_csv_response(
+                rows=result.get("table"),
+                metadata=result.get("metadata"),
+                filename=f"{project.name or 'project'}_spans.csv",
             )
 
         except Exception as exc:

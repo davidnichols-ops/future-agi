@@ -13,10 +13,6 @@ from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 
-import structlog
-
-logger = structlog.get_logger(__name__)
-
 _ASSIGNMENT_AFTER_SETTINGS = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_]*\s*=")
 _BLOCKED_HTTP_METHODS = frozenset(
     {
@@ -75,6 +71,10 @@ def _top_level_tokens(sql: str) -> Iterator[tuple[str, int, int]]:
             depth = max(0, depth - 1)
             index += 1
             continue
+        if depth == 0 and char == ";":
+            yield ";", index, index + 1
+            index += 1
+            continue
         if depth == 0 and (char.isalpha() or char == "_"):
             end = index + 1
             while end < length and (sql[end].isalnum() or sql[end] == "_"):
@@ -120,20 +120,99 @@ def without_query_settings(sql: str) -> str:
 _READ_STATEMENTS = frozenset(
     {"SELECT", "WITH", "EXPLAIN", "SHOW", "DESCRIBE", "DESC", "EXISTS"}
 )
+_MUTATION_STATEMENTS = frozenset(
+    {
+        "ALTER",
+        "ATTACH",
+        "BACKUP",
+        "CREATE",
+        "DELETE",
+        "DETACH",
+        "DROP",
+        "GRANT",
+        "INSERT",
+        "KILL",
+        "OPTIMIZE",
+        "RENAME",
+        "RESTORE",
+        "REVOKE",
+        "SET",
+        "SYSTEM",
+        "TRUNCATE",
+        "UPDATE",
+        "USE",
+    }
+)
 
 
 def ensure_read_statement(sql: str) -> None:
-    """Reject an obviously non-read statement before it reaches ClickHouse."""
+    """Allow one top-level read statement and reject mutation disguises."""
 
-    first_token = next(_top_level_tokens(sql), ("", 0, 0))[0]
+    tokens = [token for token, _, _ in _top_level_tokens(sql)]
+    semicolons = [index for index, token in enumerate(tokens) if token == ";"]
+    if len(semicolons) > 1 or (semicolons and semicolons[0] != len(tokens) - 1):
+        raise RuntimeError(
+            "Only read statements are allowed for the server-enforced "
+            "read-only ClickHouse client."
+        )
+    if semicolons:
+        tokens.pop()
+
+    first_token = tokens[0] if tokens else ""
     if first_token not in _READ_STATEMENTS:
         raise RuntimeError(
             "Only read statements are allowed for the server-enforced "
             "read-only ClickHouse client."
         )
 
+    if first_token == "WITH":
+        body_token = next(
+            (
+                token
+                for token in tokens[1:]
+                if token == "SELECT" or token in _MUTATION_STATEMENTS
+            ),
+            "",
+        )
+        if body_token != "SELECT":
+            raise RuntimeError(
+                "Only read statements are allowed for the server-enforced "
+                "read-only ClickHouse client."
+            )
+    elif first_token == "EXPLAIN":
+        target = next(
+            (
+                (index, token)
+                for index, token in enumerate(tokens[1:], start=1)
+                if token in (_READ_STATEMENTS - {"EXPLAIN"})
+                or token in _MUTATION_STATEMENTS
+            ),
+            None,
+        )
+        if target is None or target[1] not in _READ_STATEMENTS:
+            raise RuntimeError(
+                "Only read statements are allowed for the server-enforced "
+                "read-only ClickHouse client."
+            )
+        if target[1] == "WITH":
+            body_token = next(
+                (
+                    token
+                    for token in tokens[target[0] + 1 :]
+                    if token == "SELECT" or token in _MUTATION_STATEMENTS
+                ),
+                "",
+            )
+            if body_token != "SELECT":
+                raise RuntimeError(
+                    "Only read statements are allowed for the server-enforced "
+                    "read-only ClickHouse client."
+                )
+
 
 class _NativeBlockStream:
+    """Compatibility adapter over the core client's managed read stream."""
+
     def __init__(
         self,
         client: Any,
@@ -142,60 +221,17 @@ class _NativeBlockStream:
         *,
         block_size: int = 8192,
     ):
-        self._client = client
-        self._query = query
-        self._parameters = parameters
-        self._block_size = block_size
-        self._connection = None
-        self._exhausted = False
-
-    def _retire_connection(self) -> None:
-        """Disconnect a native connection whose result was not drained."""
-
-        if self._connection is None:
-            return
-        try:
-            self._connection.disconnect()
-        except Exception as exc:
-            logger.warning(
-                "server_readonly_native_disconnect_failed",
-                error_type=type(exc).__name__,
-                exc_info=True,
-            )
-        finally:
-            self._connection = None
+        self._stream = client.execute_read_block_stream(
+            query,
+            parameters,
+            block_size=block_size,
+        )
 
     def __enter__(self):
-        self._connection = self._client._get_client()
-        try:
-            rows = self._connection.execute_iter(self._query, self._parameters)
-        except Exception:
-            self._retire_connection()
-            raise
-
-        def blocks():
-            block: list[tuple] = []
-            for row in rows:
-                block.append(row)
-                if len(block) >= self._block_size:
-                    yield block
-                    block = []
-            if block:
-                yield block
-            # A native connection is reusable only after the result has been
-            # fully consumed.  Breaking out early deliberately leaves this
-            # false so __exit__ retires, rather than pools, it.
-            self._exhausted = True
-
-        return blocks()
+        return self._stream.__enter__()
 
     def __exit__(self, exc_type, *_exc) -> None:
-        if self._connection is not None:
-            if exc_type is None and self._exhausted:
-                self._client._return_client(self._connection)
-                self._connection = None
-            else:
-                self._retire_connection()
+        self._stream.__exit__(exc_type, *_exc)
 
 
 class ServerEnforcedReadOnlyNativeClient:
@@ -255,8 +291,6 @@ class ServerEnforcedReadOnlyNativeClient:
         **_kwargs: Any,
     ) -> _NativeBlockStream:
         del settings
-        query = without_query_settings(query)
-        ensure_read_statement(query)
         return _NativeBlockStream(self._client, query, parameters or {})
 
     def close(self) -> None:

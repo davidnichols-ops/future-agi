@@ -69,7 +69,7 @@ _EVAL_TASK_STREAM_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
     "max_threads": 2,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
-    "max_bytes_to_read": 2 * 1024 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
 }
 _EVAL_TASK_FILTER_CLASSIFY_QUERY_TIMEOUT_MS = 3_000
@@ -88,7 +88,7 @@ _EVAL_TASK_FILTER_CLASSIFY_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 2_048,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
-    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "result_overflow_mode": "throw",
 }

@@ -9,7 +9,7 @@ import {
   FILTER_TYPE_ALLOWED_OPS,
   LIST_FILTER_OPS,
 } from "src/api/contracts/filter-contract.generated";
-import { followEmptyListContinuations } from "src/sections/projects/LLMTracing/listCursorPagination";
+import { accumulateUniqueListContinuations } from "src/sections/projects/LLMTracing/listCursorPagination";
 
 const LOAD_MORE_OPTION = Object.freeze({ __loadMore: true });
 const RETRY_OPTION = Object.freeze({ __retry: true });
@@ -23,9 +23,9 @@ const CURSOR_STOPPED_KEY = "filter_value_cursor_stopped";
 // The shared Axios client intentionally has no global timeout. Attribute
 // browsing is interactive, though, and an interrupted proxy/backend response
 // must not leave the picker in an endless "Loading more" state. This is just
-// above the server-side 30-second ceiling so ordinary server timeouts can
+// above the server-side 9.5-second ceiling so ordinary server timeouts can
 // retain their structured response while transport stalls fail into Retry.
-const ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS = 35_000;
+const ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS = 9_800;
 
 const normalizeBrowseMetadata = (result = {}) =>
   TERMINAL_BROWSE_STATUSES.has(result?.browse_status)
@@ -178,9 +178,10 @@ const AutocompleteTextValueSelector = ({
   } = useInfiniteQuery({
     queryKey,
     queryFn: async ({ signal, pageParam }) => {
-      const requestPage = (cursor) =>
+      const actionStartedAt = Date.now();
+      const requestPage = (cursor, requestSignal = signal) =>
         axios.get(endpoints.dashboard.filterValues, {
-          signal,
+          signal: requestSignal,
           timeout: ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS,
           params: {
             project_ids: projectId,
@@ -196,14 +197,12 @@ const AutocompleteTextValueSelector = ({
       const cachedData = queryClient.getQueryData(queryKey);
       const cachedPages = cachedData?.pages || [];
       const isFreshChainRead = pageParam == null;
-      const knownValueIdentities = new Set(
-        isFreshChainRead
-          ? []
-          : cachedPages.flatMap((page) =>
-              (page?.data?.result?.values || []).map(optionIdentity),
-            ),
-      );
-      const followedCursors = new Set(
+      const knownValueIdentities = isFreshChainRead
+        ? []
+        : cachedPages.flatMap((page) =>
+            (page?.data?.result?.values || []).map(optionIdentity),
+          );
+      const consumedCursors = new Set(
         [
           ...(isFreshChainRead ? [] : cachedData?.pageParams || []),
           ...(isFreshChainRead
@@ -216,20 +215,19 @@ const AutocompleteTextValueSelector = ({
       );
       const initialResponse = await requestPage(pageParam);
       const checkedResult = (response) =>
-        validateBrowseCursor(response?.data?.result || {}, followedCursors);
-      // The shared guard follows at most 12 empty checkpoints per UI action.
-      // Its 30-second elapsed check is deliberately soft and runs between
-      // completed requests; cancellation of an in-flight request remains the
-      // responsibility of the query's AbortSignal/HTTP client.
-      const response = await followEmptyListContinuations({
+        validateBrowseCursor(response?.data?.result || {}, consumedCursors);
+      // Every checkpoint shares the same action clock. The follower stops
+      // before a continuation can multiply the 9.5-second request wall.
+      const {
+        response,
+        rows: values,
+        followedCursors,
+      } = await accumulateUniqueListContinuations({
         initialResponse,
-        rowsFromResponse: (response) =>
-          (response?.data?.result?.values || []).filter((option) => {
-            const identity = optionIdentity(option);
-            if (knownValueIdentities.has(identity)) return false;
-            knownValueIdentities.add(identity);
-            return true;
-          }),
+        rowsFromResponse: (page) => page?.data?.result?.values || [],
+        identityFromRow: optionIdentity,
+        knownIdentities: knownValueIdentities,
+        targetRowCount: isFreshChainRead ? 1 : 10,
         metadataFromResponse: (response) => {
           const checked = checkedResult(response);
           return isBrowseCursorStopped(checked)
@@ -238,19 +236,23 @@ const AutocompleteTextValueSelector = ({
         },
         nextResponse: requestPage,
         onContinuation: (metadata) => {
-          if (metadata?.next_cursor) {
-            followedCursors.add(metadata.next_cursor);
-          }
+          if (metadata?.next_cursor) consumedCursors.add(metadata.next_cursor);
         },
         isCurrent: () => !signal.aborted,
+        cancellationSignal: signal,
+        startedAt: actionStartedAt,
+      });
+      const accumulatedResponse = withBrowseResult(response, {
+        ...response?.data?.result,
+        values,
       });
       // A sparse exact lookup can need more checkpoints than one browser
       // action may safely fan out. Keep the signed cursor as the next page,
       // but mark the action as bounded so the picker offers a retry instead
       // of exposing an empty transport page as ordinary pagination.
-      const boundedResponse = hasEmptyContinuation(response)
-        ? markEmptyContinuationGuardExhausted(response)
-        : response;
+      const boundedResponse = hasEmptyContinuation(accumulatedResponse)
+        ? markEmptyContinuationGuardExhausted(accumulatedResponse)
+        : accumulatedResponse;
       const checkedResponse = withBrowseResult(
         boundedResponse,
         checkedResult(boundedResponse),
@@ -261,7 +263,7 @@ const AutocompleteTextValueSelector = ({
           ...checkedResponse?.data,
           result: {
             ...checkedResponse?.data?.result,
-            [FOLLOWED_CURSORS_KEY]: [...followedCursors],
+            [FOLLOWED_CURSORS_KEY]: followedCursors,
           },
         },
       };

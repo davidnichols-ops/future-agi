@@ -17,7 +17,12 @@ def _get_navigation_query_data(request, query_data=None):
 
 
 def _try_session_navigation_ch(
-    request, project_id, current_session_id, query_data=None
+    request,
+    project_id,
+    current_session_id,
+    query_data=None,
+    *,
+    deadline=None,
 ):
     """Attempt to compute session navigation using ClickHouse.
 
@@ -32,7 +37,7 @@ def _try_session_navigation_ch(
 
     try:
         service = V2AnalyticsQueryService()
-        deadline = ReadDeadline.start(3000)
+        deadline = deadline or ReadDeadline.start(3000)
         query_data = _get_navigation_query_data(request, query_data)
         filters = query_data.get("filters", [])
         sort_params = query_data.get("sort_params", [])
@@ -45,7 +50,9 @@ def _try_session_navigation_ch(
             )
 
             end_user_ids = resolve_end_user_ids_by_user_id(
-                user_id, project_id=project_id
+                user_id,
+                project_id=project_id,
+                timeout_ms=deadline.remaining_ms(),
             )
             if not end_user_ids:
                 return None
@@ -136,7 +143,14 @@ def _try_session_navigation_ch(
         return None
 
 
-def get_session_navigation(request, project_id, current_session_id, query_data=None):
+def get_session_navigation(
+    request,
+    project_id,
+    current_session_id,
+    query_data=None,
+    *,
+    deadline=None,
+):
     """
     Get previous and next session IDs based on the same ordering as list_sessions.
 
@@ -148,12 +162,21 @@ def get_session_navigation(request, project_id, current_session_id, query_data=N
     Returns ``(None, None)`` when ClickHouse is unavailable; callers
     render the page without prev/next arrows in that case.
     """
-    ch_result = _try_session_navigation_ch(
-        request,
-        project_id,
-        current_session_id,
-        query_data,
-    )
+    if deadline is None:
+        ch_result = _try_session_navigation_ch(
+            request,
+            project_id,
+            current_session_id,
+            query_data,
+        )
+    else:
+        ch_result = _try_session_navigation_ch(
+            request,
+            project_id,
+            current_session_id,
+            query_data,
+            deadline=deadline,
+        )
     if ch_result is None:
         return None, None
     return ch_result

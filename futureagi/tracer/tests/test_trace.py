@@ -746,16 +746,14 @@ class TestTraceExportAPI:
         assert response.status_code == status.HTTP_400_BAD_REQUEST
 
     def test_export_traces_success(self, auth_client, project, trace, observation_span):
-        """A bounded trace page must never be published as a complete export."""
+        """Trace export remains available through the bounded CSV contract."""
         response = auth_client.get(
             "/tracer/trace/get_trace_export_data/",
             {"project_id": str(project.id)},
         )
-        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-        assert response.json()["code"] == "service_unavailable"
-        assert response.json()["result"] == (
-            "A complete trace export is temporarily unavailable. Please retry later."
-        )
+        assert response.status_code == status.HTTP_200_OK
+        assert response["Content-Type"].startswith("text/csv")
+        assert "attachment" in response["Content-Disposition"]
 
 
 def test_get_span_trace_map_selects_from_spans(monkeypatch):

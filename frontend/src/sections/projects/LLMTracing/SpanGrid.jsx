@@ -68,9 +68,9 @@ import {
 } from "./defaultColumns";
 
 const ROWS_LIMIT = 25;
-const loadSpanObservePage = (params) =>
+const loadSpanObservePage = (params, signal) =>
   axios
-    .get(endpoints.project.getSpansForObserveProject(), { params })
+    .get(endpoints.project.getSpansForObserveProject(), { params, signal })
     .then((response) =>
       parseAxiosResult(response, parseSpanObserveListResponse),
     );
@@ -503,11 +503,12 @@ const SpanGrid = React.forwardRef(
                 pagination: cursorPagination.current,
                 pageNumber,
                 targetRowCount: ROWS_LIMIT,
-                loadResponse: () => {
+                loadResponse: (signal) => {
                   const prefetched = cached;
                   cached = undefined;
                   return (
-                    prefetched || loadSpanObservePage(buildParams(pageNumber))
+                    prefetched ||
+                    loadSpanObservePage(buildParams(pageNumber), signal)
                   );
                 },
                 rowsFromResponse: (response) => response.data.table,
@@ -515,8 +516,8 @@ const SpanGrid = React.forwardRef(
                 rowIdentity: getSpanPhysicalRowId,
                 isCurrent: () =>
                   cursorPagination.current.isCurrent(requestGeneration),
-                nextResponse: () =>
-                  loadSpanObservePage(buildParams(pageNumber)),
+                nextResponse: (_cursor, signal) =>
+                  loadSpanObservePage(buildParams(pageNumber), signal),
               });
               if (!cursorPagination.current.isCurrent(requestGeneration)) {
                 // A newer filter/range owns the grid now. Do not let this stale

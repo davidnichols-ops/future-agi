@@ -68,7 +68,9 @@ def test_voice_list_uses_provider_ended_reason(provider, raw_log, expected):
         ),
     ],
 )
-def test_voice_list_does_not_replace_missing_provider_reason(provider, raw_log):
+def test_voice_list_falls_back_to_stored_reason_when_provider_reason_is_missing(
+    provider, raw_log
+):
     attrs = {"ended_reason": "collector-ended-call"}
 
     result = ObservabilityService.process_raw_logs(
@@ -77,7 +79,7 @@ def test_voice_list_does_not_replace_missing_provider_reason(provider, raw_log):
         span_attributes=attrs,
     )
 
-    assert result["ended_reason"] is None
+    assert result["ended_reason"] == "collector-ended-call"
 
 
 @pytest.mark.unit
@@ -102,7 +104,8 @@ def test_voice_ended_reason_expression_matches_provider_list_contract():
     assert "NOT ((JSONHas(span_attributes_raw, 'raw_log')" in expression
     assert "= 'retell'" in expression
     assert "= 'vapi'" in expression
-    assert expression.endswith("CAST(NULL AS Nullable(String)))")
+    assert "coalesce(" in expression
+    assert expression.endswith("span_attr_str['ended_reason'], ''), null))")
 
 
 @pytest.mark.unit

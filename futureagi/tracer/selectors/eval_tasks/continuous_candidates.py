@@ -35,7 +35,7 @@ _READ_SETTINGS = {
     "max_execution_time": 30,
     "max_threads": 2,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
-    "max_bytes_to_read": 2 * 1024 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "timeout_overflow_mode": "throw",
 }

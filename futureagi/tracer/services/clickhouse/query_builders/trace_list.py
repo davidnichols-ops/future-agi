@@ -129,12 +129,19 @@ _LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ = 192 * 1024 * 1024
 # every root batch while preserving chronological fallback for heavy Map/JSON.
 _LONG_WINDOW_CANDIDATE_WITNESS_STRATA = 1
 _LONG_WINDOW_ORDERED_ROOT_INITIAL_SLICE = timedelta(hours=1)
-_USER_DETAIL_FILTER_TIMEOUT_MS = 30_000
+_USER_DETAIL_FILTER_TIMEOUT_MS = 9_500
 _UNINDEXED_POSITIVE_MICRO_SEED_WIDTH = timedelta(minutes=5)
 _UNINDEXED_POSITIVE_MICRO_SEED_STRATA = 4
 _CANONICAL_TRACE_ID_SEED_PREDICATE = re.compile(
     r"trace_id (?:=|IN) %\(latest_filter_param_\d+\)s"
 )
+# These public voice values parse provider-specific ``raw_log`` JSON.  Running
+# that expression while discovering roots makes a sparse 12-month filter scan
+# every root in a wide time slice before its finite LIMIT can help.  Acquire a
+# cheap root-ordered identity superset instead and keep the existing finite
+# latest-state classifier authoritative for membership.  ``call_type`` already
+# used this lane; ``ended_reason`` has the same provider-normalization shape.
+_CLASSIFIER_ONLY_ROOT_SEED_METRICS = frozenset({"call_type", "ended_reason"})
 
 
 def _unix_microseconds(value: datetime) -> int:
@@ -492,49 +499,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return None
         return item
 
-    def _positive_exact_annotator_seed_filter(self) -> dict[str, Any] | None:
-        """Return one positive global annotator leaf usable as a candidate set.
+    @staticmethod
+    def _root_plan_runs_only_in_classifier(plan: LatestFilterPredicate) -> bool:
+        """Return whether root discovery must avoid a provider JSON predicate.
 
-        Annotation membership is relational and therefore stays in the exact
-        classifier.  A positive annotator equality/IN is also a necessary
-        condition for the complete conjunction, though: every matching trace
-        must occur in the project-scoped Score relation for that user.  Using
-        that relation to constrain the ordered-root seed avoids replaying every
-        root batch across a long window before applying the same sparse Score
-        predicate.  Negative/null shapes cannot provide that candidate bound.
+        The seed remains a complete superset when this predicate is omitted:
+        every matching trace still has a canonical root in the requested
+        window.  The exact candidate classifier repeats all root predicates
+        against latest state before a row can be published.
         """
 
-        if self.search:
-            return None
-        for item in self._active_non_time_filters():
-            if (item.get("column_id") or item.get("columnId")) != "annotator":
-                continue
-            config = item.get("filter_config") or item.get("filterConfig") or {}
-            if not isinstance(config, dict):
-                continue
-            col_type = str(
-                config.get("col_type") or config.get("colType") or ""
-            ).upper()
-            if col_type not in {"", "NORMAL", "SYSTEM_METRIC", "ANNOTATION_METRIC"}:
-                continue
-            filter_type = str(
-                config.get("filter_type") or config.get("filterType") or ""
-            ).lower()
-            if filter_type not in {"", "annotator"}:
-                continue
-            operation = normalize_filter_op(
-                config.get("filter_op") or config.get("filterOp")
-            )
-            if operation not in {"equals", "in"}:
-                continue
-            raw_value = config.get("filter_value", config.get("filterValue"))
-            values = raw_value if isinstance(raw_value, (list, tuple)) else [raw_value]
-            if not values or any(
-                not isinstance(value, str) or not value for value in values
-            ):
-                continue
-            return item
-        return None
+        return plan.source_metric in _CLASSIFIER_ONLY_ROOT_SEED_METRICS
 
     def _positive_exact_end_user_span_seed(self) -> tuple[str, dict[str, Any]]:
         """Compile the direct span predicate for candidate-first user seeding.
@@ -600,10 +575,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._bounded_bulk_scan
             and not self._bounded_population_proof
             and not self.sort_params
-            and (
-                self._positive_exact_end_user_seed_filter() is not None
-                or self._positive_exact_annotator_seed_filter() is not None
-            )
+            and self._positive_exact_end_user_seed_filter() is not None
         )
 
     @staticmethod
@@ -630,33 +602,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         predicate, params = filter_builder.translate([filter_item])
         return predicate or "", params
 
-    def _positive_exact_annotator_seed(self) -> tuple[str, dict[str, Any]]:
-        """Compile all-history Score membership for one positive annotator."""
-
-        filter_item = self._positive_exact_annotator_seed_filter()
-        if filter_item is None:
-            return "", {}
-        filter_builder = self._FILTER_BUILDER_CLS(
-            table=self.TABLE,
-            query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_TRACE,
-            annotation_label_ids=self.annotation_label_ids,
-            project_id=self.project_id,
-            project_ids=self.project_ids,
-            # Annotation creation and the annotated child can both fall outside
-            # the root's display window.  Project + annotator + exact identity
-            # are the safe pruning boundary; the classifier repeats the full
-            # relation predicate before publication.
-            score_date_scope=False,
-            span_date_scope=False,
-            strict_trace_project_correlation=True,
-        )
-        predicate, params = filter_builder.translate([filter_item])
-        return predicate or "", params
-
     def recommended_filter_query_timeout_ms(self) -> int | None:
         """Use the request deadline for every public filtered trace page.
 
-        The endpoint owns one 30-second wall, while finite candidate, query-count,
+        The endpoint owns one 9.5-second wall, while finite candidate, query-count,
         byte, memory, thread and result controls still bound each physical read.
         Optional anchor/proof builders retain their independently shorter timeout
         recommendations. Internal bulk/workflow readers keep their existing
@@ -1176,15 +1125,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._bounded_bulk_scan
             and not self._bounded_population_proof
             and request_width >= timedelta(minutes=5)
-            and (
-                self._positive_exact_end_user_seed_filter() is not None
-                or self._positive_exact_annotator_seed_filter() is not None
-            )
+            and self._positive_exact_end_user_seed_filter() is not None
         ):
-            # The root seed is constrained by an exact project-scoped
-            # end-user or Score membership subquery. Read the requested window
-            # once instead of serially proving empty two-day slices for a
-            # sparse relational value.
+            # The root seed is constrained by an exact project-scoped end-user
+            # membership subquery. Read the requested window once
+            # instead of serially proving empty two-day slices for a sparse
+            # relational value.
             return request_width
         if (
             not self._bounded_identity_only
@@ -1197,27 +1143,47 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return _LONG_WINDOW_ORDERED_ROOT_INITIAL_SLICE
         return None
 
+    def _uses_default_newest_first_partition_walk(self) -> bool:
+        request_start, request_end = self._bounded_request_window
+        return bool(
+            not self._bounded_identity_only
+            and not self._bounded_internal_scan
+            and not self._bounded_bulk_scan
+            and not self._bounded_population_proof
+            and request_end - request_start >= timedelta(minutes=5)
+            and not self.sort_params
+            and not self.search
+            and not self._active_non_time_filters()
+        )
+
+    def allow_repeated_eager_identity_prefix_flushes(self) -> bool:
+        """Classify each sufficient tail batch until the default page closes."""
+
+        return self._uses_default_newest_first_partition_walk()
+
     def recommended_filter_max_slice_width(self) -> timedelta | None:
         """Permit adaptive sparse cursor widening on index-pruned root seeds.
 
-        Cursor mode starts at one hour and doubles only after an exhausted
-        slice. Allowing it to grow to the request window lets empty months be
-        skipped logarithmically; a dense wide read remains safe because the
-        selector halves a read-budget failure before publishing anything.
+        A default newest-first page starts at the same five-minute tail for a
+        one-month and a twelve-month request.  Once an adjacent slice is
+        exhausted, allowing it to double to the request width reaches sparse
+        historical data logarithmically without inflating the first read just
+        because the lower bound is older.  Dense tails still stop as soon as
+        the exact page prefix is classified.  Cursor reads retain the same
+        progression and halve a read-budget failure before publishing.
         """
 
         request_start, request_end = self._bounded_request_window
         request_width = request_end - request_start
+        if self._uses_default_newest_first_partition_walk():
+            return request_width
         if (
             not self._bounded_identity_only
             and not self._bounded_internal_scan
             and not self._bounded_bulk_scan
             and not self._bounded_population_proof
             and request_width >= timedelta(minutes=5)
-            and (
-                self._positive_exact_end_user_seed_filter() is not None
-                or self._positive_exact_annotator_seed_filter() is not None
-            )
+            and self._positive_exact_end_user_seed_filter() is not None
         ):
             return request_width
         if (
@@ -2474,7 +2440,6 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         before_id: Any = None,
         direction: str = "older",
         _positive_user_candidate_first: bool = False,
-        _positive_annotator_candidate_first: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Return a root-ordered superset after a common anchor sentinel.
 
@@ -2494,27 +2459,22 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self.supports_filter_candidate_seed_page()
         ):
             raise ValueError("trace user candidate seed is unavailable")
-        if (
-            _positive_annotator_candidate_first
-            and self._positive_exact_annotator_seed_filter() is None
-        ):
-            raise ValueError("trace annotator candidate seed is unavailable")
-        if _positive_user_candidate_first and _positive_annotator_candidate_first:
-            raise ValueError("trace candidate seed must use one relational anchor")
         request_start, request_end = self.parse_time_range(self.filters)
         if not request_start <= slice_start < slice_end <= request_end:
             raise ValueError("trace seed slice must stay inside the request window")
         self.start_date, self.end_date = request_start, request_end
         self.params.update({"start_date": request_start, "end_date": request_end})
         plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
-        # call_type is a root-scoped semantic predicate, but its provider
-        # normalization parses unindexed JSON. Keep ordinary ordered seeds as
-        # cheap root-identity supersets; the dedicated five-minute micro-seed
-        # below may opt into the exact raw predicate on a bounded slice.
+        # Provider-normalized root strings parse unindexed JSON. Keep ordinary
+        # ordered seeds as cheap root-identity supersets; candidate
+        # classification below remains the exact latest-state authority. The
+        # dedicated call-type micro-seed may still opt into its raw predicate
+        # on one explicitly bounded slice.
         root_plans = [
             plan
             for plan in plans
-            if plan.scope == "root" and plan.source_metric != "call_type"
+            if plan.scope == "root"
+            and not self._root_plan_runs_only_in_classifier(plan)
         ]
         root_seed_plan_predicates = [
             (plan, plan.raw_witness_predicate or plan.seed_predicate)
@@ -2561,14 +2521,6 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         params.update(end_user_seed_params)
         if end_user_seed_predicate and not _positive_user_candidate_first:
             root_seed_predicates.append(end_user_seed_predicate)
-        if _positive_annotator_candidate_first:
-            annotator_seed_predicate, annotator_seed_params = (
-                self._positive_exact_annotator_seed()
-            )
-            if not annotator_seed_predicate:
-                raise ValueError("trace annotator candidate predicate is unavailable")
-            params.update(annotator_seed_params)
-            root_seed_predicates.append(annotator_seed_predicate)
         root_predicate = " AND ".join(root_seed_predicates)
         predicate_fragment = f"AND {root_predicate}" if root_predicate else ""
         trace_id_prewhere_predicate = " AND ".join(trace_id_prewhere_predicates)
@@ -2709,8 +2661,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Seed ordered roots from an exact positive relational candidate."""
 
         positive_user = self._positive_exact_end_user_seed_filter() is not None
-        positive_annotator = self._positive_exact_annotator_seed_filter() is not None
-        if not (positive_user or positive_annotator):
+        if not positive_user:
             # Preserve the established domain error for unsupported callers.
             raise ValueError("trace user candidate seed is unavailable")
 
@@ -2722,9 +2673,6 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             before_start_time=before_start_time,
             before_id=before_id,
             _positive_user_candidate_first=positive_user,
-            _positive_annotator_candidate_first=(
-                positive_annotator and not positive_user
-            ),
         )
 
     def build_filter_navigation_seed_page(
@@ -2786,7 +2734,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         root_plans = [
             plan
             for plan in plans
-            if plan.scope == "root" and plan.source_metric != "call_type"
+            if plan.scope == "root"
+            and not self._root_plan_runs_only_in_classifier(plan)
         ]
         any_span_plans = [plan for plan in plans if plan.scope == "any"]
         allowed_start, allowed_end = request_start, request_end
@@ -4731,7 +4680,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if not user_query:
             return {}
 
-        result = analytics.execute_ch_query(user_query, user_params, timeout_ms=10000)
+        result = analytics.execute_ch_query(user_query, user_params, timeout_ms=9_500)
 
         # Build trace_id → user_id mapping (filter already applied in query)
         user_id_map = {

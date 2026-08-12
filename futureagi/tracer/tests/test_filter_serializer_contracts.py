@@ -125,6 +125,28 @@ class TestFilterSerializerContracts:
         filters = serializer.validated_data["filters"]
         assert filters[0]["filter_config"]["filter_op"] == "equals"
 
+    @pytest.mark.parametrize(
+        "attribute_key",
+        ["raw.payload", "llm.input_messages.0", "input.value.text"],
+    )
+    def test_users_query_serializer_rejects_reserved_projection_attribute_keys(
+        self, attribute_key
+    ):
+        serializer = UsersQuerySerializer(
+            data={"attribute_keys": json.dumps([attribute_key])}
+        )
+
+        assert not serializer.is_valid()
+        assert "attribute_keys" in serializer.errors
+
+    def test_users_query_serializer_rejects_reserved_filter_attribute_key(self):
+        payload = _span_attr_filter()
+        payload["column_id"] = "output.value"
+        serializer = UsersQuerySerializer(data={"filters": json.dumps([payload])})
+
+        assert not serializer.is_valid()
+        assert "filters" in serializer.errors
+
     def test_users_cursor_rejects_ambiguous_numbered_pagination(self):
         with_cursor_and_page = UsersQuerySerializer(
             data={"cursor": "signed-token", "current_page_index": 0}

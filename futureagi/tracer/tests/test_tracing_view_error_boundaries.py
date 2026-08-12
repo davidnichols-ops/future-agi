@@ -516,6 +516,41 @@ def test_graph_boundaries_reject_labelled_sample_even_with_legacy_opt_in(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("view_kind", ["trace", "span"])
+def test_primary_graph_boundaries_publish_proven_bounded_sample_with_opt_in(
+    monkeypatch,
+    view_kind,
+):
+    point = {
+        "timestamp": "2026-08-03T00:00:00Z",
+        "value": 7,
+        "primary_traffic": 1,
+    }
+    response = _graph_call(
+        monkeypatch,
+        view_kind,
+        {
+            "metric_name": "latency",
+            "data": [point],
+            "query_complete": False,
+            "query_status": "sampled",
+            "query_sampled": True,
+            "query_exact": False,
+            "query_provenance": "bounded_candidates",
+            "query_error_code": "sample_limit",
+            "query_sampling_strategy": "time_stratified_latest_state",
+            "query_sampling_strata": 8,
+            "query_sampling_strata_completed": 8,
+        },
+        allow_sampled=True,
+    )
+
+    assert response.status_code == 200
+    assert response.data["result"]["data"] == [point]
+    assert response.data["result"]["query_status"] == "sampled"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("view_kind", ["trace", "span"])
 def test_graph_boundaries_reject_sample_without_client_opt_in(monkeypatch, view_kind):
     response = _graph_call(
         monkeypatch,
@@ -929,7 +964,7 @@ def test_session_eval_logs_uses_authoritative_table_on_direct_service(
     assert "max_rows_to_read" not in read_settings
     assert read_settings["max_result_rows"] == 1
     assert read_settings["max_result_bytes"] == 8 * 1024 * 1024
-    assert read_settings["max_bytes_to_read"] == 256 * 1024 * 1024
+    assert read_settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
     assert read_settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
     assert read_settings["max_threads"] == 2
 

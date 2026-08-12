@@ -1,7 +1,7 @@
 from datetime import timedelta
 
 import structlog
-from django.db import models, transaction
+from django.db import models
 from django.db.models import Count
 from django.utils import timezone
 from rest_framework import status
@@ -20,24 +20,24 @@ from tfc.utils.error_codes import get_error_message
 from tfc.utils.general_methods import GeneralMethods
 from tracer.db_routing import DATABASE_FOR_PROJECT_LIST
 from tracer.models.custom_eval_config import CustomEvalConfig
-from tracer.models.eval_task import EvalTask
 from tracer.models.monitor import UserAlertMonitor
-from tracer.models.observation_span import EvalLogger, ObservationSpan
 from tracer.models.project import Project
-from tracer.models.project_version import ProjectVersion
-from tracer.models.trace import Trace
 from tracer.models.trace_scan import TraceScanConfig
-from tracer.models.trace_session import TraceSession
 from tracer.queries.projects import apply_project_list_filters
-from tracer.serializers.filters import ObserveGraphDataQuerySerializer
+from tracer.serializers.filters import (
+    ObserveGraphDataQuerySerializer,
+    ObserveGraphDataResponseSerializer,
+)
 from tracer.serializers.project import (
     ProjectDetailResponseSerializer,
     ProjectGraphDataQuerySerializer,
+    ProjectGraphDataResponseSerializer,
     ProjectIdListResponseSerializer,
     ProjectNameUpdateSerializer,
     ProjectSerializer,
     ProjectUserGraphDataQuerySerializer,
     ProjectUserGraphDataRequestSerializer,
+    ProjectUserGraphDataResponseSerializer,
     ProjectUserMetricsRequestSerializer,
     ProjectUsersAggregateGraphDataRequestSerializer,
 )
@@ -66,6 +66,7 @@ from tracer.services.filter_principal_context import (
     FilterPrincipalContextError,
     bind_request_my_annotations_principal,
 )
+from tracer.services.project_deletion import soft_delete_projects
 from tracer.utils.constants import (
     INSTALLATION_GUIDE,
     INSTRUMENTORS,
@@ -81,27 +82,25 @@ from tracer.utils.helper import get_default_project_version_config, get_sort_que
 
 logger = structlog.get_logger(__name__)
 
-# The Observe landing page is on the critical navigation path. Its activity
-# cells must preserve exact latest-root semantics and root event time. The
-# insert-only count rollup cannot retract tombstones or guarantee historical
-# coverage, while ``traces.created_at`` is arrival time and mis-buckets late
-# telemetry. The deployed replacement identity contains the start-hour and the
-# table is partitioned by event day, so one physical identity cannot cross a
-# midnight boundary. Read three adjacent 30-day chunks under one wall deadline
-# and collapse the complete replacement key explicitly. This keeps peak state
-# below the monolithic 90-day ``FINAL`` merge while preserving exact tombstones
-# and producer event time. No source-row ceiling is allowed.
-_PROJECT_ACTIVITY_TIMEOUT_MS = 30_000
-_PROJECT_ACTIVITY_CHUNK_DAYS = 30
+# The Observe landing page is a latency-critical navigation path. Never replay
+# raw span versions here: the dedicated rollup has one aggregate state per
+# project/hour, so its cost is bounded by the requested time window rather than
+# tenant span volume. The rollup is an insert-time materialization and therefore
+# deliberately advertised as non-exact (a later tombstone cannot retract an
+# earlier state). Exact correction belongs in a background snapshot, not in the
+# interactive project list.
+_PROJECT_ACTIVITY_TIMEOUT_MS = 9_500
+_PROJECT_ACTIVITY_PROVENANCE = "trace_count_rollup"
 _PROJECT_ACTIVITY_READ_SETTINGS = {
-    "max_threads": 1,
+    "max_threads": 4,
     "max_block_size": 8_192,
     "read_overflow_mode": "throw",
-    "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_bytes_before_external_group_by": 64 * 1024 * 1024,
     "optimize_aggregation_in_order": 1,
     "max_result_rows": 1_000,
+    "max_result_bytes": 16 * 1024 * 1024,
     "result_overflow_mode": "throw",
     "timeout_overflow_mode": "throw",
 }
@@ -111,11 +110,11 @@ _PROJECT_ACTIVITY_READ_SETTINGS = {
 # one statement under the same public contract: source-row volume is not an
 # error condition, while bytes, memory, result size, threads, and wall time are
 # finite and fail closed.
-_PROJECT_USER_GRAPH_TIMEOUT_MS = 30_000
+_PROJECT_USER_GRAPH_TIMEOUT_MS = 9_500
 _PROJECT_USER_GRAPH_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8_192,
-    "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_bytes_before_external_group_by": 64 * 1024 * 1024,
     "max_result_rows": 10_000,
@@ -163,34 +162,7 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
         return self._project_scope_queryset().filter(id=project_id).first()
 
     def _soft_delete_projects(self, projects, project_type):
-        with transaction.atomic():
-            now = timezone.now()
-            if project_type == "experiment":
-                ProjectVersion.objects.filter(project__in=projects).update(
-                    deleted=True, deleted_at=now
-                )
-            else:
-                TraceSession.objects.filter(project__in=projects).update(
-                    deleted=True, deleted_at=now
-                )
-            Trace.objects.filter(project__in=projects).update(
-                deleted=True, deleted_at=now
-            )
-            ObservationSpan.objects.filter(project__in=projects).update(
-                deleted=True, deleted_at=now
-            )
-            UserAlertMonitor.objects.filter(project__in=projects).update(
-                deleted=True, deleted_at=now
-            )
-            EvalTask.objects.filter(project__in=projects).update(
-                deleted=True, deleted_at=now
-            )
-            eval_configs = CustomEvalConfig.objects.filter(project__in=projects)
-            EvalLogger.objects.filter(custom_eval_config__in=eval_configs).update(
-                deleted=True, deleted_at=now
-            )
-            eval_configs.update(deleted=True, deleted_at=now)
-            projects.update(deleted=True, deleted_at=now)
+        soft_delete_projects(projects, project_type)
 
     def get_queryset(self):
         # Get base queryset with automatic filtering from mixin
@@ -530,13 +502,23 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             # CH-only fields can't be sorted in PG — fall back to created_at
             sort_by = raw_sort if raw_sort in ALLOWED_SORT_FIELDS else "created_at"
             sort_direction = self.request.query_params.get("sort_direction", "desc")
+            if sort_direction not in {"asc", "desc"}:
+                return self._gm.bad_request("sort_direction must be asc or desc")
             sort_query = f"-{sort_by}" if sort_direction == "desc" else sort_by
             queryset = queryset.order_by(sort_query)
 
+            try:
+                page_number = int(self.request.query_params.get("page_number", 0))
+                page_size = int(self.request.query_params.get("page_size", 20))
+            except (TypeError, ValueError):
+                return self._gm.bad_request(
+                    "page_number and page_size must be integers"
+                )
+            if page_number < 0 or not 1 <= page_size <= 100:
+                return self._gm.bad_request(
+                    "page_number must be non-negative and page_size must be 1 to 100"
+                )
             total_count = queryset.count()
-
-            page_number = int(self.request.query_params.get("page_number", 0))
-            page_size = int(self.request.query_params.get("page_size", 20))
             start = page_number * page_size
             end = start + page_size
 
@@ -581,50 +563,20 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                             _PROJECT_ACTIVITY_TIMEOUT_MS
                         )
                         activity_query = """
-                                WITH latest_physical_spans AS (
+                                WITH daily AS (
                                     SELECT
                                         project_id,
-                                        argMax(
-                                            tuple(
-                                                parent_span_id,
-                                                start_time,
-                                                is_deleted
-                                            ),
-                                            _version
-                                        ) AS latest_span_state
-                                    FROM spans
+                                        toDate(hour) AS day,
+                                        uniqExactMerge(uniq_traces_state)
+                                            AS day_volume,
+                                        max(hour) AS day_last_active
+                                    FROM trace_count_rollup
                                     PREWHERE project_id IN %(pids)s
-                                      AND toDate(start_time) >=
-                                          toDate(%(activity_start)s)
-                                      AND toDate(start_time) <
-                                          toDate(%(activity_end)s)
-                                      AND start_time >= toDateTime64(
-                                          %(activity_start)s, 6, 'UTC'
+                                      AND hour >= toDateTime(
+                                          %(activity_start)s, 'UTC'
                                       )
-                                      AND start_time < toDateTime64(
-                                          %(activity_end)s, 6, 'UTC'
-                                      )
-                                    GROUP BY
-                                        project_id,
-                                        observation_type,
-                                        service_name,
-                                        toStartOfHour(start_time),
-                                        trace_id,
-                                        id
-                                ), live_daily AS (
-                                    SELECT
-                                        project_id,
-                                        toDate(latest_span_state.2) AS day,
-                                        count() AS day_volume,
-                                        max(latest_span_state.2) AS day_last_active
-                                    FROM latest_physical_spans
-                                    WHERE latest_span_state.3 = 0
-                                      AND latest_span_state.1 = ''
-                                      AND latest_span_state.2 >= toDateTime64(
-                                          %(activity_start)s, 6, 'UTC'
-                                      )
-                                      AND latest_span_state.2 < toDateTime64(
-                                          %(activity_end)s, 6, 'UTC'
+                                      AND hour < toDateTime(
+                                          %(activity_end)s, 'UTC'
                                       )
                                     GROUP BY project_id, day
                                 )
@@ -642,54 +594,52 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                                             day >= toDate(%(volume_start)s)
                                         )
                                     ) AS daily_volume
-                                FROM live_daily
+                                FROM daily
                                 GROUP BY project_id
                             """
 
-                        # Parse every chunk into request-local pending maps and
-                        # publish all three activity fields only after the full
-                        # 90-day window succeeds. A later cap breach, timeout,
-                        # or malformed row discards every earlier chunk.
+                        # Publish all three activity fields atomically only
+                        # after the single bounded rollup read parses cleanly.
                         pending_volume_map = dict.fromkeys(project_ids, 0)
                         pending_daily_map_raw = {pid: {} for pid in project_ids}
                         pending_last_active_values = dict.fromkeys(project_ids)
-                        chunk_start = activity_window_start
-                        while chunk_start < activity_window_end:
-                            chunk_end = min(
-                                chunk_start
-                                + timedelta(days=_PROJECT_ACTIVITY_CHUNK_DAYS),
-                                activity_window_end,
-                            )
-                            activity_result = service.execute_ch_query(
-                                activity_query,
-                                {
-                                    "pids": project_ids,
-                                    "activity_start": chunk_start.strftime("%Y-%m-%d"),
-                                    "activity_end": chunk_end.strftime("%Y-%m-%d"),
-                                    "volume_start": volume_window_start.strftime(
-                                        "%Y-%m-%d"
-                                    ),
-                                },
-                                timeout_ms=activity_deadline.remaining_ms(),
-                                settings=_PROJECT_ACTIVITY_READ_SETTINGS,
-                            )
-                            for row in activity_result.data:
-                                pid = str(row["project_id_text"])
-                                if pid not in pending_volume_map:
-                                    continue
-                                pending_volume_map[pid] += int(row.get("volume") or 0)
-                                for day, day_volume in row.get("daily_volume") or []:
-                                    pending_daily_map_raw[pid][str(day)] = int(
-                                        day_volume
-                                    )
-                                last_active = row.get("last_active")
-                                previous_last_active = pending_last_active_values[pid]
-                                if last_active and (
-                                    previous_last_active is None
-                                    or last_active > previous_last_active
-                                ):
-                                    pending_last_active_values[pid] = last_active
-                            chunk_start = chunk_end
+                        activity_result = service.execute_ch_query(
+                            activity_query,
+                            {
+                                "pids": project_ids,
+                                "activity_start": activity_window_start.strftime(
+                                    "%Y-%m-%d"
+                                ),
+                                "activity_end": activity_window_end.strftime(
+                                    "%Y-%m-%d"
+                                ),
+                                "volume_start": volume_window_start.strftime(
+                                    "%Y-%m-%d"
+                                ),
+                            },
+                            timeout_ms=activity_deadline.remaining_ms(),
+                            settings=_PROJECT_ACTIVITY_READ_SETTINGS,
+                        )
+                        for row in activity_result.data:
+                            required_columns = {
+                                "project_id_text",
+                                "volume",
+                                "last_active",
+                                "daily_volume",
+                            }
+                            if not isinstance(
+                                row, dict
+                            ) or not required_columns.issubset(row):
+                                raise ValueError(
+                                    "project activity rollup returned an invalid schema"
+                                )
+                            pid = str(row["project_id_text"])
+                            if pid not in pending_volume_map:
+                                continue
+                            pending_volume_map[pid] = int(row.get("volume") or 0)
+                            for day, day_volume in row.get("daily_volume") or []:
+                                pending_daily_map_raw[pid][str(day)] = int(day_volume)
+                            pending_last_active_values[pid] = row.get("last_active")
 
                         pending_daily_volume_map = {
                             pid: [
@@ -775,6 +725,8 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                     ),
                     "activity_query_complete": activity_query_complete,
                     "activity_error_code": activity_error_code,
+                    "activity_query_exact": False,
+                    "activity_query_provenance": _PROJECT_ACTIVITY_PROVENANCE,
                     "run_count": run_count_map.get(str(project["id"]), 0),
                     "issues": alert_count_map.get(str(project["id"]), 0),
                     "tags": project.get("tags") or [],
@@ -824,6 +776,7 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
     @validated_request(
         query_serializer=ProjectGraphDataQuerySerializer,
         responses={
+            200: ProjectGraphDataResponseSerializer,
             400: ApiErrorResponseSerializer,
             500: ApiErrorResponseSerializer,
             503: ApiErrorResponseSerializer,
@@ -986,6 +939,12 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
     @validated_request(
         query_serializer=ObserveGraphDataQuerySerializer,
         request_serializer=ProjectUsersAggregateGraphDataRequestSerializer,
+        responses={
+            200: ObserveGraphDataResponseSerializer,
+            400: ApiErrorResponseSerializer,
+            500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        },
     )
     @action(detail=False, methods=["post"])
     def get_users_aggregate_graph_data(self, request, *args, **kwargs):
@@ -1145,6 +1104,12 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
     @validated_request(
         query_serializer=ProjectUserGraphDataQuerySerializer,
         request_serializer=ProjectUserGraphDataRequestSerializer,
+        responses={
+            200: ProjectUserGraphDataResponseSerializer,
+            400: ApiErrorResponseSerializer,
+            500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        },
     )
     @action(detail=False, methods=["post"])
     def get_user_graph_data(self, request, *args, **kwargs):

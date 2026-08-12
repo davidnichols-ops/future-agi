@@ -136,7 +136,7 @@ def test_eval_list_charts_uses_one_bounded_materialized_clickhouse_aggregate(
     assert call["timeout_ms"] == 2_000
     assert call["settings"]["max_threads"] == 2
     assert "max_rows_to_read" not in call["settings"]
-    assert call["settings"]["max_bytes_to_read"] == 512 * 1024 * 1024
+    assert call["settings"]["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
     assert call["settings"]["max_memory_usage"] == 36 * 1024 * 1024 * 1024
     assert "eval_score" in call["query"]
     assert "eval_output_str" in call["query"]

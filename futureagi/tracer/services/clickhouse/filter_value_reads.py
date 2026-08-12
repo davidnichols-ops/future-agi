@@ -23,6 +23,7 @@ from tracer.services.clickhouse.query_builders.voice_filter_expressions import (
 )
 from tracer.services.clickhouse.query_service import QueryExecutor
 from tracer.services.clickhouse.read_budget import (
+    ReadDeadline,
     ReadDeadlineExceeded,
     is_read_budget_error,
 )
@@ -35,8 +36,10 @@ from tracer.services.clickhouse.v2.query_builders.filters import (
     rewrite_v1_sql_to_v2,
 )
 
-FILTER_VALUE_READ_TIMEOUT_MS = 30_000
-FILTER_VALUE_MAX_BYTES_TO_READ = 512 * 1024 * 1024
+# Keep two seconds of the product's ten-second SLA for HTTP serialization and
+# transport. Adjacent exact slices share this selector-owned wall.
+FILTER_VALUE_READ_TIMEOUT_MS = 8_000
+FILTER_VALUE_MAX_BYTES_TO_READ = 36 * 1024 * 1024 * 1024
 FILTER_VALUE_MAX_MEMORY_USAGE = 36 * 1024 * 1024 * 1024
 FILTER_VALUE_CURSOR_MIN_SEGMENT = timedelta(seconds=5)
 FILTER_VALUE_CURSOR_INITIAL_SEGMENT = timedelta(minutes=5)
@@ -465,6 +468,7 @@ def read_span_system_filter_value_cursor_page(
 
     if not 1 <= int(page_size) <= 50:
         raise ValueError("filter-value page_size must be between 1 and 50")
+    deadline = ReadDeadline.start(FILTER_VALUE_READ_TIMEOUT_MS)
     start = _utc(window_start)
     end = _utc(window_end)
     current_end = _utc(segment_end or end)
@@ -587,10 +591,20 @@ def read_span_system_filter_value_cursor_page(
         if after is not None:
             params["value_after"] = after
         try:
+            query_timeout_ms = deadline.remaining_ms(FILTER_VALUE_READ_TIMEOUT_MS)
+        except ReadDeadlineExceeded:
+            # A prior exact slice/keyset page already provides an advancing
+            # public checkpoint. Never start another eight-second statement
+            # after the request-owned wall is exhausted.
+            progress_state = (current_end, current_start, after)
+            if progress_state != initial_state:
+                break
+            raise
+        try:
             result = analytics.execute_ch_query(
                 query,
                 params,
-                timeout_ms=FILTER_VALUE_READ_TIMEOUT_MS,
+                timeout_ms=query_timeout_ms,
                 settings={
                     **FILTER_VALUE_READ_SETTINGS,
                     "max_result_rows": FILTER_VALUE_CURSOR_SCAN_LIMIT,

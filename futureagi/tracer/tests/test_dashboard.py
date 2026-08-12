@@ -294,7 +294,7 @@ def test_dashboard_30d_114m_row_read_has_no_application_row_ceiling():
     assert observed_sql is sql
     assert observed_params is params
     assert observed_settings is _DASHBOARD_TRACE_READ_SETTINGS
-    assert observed_timeout == 30_000
+    assert observed_timeout == 9_500
     assert "max_rows_to_read" not in observed_settings
     assert params == _dashboard_full_window_params(days=30)
 
@@ -328,8 +328,8 @@ def test_dashboard_full_window_read_keeps_all_independent_finite_limits():
     read_settings = _DASHBOARD_TRACE_READ_SETTINGS
 
     assert read_settings == {
-        "max_threads": 2,
-        "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
+        "max_threads": 4,
+        "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
         "max_memory_usage": 36 * 1024 * 1024 * 1024,
         "read_overflow_mode": "throw",
         "max_result_rows": 250_000,
@@ -343,7 +343,7 @@ def test_dashboard_full_window_read_keeps_all_independent_finite_limits():
 def test_dashboard_worker_has_one_deadline_for_every_exact_source():
     source = inspect.getsource(DashboardWidgetViewSet._execute_ch_query_config)
 
-    assert _DASHBOARD_EXACT_QUERY_TIMEOUT_MS == 30_000
+    assert _DASHBOARD_EXACT_QUERY_TIMEOUT_MS == 9_500
     assert source.count("ReadDeadline.start(") == 1
     assert source.count("timeout_ms=read_deadline.remaining_ms(") == 3
     assert source.count("read_deadline.remaining_ms(floor_ms=1)") == 2
@@ -466,7 +466,6 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
             "tracer.views.dashboard._materialize_dashboard_query_scope",
             side_effect=lambda config, *_args, **_kwargs: config,
         ),
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
         patch(
             "tracer.views.dashboard._project_queryset_for_dashboard_scope",
             return_value=project_queryset,
@@ -501,17 +500,17 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
     assert len(analytics.calls) == 4
     deadline_start.assert_called_once_with(_DASHBOARD_EXACT_QUERY_TIMEOUT_MS)
     assert sorted(deadline.statement_timeouts, reverse=True) == [
-        30_000,
-        29_000,
-        28_000,
-        27_000,
+        9_500,
+        8_500,
+        7_500,
+        6_500,
     ]
     assert deadline.publication_fences == 2
     assert sorted([call[2] for call in analytics.calls], reverse=True) == [
-        30_000,
-        29_000,
-        28_000,
-        27_000,
+        9_500,
+        8_500,
+        7_500,
+        6_500,
     ]
     assert {call[0] for call in analytics.calls} == {
         "SELECT latency FROM spans FINAL",
@@ -604,14 +603,12 @@ def test_dashboard_worker_does_not_return_payload_after_formatting_crosses_deadl
     project_queryset.filter.return_value = project_queryset
     project_queryset.count.return_value = 1
     project_queryset.values_list.return_value = []
-    publish = MagicMock()
 
     with (
         patch(
             "tracer.views.dashboard._materialize_dashboard_query_scope",
             side_effect=lambda config, *_args, **_kwargs: config,
         ),
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
         patch(
             "tracer.views.dashboard._project_queryset_for_dashboard_scope",
             return_value=project_queryset,
@@ -629,7 +626,6 @@ def test_dashboard_worker_does_not_return_payload_after_formatting_crosses_deadl
             "tracer.views.dashboard.ReadDeadline.start",
             return_value=ExpiresAfterFormattingDeadline(),
         ),
-        patch("tracer.views.dashboard.publish_exact_snapshot", publish),
     ):
         with pytest.raises(
             DashboardExactReadError,
@@ -647,7 +643,6 @@ def test_dashboard_worker_does_not_return_payload_after_formatting_crosses_deadl
 
     assert formatting["complete"] is True
     assert len(analytics.calls) == 1
-    publish.assert_not_called()
 
 
 @pytest.mark.django_db
@@ -721,7 +716,6 @@ def test_dashboard_worker_accepts_legacy_null_project_in_default_workspace_scope
 
     analytics = _DashboardFullWindowAnalytics()
     with (
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
         patch(
             "tracer.views.dashboard.DashboardQueryBuilderV2",
             FakeTraceBuilder,
@@ -791,7 +785,6 @@ def test_dashboard_worker_keeps_frozen_empty_project_scope_after_project_added(
     builder_configs = []
     analytics = _DashboardFullWindowAnalytics()
     with (
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
         patch(
             "tracer.views.dashboard.DashboardQueryBuilderV2",
             _recording_dashboard_builder(builder_configs),
@@ -850,7 +843,6 @@ def test_dashboard_dataset_worker_replays_internal_concrete_scope(
     analytics = _DashboardFullWindowAnalytics()
 
     with (
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
         patch(
             "tracer.views.dashboard.DatasetQueryBuilder",
             _recording_dashboard_builder(builder_configs),
@@ -924,7 +916,6 @@ def test_dashboard_dataset_worker_keeps_frozen_empty_scope_after_dataset_added(
     builder_configs = []
     analytics = _DashboardFullWindowAnalytics()
     with (
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
         patch(
             "tracer.views.dashboard.DatasetQueryBuilder",
             _recording_dashboard_builder(builder_configs),
@@ -1006,7 +997,6 @@ def test_dashboard_dataset_worker_includes_authorized_legacy_null_dataset(
 
     analytics = _DashboardFullWindowAnalytics()
     with (
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
         patch(
             "tracer.views.dashboard.DatasetQueryBuilder",
             RecordingRealDatasetBuilder,
@@ -5940,7 +5930,6 @@ class TestDashboardQueryExecution:
                 "tracer.views.dashboard.V2AnalyticsQueryService",
                 return_value=isolated_eval_usage_analytics,
             ),
-            patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
         ):
             # Public dashboard polls intentionally return a non-chartable
             # pending envelope while the exact worker runs out of band. Drive
@@ -6382,7 +6371,7 @@ class TestDashboardTraceTimeoutSelection:
                 "breakdowns": [],
             }
         )
-        assert timeout == 10000
+        assert timeout == 9500
 
     def test_project_breakdown_uses_longer_timeout(self):
         viewset = DashboardViewSet()
@@ -6399,7 +6388,7 @@ class TestDashboardTraceTimeoutSelection:
                 "breakdowns": [{"type": "system_metric", "name": "project"}],
             }
         )
-        assert timeout == 30000
+        assert timeout == 9500
 
     def test_eval_metric_uses_longer_timeout(self):
         viewset = DashboardViewSet()
@@ -6416,7 +6405,7 @@ class TestDashboardTraceTimeoutSelection:
                 "breakdowns": [],
             }
         )
-        assert timeout == 30000
+        assert timeout == 9500
 
 
 class TestDashboardMetricSourceNormalization:
@@ -7465,6 +7454,16 @@ class TestDashboardQuerySerializer:
             "operator": "greater_than",
             "value": 100,
             "source": "traces",
+            "canonical_filter": {
+                "column_id": "latency",
+                "source": "traces",
+                "filter_config": {
+                    "filter_type": "number",
+                    "filter_op": "greater_than",
+                    "filter_value": 100,
+                    "col_type": "SYSTEM_METRIC",
+                },
+            },
         }
         assert normalized["metrics"][0]["filters"][0]["operator"] == "contains"
 
@@ -9987,7 +9986,6 @@ class TestFilterValuesEvalBranches:
     @staticmethod
     def _eval_config(project, organization, workspace, *, output, choices=None):
         from model_hub.models.evals_metric import EvalTemplate
-
         from tracer.models.custom_eval_config import CustomEvalConfig
 
         template = EvalTemplate.no_workspace_objects.create(
@@ -10454,7 +10452,7 @@ class TestXSSPayloadNonExecutable:
 
 
 @pytest.mark.django_db
-def test_dashboard_query_defers_exact_read_without_inline_clickhouse(
+def test_dashboard_query_serves_inline_rollup_while_exact_refresh_runs(
     auth_client,
     observe_project,
 ):
@@ -10464,6 +10462,17 @@ def test_dashboard_query_defers_exact_read_without_inline_clickhouse(
         captured.update(namespace=namespace, identity=identity, options=kwargs)
         return kwargs["pending_payload"]
 
+    rollup_analytics = MagicMock()
+    rollup_analytics.execute_ch_query.return_value = SimpleNamespace(
+        data=[
+            {
+                "time_bucket": datetime(2026, 8, 1, tzinfo=UTC),
+                "metric_0": 12.0,
+            }
+        ],
+        columns=["time_bucket", "metric_0"],
+    )
+
     with (
         patch(
             "tracer.views.dashboard.read_or_schedule_exact_snapshot",
@@ -10471,7 +10480,7 @@ def test_dashboard_query_defers_exact_read_without_inline_clickhouse(
         ),
         patch(
             "tracer.views.dashboard.V2AnalyticsQueryService",
-            side_effect=AssertionError("public poll must not query ClickHouse"),
+            return_value=rollup_analytics,
         ),
         patch(
             "tracer.views.dashboard.AnalyticsQueryService",
@@ -10498,9 +10507,11 @@ def test_dashboard_query_defers_exact_read_without_inline_clickhouse(
 
     assert response.status_code == 200
     result = response.json()["result"]
-    assert result["query_status"] == "pending"
-    assert result["query_complete"] is False
+    assert result["query_status"] == "complete"
+    assert result["query_complete"] is True
     assert result["query_sampled"] is False
+    assert result["query_exact"] is False
+    assert result["query_provenance"] == "materialized_rollup"
     assert result["query_refreshing"] is True
     assert captured["namespace"] == "dashboard-query"
     assert captured["identity"]["query_config"]["project_ids"] == [
@@ -10567,7 +10578,7 @@ def test_dashboard_query_replays_legacy_metric_filter_without_400(
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("action", ["execute", "preview"])
-def test_widget_query_defers_exact_read_without_inline_clickhouse(
+def test_widget_query_serves_inline_rollup_while_exact_refresh_runs(
     action,
     auth_client,
     dashboard,
@@ -10596,16 +10607,26 @@ def test_widget_query_defers_exact_read_without_inline_clickhouse(
         captured.update(kwargs)
         return kwargs["pending_payload"]
 
+    rollup_analytics = MagicMock()
+    rollup_analytics.execute_ch_query.return_value = SimpleNamespace(
+        data=[
+            {
+                "time_bucket": datetime(2026, 8, 1, tzinfo=UTC),
+                "metric_0": 12.0,
+            }
+        ],
+        columns=["time_bucket", "metric_0"],
+    )
+
     with (
         patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True),
         patch(
             "tracer.views.dashboard.read_or_schedule_exact_snapshot",
             side_effect=_pending,
         ),
-        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
         patch(
             "tracer.views.dashboard.V2AnalyticsQueryService",
-            side_effect=AssertionError("public poll must not query ClickHouse"),
+            return_value=rollup_analytics,
         ),
         patch(
             "tracer.views.dashboard.get_clickhouse_client",
@@ -10626,8 +10647,10 @@ def test_widget_query_defers_exact_read_without_inline_clickhouse(
 
     assert response.status_code == 200
     result = response.json()["result"]
-    assert result["query_status"] == "pending"
-    assert result["query_complete"] is False
+    assert result["query_status"] == "complete"
+    assert result["query_complete"] is True
     assert result["query_sampled"] is False
+    assert result["query_exact"] is False
+    assert result["query_provenance"] == "materialized_rollup"
     assert result["query_refreshing"] is True
     assert captured["refresh"] is True

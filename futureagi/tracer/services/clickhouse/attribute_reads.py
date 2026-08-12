@@ -53,13 +53,14 @@ JsonScalar = str | int | float | bool
 AttributeValue = str | int | float | bool | tuple[JsonScalar, ...]
 
 ATTRIBUTE_READ_HORIZON_DAYS = (7, 14, 30, 180, 365)
-# Attribute inventory and value reads use the same hard 30-second production
-# ceiling as the surrounding API. Each statement receives only the operation's
+# Attribute inventory and value reads reserve HTTP serialization/transport time
+# inside the product's ten-second SLA. Each selector owns at most eight seconds.
+# Every statement receives only the operation's
 # remaining time; finite query-count, candidate, byte, memory, and result caps
 # continue to bound the work independently of source-row volume.
-ATTRIBUTE_READ_WALL_TIMEOUT_MS = 30_000
-ATTRIBUTE_READ_QUERY_TIMEOUT_MS = 30_000
-ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS = 30_000
+ATTRIBUTE_READ_WALL_TIMEOUT_MS = 8_000
+ATTRIBUTE_READ_QUERY_TIMEOUT_MS = 8_000
+ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS = 8_000
 # Keep one operation below the production low-load harness ceiling (32) even
 # when a typed value page needs candidate, version-certificate, and hydration
 # queries. Candidate-page caps bound discovery breadth; this separate ceiling
@@ -67,10 +68,10 @@ ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS = 30_000
 ATTRIBUTE_READ_MAX_QUERY_COUNT = 30
 # JSON overflow has no key skip index, but it still follows the one shared
 # operation deadline rather than imposing a smaller data-dependent cutoff.
-ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS = 30_000
+ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS = 8_000
 # The active-part lower bound is only a pagination accelerator: Unix epoch is
 # the conservative lossless fallback. Keep this metadata probe short so it
-# cannot consume the authoritative cursor read's shared 30-second wall.
+# cannot consume the authoritative cursor read's shared eight-second wall.
 ATTRIBUTE_READ_METADATA_TIMEOUT_MS = 750
 ATTRIBUTE_READ_FALLBACK_RETAINED_START = datetime(1970, 1, 1, tzinfo=UTC)
 # Production A/B on the largest US project showed that one-day and 12-hour
@@ -98,7 +99,7 @@ ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT = 6
 # First probes cover all adaptive bands before these pages run round-robin, so a
 # dense recent week cannot hide an older value. A first sample that already has
 # usable values remains a visibly degraded sample instead of paying for a full
-# global sort. The 30-second wall deadline remains the tighter production cap.
+# global sort. The eight-second wall deadline remains the tighter production cap.
 ATTRIBUTE_READ_VALUE_CANDIDATE_PAGE_LIMIT = 6
 ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT = 15
 ATTRIBUTE_READ_MAX_KEYS = 1_000
@@ -124,6 +125,11 @@ ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS = (
 )
 ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT = 64
 ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT = 512
+# Only ``call_id`` has representative production evidence for a larger first
+# prefix: 960 exact identities yielded 40 values in 2.49s on Colektia, while
+# 512 yielded 11. Every other key starts at 64 and grows only after a completed
+# batch proves that its current prefix produced no new values.
+ATTRIBUTE_VALUE_CURSOR_DENSE_CANDIDATE_LIMIT = 960
 # One cursor request is a responsive, exact prefix read rather than a request
 # to exhaust the vocabulary. Four candidate batches and their bounded
 # latest-state reads cover up to 256 newest matching physical spans once the
@@ -139,7 +145,7 @@ ATTRIBUTE_VALUE_CURSOR_DUPLICATE_ONLY_MAX_CANDIDATE_PAGES = (
 # candidate in that half-open physical slice.  Grow only after such a proof so
 # sparse retained history does not require one public cursor round-trip per
 # day.  The 60-day ceiling still exhausts a frozen 365-day window in a small,
-# finite number of statements, while the selector's independent 30-second /
+# finite number of statements, while the selector's independent eight-second /
 # 30-query ceilings remain the hard request bound.
 ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT = timedelta(days=60)
 # A widened physical candidate slice is an optional accelerator.  If
@@ -175,6 +181,12 @@ ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_S
 # 658 ms successful boundary observed immediately before a 750 ms doubled-slice
 # timeout, while still allowing its 438 ms predecessor to grow once.
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS = 2_500
+# Load-more continuations without a search term can cheaply certify runs of
+# already-published values, but exhausting a sparse year is not one HTTP
+# response's job. Two complete adjacent proofs yield an exact advancing cursor
+# while bounding the duplicate-only fast path independently of the wall clock.
+ATTRIBUTE_VALUE_CURSOR_MAX_UNSEARCHED_CONTINUATION_PROOFS = 2
+ATTRIBUTE_VALUE_CURSOR_MAX_SEARCH_PROOFS = 6
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS = 500
 # Retain at least four-times resource headroom before carrying the same width
 # into an adjacent slice, whose density is not known yet. A proof at or above
@@ -220,6 +232,10 @@ ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT = 512
 # at most 15 pairs, but an empty historical suffix can collapse up to 29
 # adjacent probes inside one API request instead of exposing empty UI pages.
 ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES = ATTRIBUTE_READ_MAX_QUERY_COUNT
+# Exact lookup is cursor-backed. Eight candidate slices per response keep sparse
+# missing-key discovery from issuing 29 near-duplicate statements; the signed
+# next cursor resumes the already-advanced frozen window without skipping data.
+ATTRIBUTE_KEY_CURSOR_EXACT_MAX_CANDIDATE_PAGES = 8
 ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT = timedelta(minutes=5)
 # Exact-key JSON discovery starts at the same production-qualified five-minute
 # slice, but a newly dense interval must not turn that soft starting point into
@@ -263,7 +279,7 @@ ATTRIBUTE_READ_SETTINGS: dict[str, Any] = {
     # of pulling the default ~65k-row block after the 513th identity.
     "max_block_size": 8_192,
     "max_memory_usage": 36 * 1024 * _MIB,
-    "max_bytes_to_read": 512 * _MIB,
+    "max_bytes_to_read": 36 * 1024 * _MIB,
     "read_overflow_mode": "throw",
     "max_result_rows": ATTRIBUTE_READ_CANDIDATE_LIMIT + 1,
     "max_result_bytes": 16 * _MIB,
@@ -277,16 +293,15 @@ ATTRIBUTE_READ_SETTINGS: dict[str, Any] = {
 # only during latest-state hydration of the finite sampled identities.
 _JSON_VALUE_CANDIDATE_SETTINGS: dict[str, Any] = {
     "max_block_size": 2_048,
-    "max_bytes_to_read": 64 * _MIB,
+    "max_bytes_to_read": 36 * 1024 * _MIB,
 }
 
 # A single indexed Map granule on the largest production tenant exceeds the
-# generic 512 MiB *read-volume* guard even for a 30-second temporal slice.
-# Cursor value reads remain single-threaded, statement- and
-# wall-time bounded, and retain the stricter 256 MiB memory ceiling; this local
-# allowance merely lets ClickHouse finish that one already-selected granule.
+# old low read-volume guard even for a 30-second temporal slice. Cursor value
+# reads remain single-threaded and share the eight-second wall; the common 36 GiB
+# memory/read ceilings let ClickHouse finish that already-selected granule.
 _ATTRIBUTE_VALUE_PROOF_MAP_SETTINGS: dict[str, Any] = {
-    "max_bytes_to_read": 1_024 * _MIB,
+    "max_bytes_to_read": 36 * 1024 * _MIB,
 }
 
 # The ordered fallback stops at a 65-row sentinel, but ClickHouse may have to
@@ -295,7 +310,7 @@ _ATTRIBUTE_VALUE_PROOF_MAP_SETTINGS: dict[str, Any] = {
 # lets that finite keyset seed complete; latest-version replay remains bounded
 # to the returned identities and the memory/byte limits are unchanged.
 _ATTRIBUTE_VALUE_CANDIDATE_MAP_SETTINGS: dict[str, Any] = {
-    "max_bytes_to_read": 1_024 * _MIB,
+    "max_bytes_to_read": 36 * 1024 * _MIB,
 }
 
 _TYPE_PRIORITY: dict[AttributeType, int] = {
@@ -1135,7 +1150,7 @@ _LATEST_CARDINALITY_SQL = """
 class AttributeReadSelector:
     """Thin typed selector shared by every production attribute picker.
 
-    Each public operation gets one 30-second wall budget shared by all of its
+    Each public operation gets one eight-second wall budget shared by all of its
     adaptive candidate and latest-state replay queries. Default-horizon reads
     keep the existing finite band/page caps; caller-supplied windows are split
     into adjacent six-hour probes under the same whole-operation deadline. Common
@@ -2872,6 +2887,7 @@ class AttributeReadSelector:
         budget_exceeded = False
         json_budget_exceeded = False
         budget_warning_emitted = False
+        deadline_sampled = False
         covered_start = overall_end
         json_lane_available = self._reads_json_overflow
         typed_lane_halted = False
@@ -3038,6 +3054,19 @@ class AttributeReadSelector:
                         typed_lane_halted = True
                         truncated = True
                         break
+                    if (
+                        isinstance(exc, ReadDeadlineExceeded)
+                        and covered_start < overall_end
+                    ):
+                        # This cursorless compatibility endpoint already
+                        # completed latest-state replay for a bounded temporal
+                        # sample. Label that sample rather than restarting the
+                        # same adaptive walk as a 503 retry loop. Exhaustive
+                        # consumers use the signed value cursor.
+                        deadline_sampled = True
+                        typed_lane_halted = True
+                        truncated = True
+                        break
                     if lane_name == "json" and is_read_budget_error(exc):
                         json_lane_available = False
                         mark_json_budget_exceeded()
@@ -3185,6 +3214,14 @@ class AttributeReadSelector:
                         typed_lane_halted = True
                         truncated = True
                         break
+                    if (
+                        isinstance(exc, ReadDeadlineExceeded)
+                        and covered_start < overall_end
+                    ):
+                        deadline_sampled = True
+                        typed_lane_halted = True
+                        truncated = True
+                        break
                     if state["lane_name"] == "json" and is_read_budget_error(exc):
                         json_lane_available = False
                         state["complete"] = True
@@ -3263,6 +3300,13 @@ class AttributeReadSelector:
                 if isinstance(exc, AttributeReadQueryLimitExceeded):
                     typed_lane_halted = True
                     truncated = True
+                elif (
+                    isinstance(exc, ReadDeadlineExceeded)
+                    and covered_start < overall_end
+                ):
+                    deadline_sampled = True
+                    typed_lane_halted = True
+                    truncated = True
                 elif is_read_budget_error(exc):
                     json_lane_available = False
                     mark_json_budget_exceeded()
@@ -3321,7 +3365,7 @@ class AttributeReadSelector:
         effective_budget_exceeded = budget_exceeded or (
             json_budget_exceeded and not ordered
         )
-        effective_truncated = truncated or usable_json_degradation
+        effective_truncated = truncated or usable_json_degradation or deadline_sampled
         return AttributeValueRead(
             tuple(
                 AttributeValueRow(
@@ -3343,7 +3387,7 @@ class AttributeReadSelector:
                 sampled=(
                     effective_truncated
                     and not effective_budget_exceeded
-                    and bool(ordered)
+                    and (bool(ordered) or deadline_sampled)
                 ),
                 window_start=covered_start,
                 window_end=overall_end,
@@ -3519,6 +3563,11 @@ class AttributeReadSelector:
         exact_fallback_started = False
         next_resume_identity: PhysicalSpanIdentity | None = None
         next_resume_key_offset = 0
+        candidate_page_ceiling = (
+            ATTRIBUTE_KEY_CURSOR_EXACT_MAX_CANDIDATE_PAGES
+            if exact_key is not None
+            else ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
+        )
 
         def anchor_checkpoint_window(
             checkpoint: PhysicalSpanIdentity,
@@ -3681,7 +3730,7 @@ class AttributeReadSelector:
             current_segment_end > start
             and len(emitted) < effective_page_size
             and next_resume_identity is None
-            and candidate_pages < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
+            and candidate_pages < candidate_page_ceiling
             # Generic browsing needs a candidate/replay pair. An exact search
             # may first spend another pair on the typed Map bloom indexes; it
             # must still leave room for the ordered structured-JSON fallback.
@@ -3924,7 +3973,7 @@ class AttributeReadSelector:
                 )
             except Exception as exc:
                 if is_read_budget_error(exc) and exact_key is not None:
-                    if candidate_limit > 1:
+                    if candidate_limit > 1 and len(candidate_ids) > 1:
                         # Hydrating exact latest state can be dominated by one
                         # large JSON value. Reduce only the finite replay batch;
                         # candidate/keyset progress remains unpublished until a
@@ -4326,7 +4375,24 @@ class AttributeReadSelector:
             4 if unpinned_cursor_read else 3 if typed_cursor_read else 2
         )
         candidate_pages = 0
-        candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+        # A typed value can repeat across hundreds of adjacent spans (voice
+        # ``call_id`` is the production example).  The ordered candidate read
+        # already scans the same frozen segment before its LIMIT can stop, so
+        # acquiring a larger finite identity prefix costs roughly the same
+        # source read as 64 identities while yielding a useful value page.
+        # Keep tiny/untyped/search pages on the conservative seed and
+        # retain the exact replay + eight-second request wall.
+        dense_typed_oversample = bool(
+            key == "call_id"
+            and typed_cursor_read
+            and not needle
+            and effective_page_size >= 10
+        )
+        candidate_limit = (
+            ATTRIBUTE_VALUE_CURSOR_DENSE_CANDIDATE_LIMIT
+            if dense_typed_oversample
+            else ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+        )
         cursor_before = before_identity
         # A searched value request starts at the production-qualified five-second
         # floor, then grows only after a complete adjacent-slice proof. Signed
@@ -4585,6 +4651,7 @@ class AttributeReadSelector:
         # server-held digests.
         skip_physical_walk = False
         distinct_proof_supported = unpinned_cursor_read or typed_cursor_read
+        distinct_proof_count = 0
         if (
             (resolved_seen_count or needle)
             and distinct_proof_supported
@@ -4608,6 +4675,17 @@ class AttributeReadSelector:
             distinct_advanced = False
             failed_distinct_ceiling: timedelta | None = None
             while current_segment_end > start:
+                if distinct_proof_count >= (
+                    ATTRIBUTE_VALUE_CURSOR_MAX_SEARCH_PROOFS
+                    if needle
+                    else ATTRIBUTE_VALUE_CURSOR_MAX_UNSEARCHED_CONTINUATION_PROOFS
+                ):
+                    if failed_distinct_ceiling is not None and not distinct_advanced:
+                        narrow_physical_fallback(
+                            width=ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+                        )
+                    skip_physical_walk = distinct_advanced
+                    break
                 assert self._deadline is not None
                 remaining_ms = int((self._deadline - self._clock()) * 1000)
                 # Before the first proof, preserve the complete physical
@@ -4667,6 +4745,7 @@ class AttributeReadSelector:
                     ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS,
                 )
                 proof_timeout_ms = planned_proof_timeout_ms
+                distinct_proof_count += 1
                 try:
                     distinct_rows = self._seen_value_slice_groups(
                         project_ids=projects,
@@ -4901,7 +4980,10 @@ class AttributeReadSelector:
                         else ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
                         if adaptive_search_probe
                         or widened_probe
-                        or candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                        or (
+                            candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                            and not dense_typed_oversample
+                        )
                         else None
                     ),
                     include_versions=versioned_cursor_read,
@@ -4931,6 +5013,17 @@ class AttributeReadSelector:
                     # Publish only that earlier checkpoint.
                     empty_segment_width = last_successful_segment_width
                     break
+                if (
+                    is_read_budget_error(exc)
+                    and dense_typed_oversample
+                    and candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                ):
+                    # The large first prefix is an accelerator, not a
+                    # correctness dependency. Retry the identical unconsumed
+                    # frontier with the proven 64-identity batch when a hotter
+                    # tenant cannot acquire/replay 960 identities in-budget.
+                    dense_typed_oversample = False
+                    candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                 if is_read_budget_error(exc) and candidate_limit > (
                     ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                 ):
@@ -4978,7 +5071,10 @@ class AttributeReadSelector:
                 try:
                     replay_timeout_ms = (
                         ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
-                        if candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                        if (
+                            candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                            and not dense_typed_oversample
+                        )
                         else None
                     )
                     rows = (
@@ -5013,6 +5109,15 @@ class AttributeReadSelector:
                         # complete batch in this request.
                         empty_segment_width = last_successful_segment_width
                         break
+                    if (
+                        is_read_budget_error(exc)
+                        and dense_typed_oversample
+                        and candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                    ):
+                        # Discard the unverified large prefix and retry the
+                        # same cursor with the conservative batch.
+                        dense_typed_oversample = False
+                        candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                     if is_read_budget_error(exc) and candidate_limit > (
                         ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                     ):

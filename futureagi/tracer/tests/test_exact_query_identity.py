@@ -35,6 +35,18 @@ def _time_filter() -> dict:
     }
 
 
+def _attribute_filter() -> dict:
+    return {
+        "column_id": "model",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "text",
+            "filter_op": "equals",
+            "filter_value": "gpt-4.1",
+        },
+    }
+
+
 def _pending(metric_name: str) -> dict:
     return {
         "metric_name": metric_name,
@@ -164,72 +176,48 @@ def test_no_filter_poll_at_a_later_time_reuses_the_original_frozen_job(monkeypat
 
 
 @pytest.mark.unit
-@pytest.mark.django_db
-@override_settings(EXACT_AGGREGATION_TASK_QUEUE="exact_aggregation")
-def test_system_graph_worker_publication_is_visible_to_a_later_http_poll(
+def test_filtered_system_graph_does_not_enqueue_or_poll_retired_exact_worker(
     monkeypatch,
 ):
-    """Exercise the dispatch -> worker publish -> HTTP poll cache lifecycle."""
-
     from tracer.services.clickhouse import graph_dispatch
-    from tracer.tasks import exact_aggregation as task_module
+    from tracer.services.clickhouse.bounded_graph_reads import GraphCandidateSample
 
-    class FrozenDateTime(datetime):
-        current = datetime(2026, 8, 9, 12, 30)
-
-        @classmethod
-        def utcnow(cls):
-            return cls.current
-
-    monkeypatch.setattr(base_query_module, "datetime", FrozenDateTime)
-    cache.clear()
-    points = [
-        {
-            "timestamp": f"2026-08-{day:02d}T00:00:00Z",
-            "value": float(day),
-            "primary_traffic": day,
-        }
-        for day in range(1, 6)
-    ]
-    complete = {
-        "metric_name": "latency",
-        "data": points,
-        "query_complete": True,
-        "query_status": "complete",
-        "query_sampled": False,
-    }
-    monkeypatch.setattr(task_module, "_load_exact_payload", lambda *_args: complete)
+    sample = GraphCandidateSample(
+        rows=(),
+        query_complete=True,
+        query_status="complete",
+        query_error_code=None,
+        window_start=datetime(2026, 8, 1),
+        window_end=datetime(2026, 9, 1),
+        elapsed_ms=1,
+        query_count=1,
+        rows_returned=0,
+        result_payload_bytes=0,
+        total_rows_lower_bound=0,
+    )
+    monkeypatch.setattr(
+        graph_dispatch,
+        "read_graph_candidates",
+        lambda **_kwargs: sample,
+    )
 
     with patch(
         "tracer.tasks.exact_aggregation.refresh_exact_aggregation_snapshot.apply_async"
     ) as enqueue:
-        cold = graph_dispatch.fetch_system_metric_graph_ch(
+        result = graph_dispatch.fetch_system_metric_graph_ch(
             analytics=object(),
             project_id=PROJECT_ID,
-            filters=[],
+            filters=[_attribute_filter()],
             interval="day",
             metric_id="latency",
-        )
-        task = enqueue.call_args.kwargs["kwargs"]
-        task_module.refresh_exact_aggregation_snapshot.run_sync(**task)
-
-        # A rolling default window would address a different key here without
-        # the frozen-identity alias, reproducing the live endless-reschedule
-        # failure even though the worker had successfully produced five rows.
-        FrozenDateTime.current = datetime(2026, 8, 9, 12, 30, 5)
-        polled = graph_dispatch.fetch_system_metric_graph_ch(
-            analytics=object(),
-            project_id=PROJECT_ID,
-            filters=[],
-            interval="day",
-            metric_id="latency",
+            observe_type="span",
         )
 
-    assert cold["query_status"] == "pending"
-    assert polled["query_status"] == "complete"
-    assert polled["query_refreshing"] is False
-    assert polled["data"] == points
-    assert enqueue.call_count == 1
+    assert result["query_status"] == "complete"
+    assert result["query_provenance"] == "bounded_candidates"
+    assert result["query_exact"] is True
+    assert "query_refreshing" not in result
+    enqueue.assert_not_called()
 
 
 @pytest.mark.unit

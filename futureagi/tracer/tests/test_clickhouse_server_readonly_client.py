@@ -7,11 +7,11 @@ import pytest
 from django.test import override_settings
 
 from tracer.services.clickhouse import client as client_module
-from tracer.services.clickhouse import server_readonly as server_readonly_module
 from tracer.services.clickhouse.client import ClickHouseClient
 from tracer.services.clickhouse.server_readonly import (
     ServerEnforcedReadOnlyNativeClient,
     _NativeBlockStream,
+    ensure_read_statement,
     without_query_settings,
 )
 from tracer.services.clickhouse.v2.span_reader import CHSpanReader
@@ -102,10 +102,82 @@ def test_regular_read_keeps_client_side_guardrails(monkeypatch):
 
     assert native.execute.call_args.kwargs["settings"] == {
         "max_threads": 1,
-        "max_memory_usage": 36 * 1024 * 1024 * 1024,
+        "max_memory_usage": 2 * 1024 * 1024 * 1024,
+        "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
+        "max_result_rows": 1_000_000,
+        "max_result_bytes": 512 * 1024 * 1024,
+        "result_overflow_mode": "throw",
         "readonly": 2,
         "max_execution_time": 0.25,
     }
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (2, 2),
+        (8, 8),
+        (64, 8),
+    ],
+)
+def test_regular_read_allows_only_explicit_threads_up_to_eight(
+    monkeypatch, requested, expected
+):
+    native = Mock()
+    native.execute.return_value = ([], [])
+    client = _client(server_enforced_readonly=False)
+    monkeypatch.setattr(client, "_get_client", Mock(return_value=native))
+    monkeypatch.setattr(client, "_return_client", Mock())
+
+    client.execute_read("SELECT 1", settings={"max_threads": requested})
+
+    assert native.execute.call_args.kwargs["settings"]["max_threads"] == expected
+
+
+@pytest.mark.parametrize("server_enforced_readonly", [False, True])
+def test_read_temporarily_clamps_pooled_socket_to_remaining_wall(
+    monkeypatch, server_enforced_readonly
+):
+    socket = Mock()
+    socket.gettimeout.return_value = 300.0
+    connection = SimpleNamespace(
+        connected=True,
+        connect_timeout=10.0,
+        send_receive_timeout=300.0,
+        socket=socket,
+    )
+    native = Mock(connection=connection)
+    native.execute.return_value = ([], [])
+    client = _client(server_enforced_readonly=server_enforced_readonly)
+    monkeypatch.setattr(client, "_get_client", Mock(return_value=native))
+    monkeypatch.setattr(client, "_return_client", Mock())
+
+    client.execute_read("SELECT 1", timeout_ms=250)
+
+    narrowed_timeout = socket.settimeout.call_args_list[0].args[0]
+    assert 0 < narrowed_timeout <= 0.25
+    assert socket.settimeout.call_args_list[-1] == call(300.0)
+    assert connection.connect_timeout == 10.0
+    assert connection.send_receive_timeout == 300.0
+
+
+@pytest.mark.parametrize("server_enforced_readonly", [False, True])
+def test_read_fails_before_transport_when_admission_wall_is_exhausted(
+    monkeypatch, server_enforced_readonly
+):
+    client = _client(server_enforced_readonly=server_enforced_readonly)
+    admission = Mock()
+    admission.acquire.return_value = False
+    client._read_admission = admission
+    get_client = Mock()
+    monkeypatch.setattr(client, "_get_client", get_client)
+
+    with pytest.raises(TimeoutError, match="admission deadline"):
+        client.execute_read("SELECT 1", timeout_ms=25)
+
+    admission.acquire.assert_called_once_with(timeout=0.025)
+    admission.release.assert_not_called()
+    get_client.assert_not_called()
 
 
 def test_regular_read_does_not_revive_exhausted_timeout(monkeypatch):
@@ -181,6 +253,10 @@ def test_regular_read_retries_transient_admission_without_mutating_settings(
     assert native.execute.call_args_list[0].kwargs["settings"] == {
         "max_threads": 1,
         "max_memory_usage": 36 * 1024 * 1024 * 1024,
+        "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
+        "max_result_rows": 1_000_000,
+        "max_result_bytes": 512 * 1024 * 1024,
+        "result_overflow_mode": "throw",
         "readonly": 2,
         "max_execution_time": 1.0,
     }
@@ -250,8 +326,13 @@ def test_long_read_is_clamped_to_application_read_policy(monkeypatch):
     driver.assert_not_called()
     assert native.execute.call_args.kwargs["settings"] == {
         "max_memory_usage": 36 * 1024 * 1024 * 1024,
+        "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
+        "max_threads": 4,
+        "max_result_rows": 1_000_000,
+        "max_result_bytes": 512 * 1024 * 1024,
+        "result_overflow_mode": "throw",
         "readonly": 2,
-        "max_execution_time": 30.0,
+        "max_execution_time": 9.5,
     }
 
 
@@ -320,6 +401,34 @@ def test_server_locked_core_client_rejects_non_read_sql_before_transport(monkeyp
     get_client.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "WITH 1 AS value INSERT INTO spans SELECT value",
+        "SELECT 1; DROP TABLE spans",
+        "EXPLAIN INSERT INTO spans SELECT 1",
+        "EXPLAIN WITH 1 AS value INSERT INTO spans SELECT value",
+        "SELECT 1;;",
+    ],
+)
+def test_read_statement_guard_rejects_disguised_mutations(query):
+    with pytest.raises(RuntimeError, match="Only read statements"):
+        ensure_read_statement(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "WITH 1 AS value SELECT value",
+        "EXPLAIN PIPELINE SELECT 1",
+        "SHOW CREATE TABLE spans",
+        "SELECT ';' AS delimiter; -- trailing comment",
+    ],
+)
+def test_read_statement_guard_preserves_single_read_queries(query):
+    ensure_read_statement(query)
+
+
 def test_server_locked_execute_iter_is_blocked_before_acquiring_connection(
     monkeypatch,
 ):
@@ -333,66 +442,247 @@ def test_server_locked_execute_iter_is_blocked_before_acquiring_connection(
     get_client.assert_not_called()
 
 
-def test_native_block_stream_returns_connection_only_after_full_exhaustion():
+def _managed_stream_client(monkeypatch, rows):
+    socket = Mock()
+    socket.gettimeout.return_value = 300.0
+    transport = SimpleNamespace(
+        connected=True,
+        connect_timeout=10.0,
+        send_receive_timeout=300.0,
+        socket=socket,
+    )
     connection = Mock()
-    connection.execute_iter.return_value = iter([(1,), (2,)])
-    pool = Mock()
-    pool._get_client.return_value = connection
+    connection.connection = transport
+    connection.execute_iter.return_value = iter(rows)
+    client = _client(server_enforced_readonly=True)
+    admission = Mock()
+    admission.acquire.return_value = True
+    client._read_admission = admission
+    monkeypatch.setattr(client, "_get_client", Mock(return_value=connection))
+    monkeypatch.setattr(client, "_return_client", Mock())
+    return client, admission, connection, transport, socket
 
-    with _NativeBlockStream(pool, "SELECT 1", {}, block_size=1) as blocks:
+
+def test_native_block_stream_returns_connection_only_after_full_exhaustion(
+    monkeypatch,
+):
+    client, admission, connection, transport, socket = _managed_stream_client(
+        monkeypatch, [(1,), (2,)]
+    )
+
+    with client.execute_read_block_stream(
+        "SELECT 1 SETTINGS max_threads = 8",
+        timeout_ms=250,
+        block_size=1,
+    ) as blocks:
         assert list(blocks) == [[(1,)], [(2,)]]
 
-    pool._return_client.assert_called_once_with(connection)
+    assert 0 < admission.acquire.call_args.kwargs["timeout"] <= 0.25
+    admission.release.assert_called_once_with()
+    client._return_client.assert_called_once_with(connection)
+    connection.execute_iter.assert_called_once_with("SELECT 1", {})
     connection.disconnect.assert_not_called()
+    assert 0 < socket.settimeout.call_args_list[0].args[0] <= 0.25
+    assert socket.settimeout.call_args_list[-1] == call(300.0)
+    assert transport.connect_timeout == 10.0
+    assert transport.send_receive_timeout == 300.0
 
 
-def test_native_block_stream_retires_connection_when_consumer_stops_early():
-    connection = Mock()
-    connection.execute_iter.return_value = iter([(1,), (2,)])
-    pool = Mock()
-    pool._get_client.return_value = connection
+def test_native_block_stream_clamps_long_request_to_application_wall(monkeypatch):
+    client, admission, _, _, socket = _managed_stream_client(monkeypatch, [(1,)])
 
-    with _NativeBlockStream(pool, "SELECT 1", {}, block_size=1) as blocks:
+    with client.execute_read_block_stream("SELECT 1", timeout_ms=1_200_000) as blocks:
+        assert list(blocks) == [[(1,)]]
+
+    assert 0 < admission.acquire.call_args.kwargs["timeout"] <= 9.5
+    assert 0 < socket.settimeout.call_args_list[0].args[0] <= 9.5
+
+
+def test_native_block_stream_retires_connection_when_consumer_stops_early(
+    monkeypatch,
+):
+    client, admission, connection, _, _ = _managed_stream_client(
+        monkeypatch, [(1,), (2,)]
+    )
+
+    with client.execute_read_block_stream(
+        "SELECT 1", timeout_ms=250, block_size=1
+    ) as blocks:
         assert next(blocks) == [(1,)]
 
-    pool._return_client.assert_not_called()
+    client._return_client.assert_not_called()
     connection.disconnect.assert_called_once_with()
+    admission.release.assert_called_once_with()
 
 
-def test_native_block_stream_retires_connection_when_iterator_raises():
+def test_native_block_stream_restores_blocking_socket_before_pooling(monkeypatch):
+    client, _, connection, _, socket = _managed_stream_client(monkeypatch, [(1,)])
+    socket.gettimeout.return_value = None
+
+    with client.execute_read_block_stream("SELECT 1", timeout_ms=250) as blocks:
+        assert list(blocks) == [[(1,)]]
+
+    assert 0 < socket.settimeout.call_args_list[0].args[0] <= 0.25
+    assert socket.settimeout.call_args_list[-1] == call(None)
+    client._return_client.assert_called_once_with(connection)
+
+
+def test_native_block_stream_clamps_lazy_connect_and_restores_new_socket(monkeypatch):
+    client, _, connection, transport, socket = _managed_stream_client(monkeypatch, [])
+    transport.connected = False
+    transport.socket = None
+
+    def rows():
+        assert 0 < transport.connect_timeout <= 0.25
+        assert 0 < transport.send_receive_timeout <= 0.25
+        transport.connected = True
+        transport.socket = socket
+        yield (1,)
+
+    connection.execute_iter.return_value = rows()
+
+    with client.execute_read_block_stream("SELECT 1", timeout_ms=250) as blocks:
+        assert list(blocks) == [[(1,)]]
+
+    assert socket.settimeout.call_args_list[-1] == call(300.0)
+    assert transport.connect_timeout == 10.0
+    assert transport.send_receive_timeout == 300.0
+    client._return_client.assert_called_once_with(connection)
+
+
+def test_native_block_stream_retires_when_transport_cannot_be_restored(
+    monkeypatch,
+):
+    client, admission, connection, _, socket = _managed_stream_client(
+        monkeypatch, [(1,)]
+    )
+    socket.settimeout.side_effect = [
+        None,
+        None,
+        None,
+        None,
+        RuntimeError("closed socket"),
+    ]
+
+    with client.execute_read_block_stream("SELECT 1", timeout_ms=250) as blocks:
+        assert list(blocks) == [[(1,)]]
+
+    client._return_client.assert_not_called()
+    connection.disconnect.assert_called_once_with()
+    admission.release.assert_called_once_with()
+
+
+def test_native_block_stream_retires_connection_when_iterator_raises(monkeypatch):
     def rows():
         yield (1,)
         raise RuntimeError("native stream failed")
 
-    connection = Mock()
-    connection.execute_iter.return_value = rows()
-    pool = Mock()
-    pool._get_client.return_value = connection
+    client, admission, connection, _, _ = _managed_stream_client(monkeypatch, rows())
 
     with pytest.raises(RuntimeError, match="native stream failed"):
-        with _NativeBlockStream(pool, "SELECT 1", {}, block_size=1) as blocks:
+        with client.execute_read_block_stream(
+            "SELECT 1", timeout_ms=250, block_size=1
+        ) as blocks:
             list(blocks)
 
-    pool._return_client.assert_not_called()
+    client._return_client.assert_not_called()
     connection.disconnect.assert_called_once_with()
+    admission.release.assert_called_once_with()
 
 
 def test_native_block_stream_logs_disconnect_failure_without_surfacing(monkeypatch):
-    connection = Mock()
+    client, admission, connection, _, _ = _managed_stream_client(
+        monkeypatch, [(1,), (2,)]
+    )
     connection.disconnect.side_effect = RuntimeError("disconnect failed")
     warning = Mock()
-    monkeypatch.setattr(server_readonly_module.logger, "warning", warning)
-    stream = _NativeBlockStream(Mock(), "SELECT 1", {})
-    stream._connection = connection
+    monkeypatch.setattr(client_module.logger, "warning", warning)
 
-    stream._retire_connection()
+    with client.execute_read_block_stream(
+        "SELECT 1", timeout_ms=250, block_size=1
+    ) as blocks:
+        assert next(blocks) == [(1,)]
 
     warning.assert_called_once_with(
         "server_readonly_native_disconnect_failed",
         error_type="RuntimeError",
         exc_info=True,
     )
-    assert stream._connection is None
+    admission.release.assert_called_once_with()
+
+
+def test_native_block_stream_fails_before_connection_when_admission_is_saturated(
+    monkeypatch,
+):
+    client = _client(server_enforced_readonly=True)
+    admission = Mock()
+    admission.acquire.return_value = False
+    client._read_admission = admission
+    get_client = Mock()
+    monkeypatch.setattr(client, "_get_client", get_client)
+
+    with pytest.raises(TimeoutError, match="admission deadline"):
+        with client.execute_read_block_stream("SELECT 1", timeout_ms=25):
+            pass
+
+    assert 0 < admission.acquire.call_args.kwargs["timeout"] <= 0.025
+    admission.release.assert_not_called()
+    get_client.assert_not_called()
+
+
+def test_native_block_stream_rejects_mutation_before_admission(monkeypatch):
+    client = _client(server_enforced_readonly=True)
+    acquire = Mock()
+    client._read_admission = Mock(acquire=acquire)
+
+    with pytest.raises(RuntimeError, match="Only read statements"):
+        client.execute_read_block_stream("INSERT INTO spans SELECT 1")
+
+    acquire.assert_not_called()
+
+
+def test_native_block_stream_enforces_one_wall_during_iteration(monkeypatch):
+    clock = {"now": 0.0}
+
+    def rows():
+        yield (1,)
+        clock["now"] = 0.026
+        yield (2,)
+
+    client, admission, connection, _, _ = _managed_stream_client(monkeypatch, rows())
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock["now"])
+
+    with pytest.raises(TimeoutError, match="read deadline"):
+        with client.execute_read_block_stream(
+            "SELECT 1", timeout_ms=25, block_size=1
+        ) as blocks:
+            assert next(blocks) == [(1,)]
+            next(blocks)
+
+    client._return_client.assert_not_called()
+    connection.disconnect.assert_called_once_with()
+    admission.release.assert_called_once_with()
+
+
+def test_server_locked_stream_adapter_discards_settings(monkeypatch):
+    core = Mock()
+    managed = Mock()
+    core.execute_read_block_stream.return_value = managed
+    proxy = object.__new__(ServerEnforcedReadOnlyNativeClient)
+    proxy._client = core
+
+    stream = proxy.query_row_block_stream(
+        "SELECT 1 SETTINGS max_threads = 8",
+        parameters={"value": 1},
+        settings={"max_threads": 8},
+    )
+
+    assert isinstance(stream, _NativeBlockStream)
+    core.execute_read_block_stream.assert_called_once_with(
+        "SELECT 1 SETTINGS max_threads = 8",
+        {"value": 1},
+        block_size=8192,
+    )
 
 
 @pytest.mark.parametrize(

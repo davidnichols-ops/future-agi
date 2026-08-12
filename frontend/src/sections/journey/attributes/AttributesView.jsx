@@ -6,7 +6,7 @@ import {
   CircularProgress,
   Button,
 } from "@mui/material";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { LoadingScreen } from "src/components/loading-screen";
 import axios, { endpoints } from "src/utils/axios";
 import { useParams } from "react-router-dom";
@@ -26,6 +26,8 @@ const AttributesView = () => {
   const [selectedKey, setSelectedKey] = useState(null);
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search.trim(), 350);
+  const queryClient = useQueryClient();
+  const queryKey = ["span-attribute-keys", projectId, debouncedSearch];
 
   const {
     data,
@@ -37,15 +39,17 @@ const AttributesView = () => {
     fetchNextPage,
     isFetchingNextPage,
   } = useInfiniteQuery({
-    queryKey: ["span-attribute-keys", projectId, debouncedSearch],
+    queryKey,
     queryFn: ({ signal, pageParam }) =>
       readAttributeKeyPage({
         pageParam,
+        pageSize: 25,
+        publishedData: queryClient.getQueryData(queryKey),
         signal,
-        requestPage: (cursor) =>
+        requestPage: (cursor, requestSignal = signal) =>
           axios
             .get(endpoints.project.spanAttributeKeys(), {
-              signal,
+              signal: requestSignal,
               timeout: ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
               params: {
                 project_id: projectId,

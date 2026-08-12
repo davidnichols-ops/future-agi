@@ -43,7 +43,10 @@ from tracer.services.clickhouse.v2.id_remap_sql import (
     remap_left_join,
     resolved_id_expr,
 )
-from tracer.services.clickhouse.v2.query_settings import current_settings
+from tracer.services.clickhouse.v2.query_settings import (
+    application_read_settings,
+    current_settings,
+)
 
 
 # Field list that the eval runner actually reads off of an ObservationSpan.
@@ -461,7 +464,7 @@ class CHSpanReader:
         username: str = "default",
         password: str = "",
         database: str = "default",
-        timeout_sec: int = 30,
+        timeout_sec: float = 9.5,
         server_enforced_readonly: bool = False,
         native_port: int | None = None,
     ):
@@ -2199,10 +2202,13 @@ class CHSpanReader:
         so neither the client nor the caller holds the full result in memory — a
         large historical scan can be consumed in waves."""
         batch: list[str] = []
+        query_settings = application_read_settings(
+            {**current_settings(), **(settings or {})}
+        )
         with self._client.query_row_block_stream(
             sql,
             parameters=params or {},
-            settings=settings or {},
+            settings=query_settings,
         ) as stream:
             for block in stream:
                 for row in block:

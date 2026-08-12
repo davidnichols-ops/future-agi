@@ -425,18 +425,10 @@ describe("useDashboardFilterValues bounded-read state", () => {
 
     await waitFor(() => expect(result.current.hasNextPage).toBe(true));
     await act(async () => result.current.fetchNextPage());
-    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
-    expect(result.current.hasNextPage).toBe(true);
-
-    await act(async () => result.current.fetchNextPage());
-    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(3));
-    expect(result.current.hasNextPage).toBe(true);
-
-    // The next deliberate action lands on page 4. Pages 4-6 add no exact
-    // value, so the hook transparently advances through terminal page 7.
-    await act(async () => result.current.fetchNextPage());
     await waitFor(() => expect(result.current.hasNextPage).toBe(false));
 
+    // One explicit Load more action fills across all advancing physical pages.
+    // Pages 4-6 add no exact value, so it continues through terminal page 7.
     expect(mocks.get).toHaveBeenCalledTimes(7);
     expect(result.current.data).toHaveLength(7);
     expect(mocks.get.mock.calls[3][1].params.cursor).toBe("page-4");

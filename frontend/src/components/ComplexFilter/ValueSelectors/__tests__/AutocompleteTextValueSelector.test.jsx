@@ -34,6 +34,14 @@ function Wrapper({ children }) {
 }
 Wrapper.propTypes = { children: PropTypes.node };
 
+const fullTypedValuePage = (featuredValue, prefix) => [
+  { value: featuredValue, type: "string" },
+  ...Array.from({ length: 9 }, (_, index) => ({
+    value: `${prefix}-${index}`,
+    type: "string",
+  })),
+];
+
 describe("AutocompleteTextValueSelector", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -45,7 +53,7 @@ describe("AutocompleteTextValueSelector", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
-            values: [{ value: "completed", type: "string" }],
+            values: fullTypedValuePage("completed", "initial"),
             query_complete: true,
             query_status: "complete",
             has_more: true,
@@ -90,7 +98,7 @@ describe("AutocompleteTextValueSelector", () => {
       1,
       "/filter-values/",
       expect.objectContaining({
-        timeout: 35_000,
+        timeout: 9_800,
         params: expect.objectContaining({
           project_ids: "project-large",
           metric_name: "call.status",
@@ -143,7 +151,7 @@ describe("AutocompleteTextValueSelector", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
-            values: [{ value: "completed", type: "string" }],
+            values: fullTypedValuePage("completed", "initial"),
             query_complete: true,
             query_status: "complete",
             has_more: true,
@@ -197,7 +205,7 @@ describe("AutocompleteTextValueSelector", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
-            values: [{ value: "completed", type: "string" }],
+            values: fullTypedValuePage("completed", "initial"),
             has_more: true,
             next_cursor: "page-2",
           },
@@ -206,7 +214,7 @@ describe("AutocompleteTextValueSelector", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
-            values: [{ value: "ended", type: "string" }],
+            values: fullTypedValuePage("ended", "middle"),
             has_more: true,
             next_cursor: "page-3",
           },
@@ -353,12 +361,12 @@ describe("AutocompleteTextValueSelector", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("automatically follows a page containing only already-loaded typed values", async () => {
+  it("fills load more across duplicate-heavy physical pages", async () => {
     mocks.get
       .mockResolvedValueOnce({
         data: {
           result: {
-            values: [{ value: "completed", type: "string" }],
+            values: fullTypedValuePage("completed", "initial"),
             query_complete: true,
             query_status: "complete",
             has_more: true,
@@ -369,7 +377,10 @@ describe("AutocompleteTextValueSelector", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
-            values: [{ value: "completed", type: "string" }],
+            values: [
+              { value: "completed", type: "string" },
+              { value: "ended", type: "string" },
+            ],
             query_complete: true,
             query_status: "complete",
             has_more: true,
@@ -380,7 +391,10 @@ describe("AutocompleteTextValueSelector", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
-            values: [{ value: "ended", type: "string" }],
+            values: [
+              { value: "completed", type: "string" },
+              { value: "failed", type: "string" },
+            ],
             query_complete: true,
             query_status: "complete",
             has_more: false,
@@ -405,6 +419,7 @@ describe("AutocompleteTextValueSelector", () => {
     fireEvent.click(screen.getByRole("option", { name: "Load more values" }));
 
     expect(await screen.findByRole("option", { name: "ended" })).toBeVisible();
+    expect(await screen.findByRole("option", { name: "failed" })).toBeVisible();
     expect(screen.getAllByRole("option", { name: "completed" })).toHaveLength(
       1,
     );
@@ -572,7 +587,7 @@ describe("AutocompleteTextValueSelector", () => {
         return {
           data: {
             result: {
-              values: [{ value: "completed", type: "string" }],
+              values: fullTypedValuePage("completed", "initial"),
               query_complete: true,
               query_status: "complete",
               has_more: true,
@@ -633,7 +648,7 @@ describe("AutocompleteTextValueSelector", () => {
 
     fireEvent.click(retry);
     await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(15));
-    // Twelve continuations and the 30-second soft check are per-action guards.
+    // Twelve continuations and the 9.5-second soft check are per-action guards.
     // The latter is evaluated only between completed HTTP requests, so the
     // deterministic hop bound is what this regression exercises.
     expect(screen.getByRole("option", { name: "completed" })).toBeVisible();

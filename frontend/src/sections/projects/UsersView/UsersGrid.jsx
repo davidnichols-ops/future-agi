@@ -35,6 +35,7 @@ import {
   failServerSideGridRead,
   QUERY_FAILED_RETRY_MESSAGE,
 } from "src/utils/queryReadState";
+import { getListReadMessage } from "../LLMTracing/listTotalMetadata";
 import {
   isUserGlobalSortSupported,
   sanitizeUserSortModel,
@@ -345,9 +346,10 @@ const UsersGrid = React.memo(
                 pagination: cursorPagination.current,
                 pageNumber,
                 targetRowCount: pageSize,
-                loadResponse: () =>
+                loadResponse: (signal) =>
                   axios.get(endpoints.project.getUsersList(), {
                     params: buildParams(pageNumber),
+                    signal,
                   }),
                 rowsFromResponse: (response) =>
                   response?.data?.result?.table || [],
@@ -358,9 +360,10 @@ const UsersGrid = React.memo(
                 rowIdentity: userRowIdentity,
                 isCurrent: () =>
                   cursorPagination.current.isCurrent(requestGeneration),
-                nextResponse: () =>
+                nextResponse: (_cursor, signal) =>
                   axios.get(endpoints.project.getUsersList(), {
                     params: buildParams(pageNumber),
+                    signal,
                   }),
               });
               results = exactPage.response;
@@ -395,6 +398,14 @@ const UsersGrid = React.memo(
               continuationPending = true;
               return;
             }
+            const listReadMessage = getListReadMessage({
+              result: {
+                table: userData,
+                metadata: exactPage?.metadata || res,
+              },
+            });
+            if (listReadMessage) throw new Error(listReadMessage);
+
             const hasResults = userData.length > 0;
             if (pageNumber === 0) setHasData(hasResults);
             else if (hasResults) setHasData(true);
@@ -503,7 +514,6 @@ const UsersGrid = React.memo(
             if (!continuationPending) setIsLoading(false);
           }
         },
-        getRowId: ({ data }) => data.user_id,
       };
     }, [
       updatedObserveId,
@@ -716,6 +726,7 @@ const UsersGrid = React.memo(
               onColumnMoved={onColumnMoved}
               columnDefs={userColumnDefs}
               serverSideDatasource={dataSource}
+              getRowId={({ data }) => userRowIdentity(data)}
               headerHeight={40}
               rowHeight={userTraceRowHeightMapping[cellHeight]?.height ?? 40}
               theme={agTheme}

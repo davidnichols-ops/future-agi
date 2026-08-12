@@ -106,11 +106,11 @@ def _get_client():
                     username=cfg["user"],
                     password=cfg["password"] or "",
                     database=cfg["database"],
-                    # User-detail membership owns a 30-second request budget.
+                    # User-detail membership owns a sub-ten-second request budget.
                     # Keep the HTTP socket envelope aligned with that ceiling;
                     # the individual query also receives the smaller remaining
                     # server-side max_execution_time below.
-                    send_receive_timeout=30,
+                    send_receive_timeout=9.5,
                 )
     return _client
 

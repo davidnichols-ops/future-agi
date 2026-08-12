@@ -838,8 +838,10 @@ import type {
   PricingReadResponseApi,
   ProjectApi,
   ProjectDetailResponseApi,
+  ProjectGraphDataResponseApi,
   ProjectIdListResponseApi,
   ProjectUserGraphDataRequestApi,
+  ProjectUserGraphDataResponseApi,
   ProjectUserMetricsRequestApi,
   ProjectUsersAggregateGraphDataRequestApi,
   ProjectVersionApi,
@@ -1110,6 +1112,7 @@ import type {
   TracePrototypeListResponseApi,
   TraceSessionApi,
   TraceSessionGraphDataRequestApi,
+  TraceSessionListResponseApi,
   TraceTagsUpdateApi,
   TraceToGraphRequestApi,
   TraceToGraphResponseApi,
@@ -1165,7 +1168,6 @@ import type {
   TracerObservationSpanGetObservationSpanFields200,
   TracerObservationSpanGetObservationSpanFieldsParams,
   TracerObservationSpanGetSpanAttributesListParams,
-  TracerObservationSpanGetSpansExportData200,
   TracerObservationSpanGetSpansExportDataParams,
   TracerObservationSpanGetTraceIdByIndexSpansAsBase200,
   TracerObservationSpanGetTraceIdByIndexSpansAsBaseParams,
@@ -1180,7 +1182,6 @@ import type {
   TracerObservationSpanRootSpansParams,
   TracerProjectFetchSystemMetrics200,
   TracerProjectFetchSystemMetricsParams,
-  TracerProjectGetGraphData200,
   TracerProjectGetGraphDataParams,
   TracerProjectGetUserGraphDataParams,
   TracerProjectGetUsersAggregateGraphDataParams,
@@ -1209,7 +1210,6 @@ import type {
   TracerTraceGetGraphMethodsParams,
   TracerTraceGetProperties200,
   TracerTraceGetPropertiesParams,
-  TracerTraceGetTraceExportData200,
   TracerTraceGetTraceExportDataParams,
   TracerTraceGetTraceIdByIndex200,
   TracerTraceGetTraceIdByIndexObserve200,
@@ -1222,7 +1222,6 @@ import type {
   TracerTraceListVoiceCallsParams,
   TracerTraceSessionGetSessionFilterValuesParams,
   TracerTraceSessionGetSessionGraphDataParams,
-  TracerTraceSessionGetTraceSessionExportData200,
   TracerTraceSessionGetTraceSessionExportDataParams,
   TracerTraceSessionList200,
   TracerTraceSessionListParams,
@@ -2473,6 +2472,71 @@ export const accountsAppsmithUsersPartialUpdate = async (userId: string,
 
 
 
+export type accountsAppsmithUsersReadResponse200 = {
+  data: AccountsPaginatedUserResponseApi
+  status: 200
+}
+
+export type accountsAppsmithUsersReadResponse400 = {
+  data: AccountsErrorResponseApi
+  status: 400
+}
+
+export type accountsAppsmithUsersReadResponse401 = {
+  data: AccountsErrorResponseApi
+  status: 401
+}
+
+export type accountsAppsmithUsersReadResponse403 = {
+  data: AccountsErrorResponseApi
+  status: 403
+}
+
+export type accountsAppsmithUsersReadResponse404 = {
+  data: AccountsErrorResponseApi
+  status: 404
+}
+
+export type accountsAppsmithUsersReadResponse500 = {
+  data: AccountsErrorResponseApi
+  status: 500
+}
+
+export type accountsAppsmithUsersReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 403 | 404 | 500>
+}
+
+export type accountsAppsmithUsersReadResponseSuccess = (accountsAppsmithUsersReadResponse200) & {
+  headers: Headers;
+};
+export type accountsAppsmithUsersReadResponseError = (accountsAppsmithUsersReadResponse400 | accountsAppsmithUsersReadResponse401 | accountsAppsmithUsersReadResponse403 | accountsAppsmithUsersReadResponse404 | accountsAppsmithUsersReadResponse500 | accountsAppsmithUsersReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type accountsAppsmithUsersReadResponse = (accountsAppsmithUsersReadResponseSuccess | accountsAppsmithUsersReadResponseError)
+
+export const getAccountsAppsmithUsersReadUrl = (userId: string,) => {
+
+
+
+
+  return `/accounts/appsmith/users/${userId}/`
+}
+
+export const accountsAppsmithUsersRead = async (userId: string, options?: RequestInit): Promise<accountsAppsmithUsersReadResponse> => {
+
+  return apiMutator<accountsAppsmithUsersReadResponse>(getAccountsAppsmithUsersReadUrl(userId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type accountsAppsmithUsersLoginCreateResponse200 = {
   data: AccountsTokenPairResponseApi
   status: 200
@@ -2534,71 +2598,6 @@ export const accountsAppsmithUsersLoginCreate = async (sOSLoginApi: SOSLoginApi,
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       sOSLoginApi,)
-  }
-);}
-
-
-
-export type accountsAppsmithUsersReadResponse200 = {
-  data: AccountsPaginatedUserResponseApi
-  status: 200
-}
-
-export type accountsAppsmithUsersReadResponse400 = {
-  data: AccountsErrorResponseApi
-  status: 400
-}
-
-export type accountsAppsmithUsersReadResponse401 = {
-  data: AccountsErrorResponseApi
-  status: 401
-}
-
-export type accountsAppsmithUsersReadResponse403 = {
-  data: AccountsErrorResponseApi
-  status: 403
-}
-
-export type accountsAppsmithUsersReadResponse404 = {
-  data: AccountsErrorResponseApi
-  status: 404
-}
-
-export type accountsAppsmithUsersReadResponse500 = {
-  data: AccountsErrorResponseApi
-  status: 500
-}
-
-export type accountsAppsmithUsersReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 403 | 404 | 500>
-}
-
-export type accountsAppsmithUsersReadResponseSuccess = (accountsAppsmithUsersReadResponse200) & {
-  headers: Headers;
-};
-export type accountsAppsmithUsersReadResponseError = (accountsAppsmithUsersReadResponse400 | accountsAppsmithUsersReadResponse401 | accountsAppsmithUsersReadResponse403 | accountsAppsmithUsersReadResponse404 | accountsAppsmithUsersReadResponse500 | accountsAppsmithUsersReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type accountsAppsmithUsersReadResponse = (accountsAppsmithUsersReadResponseSuccess | accountsAppsmithUsersReadResponseError)
-
-export const getAccountsAppsmithUsersReadUrl = (userId: string,) => {
-
-
-
-
-  return `/accounts/appsmith/users/${userId}/`
-}
-
-export const accountsAppsmithUsersRead = async (userId: string, options?: RequestInit): Promise<accountsAppsmithUsersReadResponse> => {
-
-  return apiMutator<accountsAppsmithUsersReadResponse>(getAccountsAppsmithUsersReadUrl(userId),
-  {
-    ...options,
-    method: 'GET'
-
-
   }
 );}
 
@@ -6882,223 +6881,6 @@ export const accountsUserRoleUpdateCreate = async (userRoleUpdateApi: UserRoleUp
 
 
 
-export type accountsWorkspaceInviteCreateResponse200 = {
-  data: WorkspaceInviteResponseApi
-  status: 200
-}
-
-export type accountsWorkspaceInviteCreateResponse400 = {
-  data: AccountsErrorResponseApi
-  status: 400
-}
-
-export type accountsWorkspaceInviteCreateResponse401 = {
-  data: AccountsErrorResponseApi
-  status: 401
-}
-
-export type accountsWorkspaceInviteCreateResponse403 = {
-  data: AccountsErrorResponseApi
-  status: 403
-}
-
-export type accountsWorkspaceInviteCreateResponse404 = {
-  data: AccountsErrorResponseApi
-  status: 404
-}
-
-export type accountsWorkspaceInviteCreateResponse500 = {
-  data: AccountsErrorResponseApi
-  status: 500
-}
-
-export type accountsWorkspaceInviteCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 403 | 404 | 500>
-}
-
-export type accountsWorkspaceInviteCreateResponseSuccess = (accountsWorkspaceInviteCreateResponse200) & {
-  headers: Headers;
-};
-export type accountsWorkspaceInviteCreateResponseError = (accountsWorkspaceInviteCreateResponse400 | accountsWorkspaceInviteCreateResponse401 | accountsWorkspaceInviteCreateResponse403 | accountsWorkspaceInviteCreateResponse404 | accountsWorkspaceInviteCreateResponse500 | accountsWorkspaceInviteCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type accountsWorkspaceInviteCreateResponse = (accountsWorkspaceInviteCreateResponseSuccess | accountsWorkspaceInviteCreateResponseError)
-
-export const getAccountsWorkspaceInviteCreateUrl = () => {
-
-
-
-
-  return `/accounts/workspace/invite/`
-}
-
-/**
- * Invite users to workspaces
- */
-export const accountsWorkspaceInviteCreate = async (workspaceInviteApi: WorkspaceInviteApi, options?: RequestInit): Promise<accountsWorkspaceInviteCreateResponse> => {
-
-  return apiMutator<accountsWorkspaceInviteCreateResponse>(getAccountsWorkspaceInviteCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      workspaceInviteApi,)
-  }
-);}
-
-
-
-export type accountsWorkspaceListListResponse200 = {
-  data: WorkspaceListPaginatedResponseApi
-  status: 200
-}
-
-export type accountsWorkspaceListListResponse400 = {
-  data: AccountsErrorResponseApi
-  status: 400
-}
-
-export type accountsWorkspaceListListResponse401 = {
-  data: AccountsErrorResponseApi
-  status: 401
-}
-
-export type accountsWorkspaceListListResponse403 = {
-  data: AccountsErrorResponseApi
-  status: 403
-}
-
-export type accountsWorkspaceListListResponse404 = {
-  data: AccountsErrorResponseApi
-  status: 404
-}
-
-export type accountsWorkspaceListListResponse500 = {
-  data: AccountsErrorResponseApi
-  status: 500
-}
-
-export type accountsWorkspaceListListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 403 | 404 | 500>
-}
-
-export type accountsWorkspaceListListResponseSuccess = (accountsWorkspaceListListResponse200) & {
-  headers: Headers;
-};
-export type accountsWorkspaceListListResponseError = (accountsWorkspaceListListResponse400 | accountsWorkspaceListListResponse401 | accountsWorkspaceListListResponse403 | accountsWorkspaceListListResponse404 | accountsWorkspaceListListResponse500 | accountsWorkspaceListListResponseDefault) & {
-  headers: Headers;
-};
-
-export type accountsWorkspaceListListResponse = (accountsWorkspaceListListResponseSuccess | accountsWorkspaceListListResponseError)
-
-export const getAccountsWorkspaceListListUrl = (params?: AccountsWorkspaceListListParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/accounts/workspace/list/?${stringifiedParams}` : `/accounts/workspace/list/`
-}
-
-/**
- * Get paginated list of workspaces
- */
-export const accountsWorkspaceListList = async (params?: AccountsWorkspaceListListParams, options?: RequestInit): Promise<accountsWorkspaceListListResponse> => {
-
-  return apiMutator<accountsWorkspaceListListResponse>(getAccountsWorkspaceListListUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type accountsWorkspaceSwitchCreateResponse200 = {
-  data: SwitchWorkspaceResponseApi
-  status: 200
-}
-
-export type accountsWorkspaceSwitchCreateResponse400 = {
-  data: AccountsErrorResponseApi
-  status: 400
-}
-
-export type accountsWorkspaceSwitchCreateResponse401 = {
-  data: AccountsErrorResponseApi
-  status: 401
-}
-
-export type accountsWorkspaceSwitchCreateResponse403 = {
-  data: AccountsErrorResponseApi
-  status: 403
-}
-
-export type accountsWorkspaceSwitchCreateResponse404 = {
-  data: AccountsErrorResponseApi
-  status: 404
-}
-
-export type accountsWorkspaceSwitchCreateResponse500 = {
-  data: AccountsErrorResponseApi
-  status: 500
-}
-
-export type accountsWorkspaceSwitchCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 403 | 404 | 500>
-}
-
-export type accountsWorkspaceSwitchCreateResponseSuccess = (accountsWorkspaceSwitchCreateResponse200) & {
-  headers: Headers;
-};
-export type accountsWorkspaceSwitchCreateResponseError = (accountsWorkspaceSwitchCreateResponse400 | accountsWorkspaceSwitchCreateResponse401 | accountsWorkspaceSwitchCreateResponse403 | accountsWorkspaceSwitchCreateResponse404 | accountsWorkspaceSwitchCreateResponse500 | accountsWorkspaceSwitchCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type accountsWorkspaceSwitchCreateResponse = (accountsWorkspaceSwitchCreateResponseSuccess | accountsWorkspaceSwitchCreateResponseError)
-
-export const getAccountsWorkspaceSwitchCreateUrl = () => {
-
-
-
-
-  return `/accounts/workspace/switch/`
-}
-
-/**
- * Switch to a different workspace with proper validation
- */
-export const accountsWorkspaceSwitchCreate = async (switchWorkspaceApi: SwitchWorkspaceApi, options?: RequestInit): Promise<accountsWorkspaceSwitchCreateResponse> => {
-
-  return apiMutator<accountsWorkspaceSwitchCreateResponse>(getAccountsWorkspaceSwitchCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      switchWorkspaceApi,)
-  }
-);}
-
-
-
 export type accountsWorkspaceMembersListResponse200 = {
   data: WorkspaceMemberListResponseApi
   status: 200
@@ -7319,6 +7101,223 @@ export const accountsWorkspaceMembersRoleCreate = async (workspaceId: string,
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       workspaceMemberRoleUpdateApi,)
+  }
+);}
+
+
+
+export type accountsWorkspaceInviteCreateResponse200 = {
+  data: WorkspaceInviteResponseApi
+  status: 200
+}
+
+export type accountsWorkspaceInviteCreateResponse400 = {
+  data: AccountsErrorResponseApi
+  status: 400
+}
+
+export type accountsWorkspaceInviteCreateResponse401 = {
+  data: AccountsErrorResponseApi
+  status: 401
+}
+
+export type accountsWorkspaceInviteCreateResponse403 = {
+  data: AccountsErrorResponseApi
+  status: 403
+}
+
+export type accountsWorkspaceInviteCreateResponse404 = {
+  data: AccountsErrorResponseApi
+  status: 404
+}
+
+export type accountsWorkspaceInviteCreateResponse500 = {
+  data: AccountsErrorResponseApi
+  status: 500
+}
+
+export type accountsWorkspaceInviteCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 403 | 404 | 500>
+}
+
+export type accountsWorkspaceInviteCreateResponseSuccess = (accountsWorkspaceInviteCreateResponse200) & {
+  headers: Headers;
+};
+export type accountsWorkspaceInviteCreateResponseError = (accountsWorkspaceInviteCreateResponse400 | accountsWorkspaceInviteCreateResponse401 | accountsWorkspaceInviteCreateResponse403 | accountsWorkspaceInviteCreateResponse404 | accountsWorkspaceInviteCreateResponse500 | accountsWorkspaceInviteCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type accountsWorkspaceInviteCreateResponse = (accountsWorkspaceInviteCreateResponseSuccess | accountsWorkspaceInviteCreateResponseError)
+
+export const getAccountsWorkspaceInviteCreateUrl = () => {
+
+
+
+
+  return `/accounts/workspace/invite/`
+}
+
+/**
+ * Invite users to workspaces
+ */
+export const accountsWorkspaceInviteCreate = async (workspaceInviteApi: WorkspaceInviteApi, options?: RequestInit): Promise<accountsWorkspaceInviteCreateResponse> => {
+
+  return apiMutator<accountsWorkspaceInviteCreateResponse>(getAccountsWorkspaceInviteCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      workspaceInviteApi,)
+  }
+);}
+
+
+
+export type accountsWorkspaceListListResponse200 = {
+  data: WorkspaceListPaginatedResponseApi
+  status: 200
+}
+
+export type accountsWorkspaceListListResponse400 = {
+  data: AccountsErrorResponseApi
+  status: 400
+}
+
+export type accountsWorkspaceListListResponse401 = {
+  data: AccountsErrorResponseApi
+  status: 401
+}
+
+export type accountsWorkspaceListListResponse403 = {
+  data: AccountsErrorResponseApi
+  status: 403
+}
+
+export type accountsWorkspaceListListResponse404 = {
+  data: AccountsErrorResponseApi
+  status: 404
+}
+
+export type accountsWorkspaceListListResponse500 = {
+  data: AccountsErrorResponseApi
+  status: 500
+}
+
+export type accountsWorkspaceListListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 403 | 404 | 500>
+}
+
+export type accountsWorkspaceListListResponseSuccess = (accountsWorkspaceListListResponse200) & {
+  headers: Headers;
+};
+export type accountsWorkspaceListListResponseError = (accountsWorkspaceListListResponse400 | accountsWorkspaceListListResponse401 | accountsWorkspaceListListResponse403 | accountsWorkspaceListListResponse404 | accountsWorkspaceListListResponse500 | accountsWorkspaceListListResponseDefault) & {
+  headers: Headers;
+};
+
+export type accountsWorkspaceListListResponse = (accountsWorkspaceListListResponseSuccess | accountsWorkspaceListListResponseError)
+
+export const getAccountsWorkspaceListListUrl = (params?: AccountsWorkspaceListListParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/accounts/workspace/list/?${stringifiedParams}` : `/accounts/workspace/list/`
+}
+
+/**
+ * Get paginated list of workspaces
+ */
+export const accountsWorkspaceListList = async (params?: AccountsWorkspaceListListParams, options?: RequestInit): Promise<accountsWorkspaceListListResponse> => {
+
+  return apiMutator<accountsWorkspaceListListResponse>(getAccountsWorkspaceListListUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type accountsWorkspaceSwitchCreateResponse200 = {
+  data: SwitchWorkspaceResponseApi
+  status: 200
+}
+
+export type accountsWorkspaceSwitchCreateResponse400 = {
+  data: AccountsErrorResponseApi
+  status: 400
+}
+
+export type accountsWorkspaceSwitchCreateResponse401 = {
+  data: AccountsErrorResponseApi
+  status: 401
+}
+
+export type accountsWorkspaceSwitchCreateResponse403 = {
+  data: AccountsErrorResponseApi
+  status: 403
+}
+
+export type accountsWorkspaceSwitchCreateResponse404 = {
+  data: AccountsErrorResponseApi
+  status: 404
+}
+
+export type accountsWorkspaceSwitchCreateResponse500 = {
+  data: AccountsErrorResponseApi
+  status: 500
+}
+
+export type accountsWorkspaceSwitchCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 403 | 404 | 500>
+}
+
+export type accountsWorkspaceSwitchCreateResponseSuccess = (accountsWorkspaceSwitchCreateResponse200) & {
+  headers: Headers;
+};
+export type accountsWorkspaceSwitchCreateResponseError = (accountsWorkspaceSwitchCreateResponse400 | accountsWorkspaceSwitchCreateResponse401 | accountsWorkspaceSwitchCreateResponse403 | accountsWorkspaceSwitchCreateResponse404 | accountsWorkspaceSwitchCreateResponse500 | accountsWorkspaceSwitchCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type accountsWorkspaceSwitchCreateResponse = (accountsWorkspaceSwitchCreateResponseSuccess | accountsWorkspaceSwitchCreateResponseError)
+
+export const getAccountsWorkspaceSwitchCreateUrl = () => {
+
+
+
+
+  return `/accounts/workspace/switch/`
+}
+
+/**
+ * Switch to a different workspace with proper validation
+ */
+export const accountsWorkspaceSwitchCreate = async (switchWorkspaceApi: SwitchWorkspaceApi, options?: RequestInit): Promise<accountsWorkspaceSwitchCreateResponse> => {
+
+  return apiMutator<accountsWorkspaceSwitchCreateResponse>(getAccountsWorkspaceSwitchCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      switchWorkspaceApi,)
   }
 );}
 
@@ -8128,128 +8127,6 @@ export const agentPlaygroundGraphsCreate = async (graphCreateApi: GraphCreateApi
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       graphCreateApi,)
-  }
-);}
-
-
-
-export type agentPlaygroundGraphsBulkDeleteResponse201 = {
-  data: GraphListApi
-  status: 201
-}
-
-export type agentPlaygroundGraphsBulkDeleteResponse400 = {
-  data: AgentPlaygroundErrorResponseApi
-  status: 400
-}
-
-export type agentPlaygroundGraphsBulkDeleteResponse404 = {
-  data: AgentPlaygroundErrorResponseApi
-  status: 404
-}
-
-export type agentPlaygroundGraphsBulkDeleteResponse500 = {
-  data: AgentPlaygroundErrorResponseApi
-  status: 500
-}
-
-export type agentPlaygroundGraphsBulkDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201 | 400 | 404 | 500>
-}
-
-export type agentPlaygroundGraphsBulkDeleteResponseSuccess = (agentPlaygroundGraphsBulkDeleteResponse201) & {
-  headers: Headers;
-};
-export type agentPlaygroundGraphsBulkDeleteResponseError = (agentPlaygroundGraphsBulkDeleteResponse400 | agentPlaygroundGraphsBulkDeleteResponse404 | agentPlaygroundGraphsBulkDeleteResponse500 | agentPlaygroundGraphsBulkDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentPlaygroundGraphsBulkDeleteResponse = (agentPlaygroundGraphsBulkDeleteResponseSuccess | agentPlaygroundGraphsBulkDeleteResponseError)
-
-export const getAgentPlaygroundGraphsBulkDeleteUrl = () => {
-
-
-
-
-  return `/agent-playground/graphs/delete/`
-}
-
-/**
- * Accepts a list of graph IDs. Before deleting, checks if any graph version
-being deleted is referenced by nodes in graphs outside the deletion set.
-If all referencing graphs are also being deleted, it's allowed; otherwise blocked.
- * @summary Bulk soft-delete graphs with reference validation.
- */
-export const agentPlaygroundGraphsBulkDelete = async (graphListApi: NonReadonly<GraphListApi>, options?: RequestInit): Promise<agentPlaygroundGraphsBulkDeleteResponse> => {
-
-  return apiMutator<agentPlaygroundGraphsBulkDeleteResponse>(getAgentPlaygroundGraphsBulkDeleteUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      graphListApi,)
-  }
-);}
-
-
-
-export type agentPlaygroundGraphsFromTraceCreateResponse201 = {
-  data: TraceToGraphResponseApi
-  status: 201
-}
-
-export type agentPlaygroundGraphsFromTraceCreateResponse400 = {
-  data: AgentPlaygroundErrorResponseApi
-  status: 400
-}
-
-export type agentPlaygroundGraphsFromTraceCreateResponse404 = {
-  data: AgentPlaygroundErrorResponseApi
-  status: 404
-}
-
-export type agentPlaygroundGraphsFromTraceCreateResponse500 = {
-  data: AgentPlaygroundErrorResponseApi
-  status: 500
-}
-
-export type agentPlaygroundGraphsFromTraceCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201 | 400 | 404 | 500>
-}
-
-export type agentPlaygroundGraphsFromTraceCreateResponseSuccess = (agentPlaygroundGraphsFromTraceCreateResponse201) & {
-  headers: Headers;
-};
-export type agentPlaygroundGraphsFromTraceCreateResponseError = (agentPlaygroundGraphsFromTraceCreateResponse400 | agentPlaygroundGraphsFromTraceCreateResponse404 | agentPlaygroundGraphsFromTraceCreateResponse500 | agentPlaygroundGraphsFromTraceCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentPlaygroundGraphsFromTraceCreateResponse = (agentPlaygroundGraphsFromTraceCreateResponseSuccess | agentPlaygroundGraphsFromTraceCreateResponseError)
-
-export const getAgentPlaygroundGraphsFromTraceCreateUrl = () => {
-
-
-
-
-  return `/agent-playground/graphs/from-trace/`
-}
-
-/**
- * Create a new agent playground graph from a trace's LLM spans.
- * @summary POST /agent-playground/graphs/from-trace/
- */
-export const agentPlaygroundGraphsFromTraceCreate = async (traceToGraphRequestApi: TraceToGraphRequestApi, options?: RequestInit): Promise<agentPlaygroundGraphsFromTraceCreateResponse> => {
-
-  return apiMutator<agentPlaygroundGraphsFromTraceCreateResponse>(getAgentPlaygroundGraphsFromTraceCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      traceToGraphRequestApi,)
   }
 );}
 
@@ -9876,6 +9753,128 @@ export const agentPlaygroundGraphsVersionsPortsPartialUpdate = async (id: string
 
 
 
+export type agentPlaygroundGraphsBulkDeleteResponse201 = {
+  data: GraphListApi
+  status: 201
+}
+
+export type agentPlaygroundGraphsBulkDeleteResponse400 = {
+  data: AgentPlaygroundErrorResponseApi
+  status: 400
+}
+
+export type agentPlaygroundGraphsBulkDeleteResponse404 = {
+  data: AgentPlaygroundErrorResponseApi
+  status: 404
+}
+
+export type agentPlaygroundGraphsBulkDeleteResponse500 = {
+  data: AgentPlaygroundErrorResponseApi
+  status: 500
+}
+
+export type agentPlaygroundGraphsBulkDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201 | 400 | 404 | 500>
+}
+
+export type agentPlaygroundGraphsBulkDeleteResponseSuccess = (agentPlaygroundGraphsBulkDeleteResponse201) & {
+  headers: Headers;
+};
+export type agentPlaygroundGraphsBulkDeleteResponseError = (agentPlaygroundGraphsBulkDeleteResponse400 | agentPlaygroundGraphsBulkDeleteResponse404 | agentPlaygroundGraphsBulkDeleteResponse500 | agentPlaygroundGraphsBulkDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentPlaygroundGraphsBulkDeleteResponse = (agentPlaygroundGraphsBulkDeleteResponseSuccess | agentPlaygroundGraphsBulkDeleteResponseError)
+
+export const getAgentPlaygroundGraphsBulkDeleteUrl = () => {
+
+
+
+
+  return `/agent-playground/graphs/delete/`
+}
+
+/**
+ * Accepts a list of graph IDs. Before deleting, checks if any graph version
+being deleted is referenced by nodes in graphs outside the deletion set.
+If all referencing graphs are also being deleted, it's allowed; otherwise blocked.
+ * @summary Bulk soft-delete graphs with reference validation.
+ */
+export const agentPlaygroundGraphsBulkDelete = async (graphListApi: NonReadonly<GraphListApi>, options?: RequestInit): Promise<agentPlaygroundGraphsBulkDeleteResponse> => {
+
+  return apiMutator<agentPlaygroundGraphsBulkDeleteResponse>(getAgentPlaygroundGraphsBulkDeleteUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      graphListApi,)
+  }
+);}
+
+
+
+export type agentPlaygroundGraphsFromTraceCreateResponse201 = {
+  data: TraceToGraphResponseApi
+  status: 201
+}
+
+export type agentPlaygroundGraphsFromTraceCreateResponse400 = {
+  data: AgentPlaygroundErrorResponseApi
+  status: 400
+}
+
+export type agentPlaygroundGraphsFromTraceCreateResponse404 = {
+  data: AgentPlaygroundErrorResponseApi
+  status: 404
+}
+
+export type agentPlaygroundGraphsFromTraceCreateResponse500 = {
+  data: AgentPlaygroundErrorResponseApi
+  status: 500
+}
+
+export type agentPlaygroundGraphsFromTraceCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201 | 400 | 404 | 500>
+}
+
+export type agentPlaygroundGraphsFromTraceCreateResponseSuccess = (agentPlaygroundGraphsFromTraceCreateResponse201) & {
+  headers: Headers;
+};
+export type agentPlaygroundGraphsFromTraceCreateResponseError = (agentPlaygroundGraphsFromTraceCreateResponse400 | agentPlaygroundGraphsFromTraceCreateResponse404 | agentPlaygroundGraphsFromTraceCreateResponse500 | agentPlaygroundGraphsFromTraceCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentPlaygroundGraphsFromTraceCreateResponse = (agentPlaygroundGraphsFromTraceCreateResponseSuccess | agentPlaygroundGraphsFromTraceCreateResponseError)
+
+export const getAgentPlaygroundGraphsFromTraceCreateUrl = () => {
+
+
+
+
+  return `/agent-playground/graphs/from-trace/`
+}
+
+/**
+ * Create a new agent playground graph from a trace's LLM spans.
+ * @summary POST /agent-playground/graphs/from-trace/
+ */
+export const agentPlaygroundGraphsFromTraceCreate = async (traceToGraphRequestApi: TraceToGraphRequestApi, options?: RequestInit): Promise<agentPlaygroundGraphsFromTraceCreateResponse> => {
+
+  return apiMutator<agentPlaygroundGraphsFromTraceCreateResponse>(getAgentPlaygroundGraphsFromTraceCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      traceToGraphRequestApi,)
+  }
+);}
+
+
+
 export type agentPlaygroundNodeTemplatesListResponse200 = {
   data: AgentPlaygroundNodeTemplatesList200
   status: 200
@@ -10584,99 +10583,6 @@ export const agentccApiKeysCreate = async (agentccAPIKeyApi: NonReadonly<Agentcc
 
 
 
-export type agentccApiKeysBulkListResponse200 = {
-  data: APIKeyBulkResponseApi
-  status: 200
-}
-
-export type agentccApiKeysBulkListResponse400 = {
-  data: AgentccErrorResponseApi
-  status: 400
-}
-
-export type agentccApiKeysBulkListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
-}
-
-export type agentccApiKeysBulkListResponseSuccess = (agentccApiKeysBulkListResponse200) & {
-  headers: Headers;
-};
-export type agentccApiKeysBulkListResponseError = (agentccApiKeysBulkListResponse400 | agentccApiKeysBulkListResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccApiKeysBulkListResponse = (agentccApiKeysBulkListResponseSuccess | agentccApiKeysBulkListResponseError)
-
-export const getAgentccApiKeysBulkListUrl = () => {
-
-
-
-
-  return `/agentcc/api-keys/bulk/`
-}
-
-/**
- * Bulk endpoint for gateway startup key sync.
-Returns all active keys with their hashes so the gateway can restore
-its in-memory KeyStore on restart.
-
-Authenticated by admin token (not user JWT).
- */
-export const agentccApiKeysBulkList = async ( options?: RequestInit): Promise<agentccApiKeysBulkListResponse> => {
-
-  return apiMutator<agentccApiKeysBulkListResponse>(getAgentccApiKeysBulkListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type agentccApiKeysSyncResponse201 = {
-  data: AgentccAPIKeyApi
-  status: 201
-}
-
-export type agentccApiKeysSyncResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type agentccApiKeysSyncResponseSuccess = (agentccApiKeysSyncResponse201) & {
-  headers: Headers;
-};
-export type agentccApiKeysSyncResponseError = (agentccApiKeysSyncResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccApiKeysSyncResponse = (agentccApiKeysSyncResponseSuccess | agentccApiKeysSyncResponseError)
-
-export const getAgentccApiKeysSyncUrl = () => {
-
-
-
-
-  return `/agentcc/api-keys/sync/`
-}
-
-export const agentccApiKeysSync = async (agentccAPIKeyApi: NonReadonly<AgentccAPIKeyApi>, options?: RequestInit): Promise<agentccApiKeysSyncResponse> => {
-
-  return apiMutator<agentccApiKeysSyncResponse>(getAgentccApiKeysSyncUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      agentccAPIKeyApi,)
-  }
-);}
-
-
-
 export type agentccApiKeysReadResponse200 = {
   data: AgentccAPIKeyApi
   status: 200
@@ -10872,6 +10778,99 @@ export const agentccApiKeysRevoke = async (id: string,
     agentccAPIKeyApi: NonReadonly<AgentccAPIKeyApi>, options?: RequestInit): Promise<agentccApiKeysRevokeResponse> => {
 
   return apiMutator<agentccApiKeysRevokeResponse>(getAgentccApiKeysRevokeUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      agentccAPIKeyApi,)
+  }
+);}
+
+
+
+export type agentccApiKeysBulkListResponse200 = {
+  data: APIKeyBulkResponseApi
+  status: 200
+}
+
+export type agentccApiKeysBulkListResponse400 = {
+  data: AgentccErrorResponseApi
+  status: 400
+}
+
+export type agentccApiKeysBulkListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400>
+}
+
+export type agentccApiKeysBulkListResponseSuccess = (agentccApiKeysBulkListResponse200) & {
+  headers: Headers;
+};
+export type agentccApiKeysBulkListResponseError = (agentccApiKeysBulkListResponse400 | agentccApiKeysBulkListResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccApiKeysBulkListResponse = (agentccApiKeysBulkListResponseSuccess | agentccApiKeysBulkListResponseError)
+
+export const getAgentccApiKeysBulkListUrl = () => {
+
+
+
+
+  return `/agentcc/api-keys/bulk/`
+}
+
+/**
+ * Bulk endpoint for gateway startup key sync.
+Returns all active keys with their hashes so the gateway can restore
+its in-memory KeyStore on restart.
+
+Authenticated by admin token (not user JWT).
+ */
+export const agentccApiKeysBulkList = async ( options?: RequestInit): Promise<agentccApiKeysBulkListResponse> => {
+
+  return apiMutator<agentccApiKeysBulkListResponse>(getAgentccApiKeysBulkListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type agentccApiKeysSyncResponse201 = {
+  data: AgentccAPIKeyApi
+  status: 201
+}
+
+export type agentccApiKeysSyncResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type agentccApiKeysSyncResponseSuccess = (agentccApiKeysSyncResponse201) & {
+  headers: Headers;
+};
+export type agentccApiKeysSyncResponseError = (agentccApiKeysSyncResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccApiKeysSyncResponse = (agentccApiKeysSyncResponseSuccess | agentccApiKeysSyncResponseError)
+
+export const getAgentccApiKeysSyncUrl = () => {
+
+
+
+
+  return `/agentcc/api-keys/sync/`
+}
+
+export const agentccApiKeysSync = async (agentccAPIKeyApi: NonReadonly<AgentccAPIKeyApi>, options?: RequestInit): Promise<agentccApiKeysSyncResponse> => {
+
+  return apiMutator<agentccApiKeysSyncResponse>(getAgentccApiKeysSyncUrl(),
   {
     ...options,
     method: 'POST',
@@ -11345,50 +11344,6 @@ export const agentccCustomPropertiesCreate = async (agentccCustomPropertySchemaA
 
 
 
-export type agentccCustomPropertiesValidateResponse201 = {
-  data: AgentccCustomPropertySchemaApi
-  status: 201
-}
-
-export type agentccCustomPropertiesValidateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type agentccCustomPropertiesValidateResponseSuccess = (agentccCustomPropertiesValidateResponse201) & {
-  headers: Headers;
-};
-export type agentccCustomPropertiesValidateResponseError = (agentccCustomPropertiesValidateResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccCustomPropertiesValidateResponse = (agentccCustomPropertiesValidateResponseSuccess | agentccCustomPropertiesValidateResponseError)
-
-export const getAgentccCustomPropertiesValidateUrl = () => {
-
-
-
-
-  return `/agentcc/custom-properties/validate/`
-}
-
-/**
- * Validate a set of custom properties against the org's schemas.
- */
-export const agentccCustomPropertiesValidate = async (agentccCustomPropertySchemaApi: NonReadonly<AgentccCustomPropertySchemaApi>, options?: RequestInit): Promise<agentccCustomPropertiesValidateResponse> => {
-
-  return apiMutator<agentccCustomPropertiesValidateResponse>(getAgentccCustomPropertiesValidateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      agentccCustomPropertySchemaApi,)
-  }
-);}
-
-
-
 export type agentccCustomPropertiesReadResponse200 = {
   data: AgentccCustomPropertySchemaApi
   status: 200
@@ -11560,6 +11515,50 @@ export const agentccCustomPropertiesDelete = async (id: string, options?: Reques
     method: 'DELETE'
 
 
+  }
+);}
+
+
+
+export type agentccCustomPropertiesValidateResponse201 = {
+  data: AgentccCustomPropertySchemaApi
+  status: 201
+}
+
+export type agentccCustomPropertiesValidateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type agentccCustomPropertiesValidateResponseSuccess = (agentccCustomPropertiesValidateResponse201) & {
+  headers: Headers;
+};
+export type agentccCustomPropertiesValidateResponseError = (agentccCustomPropertiesValidateResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccCustomPropertiesValidateResponse = (agentccCustomPropertiesValidateResponseSuccess | agentccCustomPropertiesValidateResponseError)
+
+export const getAgentccCustomPropertiesValidateUrl = () => {
+
+
+
+
+  return `/agentcc/custom-properties/validate/`
+}
+
+/**
+ * Validate a set of custom properties against the org's schemas.
+ */
+export const agentccCustomPropertiesValidate = async (agentccCustomPropertySchemaApi: NonReadonly<AgentccCustomPropertySchemaApi>, options?: RequestInit): Promise<agentccCustomPropertiesValidateResponse> => {
+
+  return apiMutator<agentccCustomPropertiesValidateResponse>(getAgentccCustomPropertiesValidateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      agentccCustomPropertySchemaApi,)
   }
 );}
 
@@ -11923,54 +11922,6 @@ No DB model — returns a virtual singleton gateway with live health.
 export const agentccGatewaysList = async ( options?: RequestInit): Promise<agentccGatewaysListResponse> => {
 
   return apiMutator<agentccGatewaysListResponse>(getAgentccGatewaysListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type agentccGatewaysProtectTemplatesResponse200 = {
-  data: AgentccListResultResponseApi
-  status: 200
-}
-
-export type agentccGatewaysProtectTemplatesResponse400 = {
-  data: AgentccErrorResponseApi
-  status: 400
-}
-
-export type agentccGatewaysProtectTemplatesResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
-}
-
-export type agentccGatewaysProtectTemplatesResponseSuccess = (agentccGatewaysProtectTemplatesResponse200) & {
-  headers: Headers;
-};
-export type agentccGatewaysProtectTemplatesResponseError = (agentccGatewaysProtectTemplatesResponse400 | agentccGatewaysProtectTemplatesResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccGatewaysProtectTemplatesResponse = (agentccGatewaysProtectTemplatesResponseSuccess | agentccGatewaysProtectTemplatesResponseError)
-
-export const getAgentccGatewaysProtectTemplatesUrl = () => {
-
-
-
-
-  return `/agentcc/gateways/protect-templates/`
-}
-
-/**
- * Return eval templates compatible with the FI protect guardrail.
- */
-export const agentccGatewaysProtectTemplates = async ( options?: RequestInit): Promise<agentccGatewaysProtectTemplatesResponse> => {
-
-  return apiMutator<agentccGatewaysProtectTemplatesResponse>(getAgentccGatewaysProtectTemplatesUrl(),
   {
     ...options,
     method: 'GET'
@@ -13188,6 +13139,54 @@ export const agentccGatewaysUpdateProvider = async (id: string,
 
 
 
+export type agentccGatewaysProtectTemplatesResponse200 = {
+  data: AgentccListResultResponseApi
+  status: 200
+}
+
+export type agentccGatewaysProtectTemplatesResponse400 = {
+  data: AgentccErrorResponseApi
+  status: 400
+}
+
+export type agentccGatewaysProtectTemplatesResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400>
+}
+
+export type agentccGatewaysProtectTemplatesResponseSuccess = (agentccGatewaysProtectTemplatesResponse200) & {
+  headers: Headers;
+};
+export type agentccGatewaysProtectTemplatesResponseError = (agentccGatewaysProtectTemplatesResponse400 | agentccGatewaysProtectTemplatesResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccGatewaysProtectTemplatesResponse = (agentccGatewaysProtectTemplatesResponseSuccess | agentccGatewaysProtectTemplatesResponseError)
+
+export const getAgentccGatewaysProtectTemplatesUrl = () => {
+
+
+
+
+  return `/agentcc/gateways/protect-templates/`
+}
+
+/**
+ * Return eval templates compatible with the FI protect guardrail.
+ */
+export const agentccGatewaysProtectTemplates = async ( options?: RequestInit): Promise<agentccGatewaysProtectTemplatesResponse> => {
+
+  return apiMutator<agentccGatewaysProtectTemplatesResponse>(getAgentccGatewaysProtectTemplatesUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type agentccGuardrailConfigsPiiEntitiesResponse200 = {
   data: PIIEntitiesResponseApi
   status: 200
@@ -13443,60 +13442,6 @@ export const agentccGuardrailFeedbackCreate = async (agentccGuardrailFeedbackApi
 
 
 
-export type agentccGuardrailFeedbackSummaryResponse200 = {
-  data: AgentccGuardrailFeedbackSummary200
-  status: 200
-}
-
-export type agentccGuardrailFeedbackSummaryResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type agentccGuardrailFeedbackSummaryResponseSuccess = (agentccGuardrailFeedbackSummaryResponse200) & {
-  headers: Headers;
-};
-export type agentccGuardrailFeedbackSummaryResponseError = (agentccGuardrailFeedbackSummaryResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccGuardrailFeedbackSummaryResponse = (agentccGuardrailFeedbackSummaryResponseSuccess | agentccGuardrailFeedbackSummaryResponseError)
-
-export const getAgentccGuardrailFeedbackSummaryUrl = (params?: AgentccGuardrailFeedbackSummaryParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/agentcc/guardrail-feedback/summary/?${stringifiedParams}` : `/agentcc/guardrail-feedback/summary/`
-}
-
-/**
- * Aggregate feedback stats per check_name.
- */
-export const agentccGuardrailFeedbackSummary = async (params?: AgentccGuardrailFeedbackSummaryParams, options?: RequestInit): Promise<agentccGuardrailFeedbackSummaryResponse> => {
-
-  return apiMutator<agentccGuardrailFeedbackSummaryResponse>(getAgentccGuardrailFeedbackSummaryUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type agentccGuardrailFeedbackReadResponse200 = {
   data: AgentccGuardrailFeedbackApi
   status: 200
@@ -13673,6 +13618,60 @@ export const agentccGuardrailFeedbackDelete = async (id: string, options?: Reque
 
 
 
+export type agentccGuardrailFeedbackSummaryResponse200 = {
+  data: AgentccGuardrailFeedbackSummary200
+  status: 200
+}
+
+export type agentccGuardrailFeedbackSummaryResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type agentccGuardrailFeedbackSummaryResponseSuccess = (agentccGuardrailFeedbackSummaryResponse200) & {
+  headers: Headers;
+};
+export type agentccGuardrailFeedbackSummaryResponseError = (agentccGuardrailFeedbackSummaryResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccGuardrailFeedbackSummaryResponse = (agentccGuardrailFeedbackSummaryResponseSuccess | agentccGuardrailFeedbackSummaryResponseError)
+
+export const getAgentccGuardrailFeedbackSummaryUrl = (params?: AgentccGuardrailFeedbackSummaryParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/agentcc/guardrail-feedback/summary/?${stringifiedParams}` : `/agentcc/guardrail-feedback/summary/`
+}
+
+/**
+ * Aggregate feedback stats per check_name.
+ */
+export const agentccGuardrailFeedbackSummary = async (params?: AgentccGuardrailFeedbackSummaryParams, options?: RequestInit): Promise<agentccGuardrailFeedbackSummaryResponse> => {
+
+  return apiMutator<agentccGuardrailFeedbackSummaryResponse>(getAgentccGuardrailFeedbackSummaryUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type agentccGuardrailPoliciesListResponse200 = {
   data: AgentccGuardrailPoliciesList200
   status: 200
@@ -13760,50 +13759,6 @@ export const getAgentccGuardrailPoliciesCreateUrl = () => {
 export const agentccGuardrailPoliciesCreate = async (agentccGuardrailPolicyApi: NonReadonly<AgentccGuardrailPolicyApi>, options?: RequestInit): Promise<agentccGuardrailPoliciesCreateResponse> => {
 
   return apiMutator<agentccGuardrailPoliciesCreateResponse>(getAgentccGuardrailPoliciesCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      agentccGuardrailPolicyApi,)
-  }
-);}
-
-
-
-export type agentccGuardrailPoliciesSyncResponse201 = {
-  data: AgentccGuardrailPolicyApi
-  status: 201
-}
-
-export type agentccGuardrailPoliciesSyncResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type agentccGuardrailPoliciesSyncResponseSuccess = (agentccGuardrailPoliciesSyncResponse201) & {
-  headers: Headers;
-};
-export type agentccGuardrailPoliciesSyncResponseError = (agentccGuardrailPoliciesSyncResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccGuardrailPoliciesSyncResponse = (agentccGuardrailPoliciesSyncResponseSuccess | agentccGuardrailPoliciesSyncResponseError)
-
-export const getAgentccGuardrailPoliciesSyncUrl = () => {
-
-
-
-
-  return `/agentcc/guardrail-policies/sync/`
-}
-
-/**
- * Manual trigger to resync all policies to gateway.
- */
-export const agentccGuardrailPoliciesSync = async (agentccGuardrailPolicyApi: NonReadonly<AgentccGuardrailPolicyApi>, options?: RequestInit): Promise<agentccGuardrailPoliciesSyncResponse> => {
-
-  return apiMutator<agentccGuardrailPoliciesSyncResponse>(getAgentccGuardrailPoliciesSyncUrl(),
   {
     ...options,
     method: 'POST',
@@ -14036,6 +13991,50 @@ export const agentccGuardrailPoliciesApply = async (id: string,
 
 
 
+export type agentccGuardrailPoliciesSyncResponse201 = {
+  data: AgentccGuardrailPolicyApi
+  status: 201
+}
+
+export type agentccGuardrailPoliciesSyncResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type agentccGuardrailPoliciesSyncResponseSuccess = (agentccGuardrailPoliciesSyncResponse201) & {
+  headers: Headers;
+};
+export type agentccGuardrailPoliciesSyncResponseError = (agentccGuardrailPoliciesSyncResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccGuardrailPoliciesSyncResponse = (agentccGuardrailPoliciesSyncResponseSuccess | agentccGuardrailPoliciesSyncResponseError)
+
+export const getAgentccGuardrailPoliciesSyncUrl = () => {
+
+
+
+
+  return `/agentcc/guardrail-policies/sync/`
+}
+
+/**
+ * Manual trigger to resync all policies to gateway.
+ */
+export const agentccGuardrailPoliciesSync = async (agentccGuardrailPolicyApi: NonReadonly<AgentccGuardrailPolicyApi>, options?: RequestInit): Promise<agentccGuardrailPoliciesSyncResponse> => {
+
+  return apiMutator<agentccGuardrailPoliciesSyncResponse>(getAgentccGuardrailPoliciesSyncUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      agentccGuardrailPolicyApi,)
+  }
+);}
+
+
+
 export type agentccOrgConfigsListResponse200 = {
   data: AgentccOrgConfigsList200
   status: 200
@@ -14129,110 +14128,6 @@ export const agentccOrgConfigsCreate = async (agentccOrgConfigApi: NonReadonly<A
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       agentccOrgConfigApi,)
-  }
-);}
-
-
-
-export type agentccOrgConfigsActiveResponse200 = {
-  data: AgentccOrgConfigsActive200
-  status: 200
-}
-
-export type agentccOrgConfigsActiveResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type agentccOrgConfigsActiveResponseSuccess = (agentccOrgConfigsActiveResponse200) & {
-  headers: Headers;
-};
-export type agentccOrgConfigsActiveResponseError = (agentccOrgConfigsActiveResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccOrgConfigsActiveResponse = (agentccOrgConfigsActiveResponseSuccess | agentccOrgConfigsActiveResponseError)
-
-export const getAgentccOrgConfigsActiveUrl = (params?: AgentccOrgConfigsActiveParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/agentcc/org-configs/active/?${stringifiedParams}` : `/agentcc/org-configs/active/`
-}
-
-/**
- * Get the currently active config for the requesting user's org.
- */
-export const agentccOrgConfigsActive = async (params?: AgentccOrgConfigsActiveParams, options?: RequestInit): Promise<agentccOrgConfigsActiveResponse> => {
-
-  return apiMutator<agentccOrgConfigsActiveResponse>(getAgentccOrgConfigsActiveUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type agentccOrgConfigsBulkListResponse200 = {
-  data: OrgConfigBulkResponseApi
-  status: 200
-}
-
-export type agentccOrgConfigsBulkListResponse400 = {
-  data: AgentccErrorResponseApi
-  status: 400
-}
-
-export type agentccOrgConfigsBulkListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
-}
-
-export type agentccOrgConfigsBulkListResponseSuccess = (agentccOrgConfigsBulkListResponse200) & {
-  headers: Headers;
-};
-export type agentccOrgConfigsBulkListResponseError = (agentccOrgConfigsBulkListResponse400 | agentccOrgConfigsBulkListResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccOrgConfigsBulkListResponse = (agentccOrgConfigsBulkListResponseSuccess | agentccOrgConfigsBulkListResponseError)
-
-export const getAgentccOrgConfigsBulkListUrl = () => {
-
-
-
-
-  return `/agentcc/org-configs/bulk/`
-}
-
-/**
- * Bulk endpoint for gateway startup sync.
-Returns all active org configs keyed by org ID.
-Authenticated by admin token (not user JWT).
- */
-export const agentccOrgConfigsBulkList = async ( options?: RequestInit): Promise<agentccOrgConfigsBulkListResponse> => {
-
-  return apiMutator<agentccOrgConfigsBulkListResponse>(getAgentccOrgConfigsBulkListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
   }
 );}
 
@@ -14502,6 +14397,110 @@ export const agentccOrgConfigsDiff = async (id: string, options?: RequestInit): 
 
 
 
+export type agentccOrgConfigsActiveResponse200 = {
+  data: AgentccOrgConfigsActive200
+  status: 200
+}
+
+export type agentccOrgConfigsActiveResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type agentccOrgConfigsActiveResponseSuccess = (agentccOrgConfigsActiveResponse200) & {
+  headers: Headers;
+};
+export type agentccOrgConfigsActiveResponseError = (agentccOrgConfigsActiveResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccOrgConfigsActiveResponse = (agentccOrgConfigsActiveResponseSuccess | agentccOrgConfigsActiveResponseError)
+
+export const getAgentccOrgConfigsActiveUrl = (params?: AgentccOrgConfigsActiveParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/agentcc/org-configs/active/?${stringifiedParams}` : `/agentcc/org-configs/active/`
+}
+
+/**
+ * Get the currently active config for the requesting user's org.
+ */
+export const agentccOrgConfigsActive = async (params?: AgentccOrgConfigsActiveParams, options?: RequestInit): Promise<agentccOrgConfigsActiveResponse> => {
+
+  return apiMutator<agentccOrgConfigsActiveResponse>(getAgentccOrgConfigsActiveUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type agentccOrgConfigsBulkListResponse200 = {
+  data: OrgConfigBulkResponseApi
+  status: 200
+}
+
+export type agentccOrgConfigsBulkListResponse400 = {
+  data: AgentccErrorResponseApi
+  status: 400
+}
+
+export type agentccOrgConfigsBulkListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400>
+}
+
+export type agentccOrgConfigsBulkListResponseSuccess = (agentccOrgConfigsBulkListResponse200) & {
+  headers: Headers;
+};
+export type agentccOrgConfigsBulkListResponseError = (agentccOrgConfigsBulkListResponse400 | agentccOrgConfigsBulkListResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccOrgConfigsBulkListResponse = (agentccOrgConfigsBulkListResponseSuccess | agentccOrgConfigsBulkListResponseError)
+
+export const getAgentccOrgConfigsBulkListUrl = () => {
+
+
+
+
+  return `/agentcc/org-configs/bulk/`
+}
+
+/**
+ * Bulk endpoint for gateway startup sync.
+Returns all active org configs keyed by org ID.
+Authenticated by admin token (not user JWT).
+ */
+export const agentccOrgConfigsBulkList = async ( options?: RequestInit): Promise<agentccOrgConfigsBulkListResponse> => {
+
+  return apiMutator<agentccOrgConfigsBulkListResponse>(getAgentccOrgConfigsBulkListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type agentccProviderCredentialsListResponse200 = {
   data: AgentccProviderCredentialsList200
   status: 200
@@ -14583,53 +14582,6 @@ export const getAgentccProviderCredentialsCreateUrl = () => {
 export const agentccProviderCredentialsCreate = async (agentccProviderCredentialApi: NonReadonly<AgentccProviderCredentialApi>, options?: RequestInit): Promise<agentccProviderCredentialsCreateResponse> => {
 
   return apiMutator<agentccProviderCredentialsCreateResponse>(getAgentccProviderCredentialsCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      agentccProviderCredentialApi,)
-  }
-);}
-
-
-
-export type agentccProviderCredentialsFetchModelsResponse201 = {
-  data: AgentccProviderCredentialApi
-  status: 201
-}
-
-export type agentccProviderCredentialsFetchModelsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type agentccProviderCredentialsFetchModelsResponseSuccess = (agentccProviderCredentialsFetchModelsResponse201) & {
-  headers: Headers;
-};
-export type agentccProviderCredentialsFetchModelsResponseError = (agentccProviderCredentialsFetchModelsResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccProviderCredentialsFetchModelsResponse = (agentccProviderCredentialsFetchModelsResponseSuccess | agentccProviderCredentialsFetchModelsResponseError)
-
-export const getAgentccProviderCredentialsFetchModelsUrl = () => {
-
-
-
-
-  return `/agentcc/provider-credentials/fetch_models/`
-}
-
-/**
- * Two modes:
-- provider_name: look up stored credential by provider name for this org.
-- api_key + base_url + api_format: use raw values (for create-mode).
- * @summary Fetch available models from a provider's API.
- */
-export const agentccProviderCredentialsFetchModels = async (agentccProviderCredentialApi: NonReadonly<AgentccProviderCredentialApi>, options?: RequestInit): Promise<agentccProviderCredentialsFetchModelsResponse> => {
-
-  return apiMutator<agentccProviderCredentialsFetchModelsResponse>(getAgentccProviderCredentialsFetchModelsUrl(),
   {
     ...options,
     method: 'POST',
@@ -14850,6 +14802,53 @@ export const agentccProviderCredentialsRotate = async (id: string,
 
 
 
+export type agentccProviderCredentialsFetchModelsResponse201 = {
+  data: AgentccProviderCredentialApi
+  status: 201
+}
+
+export type agentccProviderCredentialsFetchModelsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type agentccProviderCredentialsFetchModelsResponseSuccess = (agentccProviderCredentialsFetchModelsResponse201) & {
+  headers: Headers;
+};
+export type agentccProviderCredentialsFetchModelsResponseError = (agentccProviderCredentialsFetchModelsResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccProviderCredentialsFetchModelsResponse = (agentccProviderCredentialsFetchModelsResponseSuccess | agentccProviderCredentialsFetchModelsResponseError)
+
+export const getAgentccProviderCredentialsFetchModelsUrl = () => {
+
+
+
+
+  return `/agentcc/provider-credentials/fetch_models/`
+}
+
+/**
+ * Two modes:
+- provider_name: look up stored credential by provider name for this org.
+- api_key + base_url + api_format: use raw values (for create-mode).
+ * @summary Fetch available models from a provider's API.
+ */
+export const agentccProviderCredentialsFetchModels = async (agentccProviderCredentialApi: NonReadonly<AgentccProviderCredentialApi>, options?: RequestInit): Promise<agentccProviderCredentialsFetchModelsResponse> => {
+
+  return apiMutator<agentccProviderCredentialsFetchModelsResponse>(getAgentccProviderCredentialsFetchModelsUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      agentccProviderCredentialApi,)
+  }
+);}
+
+
+
 export type agentccRequestLogsListResponse200 = {
   data: AgentccRequestLogsList200
   status: 200
@@ -14891,6 +14890,46 @@ export const getAgentccRequestLogsListUrl = (params?: AgentccRequestLogsListPara
 export const agentccRequestLogsList = async (params?: AgentccRequestLogsListParams, options?: RequestInit): Promise<agentccRequestLogsListResponse> => {
 
   return apiMutator<agentccRequestLogsListResponse>(getAgentccRequestLogsListUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type agentccRequestLogsReadResponse200 = {
+  data: AgentccRequestLogDetailApi
+  status: 200
+}
+
+export type agentccRequestLogsReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type agentccRequestLogsReadResponseSuccess = (agentccRequestLogsReadResponse200) & {
+  headers: Headers;
+};
+export type agentccRequestLogsReadResponseError = (agentccRequestLogsReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccRequestLogsReadResponse = (agentccRequestLogsReadResponseSuccess | agentccRequestLogsReadResponseError)
+
+export const getAgentccRequestLogsReadUrl = (id: string,) => {
+
+
+
+
+  return `/agentcc/request-logs/${id}/`
+}
+
+export const agentccRequestLogsRead = async (id: string, options?: RequestInit): Promise<agentccRequestLogsReadResponse> => {
+
+  return apiMutator<agentccRequestLogsReadResponse>(getAgentccRequestLogsReadUrl(id),
   {
     ...options,
     method: 'GET'
@@ -15119,46 +15158,6 @@ export const agentccRequestLogsSessionDetail = async (sessionId: string,
 
 
 
-export type agentccRequestLogsReadResponse200 = {
-  data: AgentccRequestLogDetailApi
-  status: 200
-}
-
-export type agentccRequestLogsReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type agentccRequestLogsReadResponseSuccess = (agentccRequestLogsReadResponse200) & {
-  headers: Headers;
-};
-export type agentccRequestLogsReadResponseError = (agentccRequestLogsReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccRequestLogsReadResponse = (agentccRequestLogsReadResponseSuccess | agentccRequestLogsReadResponseError)
-
-export const getAgentccRequestLogsReadUrl = (id: string,) => {
-
-
-
-
-  return `/agentcc/request-logs/${id}/`
-}
-
-export const agentccRequestLogsRead = async (id: string, options?: RequestInit): Promise<agentccRequestLogsReadResponse> => {
-
-  return apiMutator<agentccRequestLogsReadResponse>(getAgentccRequestLogsReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type agentccRoutingPoliciesListResponse200 = {
   data: AgentccRoutingPoliciesList200
   status: 200
@@ -15246,50 +15245,6 @@ export const getAgentccRoutingPoliciesCreateUrl = () => {
 export const agentccRoutingPoliciesCreate = async (agentccRoutingPolicyApi: NonReadonly<AgentccRoutingPolicyApi>, options?: RequestInit): Promise<agentccRoutingPoliciesCreateResponse> => {
 
   return apiMutator<agentccRoutingPoliciesCreateResponse>(getAgentccRoutingPoliciesCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      agentccRoutingPolicyApi,)
-  }
-);}
-
-
-
-export type agentccRoutingPoliciesSyncResponse201 = {
-  data: AgentccRoutingPolicyApi
-  status: 201
-}
-
-export type agentccRoutingPoliciesSyncResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type agentccRoutingPoliciesSyncResponseSuccess = (agentccRoutingPoliciesSyncResponse201) & {
-  headers: Headers;
-};
-export type agentccRoutingPoliciesSyncResponseError = (agentccRoutingPoliciesSyncResponseDefault) & {
-  headers: Headers;
-};
-
-export type agentccRoutingPoliciesSyncResponse = (agentccRoutingPoliciesSyncResponseSuccess | agentccRoutingPoliciesSyncResponseError)
-
-export const getAgentccRoutingPoliciesSyncUrl = () => {
-
-
-
-
-  return `/agentcc/routing-policies/sync/`
-}
-
-/**
- * Manual sync all active routing policies to gateway.
- */
-export const agentccRoutingPoliciesSync = async (agentccRoutingPolicyApi: NonReadonly<AgentccRoutingPolicyApi>, options?: RequestInit): Promise<agentccRoutingPoliciesSyncResponse> => {
-
-  return apiMutator<agentccRoutingPoliciesSyncResponse>(getAgentccRoutingPoliciesSyncUrl(),
   {
     ...options,
     method: 'POST',
@@ -15511,6 +15466,50 @@ export const agentccRoutingPoliciesActivate = async (id: string,
     agentccRoutingPolicyApi: NonReadonly<AgentccRoutingPolicyApi>, options?: RequestInit): Promise<agentccRoutingPoliciesActivateResponse> => {
 
   return apiMutator<agentccRoutingPoliciesActivateResponse>(getAgentccRoutingPoliciesActivateUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      agentccRoutingPolicyApi,)
+  }
+);}
+
+
+
+export type agentccRoutingPoliciesSyncResponse201 = {
+  data: AgentccRoutingPolicyApi
+  status: 201
+}
+
+export type agentccRoutingPoliciesSyncResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type agentccRoutingPoliciesSyncResponseSuccess = (agentccRoutingPoliciesSyncResponse201) & {
+  headers: Headers;
+};
+export type agentccRoutingPoliciesSyncResponseError = (agentccRoutingPoliciesSyncResponseDefault) & {
+  headers: Headers;
+};
+
+export type agentccRoutingPoliciesSyncResponse = (agentccRoutingPoliciesSyncResponseSuccess | agentccRoutingPoliciesSyncResponseError)
+
+export const getAgentccRoutingPoliciesSyncUrl = () => {
+
+
+
+
+  return `/agentcc/routing-policies/sync/`
+}
+
+/**
+ * Manual sync all active routing policies to gateway.
+ */
+export const agentccRoutingPoliciesSync = async (agentccRoutingPolicyApi: NonReadonly<AgentccRoutingPolicyApi>, options?: RequestInit): Promise<agentccRoutingPoliciesSyncResponse> => {
+
+  return apiMutator<agentccRoutingPoliciesSyncResponse>(getAgentccRoutingPoliciesSyncUrl(),
   {
     ...options,
     method: 'POST',
@@ -19416,65 +19415,6 @@ export const integrationsConnectionsCreate = async (integrationConnectionCreateA
 
 
 
-export type integrationsConnectionsValidateCredentialsResponse200 = {
-  data: IntegrationValidationResponseApi
-  status: 200
-}
-
-export type integrationsConnectionsValidateCredentialsResponse400 = {
-  data: IntegrationErrorResponseApi
-  status: 400
-}
-
-export type integrationsConnectionsValidateCredentialsResponse404 = {
-  data: IntegrationErrorResponseApi
-  status: 404
-}
-
-export type integrationsConnectionsValidateCredentialsResponse500 = {
-  data: IntegrationErrorResponseApi
-  status: 500
-}
-
-export type integrationsConnectionsValidateCredentialsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 500>
-}
-
-export type integrationsConnectionsValidateCredentialsResponseSuccess = (integrationsConnectionsValidateCredentialsResponse200) & {
-  headers: Headers;
-};
-export type integrationsConnectionsValidateCredentialsResponseError = (integrationsConnectionsValidateCredentialsResponse400 | integrationsConnectionsValidateCredentialsResponse404 | integrationsConnectionsValidateCredentialsResponse500 | integrationsConnectionsValidateCredentialsResponseDefault) & {
-  headers: Headers;
-};
-
-export type integrationsConnectionsValidateCredentialsResponse = (integrationsConnectionsValidateCredentialsResponseSuccess | integrationsConnectionsValidateCredentialsResponseError)
-
-export const getIntegrationsConnectionsValidateCredentialsUrl = () => {
-
-
-
-
-  return `/integrations/connections/validate/`
-}
-
-/**
- * Validate platform credentials without creating a connection.
- */
-export const integrationsConnectionsValidateCredentials = async (validateCredentialsApi: ValidateCredentialsApi, options?: RequestInit): Promise<integrationsConnectionsValidateCredentialsResponse> => {
-
-  return apiMutator<integrationsConnectionsValidateCredentialsResponse>(getIntegrationsConnectionsValidateCredentialsUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      validateCredentialsApi,)
-  }
-);}
-
-
-
 export type integrationsConnectionsReadResponse200 = {
   data: IntegrationConnectionDetailApi
   status: 200
@@ -19891,6 +19831,65 @@ export const integrationsConnectionsSyncNow = async (id: string,
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       integrationEmptyRequestApi,)
+  }
+);}
+
+
+
+export type integrationsConnectionsValidateCredentialsResponse200 = {
+  data: IntegrationValidationResponseApi
+  status: 200
+}
+
+export type integrationsConnectionsValidateCredentialsResponse400 = {
+  data: IntegrationErrorResponseApi
+  status: 400
+}
+
+export type integrationsConnectionsValidateCredentialsResponse404 = {
+  data: IntegrationErrorResponseApi
+  status: 404
+}
+
+export type integrationsConnectionsValidateCredentialsResponse500 = {
+  data: IntegrationErrorResponseApi
+  status: 500
+}
+
+export type integrationsConnectionsValidateCredentialsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 500>
+}
+
+export type integrationsConnectionsValidateCredentialsResponseSuccess = (integrationsConnectionsValidateCredentialsResponse200) & {
+  headers: Headers;
+};
+export type integrationsConnectionsValidateCredentialsResponseError = (integrationsConnectionsValidateCredentialsResponse400 | integrationsConnectionsValidateCredentialsResponse404 | integrationsConnectionsValidateCredentialsResponse500 | integrationsConnectionsValidateCredentialsResponseDefault) & {
+  headers: Headers;
+};
+
+export type integrationsConnectionsValidateCredentialsResponse = (integrationsConnectionsValidateCredentialsResponseSuccess | integrationsConnectionsValidateCredentialsResponseError)
+
+export const getIntegrationsConnectionsValidateCredentialsUrl = () => {
+
+
+
+
+  return `/integrations/connections/validate/`
+}
+
+/**
+ * Validate platform credentials without creating a connection.
+ */
+export const integrationsConnectionsValidateCredentials = async (validateCredentialsApi: ValidateCredentialsApi, options?: RequestInit): Promise<integrationsConnectionsValidateCredentialsResponse> => {
+
+  return apiMutator<integrationsConnectionsValidateCredentialsResponse>(getIntegrationsConnectionsValidateCredentialsUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      validateCredentialsApi,)
   }
 );}
 
@@ -21138,167 +21137,6 @@ export const modelHubAnnotationQueuesCreate = async (annotationQueueApi: NonRead
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       annotationQueueApi,)
-  }
-);}
-
-
-
-export type modelHubAnnotationQueuesForSourceResponse200 = {
-  data: QueueForSourceResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationQueuesForSourceResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubAnnotationQueuesForSourceResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationQueuesForSourceResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubAnnotationQueuesForSourceResponse409 = {
-  data: ApiTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubAnnotationQueuesForSourceResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubAnnotationQueuesForSourceResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubAnnotationQueuesForSourceResponseSuccess = (modelHubAnnotationQueuesForSourceResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationQueuesForSourceResponseError = (modelHubAnnotationQueuesForSourceResponse400 | modelHubAnnotationQueuesForSourceResponse403 | modelHubAnnotationQueuesForSourceResponse404 | modelHubAnnotationQueuesForSourceResponse409 | modelHubAnnotationQueuesForSourceResponse500 | modelHubAnnotationQueuesForSourceResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationQueuesForSourceResponse = (modelHubAnnotationQueuesForSourceResponseSuccess | modelHubAnnotationQueuesForSourceResponseError)
-
-export const getModelHubAnnotationQueuesForSourceUrl = (params?: ModelHubAnnotationQueuesForSourceParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/annotation-queues/for-source/?${stringifiedParams}` : `/model-hub/annotation-queues/for-source/`
-}
-
-/**
- * Find annotation queues for a given source that the current user can annotate.
-Includes queues where:
-- The source is a queue item AND the user is an annotator in that queue
-  (regardless of whether the item is explicitly assigned to them)
-
-Query params:
-  - source_type, source_id  (single source)
-  - OR sources (JSON array of {source_type, source_id} objects for multi-source lookup)
- */
-export const modelHubAnnotationQueuesForSource = async (params?: ModelHubAnnotationQueuesForSourceParams, options?: RequestInit): Promise<modelHubAnnotationQueuesForSourceResponse> => {
-
-  return apiMutator<modelHubAnnotationQueuesForSourceResponse>(getModelHubAnnotationQueuesForSourceUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubAnnotationQueuesGetOrCreateDefaultResponse200 = {
-  data: QueueDefaultResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationQueuesGetOrCreateDefaultResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubAnnotationQueuesGetOrCreateDefaultResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationQueuesGetOrCreateDefaultResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubAnnotationQueuesGetOrCreateDefaultResponse409 = {
-  data: ApiTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubAnnotationQueuesGetOrCreateDefaultResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubAnnotationQueuesGetOrCreateDefaultResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubAnnotationQueuesGetOrCreateDefaultResponseSuccess = (modelHubAnnotationQueuesGetOrCreateDefaultResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationQueuesGetOrCreateDefaultResponseError = (modelHubAnnotationQueuesGetOrCreateDefaultResponse400 | modelHubAnnotationQueuesGetOrCreateDefaultResponse403 | modelHubAnnotationQueuesGetOrCreateDefaultResponse404 | modelHubAnnotationQueuesGetOrCreateDefaultResponse409 | modelHubAnnotationQueuesGetOrCreateDefaultResponse500 | modelHubAnnotationQueuesGetOrCreateDefaultResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationQueuesGetOrCreateDefaultResponse = (modelHubAnnotationQueuesGetOrCreateDefaultResponseSuccess | modelHubAnnotationQueuesGetOrCreateDefaultResponseError)
-
-export const getModelHubAnnotationQueuesGetOrCreateDefaultUrl = () => {
-
-
-
-
-  return `/model-hub/annotation-queues/get-or-create-default/`
-}
-
-/**
- * Get or create the default annotation queue for a project, dataset, or agent definition.
-Default queues are open to all org members (no annotator restriction).
-
-Body params (one of):
-  - project_id
-  - dataset_id
-  - agent_definition_id
- */
-export const modelHubAnnotationQueuesGetOrCreateDefault = async (queueDefaultRequestApi: QueueDefaultRequestApi, options?: RequestInit): Promise<modelHubAnnotationQueuesGetOrCreateDefaultResponse> => {
-
-  return apiMutator<modelHubAnnotationQueuesGetOrCreateDefaultResponse>(getModelHubAnnotationQueuesGetOrCreateDefaultUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      queueDefaultRequestApi,)
   }
 );}
 
@@ -22776,367 +22614,6 @@ export const modelHubAnnotationQueuesItemsCreate = async (queueId: string,
 
 
 
-export type modelHubAnnotationQueuesItemsAddItemsResponse200 = {
-  data: QueueAddItemsResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationQueuesItemsAddItemsResponse400 = {
-  data: ApiSelectionTooLargeErrorApi
-  status: 400
-}
-
-export type modelHubAnnotationQueuesItemsAddItemsResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationQueuesItemsAddItemsResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubAnnotationQueuesItemsAddItemsResponse413 = {
-  data: ApiTooLargeErrorApi
-  status: 413
-}
-
-export type modelHubAnnotationQueuesItemsAddItemsResponse503 = {
-  data: ApiTextErrorResponseApi
-  status: 503
-}
-
-export type modelHubAnnotationQueuesItemsAddItemsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 413 | 503>
-}
-
-export type modelHubAnnotationQueuesItemsAddItemsResponseSuccess = (modelHubAnnotationQueuesItemsAddItemsResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationQueuesItemsAddItemsResponseError = (modelHubAnnotationQueuesItemsAddItemsResponse400 | modelHubAnnotationQueuesItemsAddItemsResponse403 | modelHubAnnotationQueuesItemsAddItemsResponse404 | modelHubAnnotationQueuesItemsAddItemsResponse413 | modelHubAnnotationQueuesItemsAddItemsResponse503 | modelHubAnnotationQueuesItemsAddItemsResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationQueuesItemsAddItemsResponse = (modelHubAnnotationQueuesItemsAddItemsResponseSuccess | modelHubAnnotationQueuesItemsAddItemsResponseError)
-
-export const getModelHubAnnotationQueuesItemsAddItemsUrl = (queueId: string,) => {
-
-
-
-
-  return `/model-hub/annotation-queues/${queueId}/items/add-items/`
-}
-
-export const modelHubAnnotationQueuesItemsAddItems = async (queueId: string,
-    addItemsApi: AddItemsApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsAddItemsResponse> => {
-
-  return apiMutator<modelHubAnnotationQueuesItemsAddItemsResponse>(getModelHubAnnotationQueuesItemsAddItemsUrl(queueId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      addItemsApi,)
-  }
-);}
-
-
-
-export type modelHubAnnotationQueuesItemsAssignItemsResponse200 = {
-  data: QueueAssignItemsResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationQueuesItemsAssignItemsResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubAnnotationQueuesItemsAssignItemsResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationQueuesItemsAssignItemsResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubAnnotationQueuesItemsAssignItemsResponse409 = {
-  data: ApiTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubAnnotationQueuesItemsAssignItemsResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubAnnotationQueuesItemsAssignItemsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubAnnotationQueuesItemsAssignItemsResponseSuccess = (modelHubAnnotationQueuesItemsAssignItemsResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationQueuesItemsAssignItemsResponseError = (modelHubAnnotationQueuesItemsAssignItemsResponse400 | modelHubAnnotationQueuesItemsAssignItemsResponse403 | modelHubAnnotationQueuesItemsAssignItemsResponse404 | modelHubAnnotationQueuesItemsAssignItemsResponse409 | modelHubAnnotationQueuesItemsAssignItemsResponse500 | modelHubAnnotationQueuesItemsAssignItemsResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationQueuesItemsAssignItemsResponse = (modelHubAnnotationQueuesItemsAssignItemsResponseSuccess | modelHubAnnotationQueuesItemsAssignItemsResponseError)
-
-export const getModelHubAnnotationQueuesItemsAssignItemsUrl = (queueId: string,) => {
-
-
-
-
-  return `/model-hub/annotation-queues/${queueId}/items/assign/`
-}
-
-/**
- * Assign items to one or more annotators.
- */
-export const modelHubAnnotationQueuesItemsAssignItems = async (queueId: string,
-    assignItemsApi: AssignItemsApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsAssignItemsResponse> => {
-
-  return apiMutator<modelHubAnnotationQueuesItemsAssignItemsResponse>(getModelHubAnnotationQueuesItemsAssignItemsUrl(queueId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      assignItemsApi,)
-  }
-);}
-
-
-
-export type modelHubAnnotationQueuesItemsBulkRemoveResponse200 = {
-  data: QueueBulkRemoveItemsResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationQueuesItemsBulkRemoveResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubAnnotationQueuesItemsBulkRemoveResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationQueuesItemsBulkRemoveResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubAnnotationQueuesItemsBulkRemoveResponse409 = {
-  data: ApiTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubAnnotationQueuesItemsBulkRemoveResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubAnnotationQueuesItemsBulkRemoveResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubAnnotationQueuesItemsBulkRemoveResponseSuccess = (modelHubAnnotationQueuesItemsBulkRemoveResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationQueuesItemsBulkRemoveResponseError = (modelHubAnnotationQueuesItemsBulkRemoveResponse400 | modelHubAnnotationQueuesItemsBulkRemoveResponse403 | modelHubAnnotationQueuesItemsBulkRemoveResponse404 | modelHubAnnotationQueuesItemsBulkRemoveResponse409 | modelHubAnnotationQueuesItemsBulkRemoveResponse500 | modelHubAnnotationQueuesItemsBulkRemoveResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationQueuesItemsBulkRemoveResponse = (modelHubAnnotationQueuesItemsBulkRemoveResponseSuccess | modelHubAnnotationQueuesItemsBulkRemoveResponseError)
-
-export const getModelHubAnnotationQueuesItemsBulkRemoveUrl = (queueId: string,) => {
-
-
-
-
-  return `/model-hub/annotation-queues/${queueId}/items/bulk-remove/`
-}
-
-export const modelHubAnnotationQueuesItemsBulkRemove = async (queueId: string,
-    bulkRemoveItemsApi: BulkRemoveItemsApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsBulkRemoveResponse> => {
-
-  return apiMutator<modelHubAnnotationQueuesItemsBulkRemoveResponse>(getModelHubAnnotationQueuesItemsBulkRemoveUrl(queueId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      bulkRemoveItemsApi,)
-  }
-);}
-
-
-
-export type modelHubAnnotationQueuesItemsBulkReviewResponse200 = {
-  data: QueueBulkReviewItemsResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationQueuesItemsBulkReviewResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubAnnotationQueuesItemsBulkReviewResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationQueuesItemsBulkReviewResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubAnnotationQueuesItemsBulkReviewResponse409 = {
-  data: ApiTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubAnnotationQueuesItemsBulkReviewResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubAnnotationQueuesItemsBulkReviewResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubAnnotationQueuesItemsBulkReviewResponseSuccess = (modelHubAnnotationQueuesItemsBulkReviewResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationQueuesItemsBulkReviewResponseError = (modelHubAnnotationQueuesItemsBulkReviewResponse400 | modelHubAnnotationQueuesItemsBulkReviewResponse403 | modelHubAnnotationQueuesItemsBulkReviewResponse404 | modelHubAnnotationQueuesItemsBulkReviewResponse409 | modelHubAnnotationQueuesItemsBulkReviewResponse500 | modelHubAnnotationQueuesItemsBulkReviewResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationQueuesItemsBulkReviewResponse = (modelHubAnnotationQueuesItemsBulkReviewResponseSuccess | modelHubAnnotationQueuesItemsBulkReviewResponseError)
-
-export const getModelHubAnnotationQueuesItemsBulkReviewUrl = (queueId: string,) => {
-
-
-
-
-  return `/model-hub/annotation-queues/${queueId}/items/bulk-review/`
-}
-
-/**
- * Approve or send back multiple pending-review items.
- */
-export const modelHubAnnotationQueuesItemsBulkReview = async (queueId: string,
-    bulkReviewItemsRequestApi: BulkReviewItemsRequestApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsBulkReviewResponse> => {
-
-  return apiMutator<modelHubAnnotationQueuesItemsBulkReviewResponse>(getModelHubAnnotationQueuesItemsBulkReviewUrl(queueId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      bulkReviewItemsRequestApi,)
-  }
-);}
-
-
-
-export type modelHubAnnotationQueuesItemsNextItemResponse200 = {
-  data: QueueNextItemResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationQueuesItemsNextItemResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubAnnotationQueuesItemsNextItemResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationQueuesItemsNextItemResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubAnnotationQueuesItemsNextItemResponse409 = {
-  data: ApiTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubAnnotationQueuesItemsNextItemResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubAnnotationQueuesItemsNextItemResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubAnnotationQueuesItemsNextItemResponseSuccess = (modelHubAnnotationQueuesItemsNextItemResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationQueuesItemsNextItemResponseError = (modelHubAnnotationQueuesItemsNextItemResponse400 | modelHubAnnotationQueuesItemsNextItemResponse403 | modelHubAnnotationQueuesItemsNextItemResponse404 | modelHubAnnotationQueuesItemsNextItemResponse409 | modelHubAnnotationQueuesItemsNextItemResponse500 | modelHubAnnotationQueuesItemsNextItemResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationQueuesItemsNextItemResponse = (modelHubAnnotationQueuesItemsNextItemResponseSuccess | modelHubAnnotationQueuesItemsNextItemResponseError)
-
-export const getModelHubAnnotationQueuesItemsNextItemUrl = (queueId: string,
-    params?: ModelHubAnnotationQueuesItemsNextItemParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/annotation-queues/${queueId}/items/next-item/?${stringifiedParams}` : `/model-hub/annotation-queues/${queueId}/items/next-item/`
-}
-
-/**
- * Query params:
-  exclude: comma-separated item IDs to skip
-  before:  item ID — returns the item immediately before this one in order
-  review_status: optional review status filter (for reviewer queues)
-  exclude_review_status: optional review status to omit (for annotator queues)
-  include_completed: when true, navigation can visit completed items too
- * @summary Get the next or previous item in the queue.
- */
-export const modelHubAnnotationQueuesItemsNextItem = async (queueId: string,
-    params?: ModelHubAnnotationQueuesItemsNextItemParams, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsNextItemResponse> => {
-
-  return apiMutator<modelHubAnnotationQueuesItemsNextItemResponse>(getModelHubAnnotationQueuesItemsNextItemUrl(queueId,params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type modelHubAnnotationQueuesItemsReadResponse200 = {
   data: QueueItemApi
   status: 200
@@ -23820,6 +23297,148 @@ export const modelHubAnnotationQueuesItemsDiscussionCreate = async (queueId: str
 
 
 
+export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse200 = {
+  data: QueueDiscussionResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse409 = {
+  data: ApiTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseSuccess = (modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseError = (modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse400 | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse403 | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse404 | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse409 | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse500 | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse = (modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseSuccess | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseError)
+
+export const getModelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadUrl = (queueId: string,
+    id: string,
+    threadId: string,) => {
+
+
+
+
+  return `/model-hub/annotation-queues/${queueId}/items/${id}/discussion/${threadId}/reopen/`
+}
+
+export const modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThread = async (queueId: string,
+    id: string,
+    threadId: string,
+    discussionThreadStatusRequestApi: DiscussionThreadStatusRequestApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse> => {
+
+  return apiMutator<modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse>(getModelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadUrl(queueId,id,threadId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      discussionThreadStatusRequestApi,)
+  }
+);}
+
+
+
+export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse200 = {
+  data: QueueDiscussionResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse409 = {
+  data: ApiTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseSuccess = (modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseError = (modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse400 | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse403 | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse404 | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse409 | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse500 | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse = (modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseSuccess | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseError)
+
+export const getModelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadUrl = (queueId: string,
+    id: string,
+    threadId: string,) => {
+
+
+
+
+  return `/model-hub/annotation-queues/${queueId}/items/${id}/discussion/${threadId}/resolve/`
+}
+
+export const modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThread = async (queueId: string,
+    id: string,
+    threadId: string,
+    discussionThreadStatusRequestApi: DiscussionThreadStatusRequestApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse> => {
+
+  return apiMutator<modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse>(getModelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadUrl(queueId,id,threadId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      discussionThreadStatusRequestApi,)
+  }
+);}
+
+
+
 export type modelHubAnnotationQueuesItemsDiscussionCommentsPartialUpdateResponse200 = {
   data: QueueDiscussionResponseApi
   status: 200
@@ -24010,148 +23629,6 @@ export const modelHubAnnotationQueuesItemsDiscussionCommentsDiscussionCommentRea
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       discussionReactionRequestApi,)
-  }
-);}
-
-
-
-export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse200 = {
-  data: QueueDiscussionResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse409 = {
-  data: ApiTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseSuccess = (modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseError = (modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse400 | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse403 | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse404 | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse409 | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse500 | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse = (modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseSuccess | modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponseError)
-
-export const getModelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadUrl = (queueId: string,
-    id: string,
-    threadId: string,) => {
-
-
-
-
-  return `/model-hub/annotation-queues/${queueId}/items/${id}/discussion/${threadId}/reopen/`
-}
-
-export const modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThread = async (queueId: string,
-    id: string,
-    threadId: string,
-    discussionThreadStatusRequestApi: DiscussionThreadStatusRequestApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse> => {
-
-  return apiMutator<modelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadResponse>(getModelHubAnnotationQueuesItemsDiscussionReopenDiscussionThreadUrl(queueId,id,threadId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      discussionThreadStatusRequestApi,)
-  }
-);}
-
-
-
-export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse200 = {
-  data: QueueDiscussionResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse409 = {
-  data: ApiTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseSuccess = (modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseError = (modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse400 | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse403 | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse404 | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse409 | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse500 | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse = (modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseSuccess | modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponseError)
-
-export const getModelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadUrl = (queueId: string,
-    id: string,
-    threadId: string,) => {
-
-
-
-
-  return `/model-hub/annotation-queues/${queueId}/items/${id}/discussion/${threadId}/resolve/`
-}
-
-export const modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThread = async (queueId: string,
-    id: string,
-    threadId: string,
-    discussionThreadStatusRequestApi: DiscussionThreadStatusRequestApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse> => {
-
-  return apiMutator<modelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadResponse>(getModelHubAnnotationQueuesItemsDiscussionResolveDiscussionThreadUrl(queueId,id,threadId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      discussionThreadStatusRequestApi,)
   }
 );}
 
@@ -24368,6 +23845,528 @@ export const modelHubAnnotationQueuesItemsSkipItem = async (queueId: string,
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       queueItemNavigationRequestApi,)
+  }
+);}
+
+
+
+export type modelHubAnnotationQueuesItemsAddItemsResponse200 = {
+  data: QueueAddItemsResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationQueuesItemsAddItemsResponse400 = {
+  data: ApiSelectionTooLargeErrorApi
+  status: 400
+}
+
+export type modelHubAnnotationQueuesItemsAddItemsResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationQueuesItemsAddItemsResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubAnnotationQueuesItemsAddItemsResponse413 = {
+  data: ApiTooLargeErrorApi
+  status: 413
+}
+
+export type modelHubAnnotationQueuesItemsAddItemsResponse503 = {
+  data: ApiTextErrorResponseApi
+  status: 503
+}
+
+export type modelHubAnnotationQueuesItemsAddItemsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 413 | 503>
+}
+
+export type modelHubAnnotationQueuesItemsAddItemsResponseSuccess = (modelHubAnnotationQueuesItemsAddItemsResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationQueuesItemsAddItemsResponseError = (modelHubAnnotationQueuesItemsAddItemsResponse400 | modelHubAnnotationQueuesItemsAddItemsResponse403 | modelHubAnnotationQueuesItemsAddItemsResponse404 | modelHubAnnotationQueuesItemsAddItemsResponse413 | modelHubAnnotationQueuesItemsAddItemsResponse503 | modelHubAnnotationQueuesItemsAddItemsResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationQueuesItemsAddItemsResponse = (modelHubAnnotationQueuesItemsAddItemsResponseSuccess | modelHubAnnotationQueuesItemsAddItemsResponseError)
+
+export const getModelHubAnnotationQueuesItemsAddItemsUrl = (queueId: string,) => {
+
+
+
+
+  return `/model-hub/annotation-queues/${queueId}/items/add-items/`
+}
+
+export const modelHubAnnotationQueuesItemsAddItems = async (queueId: string,
+    addItemsApi: AddItemsApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsAddItemsResponse> => {
+
+  return apiMutator<modelHubAnnotationQueuesItemsAddItemsResponse>(getModelHubAnnotationQueuesItemsAddItemsUrl(queueId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      addItemsApi,)
+  }
+);}
+
+
+
+export type modelHubAnnotationQueuesItemsAssignItemsResponse200 = {
+  data: QueueAssignItemsResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationQueuesItemsAssignItemsResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubAnnotationQueuesItemsAssignItemsResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationQueuesItemsAssignItemsResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubAnnotationQueuesItemsAssignItemsResponse409 = {
+  data: ApiTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubAnnotationQueuesItemsAssignItemsResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubAnnotationQueuesItemsAssignItemsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubAnnotationQueuesItemsAssignItemsResponseSuccess = (modelHubAnnotationQueuesItemsAssignItemsResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationQueuesItemsAssignItemsResponseError = (modelHubAnnotationQueuesItemsAssignItemsResponse400 | modelHubAnnotationQueuesItemsAssignItemsResponse403 | modelHubAnnotationQueuesItemsAssignItemsResponse404 | modelHubAnnotationQueuesItemsAssignItemsResponse409 | modelHubAnnotationQueuesItemsAssignItemsResponse500 | modelHubAnnotationQueuesItemsAssignItemsResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationQueuesItemsAssignItemsResponse = (modelHubAnnotationQueuesItemsAssignItemsResponseSuccess | modelHubAnnotationQueuesItemsAssignItemsResponseError)
+
+export const getModelHubAnnotationQueuesItemsAssignItemsUrl = (queueId: string,) => {
+
+
+
+
+  return `/model-hub/annotation-queues/${queueId}/items/assign/`
+}
+
+/**
+ * Assign items to one or more annotators.
+ */
+export const modelHubAnnotationQueuesItemsAssignItems = async (queueId: string,
+    assignItemsApi: AssignItemsApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsAssignItemsResponse> => {
+
+  return apiMutator<modelHubAnnotationQueuesItemsAssignItemsResponse>(getModelHubAnnotationQueuesItemsAssignItemsUrl(queueId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      assignItemsApi,)
+  }
+);}
+
+
+
+export type modelHubAnnotationQueuesItemsBulkRemoveResponse200 = {
+  data: QueueBulkRemoveItemsResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationQueuesItemsBulkRemoveResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubAnnotationQueuesItemsBulkRemoveResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationQueuesItemsBulkRemoveResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubAnnotationQueuesItemsBulkRemoveResponse409 = {
+  data: ApiTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubAnnotationQueuesItemsBulkRemoveResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubAnnotationQueuesItemsBulkRemoveResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubAnnotationQueuesItemsBulkRemoveResponseSuccess = (modelHubAnnotationQueuesItemsBulkRemoveResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationQueuesItemsBulkRemoveResponseError = (modelHubAnnotationQueuesItemsBulkRemoveResponse400 | modelHubAnnotationQueuesItemsBulkRemoveResponse403 | modelHubAnnotationQueuesItemsBulkRemoveResponse404 | modelHubAnnotationQueuesItemsBulkRemoveResponse409 | modelHubAnnotationQueuesItemsBulkRemoveResponse500 | modelHubAnnotationQueuesItemsBulkRemoveResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationQueuesItemsBulkRemoveResponse = (modelHubAnnotationQueuesItemsBulkRemoveResponseSuccess | modelHubAnnotationQueuesItemsBulkRemoveResponseError)
+
+export const getModelHubAnnotationQueuesItemsBulkRemoveUrl = (queueId: string,) => {
+
+
+
+
+  return `/model-hub/annotation-queues/${queueId}/items/bulk-remove/`
+}
+
+export const modelHubAnnotationQueuesItemsBulkRemove = async (queueId: string,
+    bulkRemoveItemsApi: BulkRemoveItemsApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsBulkRemoveResponse> => {
+
+  return apiMutator<modelHubAnnotationQueuesItemsBulkRemoveResponse>(getModelHubAnnotationQueuesItemsBulkRemoveUrl(queueId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      bulkRemoveItemsApi,)
+  }
+);}
+
+
+
+export type modelHubAnnotationQueuesItemsBulkReviewResponse200 = {
+  data: QueueBulkReviewItemsResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationQueuesItemsBulkReviewResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubAnnotationQueuesItemsBulkReviewResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationQueuesItemsBulkReviewResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubAnnotationQueuesItemsBulkReviewResponse409 = {
+  data: ApiTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubAnnotationQueuesItemsBulkReviewResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubAnnotationQueuesItemsBulkReviewResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubAnnotationQueuesItemsBulkReviewResponseSuccess = (modelHubAnnotationQueuesItemsBulkReviewResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationQueuesItemsBulkReviewResponseError = (modelHubAnnotationQueuesItemsBulkReviewResponse400 | modelHubAnnotationQueuesItemsBulkReviewResponse403 | modelHubAnnotationQueuesItemsBulkReviewResponse404 | modelHubAnnotationQueuesItemsBulkReviewResponse409 | modelHubAnnotationQueuesItemsBulkReviewResponse500 | modelHubAnnotationQueuesItemsBulkReviewResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationQueuesItemsBulkReviewResponse = (modelHubAnnotationQueuesItemsBulkReviewResponseSuccess | modelHubAnnotationQueuesItemsBulkReviewResponseError)
+
+export const getModelHubAnnotationQueuesItemsBulkReviewUrl = (queueId: string,) => {
+
+
+
+
+  return `/model-hub/annotation-queues/${queueId}/items/bulk-review/`
+}
+
+/**
+ * Approve or send back multiple pending-review items.
+ */
+export const modelHubAnnotationQueuesItemsBulkReview = async (queueId: string,
+    bulkReviewItemsRequestApi: BulkReviewItemsRequestApi, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsBulkReviewResponse> => {
+
+  return apiMutator<modelHubAnnotationQueuesItemsBulkReviewResponse>(getModelHubAnnotationQueuesItemsBulkReviewUrl(queueId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      bulkReviewItemsRequestApi,)
+  }
+);}
+
+
+
+export type modelHubAnnotationQueuesItemsNextItemResponse200 = {
+  data: QueueNextItemResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationQueuesItemsNextItemResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubAnnotationQueuesItemsNextItemResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationQueuesItemsNextItemResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubAnnotationQueuesItemsNextItemResponse409 = {
+  data: ApiTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubAnnotationQueuesItemsNextItemResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubAnnotationQueuesItemsNextItemResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubAnnotationQueuesItemsNextItemResponseSuccess = (modelHubAnnotationQueuesItemsNextItemResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationQueuesItemsNextItemResponseError = (modelHubAnnotationQueuesItemsNextItemResponse400 | modelHubAnnotationQueuesItemsNextItemResponse403 | modelHubAnnotationQueuesItemsNextItemResponse404 | modelHubAnnotationQueuesItemsNextItemResponse409 | modelHubAnnotationQueuesItemsNextItemResponse500 | modelHubAnnotationQueuesItemsNextItemResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationQueuesItemsNextItemResponse = (modelHubAnnotationQueuesItemsNextItemResponseSuccess | modelHubAnnotationQueuesItemsNextItemResponseError)
+
+export const getModelHubAnnotationQueuesItemsNextItemUrl = (queueId: string,
+    params?: ModelHubAnnotationQueuesItemsNextItemParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/annotation-queues/${queueId}/items/next-item/?${stringifiedParams}` : `/model-hub/annotation-queues/${queueId}/items/next-item/`
+}
+
+/**
+ * Query params:
+  exclude: comma-separated item IDs to skip
+  before:  item ID — returns the item immediately before this one in order
+  review_status: optional review status filter (for reviewer queues)
+  exclude_review_status: optional review status to omit (for annotator queues)
+  include_completed: when true, navigation can visit completed items too
+ * @summary Get the next or previous item in the queue.
+ */
+export const modelHubAnnotationQueuesItemsNextItem = async (queueId: string,
+    params?: ModelHubAnnotationQueuesItemsNextItemParams, options?: RequestInit): Promise<modelHubAnnotationQueuesItemsNextItemResponse> => {
+
+  return apiMutator<modelHubAnnotationQueuesItemsNextItemResponse>(getModelHubAnnotationQueuesItemsNextItemUrl(queueId,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubAnnotationQueuesForSourceResponse200 = {
+  data: QueueForSourceResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationQueuesForSourceResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubAnnotationQueuesForSourceResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationQueuesForSourceResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubAnnotationQueuesForSourceResponse409 = {
+  data: ApiTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubAnnotationQueuesForSourceResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubAnnotationQueuesForSourceResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubAnnotationQueuesForSourceResponseSuccess = (modelHubAnnotationQueuesForSourceResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationQueuesForSourceResponseError = (modelHubAnnotationQueuesForSourceResponse400 | modelHubAnnotationQueuesForSourceResponse403 | modelHubAnnotationQueuesForSourceResponse404 | modelHubAnnotationQueuesForSourceResponse409 | modelHubAnnotationQueuesForSourceResponse500 | modelHubAnnotationQueuesForSourceResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationQueuesForSourceResponse = (modelHubAnnotationQueuesForSourceResponseSuccess | modelHubAnnotationQueuesForSourceResponseError)
+
+export const getModelHubAnnotationQueuesForSourceUrl = (params?: ModelHubAnnotationQueuesForSourceParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/annotation-queues/for-source/?${stringifiedParams}` : `/model-hub/annotation-queues/for-source/`
+}
+
+/**
+ * Find annotation queues for a given source that the current user can annotate.
+Includes queues where:
+- The source is a queue item AND the user is an annotator in that queue
+  (regardless of whether the item is explicitly assigned to them)
+
+Query params:
+  - source_type, source_id  (single source)
+  - OR sources (JSON array of {source_type, source_id} objects for multi-source lookup)
+ */
+export const modelHubAnnotationQueuesForSource = async (params?: ModelHubAnnotationQueuesForSourceParams, options?: RequestInit): Promise<modelHubAnnotationQueuesForSourceResponse> => {
+
+  return apiMutator<modelHubAnnotationQueuesForSourceResponse>(getModelHubAnnotationQueuesForSourceUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubAnnotationQueuesGetOrCreateDefaultResponse200 = {
+  data: QueueDefaultResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationQueuesGetOrCreateDefaultResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubAnnotationQueuesGetOrCreateDefaultResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationQueuesGetOrCreateDefaultResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubAnnotationQueuesGetOrCreateDefaultResponse409 = {
+  data: ApiTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubAnnotationQueuesGetOrCreateDefaultResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubAnnotationQueuesGetOrCreateDefaultResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubAnnotationQueuesGetOrCreateDefaultResponseSuccess = (modelHubAnnotationQueuesGetOrCreateDefaultResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationQueuesGetOrCreateDefaultResponseError = (modelHubAnnotationQueuesGetOrCreateDefaultResponse400 | modelHubAnnotationQueuesGetOrCreateDefaultResponse403 | modelHubAnnotationQueuesGetOrCreateDefaultResponse404 | modelHubAnnotationQueuesGetOrCreateDefaultResponse409 | modelHubAnnotationQueuesGetOrCreateDefaultResponse500 | modelHubAnnotationQueuesGetOrCreateDefaultResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationQueuesGetOrCreateDefaultResponse = (modelHubAnnotationQueuesGetOrCreateDefaultResponseSuccess | modelHubAnnotationQueuesGetOrCreateDefaultResponseError)
+
+export const getModelHubAnnotationQueuesGetOrCreateDefaultUrl = () => {
+
+
+
+
+  return `/model-hub/annotation-queues/get-or-create-default/`
+}
+
+/**
+ * Get or create the default annotation queue for a project, dataset, or agent definition.
+Default queues are open to all org members (no annotator restriction).
+
+Body params (one of):
+  - project_id
+  - dataset_id
+  - agent_definition_id
+ */
+export const modelHubAnnotationQueuesGetOrCreateDefault = async (queueDefaultRequestApi: QueueDefaultRequestApi, options?: RequestInit): Promise<modelHubAnnotationQueuesGetOrCreateDefaultResponse> => {
+
+  return apiMutator<modelHubAnnotationQueuesGetOrCreateDefaultResponse>(getModelHubAnnotationQueuesGetOrCreateDefaultUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      queueDefaultRequestApi,)
   }
 );}
 
@@ -24905,125 +24904,6 @@ export const modelHubAnnotationsCreate = async (annotationsApi: NonReadonly<Anno
 
 
 
-export type modelHubAnnotationsBulkDestroyResponse200 = {
-  data: BulkDestroyAnnotationsResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationsBulkDestroyResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubAnnotationsBulkDestroyResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationsBulkDestroyResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubAnnotationsBulkDestroyResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 500>
-}
-
-export type modelHubAnnotationsBulkDestroyResponseSuccess = (modelHubAnnotationsBulkDestroyResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationsBulkDestroyResponseError = (modelHubAnnotationsBulkDestroyResponse400 | modelHubAnnotationsBulkDestroyResponse403 | modelHubAnnotationsBulkDestroyResponse500 | modelHubAnnotationsBulkDestroyResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationsBulkDestroyResponse = (modelHubAnnotationsBulkDestroyResponseSuccess | modelHubAnnotationsBulkDestroyResponseError)
-
-export const getModelHubAnnotationsBulkDestroyUrl = () => {
-
-
-
-
-  return `/model-hub/annotations/bulk_destroy/`
-}
-
-/**
- * Bulk delete annotations and their associated data
-Expected input: {"annotation_ids": ["uuid1", "uuid2", ...]}
- */
-export const modelHubAnnotationsBulkDestroy = async (bulkDestroyAnnotationsRequestApi: BulkDestroyAnnotationsRequestApi, options?: RequestInit): Promise<modelHubAnnotationsBulkDestroyResponse> => {
-
-  return apiMutator<modelHubAnnotationsBulkDestroyResponse>(getModelHubAnnotationsBulkDestroyUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      bulkDestroyAnnotationsRequestApi,)
-  }
-);}
-
-
-
-export type modelHubAnnotationsPreviewAnnotationsResponse200 = {
-  data: PreviewAnnotationsResponseApi
-  status: 200
-}
-
-export type modelHubAnnotationsPreviewAnnotationsResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubAnnotationsPreviewAnnotationsResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubAnnotationsPreviewAnnotationsResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubAnnotationsPreviewAnnotationsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 500>
-}
-
-export type modelHubAnnotationsPreviewAnnotationsResponseSuccess = (modelHubAnnotationsPreviewAnnotationsResponse200) & {
-  headers: Headers;
-};
-export type modelHubAnnotationsPreviewAnnotationsResponseError = (modelHubAnnotationsPreviewAnnotationsResponse400 | modelHubAnnotationsPreviewAnnotationsResponse403 | modelHubAnnotationsPreviewAnnotationsResponse500 | modelHubAnnotationsPreviewAnnotationsResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubAnnotationsPreviewAnnotationsResponse = (modelHubAnnotationsPreviewAnnotationsResponseSuccess | modelHubAnnotationsPreviewAnnotationsResponseError)
-
-export const getModelHubAnnotationsPreviewAnnotationsUrl = () => {
-
-
-
-
-  return `/model-hub/annotations/preview_annotations/`
-}
-
-/**
- * Preview the first row of data for specified columns in a dataset.
- */
-export const modelHubAnnotationsPreviewAnnotations = async (previewAnnotationsRequestApi: PreviewAnnotationsRequestApi, options?: RequestInit): Promise<modelHubAnnotationsPreviewAnnotationsResponse> => {
-
-  return apiMutator<modelHubAnnotationsPreviewAnnotationsResponse>(getModelHubAnnotationsPreviewAnnotationsUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      previewAnnotationsRequestApi,)
-  }
-);}
-
-
-
 export type modelHubAnnotationsReadResponse200 = {
   data: AnnotationsApi
   status: 200
@@ -25353,6 +25233,125 @@ export const modelHubAnnotationsUpdateCells = async (id: string,
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       updateAnnotationCellsRequestApi,)
+  }
+);}
+
+
+
+export type modelHubAnnotationsBulkDestroyResponse200 = {
+  data: BulkDestroyAnnotationsResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationsBulkDestroyResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubAnnotationsBulkDestroyResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationsBulkDestroyResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubAnnotationsBulkDestroyResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 500>
+}
+
+export type modelHubAnnotationsBulkDestroyResponseSuccess = (modelHubAnnotationsBulkDestroyResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationsBulkDestroyResponseError = (modelHubAnnotationsBulkDestroyResponse400 | modelHubAnnotationsBulkDestroyResponse403 | modelHubAnnotationsBulkDestroyResponse500 | modelHubAnnotationsBulkDestroyResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationsBulkDestroyResponse = (modelHubAnnotationsBulkDestroyResponseSuccess | modelHubAnnotationsBulkDestroyResponseError)
+
+export const getModelHubAnnotationsBulkDestroyUrl = () => {
+
+
+
+
+  return `/model-hub/annotations/bulk_destroy/`
+}
+
+/**
+ * Bulk delete annotations and their associated data
+Expected input: {"annotation_ids": ["uuid1", "uuid2", ...]}
+ */
+export const modelHubAnnotationsBulkDestroy = async (bulkDestroyAnnotationsRequestApi: BulkDestroyAnnotationsRequestApi, options?: RequestInit): Promise<modelHubAnnotationsBulkDestroyResponse> => {
+
+  return apiMutator<modelHubAnnotationsBulkDestroyResponse>(getModelHubAnnotationsBulkDestroyUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      bulkDestroyAnnotationsRequestApi,)
+  }
+);}
+
+
+
+export type modelHubAnnotationsPreviewAnnotationsResponse200 = {
+  data: PreviewAnnotationsResponseApi
+  status: 200
+}
+
+export type modelHubAnnotationsPreviewAnnotationsResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubAnnotationsPreviewAnnotationsResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubAnnotationsPreviewAnnotationsResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubAnnotationsPreviewAnnotationsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 500>
+}
+
+export type modelHubAnnotationsPreviewAnnotationsResponseSuccess = (modelHubAnnotationsPreviewAnnotationsResponse200) & {
+  headers: Headers;
+};
+export type modelHubAnnotationsPreviewAnnotationsResponseError = (modelHubAnnotationsPreviewAnnotationsResponse400 | modelHubAnnotationsPreviewAnnotationsResponse403 | modelHubAnnotationsPreviewAnnotationsResponse500 | modelHubAnnotationsPreviewAnnotationsResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubAnnotationsPreviewAnnotationsResponse = (modelHubAnnotationsPreviewAnnotationsResponseSuccess | modelHubAnnotationsPreviewAnnotationsResponseError)
+
+export const getModelHubAnnotationsPreviewAnnotationsUrl = () => {
+
+
+
+
+  return `/model-hub/annotations/preview_annotations/`
+}
+
+/**
+ * Preview the first row of data for specified columns in a dataset.
+ */
+export const modelHubAnnotationsPreviewAnnotations = async (previewAnnotationsRequestApi: PreviewAnnotationsRequestApi, options?: RequestInit): Promise<modelHubAnnotationsPreviewAnnotationsResponse> => {
+
+  return apiMutator<modelHubAnnotationsPreviewAnnotationsResponse>(getModelHubAnnotationsPreviewAnnotationsUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      previewAnnotationsRequestApi,)
   }
 );}
 
@@ -26374,670 +26373,6 @@ export const modelHubCreateCustomEvalsCreate = async (customEvalTemplateCreateAp
 
 
 
-export type modelHubCustomMetricAllReadResponse200 = {
-  data: CustomMetricListResponseApi
-  status: 200
-}
-
-export type modelHubCustomMetricAllReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubCustomMetricAllReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubCustomMetricAllReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubCustomMetricAllReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubCustomMetricAllReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubCustomMetricAllReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubCustomMetricAllReadResponseSuccess = (modelHubCustomMetricAllReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubCustomMetricAllReadResponseError = (modelHubCustomMetricAllReadResponse400 | modelHubCustomMetricAllReadResponse403 | modelHubCustomMetricAllReadResponse404 | modelHubCustomMetricAllReadResponse409 | modelHubCustomMetricAllReadResponse500 | modelHubCustomMetricAllReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubCustomMetricAllReadResponse = (modelHubCustomMetricAllReadResponseSuccess | modelHubCustomMetricAllReadResponseError)
-
-export const getModelHubCustomMetricAllReadUrl = (modelId: string,) => {
-
-
-
-
-  return `/model-hub/custom-metric/all/${modelId}/`
-}
-
-export const modelHubCustomMetricAllRead = async (modelId: string, options?: RequestInit): Promise<modelHubCustomMetricAllReadResponse> => {
-
-  return apiMutator<modelHubCustomMetricAllReadResponse>(getModelHubCustomMetricAllReadUrl(modelId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubCustomMetricCreateCreateResponse200 = {
-  data: ModelHubStatusResponseApi
-  status: 200
-}
-
-export type modelHubCustomMetricCreateCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubCustomMetricCreateCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubCustomMetricCreateCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubCustomMetricCreateCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubCustomMetricCreateCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubCustomMetricCreateCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubCustomMetricCreateCreateResponseSuccess = (modelHubCustomMetricCreateCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubCustomMetricCreateCreateResponseError = (modelHubCustomMetricCreateCreateResponse400 | modelHubCustomMetricCreateCreateResponse403 | modelHubCustomMetricCreateCreateResponse404 | modelHubCustomMetricCreateCreateResponse409 | modelHubCustomMetricCreateCreateResponse500 | modelHubCustomMetricCreateCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubCustomMetricCreateCreateResponse = (modelHubCustomMetricCreateCreateResponseSuccess | modelHubCustomMetricCreateCreateResponseError)
-
-export const getModelHubCustomMetricCreateCreateUrl = () => {
-
-
-
-
-  return `/model-hub/custom-metric/create/`
-}
-
-export const modelHubCustomMetricCreateCreate = async (customMetricMutationRequestApi: CustomMetricMutationRequestApi, options?: RequestInit): Promise<modelHubCustomMetricCreateCreateResponse> => {
-
-  return apiMutator<modelHubCustomMetricCreateCreateResponse>(getModelHubCustomMetricCreateCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      customMetricMutationRequestApi,)
-  }
-);}
-
-
-
-export type modelHubCustomMetricTagOptionsReadResponse200 = {
-  data: MetricTagOptionApi[]
-  status: 200
-}
-
-export type modelHubCustomMetricTagOptionsReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubCustomMetricTagOptionsReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubCustomMetricTagOptionsReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubCustomMetricTagOptionsReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubCustomMetricTagOptionsReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubCustomMetricTagOptionsReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubCustomMetricTagOptionsReadResponseSuccess = (modelHubCustomMetricTagOptionsReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubCustomMetricTagOptionsReadResponseError = (modelHubCustomMetricTagOptionsReadResponse400 | modelHubCustomMetricTagOptionsReadResponse403 | modelHubCustomMetricTagOptionsReadResponse404 | modelHubCustomMetricTagOptionsReadResponse409 | modelHubCustomMetricTagOptionsReadResponse500 | modelHubCustomMetricTagOptionsReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubCustomMetricTagOptionsReadResponse = (modelHubCustomMetricTagOptionsReadResponseSuccess | modelHubCustomMetricTagOptionsReadResponseError)
-
-export const getModelHubCustomMetricTagOptionsReadUrl = (metricId: string,) => {
-
-
-
-
-  return `/model-hub/custom-metric/tag-options/${metricId}/`
-}
-
-export const modelHubCustomMetricTagOptionsRead = async (metricId: string, options?: RequestInit): Promise<modelHubCustomMetricTagOptionsReadResponse> => {
-
-  return apiMutator<modelHubCustomMetricTagOptionsReadResponse>(getModelHubCustomMetricTagOptionsReadUrl(metricId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubCustomMetricTestCreateResponse200 = {
-  data: CustomMetricTestResponseApi
-  status: 200
-}
-
-export type modelHubCustomMetricTestCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubCustomMetricTestCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubCustomMetricTestCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubCustomMetricTestCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubCustomMetricTestCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubCustomMetricTestCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubCustomMetricTestCreateResponseSuccess = (modelHubCustomMetricTestCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubCustomMetricTestCreateResponseError = (modelHubCustomMetricTestCreateResponse400 | modelHubCustomMetricTestCreateResponse403 | modelHubCustomMetricTestCreateResponse404 | modelHubCustomMetricTestCreateResponse409 | modelHubCustomMetricTestCreateResponse500 | modelHubCustomMetricTestCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubCustomMetricTestCreateResponse = (modelHubCustomMetricTestCreateResponseSuccess | modelHubCustomMetricTestCreateResponseError)
-
-export const getModelHubCustomMetricTestCreateUrl = () => {
-
-
-
-
-  return `/model-hub/custom-metric/test/`
-}
-
-export const modelHubCustomMetricTestCreate = async (customMetricTestRequestApi: CustomMetricTestRequestApi, options?: RequestInit): Promise<modelHubCustomMetricTestCreateResponse> => {
-
-  return apiMutator<modelHubCustomMetricTestCreateResponse>(getModelHubCustomMetricTestCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      customMetricTestRequestApi,)
-  }
-);}
-
-
-
-export type modelHubCustomMetricUpdateCreateResponse200 = {
-  data: ModelHubStatusResponseApi
-  status: 200
-}
-
-export type modelHubCustomMetricUpdateCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubCustomMetricUpdateCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubCustomMetricUpdateCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubCustomMetricUpdateCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubCustomMetricUpdateCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubCustomMetricUpdateCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubCustomMetricUpdateCreateResponseSuccess = (modelHubCustomMetricUpdateCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubCustomMetricUpdateCreateResponseError = (modelHubCustomMetricUpdateCreateResponse400 | modelHubCustomMetricUpdateCreateResponse403 | modelHubCustomMetricUpdateCreateResponse404 | modelHubCustomMetricUpdateCreateResponse409 | modelHubCustomMetricUpdateCreateResponse500 | modelHubCustomMetricUpdateCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubCustomMetricUpdateCreateResponse = (modelHubCustomMetricUpdateCreateResponseSuccess | modelHubCustomMetricUpdateCreateResponseError)
-
-export const getModelHubCustomMetricUpdateCreateUrl = () => {
-
-
-
-
-  return `/model-hub/custom-metric/update/`
-}
-
-export const modelHubCustomMetricUpdateCreate = async (customMetricMutationRequestApi: CustomMetricMutationRequestApi, options?: RequestInit): Promise<modelHubCustomMetricUpdateCreateResponse> => {
-
-  return apiMutator<modelHubCustomMetricUpdateCreateResponse>(getModelHubCustomMetricUpdateCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      customMetricMutationRequestApi,)
-  }
-);}
-
-
-
-export type modelHubCustomMetricReadResponse200 = {
-  data: ModelHubPaginatedResponseApi
-  status: 200
-}
-
-export type modelHubCustomMetricReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubCustomMetricReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubCustomMetricReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubCustomMetricReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubCustomMetricReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubCustomMetricReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubCustomMetricReadResponseSuccess = (modelHubCustomMetricReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubCustomMetricReadResponseError = (modelHubCustomMetricReadResponse400 | modelHubCustomMetricReadResponse403 | modelHubCustomMetricReadResponse404 | modelHubCustomMetricReadResponse409 | modelHubCustomMetricReadResponse500 | modelHubCustomMetricReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubCustomMetricReadResponse = (modelHubCustomMetricReadResponseSuccess | modelHubCustomMetricReadResponseError)
-
-export const getModelHubCustomMetricReadUrl = (modelId: string,) => {
-
-
-
-
-  return `/model-hub/custom-metric/${modelId}/`
-}
-
-export const modelHubCustomMetricRead = async (modelId: string, options?: RequestInit): Promise<modelHubCustomMetricReadResponse> => {
-
-  return apiMutator<modelHubCustomMetricReadResponse>(getModelHubCustomMetricReadUrl(modelId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubCustomModelsListResponse200 = {
-  data: ModelHubPaginatedResponseApi
-  status: 200
-}
-
-export type modelHubCustomModelsListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubCustomModelsListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubCustomModelsListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubCustomModelsListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubCustomModelsListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubCustomModelsListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubCustomModelsListResponseSuccess = (modelHubCustomModelsListResponse200) & {
-  headers: Headers;
-};
-export type modelHubCustomModelsListResponseError = (modelHubCustomModelsListResponse400 | modelHubCustomModelsListResponse403 | modelHubCustomModelsListResponse404 | modelHubCustomModelsListResponse409 | modelHubCustomModelsListResponse500 | modelHubCustomModelsListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubCustomModelsListResponse = (modelHubCustomModelsListResponseSuccess | modelHubCustomModelsListResponseError)
-
-export const getModelHubCustomModelsListUrl = () => {
-
-
-
-
-  return `/model-hub/custom-models/`
-}
-
-/**
- * Return all the models that belongs to a user organization
- */
-export const modelHubCustomModelsList = async ( options?: RequestInit): Promise<modelHubCustomModelsListResponse> => {
-
-  return apiMutator<modelHubCustomModelsListResponse>(getModelHubCustomModelsListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubCustomModelsListListResponse200 = {
-  data: ModelHubPaginatedResponseApi
-  status: 200
-}
-
-export type modelHubCustomModelsListListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubCustomModelsListListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubCustomModelsListListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubCustomModelsListListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubCustomModelsListListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubCustomModelsListListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubCustomModelsListListResponseSuccess = (modelHubCustomModelsListListResponse200) & {
-  headers: Headers;
-};
-export type modelHubCustomModelsListListResponseError = (modelHubCustomModelsListListResponse400 | modelHubCustomModelsListListResponse403 | modelHubCustomModelsListListResponse404 | modelHubCustomModelsListListResponse409 | modelHubCustomModelsListListResponse500 | modelHubCustomModelsListListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubCustomModelsListListResponse = (modelHubCustomModelsListListResponseSuccess | modelHubCustomModelsListListResponseError)
-
-export const getModelHubCustomModelsListListUrl = () => {
-
-
-
-
-  return `/model-hub/custom-models/list/`
-}
-
-export const modelHubCustomModelsListList = async ( options?: RequestInit): Promise<modelHubCustomModelsListListResponse> => {
-
-  return apiMutator<modelHubCustomModelsListListResponse>(getModelHubCustomModelsListListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubCustomModelsReadResponse200 = {
-  data: CustomAIModelApi
-  status: 200
-}
-
-export type modelHubCustomModelsReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubCustomModelsReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubCustomModelsReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubCustomModelsReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubCustomModelsReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubCustomModelsReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubCustomModelsReadResponseSuccess = (modelHubCustomModelsReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubCustomModelsReadResponseError = (modelHubCustomModelsReadResponse400 | modelHubCustomModelsReadResponse403 | modelHubCustomModelsReadResponse404 | modelHubCustomModelsReadResponse409 | modelHubCustomModelsReadResponse500 | modelHubCustomModelsReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubCustomModelsReadResponse = (modelHubCustomModelsReadResponseSuccess | modelHubCustomModelsReadResponseError)
-
-export const getModelHubCustomModelsReadUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/custom-models/${id}/`
-}
-
-/**
- * Return details regarding a particular model, given his id
- */
-export const modelHubCustomModelsRead = async (id: string, options?: RequestInit): Promise<modelHubCustomModelsReadResponse> => {
-
-  return apiMutator<modelHubCustomModelsReadResponse>(getModelHubCustomModelsReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubCustomModelsCreateResponse200 = {
-  data: CustomAIModelApi
-  status: 200
-}
-
-export type modelHubCustomModelsCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubCustomModelsCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubCustomModelsCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubCustomModelsCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubCustomModelsCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubCustomModelsCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubCustomModelsCreateResponseSuccess = (modelHubCustomModelsCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubCustomModelsCreateResponseError = (modelHubCustomModelsCreateResponse400 | modelHubCustomModelsCreateResponse403 | modelHubCustomModelsCreateResponse404 | modelHubCustomModelsCreateResponse409 | modelHubCustomModelsCreateResponse500 | modelHubCustomModelsCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubCustomModelsCreateResponse = (modelHubCustomModelsCreateResponseSuccess | modelHubCustomModelsCreateResponseError)
-
-export const getModelHubCustomModelsCreateUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/custom-models/${id}/`
-}
-
-/**
- * Update custom model details
- */
-export const modelHubCustomModelsCreate = async (id: string,
-    customAIModelUpdateRequestApi: CustomAIModelUpdateRequestApi, options?: RequestInit): Promise<modelHubCustomModelsCreateResponse> => {
-
-  return apiMutator<modelHubCustomModelsCreateResponse>(getModelHubCustomModelsCreateUrl(id),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      customAIModelUpdateRequestApi,)
-  }
-);}
-
-
-
 export type modelHubCustomModelsCreateCreateResponse200 = {
   data: CustomAIModelCreateResponseApi
   status: 200
@@ -27433,6 +26768,670 @@ export const modelHubCustomModelsUpdateMetricCreate = async (id: string,
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       customAIModelDefaultMetricRequestApi,)
+  }
+);}
+
+
+
+export type modelHubCustomMetricReadResponse200 = {
+  data: ModelHubPaginatedResponseApi
+  status: 200
+}
+
+export type modelHubCustomMetricReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubCustomMetricReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubCustomMetricReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubCustomMetricReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubCustomMetricReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubCustomMetricReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubCustomMetricReadResponseSuccess = (modelHubCustomMetricReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubCustomMetricReadResponseError = (modelHubCustomMetricReadResponse400 | modelHubCustomMetricReadResponse403 | modelHubCustomMetricReadResponse404 | modelHubCustomMetricReadResponse409 | modelHubCustomMetricReadResponse500 | modelHubCustomMetricReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubCustomMetricReadResponse = (modelHubCustomMetricReadResponseSuccess | modelHubCustomMetricReadResponseError)
+
+export const getModelHubCustomMetricReadUrl = (modelId: string,) => {
+
+
+
+
+  return `/model-hub/custom-metric/${modelId}/`
+}
+
+export const modelHubCustomMetricRead = async (modelId: string, options?: RequestInit): Promise<modelHubCustomMetricReadResponse> => {
+
+  return apiMutator<modelHubCustomMetricReadResponse>(getModelHubCustomMetricReadUrl(modelId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubCustomMetricAllReadResponse200 = {
+  data: CustomMetricListResponseApi
+  status: 200
+}
+
+export type modelHubCustomMetricAllReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubCustomMetricAllReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubCustomMetricAllReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubCustomMetricAllReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubCustomMetricAllReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubCustomMetricAllReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubCustomMetricAllReadResponseSuccess = (modelHubCustomMetricAllReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubCustomMetricAllReadResponseError = (modelHubCustomMetricAllReadResponse400 | modelHubCustomMetricAllReadResponse403 | modelHubCustomMetricAllReadResponse404 | modelHubCustomMetricAllReadResponse409 | modelHubCustomMetricAllReadResponse500 | modelHubCustomMetricAllReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubCustomMetricAllReadResponse = (modelHubCustomMetricAllReadResponseSuccess | modelHubCustomMetricAllReadResponseError)
+
+export const getModelHubCustomMetricAllReadUrl = (modelId: string,) => {
+
+
+
+
+  return `/model-hub/custom-metric/all/${modelId}/`
+}
+
+export const modelHubCustomMetricAllRead = async (modelId: string, options?: RequestInit): Promise<modelHubCustomMetricAllReadResponse> => {
+
+  return apiMutator<modelHubCustomMetricAllReadResponse>(getModelHubCustomMetricAllReadUrl(modelId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubCustomMetricCreateCreateResponse200 = {
+  data: ModelHubStatusResponseApi
+  status: 200
+}
+
+export type modelHubCustomMetricCreateCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubCustomMetricCreateCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubCustomMetricCreateCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubCustomMetricCreateCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubCustomMetricCreateCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubCustomMetricCreateCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubCustomMetricCreateCreateResponseSuccess = (modelHubCustomMetricCreateCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubCustomMetricCreateCreateResponseError = (modelHubCustomMetricCreateCreateResponse400 | modelHubCustomMetricCreateCreateResponse403 | modelHubCustomMetricCreateCreateResponse404 | modelHubCustomMetricCreateCreateResponse409 | modelHubCustomMetricCreateCreateResponse500 | modelHubCustomMetricCreateCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubCustomMetricCreateCreateResponse = (modelHubCustomMetricCreateCreateResponseSuccess | modelHubCustomMetricCreateCreateResponseError)
+
+export const getModelHubCustomMetricCreateCreateUrl = () => {
+
+
+
+
+  return `/model-hub/custom-metric/create/`
+}
+
+export const modelHubCustomMetricCreateCreate = async (customMetricMutationRequestApi: CustomMetricMutationRequestApi, options?: RequestInit): Promise<modelHubCustomMetricCreateCreateResponse> => {
+
+  return apiMutator<modelHubCustomMetricCreateCreateResponse>(getModelHubCustomMetricCreateCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      customMetricMutationRequestApi,)
+  }
+);}
+
+
+
+export type modelHubCustomMetricTagOptionsReadResponse200 = {
+  data: MetricTagOptionApi[]
+  status: 200
+}
+
+export type modelHubCustomMetricTagOptionsReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubCustomMetricTagOptionsReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubCustomMetricTagOptionsReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubCustomMetricTagOptionsReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubCustomMetricTagOptionsReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubCustomMetricTagOptionsReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubCustomMetricTagOptionsReadResponseSuccess = (modelHubCustomMetricTagOptionsReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubCustomMetricTagOptionsReadResponseError = (modelHubCustomMetricTagOptionsReadResponse400 | modelHubCustomMetricTagOptionsReadResponse403 | modelHubCustomMetricTagOptionsReadResponse404 | modelHubCustomMetricTagOptionsReadResponse409 | modelHubCustomMetricTagOptionsReadResponse500 | modelHubCustomMetricTagOptionsReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubCustomMetricTagOptionsReadResponse = (modelHubCustomMetricTagOptionsReadResponseSuccess | modelHubCustomMetricTagOptionsReadResponseError)
+
+export const getModelHubCustomMetricTagOptionsReadUrl = (metricId: string,) => {
+
+
+
+
+  return `/model-hub/custom-metric/tag-options/${metricId}/`
+}
+
+export const modelHubCustomMetricTagOptionsRead = async (metricId: string, options?: RequestInit): Promise<modelHubCustomMetricTagOptionsReadResponse> => {
+
+  return apiMutator<modelHubCustomMetricTagOptionsReadResponse>(getModelHubCustomMetricTagOptionsReadUrl(metricId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubCustomMetricTestCreateResponse200 = {
+  data: CustomMetricTestResponseApi
+  status: 200
+}
+
+export type modelHubCustomMetricTestCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubCustomMetricTestCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubCustomMetricTestCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubCustomMetricTestCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubCustomMetricTestCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubCustomMetricTestCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubCustomMetricTestCreateResponseSuccess = (modelHubCustomMetricTestCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubCustomMetricTestCreateResponseError = (modelHubCustomMetricTestCreateResponse400 | modelHubCustomMetricTestCreateResponse403 | modelHubCustomMetricTestCreateResponse404 | modelHubCustomMetricTestCreateResponse409 | modelHubCustomMetricTestCreateResponse500 | modelHubCustomMetricTestCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubCustomMetricTestCreateResponse = (modelHubCustomMetricTestCreateResponseSuccess | modelHubCustomMetricTestCreateResponseError)
+
+export const getModelHubCustomMetricTestCreateUrl = () => {
+
+
+
+
+  return `/model-hub/custom-metric/test/`
+}
+
+export const modelHubCustomMetricTestCreate = async (customMetricTestRequestApi: CustomMetricTestRequestApi, options?: RequestInit): Promise<modelHubCustomMetricTestCreateResponse> => {
+
+  return apiMutator<modelHubCustomMetricTestCreateResponse>(getModelHubCustomMetricTestCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      customMetricTestRequestApi,)
+  }
+);}
+
+
+
+export type modelHubCustomMetricUpdateCreateResponse200 = {
+  data: ModelHubStatusResponseApi
+  status: 200
+}
+
+export type modelHubCustomMetricUpdateCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubCustomMetricUpdateCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubCustomMetricUpdateCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubCustomMetricUpdateCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubCustomMetricUpdateCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubCustomMetricUpdateCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubCustomMetricUpdateCreateResponseSuccess = (modelHubCustomMetricUpdateCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubCustomMetricUpdateCreateResponseError = (modelHubCustomMetricUpdateCreateResponse400 | modelHubCustomMetricUpdateCreateResponse403 | modelHubCustomMetricUpdateCreateResponse404 | modelHubCustomMetricUpdateCreateResponse409 | modelHubCustomMetricUpdateCreateResponse500 | modelHubCustomMetricUpdateCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubCustomMetricUpdateCreateResponse = (modelHubCustomMetricUpdateCreateResponseSuccess | modelHubCustomMetricUpdateCreateResponseError)
+
+export const getModelHubCustomMetricUpdateCreateUrl = () => {
+
+
+
+
+  return `/model-hub/custom-metric/update/`
+}
+
+export const modelHubCustomMetricUpdateCreate = async (customMetricMutationRequestApi: CustomMetricMutationRequestApi, options?: RequestInit): Promise<modelHubCustomMetricUpdateCreateResponse> => {
+
+  return apiMutator<modelHubCustomMetricUpdateCreateResponse>(getModelHubCustomMetricUpdateCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      customMetricMutationRequestApi,)
+  }
+);}
+
+
+
+export type modelHubCustomModelsListResponse200 = {
+  data: ModelHubPaginatedResponseApi
+  status: 200
+}
+
+export type modelHubCustomModelsListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubCustomModelsListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubCustomModelsListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubCustomModelsListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubCustomModelsListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubCustomModelsListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubCustomModelsListResponseSuccess = (modelHubCustomModelsListResponse200) & {
+  headers: Headers;
+};
+export type modelHubCustomModelsListResponseError = (modelHubCustomModelsListResponse400 | modelHubCustomModelsListResponse403 | modelHubCustomModelsListResponse404 | modelHubCustomModelsListResponse409 | modelHubCustomModelsListResponse500 | modelHubCustomModelsListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubCustomModelsListResponse = (modelHubCustomModelsListResponseSuccess | modelHubCustomModelsListResponseError)
+
+export const getModelHubCustomModelsListUrl = () => {
+
+
+
+
+  return `/model-hub/custom-models/`
+}
+
+/**
+ * Return all the models that belongs to a user organization
+ */
+export const modelHubCustomModelsList = async ( options?: RequestInit): Promise<modelHubCustomModelsListResponse> => {
+
+  return apiMutator<modelHubCustomModelsListResponse>(getModelHubCustomModelsListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubCustomModelsReadResponse200 = {
+  data: CustomAIModelApi
+  status: 200
+}
+
+export type modelHubCustomModelsReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubCustomModelsReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubCustomModelsReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubCustomModelsReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubCustomModelsReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubCustomModelsReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubCustomModelsReadResponseSuccess = (modelHubCustomModelsReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubCustomModelsReadResponseError = (modelHubCustomModelsReadResponse400 | modelHubCustomModelsReadResponse403 | modelHubCustomModelsReadResponse404 | modelHubCustomModelsReadResponse409 | modelHubCustomModelsReadResponse500 | modelHubCustomModelsReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubCustomModelsReadResponse = (modelHubCustomModelsReadResponseSuccess | modelHubCustomModelsReadResponseError)
+
+export const getModelHubCustomModelsReadUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/custom-models/${id}/`
+}
+
+/**
+ * Return details regarding a particular model, given his id
+ */
+export const modelHubCustomModelsRead = async (id: string, options?: RequestInit): Promise<modelHubCustomModelsReadResponse> => {
+
+  return apiMutator<modelHubCustomModelsReadResponse>(getModelHubCustomModelsReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubCustomModelsCreateResponse200 = {
+  data: CustomAIModelApi
+  status: 200
+}
+
+export type modelHubCustomModelsCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubCustomModelsCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubCustomModelsCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubCustomModelsCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubCustomModelsCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubCustomModelsCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubCustomModelsCreateResponseSuccess = (modelHubCustomModelsCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubCustomModelsCreateResponseError = (modelHubCustomModelsCreateResponse400 | modelHubCustomModelsCreateResponse403 | modelHubCustomModelsCreateResponse404 | modelHubCustomModelsCreateResponse409 | modelHubCustomModelsCreateResponse500 | modelHubCustomModelsCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubCustomModelsCreateResponse = (modelHubCustomModelsCreateResponseSuccess | modelHubCustomModelsCreateResponseError)
+
+export const getModelHubCustomModelsCreateUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/custom-models/${id}/`
+}
+
+/**
+ * Update custom model details
+ */
+export const modelHubCustomModelsCreate = async (id: string,
+    customAIModelUpdateRequestApi: CustomAIModelUpdateRequestApi, options?: RequestInit): Promise<modelHubCustomModelsCreateResponse> => {
+
+  return apiMutator<modelHubCustomModelsCreateResponse>(getModelHubCustomModelsCreateUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      customAIModelUpdateRequestApi,)
+  }
+);}
+
+
+
+export type modelHubCustomModelsListListResponse200 = {
+  data: ModelHubPaginatedResponseApi
+  status: 200
+}
+
+export type modelHubCustomModelsListListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubCustomModelsListListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubCustomModelsListListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubCustomModelsListListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubCustomModelsListListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubCustomModelsListListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubCustomModelsListListResponseSuccess = (modelHubCustomModelsListListResponse200) & {
+  headers: Headers;
+};
+export type modelHubCustomModelsListListResponseError = (modelHubCustomModelsListListResponse400 | modelHubCustomModelsListListResponse403 | modelHubCustomModelsListListResponse404 | modelHubCustomModelsListListResponse409 | modelHubCustomModelsListListResponse500 | modelHubCustomModelsListListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubCustomModelsListListResponse = (modelHubCustomModelsListListResponseSuccess | modelHubCustomModelsListListResponseError)
+
+export const getModelHubCustomModelsListListUrl = () => {
+
+
+
+
+  return `/model-hub/custom-models/list/`
+}
+
+export const modelHubCustomModelsListList = async ( options?: RequestInit): Promise<modelHubCustomModelsListListResponse> => {
+
+  return apiMutator<modelHubCustomModelsListListResponse>(getModelHubCustomModelsListListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
   }
 );}
 
@@ -28023,71 +28022,6 @@ export const modelHubDatasetOptimizationTrialTrialScenarios = async (id: string,
 
 
 
-export type modelHubDatasetColumnsReadResponse200 = {
-  data: DatasetColumnDetailResponseApi
-  status: 200
-}
-
-export type modelHubDatasetColumnsReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetColumnsReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetColumnsReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetColumnsReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetColumnsReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetColumnsReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetColumnsReadResponseSuccess = (modelHubDatasetColumnsReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetColumnsReadResponseError = (modelHubDatasetColumnsReadResponse400 | modelHubDatasetColumnsReadResponse403 | modelHubDatasetColumnsReadResponse404 | modelHubDatasetColumnsReadResponse409 | modelHubDatasetColumnsReadResponse500 | modelHubDatasetColumnsReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetColumnsReadResponse = (modelHubDatasetColumnsReadResponseSuccess | modelHubDatasetColumnsReadResponseError)
-
-export const getModelHubDatasetColumnsReadUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/dataset/columns/${datasetId}/`
-}
-
-export const modelHubDatasetColumnsRead = async (datasetId: string, options?: RequestInit): Promise<modelHubDatasetColumnsReadResponse> => {
-
-  return apiMutator<modelHubDatasetColumnsReadResponse>(getModelHubDatasetColumnsReadUrl(datasetId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type modelHubDatasetAnnotationSummaryListResponse200 = {
   data: AnnotationSummaryResponseApi
   status: 200
@@ -28343,793 +28277,66 @@ export const modelHubDatasetRunPromptStatsList = async (datasetId: string, optio
 
 
 
-export type modelHubDatasetsCompareGetEvalsListCreateResponse200 = {
-  data: CompareEvalListResponseApi
+export type modelHubDatasetColumnsReadResponse200 = {
+  data: DatasetColumnDetailResponseApi
   status: 200
 }
 
-export type modelHubDatasetsCompareGetEvalsListCreateResponse400 = {
+export type modelHubDatasetColumnsReadResponse400 = {
   data: ModelHubErrorResponseApi
   status: 400
 }
 
-export type modelHubDatasetsCompareGetEvalsListCreateResponse403 = {
+export type modelHubDatasetColumnsReadResponse403 = {
   data: ModelHubErrorResponseApi
   status: 403
 }
 
-export type modelHubDatasetsCompareGetEvalsListCreateResponse404 = {
+export type modelHubDatasetColumnsReadResponse404 = {
   data: ModelHubErrorResponseApi
   status: 404
 }
 
-export type modelHubDatasetsCompareGetEvalsListCreateResponse409 = {
+export type modelHubDatasetColumnsReadResponse409 = {
   data: ModelHubErrorResponseApi
   status: 409
 }
 
-export type modelHubDatasetsCompareGetEvalsListCreateResponse500 = {
+export type modelHubDatasetColumnsReadResponse500 = {
   data: ModelHubErrorResponseApi
   status: 500
 }
 
-export type modelHubDatasetsCompareGetEvalsListCreateResponseDefault = {
+export type modelHubDatasetColumnsReadResponseDefault = {
   data: ManagementAPIErrorResponseApi
   status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
 }
 
-export type modelHubDatasetsCompareGetEvalsListCreateResponseSuccess = (modelHubDatasetsCompareGetEvalsListCreateResponse200) & {
+export type modelHubDatasetColumnsReadResponseSuccess = (modelHubDatasetColumnsReadResponse200) & {
   headers: Headers;
 };
-export type modelHubDatasetsCompareGetEvalsListCreateResponseError = (modelHubDatasetsCompareGetEvalsListCreateResponse400 | modelHubDatasetsCompareGetEvalsListCreateResponse403 | modelHubDatasetsCompareGetEvalsListCreateResponse404 | modelHubDatasetsCompareGetEvalsListCreateResponse409 | modelHubDatasetsCompareGetEvalsListCreateResponse500 | modelHubDatasetsCompareGetEvalsListCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsCompareGetEvalsListCreateResponse = (modelHubDatasetsCompareGetEvalsListCreateResponseSuccess | modelHubDatasetsCompareGetEvalsListCreateResponseError)
-
-export const getModelHubDatasetsCompareGetEvalsListCreateUrl = () => {
-
-
-
-
-  return `/model-hub/datasets/compare/get-evals-list/`
-}
-
-export const modelHubDatasetsCompareGetEvalsListCreate = async (compareEvalsListRequestApi: CompareEvalsListRequestApi, options?: RequestInit): Promise<modelHubDatasetsCompareGetEvalsListCreateResponse> => {
-
-  return apiMutator<modelHubDatasetsCompareGetEvalsListCreateResponse>(getModelHubDatasetsCompareGetEvalsListCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      compareEvalsListRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDatasetsComparePreviewRunEvalCreateResponse200 = {
-  data: EvalPreviewResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsComparePreviewRunEvalCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsComparePreviewRunEvalCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsComparePreviewRunEvalCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsComparePreviewRunEvalCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsComparePreviewRunEvalCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsComparePreviewRunEvalCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsComparePreviewRunEvalCreateResponseSuccess = (modelHubDatasetsComparePreviewRunEvalCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsComparePreviewRunEvalCreateResponseError = (modelHubDatasetsComparePreviewRunEvalCreateResponse400 | modelHubDatasetsComparePreviewRunEvalCreateResponse403 | modelHubDatasetsComparePreviewRunEvalCreateResponse404 | modelHubDatasetsComparePreviewRunEvalCreateResponse409 | modelHubDatasetsComparePreviewRunEvalCreateResponse500 | modelHubDatasetsComparePreviewRunEvalCreateResponseDefault) & {
+export type modelHubDatasetColumnsReadResponseError = (modelHubDatasetColumnsReadResponse400 | modelHubDatasetColumnsReadResponse403 | modelHubDatasetColumnsReadResponse404 | modelHubDatasetColumnsReadResponse409 | modelHubDatasetColumnsReadResponse500 | modelHubDatasetColumnsReadResponseDefault) & {
   headers: Headers;
 };
 
-export type modelHubDatasetsComparePreviewRunEvalCreateResponse = (modelHubDatasetsComparePreviewRunEvalCreateResponseSuccess | modelHubDatasetsComparePreviewRunEvalCreateResponseError)
+export type modelHubDatasetColumnsReadResponse = (modelHubDatasetColumnsReadResponseSuccess | modelHubDatasetColumnsReadResponseError)
 
-export const getModelHubDatasetsComparePreviewRunEvalCreateUrl = () => {
-
-
+export const getModelHubDatasetColumnsReadUrl = (datasetId: string,) => {
 
 
-  return `/model-hub/datasets/compare/preview-run-eval/`
+
+
+  return `/model-hub/dataset/columns/${datasetId}/`
 }
 
-export const modelHubDatasetsComparePreviewRunEvalCreate = async (comparePreviewRunEvalRequestApi: ComparePreviewRunEvalRequestApi, options?: RequestInit): Promise<modelHubDatasetsComparePreviewRunEvalCreateResponse> => {
+export const modelHubDatasetColumnsRead = async (datasetId: string, options?: RequestInit): Promise<modelHubDatasetColumnsReadResponse> => {
 
-  return apiMutator<modelHubDatasetsComparePreviewRunEvalCreateResponse>(getModelHubDatasetsComparePreviewRunEvalCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      comparePreviewRunEvalRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDatasetsDeleteCompareReadResponse200 = {
-  data: CompareDatasetRowResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsDeleteCompareReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsDeleteCompareReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsDeleteCompareReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsDeleteCompareReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsDeleteCompareReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsDeleteCompareReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsDeleteCompareReadResponseSuccess = (modelHubDatasetsDeleteCompareReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsDeleteCompareReadResponseError = (modelHubDatasetsDeleteCompareReadResponse400 | modelHubDatasetsDeleteCompareReadResponse403 | modelHubDatasetsDeleteCompareReadResponse404 | modelHubDatasetsDeleteCompareReadResponse409 | modelHubDatasetsDeleteCompareReadResponse500 | modelHubDatasetsDeleteCompareReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsDeleteCompareReadResponse = (modelHubDatasetsDeleteCompareReadResponseSuccess | modelHubDatasetsDeleteCompareReadResponseError)
-
-export const getModelHubDatasetsDeleteCompareReadUrl = (compareId: string,) => {
-
-
-
-
-  return `/model-hub/datasets/delete-compare/${compareId}/`
-}
-
-export const modelHubDatasetsDeleteCompareRead = async (compareId: string, options?: RequestInit): Promise<modelHubDatasetsDeleteCompareReadResponse> => {
-
-  return apiMutator<modelHubDatasetsDeleteCompareReadResponse>(getModelHubDatasetsDeleteCompareReadUrl(compareId),
+  return apiMutator<modelHubDatasetColumnsReadResponse>(getModelHubDatasetColumnsReadUrl(datasetId),
   {
     ...options,
     method: 'GET'
 
 
-  }
-);}
-
-
-
-export type modelHubDatasetsDeleteCompareDeleteResponse200 = {
-  data: CompareDatasetDeleteResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsDeleteCompareDeleteResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsDeleteCompareDeleteResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsDeleteCompareDeleteResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsDeleteCompareDeleteResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsDeleteCompareDeleteResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsDeleteCompareDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsDeleteCompareDeleteResponseSuccess = (modelHubDatasetsDeleteCompareDeleteResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsDeleteCompareDeleteResponseError = (modelHubDatasetsDeleteCompareDeleteResponse400 | modelHubDatasetsDeleteCompareDeleteResponse403 | modelHubDatasetsDeleteCompareDeleteResponse404 | modelHubDatasetsDeleteCompareDeleteResponse409 | modelHubDatasetsDeleteCompareDeleteResponse500 | modelHubDatasetsDeleteCompareDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsDeleteCompareDeleteResponse = (modelHubDatasetsDeleteCompareDeleteResponseSuccess | modelHubDatasetsDeleteCompareDeleteResponseError)
-
-export const getModelHubDatasetsDeleteCompareDeleteUrl = (compareId: string,) => {
-
-
-
-
-  return `/model-hub/datasets/delete-compare/${compareId}/`
-}
-
-export const modelHubDatasetsDeleteCompareDelete = async (compareId: string, options?: RequestInit): Promise<modelHubDatasetsDeleteCompareDeleteResponse> => {
-
-  return apiMutator<modelHubDatasetsDeleteCompareDeleteResponse>(getModelHubDatasetsDeleteCompareDeleteUrl(compareId),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
-export type modelHubDatasetsExplanationSummaryReadResponse200 = {
-  data: DatasetExplanationSummaryResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsExplanationSummaryReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsExplanationSummaryReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsExplanationSummaryReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsExplanationSummaryReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsExplanationSummaryReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsExplanationSummaryReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsExplanationSummaryReadResponseSuccess = (modelHubDatasetsExplanationSummaryReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsExplanationSummaryReadResponseError = (modelHubDatasetsExplanationSummaryReadResponse400 | modelHubDatasetsExplanationSummaryReadResponse403 | modelHubDatasetsExplanationSummaryReadResponse404 | modelHubDatasetsExplanationSummaryReadResponse409 | modelHubDatasetsExplanationSummaryReadResponse500 | modelHubDatasetsExplanationSummaryReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsExplanationSummaryReadResponse = (modelHubDatasetsExplanationSummaryReadResponseSuccess | modelHubDatasetsExplanationSummaryReadResponseError)
-
-export const getModelHubDatasetsExplanationSummaryReadUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/datasets/explanation-summary/${datasetId}/`
-}
-
-export const modelHubDatasetsExplanationSummaryRead = async (datasetId: string, options?: RequestInit): Promise<modelHubDatasetsExplanationSummaryReadResponse> => {
-
-  return apiMutator<modelHubDatasetsExplanationSummaryReadResponse>(getModelHubDatasetsExplanationSummaryReadUrl(datasetId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDatasetsExplanationSummaryRefreshCreateResponse200 = {
-  data: DatasetExplanationSummaryResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsExplanationSummaryRefreshCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsExplanationSummaryRefreshCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsExplanationSummaryRefreshCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsExplanationSummaryRefreshCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsExplanationSummaryRefreshCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsExplanationSummaryRefreshCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsExplanationSummaryRefreshCreateResponseSuccess = (modelHubDatasetsExplanationSummaryRefreshCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsExplanationSummaryRefreshCreateResponseError = (modelHubDatasetsExplanationSummaryRefreshCreateResponse400 | modelHubDatasetsExplanationSummaryRefreshCreateResponse403 | modelHubDatasetsExplanationSummaryRefreshCreateResponse404 | modelHubDatasetsExplanationSummaryRefreshCreateResponse409 | modelHubDatasetsExplanationSummaryRefreshCreateResponse500 | modelHubDatasetsExplanationSummaryRefreshCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsExplanationSummaryRefreshCreateResponse = (modelHubDatasetsExplanationSummaryRefreshCreateResponseSuccess | modelHubDatasetsExplanationSummaryRefreshCreateResponseError)
-
-export const getModelHubDatasetsExplanationSummaryRefreshCreateUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/datasets/explanation-summary/${datasetId}/refresh/`
-}
-
-export const modelHubDatasetsExplanationSummaryRefreshCreate = async (datasetId: string,
-    modelHubEmptyRequestApi: ModelHubEmptyRequestApi, options?: RequestInit): Promise<modelHubDatasetsExplanationSummaryRefreshCreateResponse> => {
-
-  return apiMutator<modelHubDatasetsExplanationSummaryRefreshCreateResponse>(getModelHubDatasetsExplanationSummaryRefreshCreateUrl(datasetId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      modelHubEmptyRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDatasetsGetBaseColumnsListResponse200 = {
-  data: BaseColumnsResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsGetBaseColumnsListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsGetBaseColumnsListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsGetBaseColumnsListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsGetBaseColumnsListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsGetBaseColumnsListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsGetBaseColumnsListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsGetBaseColumnsListResponseSuccess = (modelHubDatasetsGetBaseColumnsListResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsGetBaseColumnsListResponseError = (modelHubDatasetsGetBaseColumnsListResponse400 | modelHubDatasetsGetBaseColumnsListResponse403 | modelHubDatasetsGetBaseColumnsListResponse404 | modelHubDatasetsGetBaseColumnsListResponse409 | modelHubDatasetsGetBaseColumnsListResponse500 | modelHubDatasetsGetBaseColumnsListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsGetBaseColumnsListResponse = (modelHubDatasetsGetBaseColumnsListResponseSuccess | modelHubDatasetsGetBaseColumnsListResponseError)
-
-export const getModelHubDatasetsGetBaseColumnsListUrl = () => {
-
-
-
-
-  return `/model-hub/datasets/get-base-columns/`
-}
-
-export const modelHubDatasetsGetBaseColumnsList = async ( options?: RequestInit): Promise<modelHubDatasetsGetBaseColumnsListResponse> => {
-
-  return apiMutator<modelHubDatasetsGetBaseColumnsListResponse>(getModelHubDatasetsGetBaseColumnsListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDatasetsGetCompareRowReadResponse200 = {
-  data: CompareDatasetRowResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsGetCompareRowReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsGetCompareRowReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsGetCompareRowReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsGetCompareRowReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsGetCompareRowReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsGetCompareRowReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsGetCompareRowReadResponseSuccess = (modelHubDatasetsGetCompareRowReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsGetCompareRowReadResponseError = (modelHubDatasetsGetCompareRowReadResponse400 | modelHubDatasetsGetCompareRowReadResponse403 | modelHubDatasetsGetCompareRowReadResponse404 | modelHubDatasetsGetCompareRowReadResponse409 | modelHubDatasetsGetCompareRowReadResponse500 | modelHubDatasetsGetCompareRowReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsGetCompareRowReadResponse = (modelHubDatasetsGetCompareRowReadResponseSuccess | modelHubDatasetsGetCompareRowReadResponseError)
-
-export const getModelHubDatasetsGetCompareRowReadUrl = (compareId: string,
-    rowId: string,) => {
-
-
-
-
-  return `/model-hub/datasets/get-compare-row/${compareId}/${rowId}/`
-}
-
-export const modelHubDatasetsGetCompareRowRead = async (compareId: string,
-    rowId: string, options?: RequestInit): Promise<modelHubDatasetsGetCompareRowReadResponse> => {
-
-  return apiMutator<modelHubDatasetsGetCompareRowReadResponse>(getModelHubDatasetsGetCompareRowReadUrl(compareId,rowId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDatasetsGetCompareRowDeleteResponse200 = {
-  data: CompareDatasetDeleteResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsGetCompareRowDeleteResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsGetCompareRowDeleteResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsGetCompareRowDeleteResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsGetCompareRowDeleteResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsGetCompareRowDeleteResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsGetCompareRowDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsGetCompareRowDeleteResponseSuccess = (modelHubDatasetsGetCompareRowDeleteResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsGetCompareRowDeleteResponseError = (modelHubDatasetsGetCompareRowDeleteResponse400 | modelHubDatasetsGetCompareRowDeleteResponse403 | modelHubDatasetsGetCompareRowDeleteResponse404 | modelHubDatasetsGetCompareRowDeleteResponse409 | modelHubDatasetsGetCompareRowDeleteResponse500 | modelHubDatasetsGetCompareRowDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsGetCompareRowDeleteResponse = (modelHubDatasetsGetCompareRowDeleteResponseSuccess | modelHubDatasetsGetCompareRowDeleteResponseError)
-
-export const getModelHubDatasetsGetCompareRowDeleteUrl = (compareId: string,
-    rowId: string,) => {
-
-
-
-
-  return `/model-hub/datasets/get-compare-row/${compareId}/${rowId}/`
-}
-
-export const modelHubDatasetsGetCompareRowDelete = async (compareId: string,
-    rowId: string, options?: RequestInit): Promise<modelHubDatasetsGetCompareRowDeleteResponse> => {
-
-  return apiMutator<modelHubDatasetsGetCompareRowDeleteResponse>(getModelHubDatasetsGetCompareRowDeleteUrl(compareId,rowId),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
-export type modelHubDatasetsHuggingfaceDetailCreateResponse200 = {
-  data: HuggingFaceDatasetDetailResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsHuggingfaceDetailCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsHuggingfaceDetailCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsHuggingfaceDetailCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsHuggingfaceDetailCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsHuggingfaceDetailCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsHuggingfaceDetailCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsHuggingfaceDetailCreateResponseSuccess = (modelHubDatasetsHuggingfaceDetailCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsHuggingfaceDetailCreateResponseError = (modelHubDatasetsHuggingfaceDetailCreateResponse400 | modelHubDatasetsHuggingfaceDetailCreateResponse403 | modelHubDatasetsHuggingfaceDetailCreateResponse404 | modelHubDatasetsHuggingfaceDetailCreateResponse409 | modelHubDatasetsHuggingfaceDetailCreateResponse500 | modelHubDatasetsHuggingfaceDetailCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsHuggingfaceDetailCreateResponse = (modelHubDatasetsHuggingfaceDetailCreateResponseSuccess | modelHubDatasetsHuggingfaceDetailCreateResponseError)
-
-export const getModelHubDatasetsHuggingfaceDetailCreateUrl = () => {
-
-
-
-
-  return `/model-hub/datasets/huggingface/detail/`
-}
-
-export const modelHubDatasetsHuggingfaceDetailCreate = async (huggingFaceDatasetDetailRequestApi: HuggingFaceDatasetDetailRequestApi, options?: RequestInit): Promise<modelHubDatasetsHuggingfaceDetailCreateResponse> => {
-
-  return apiMutator<modelHubDatasetsHuggingfaceDetailCreateResponse>(getModelHubDatasetsHuggingfaceDetailCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      huggingFaceDatasetDetailRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDatasetsHuggingfaceListCreateResponse200 = {
-  data: HuggingFaceDatasetListResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsHuggingfaceListCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsHuggingfaceListCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsHuggingfaceListCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsHuggingfaceListCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsHuggingfaceListCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsHuggingfaceListCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsHuggingfaceListCreateResponseSuccess = (modelHubDatasetsHuggingfaceListCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsHuggingfaceListCreateResponseError = (modelHubDatasetsHuggingfaceListCreateResponse400 | modelHubDatasetsHuggingfaceListCreateResponse403 | modelHubDatasetsHuggingfaceListCreateResponse404 | modelHubDatasetsHuggingfaceListCreateResponse409 | modelHubDatasetsHuggingfaceListCreateResponse500 | modelHubDatasetsHuggingfaceListCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsHuggingfaceListCreateResponse = (modelHubDatasetsHuggingfaceListCreateResponseSuccess | modelHubDatasetsHuggingfaceListCreateResponseError)
-
-export const getModelHubDatasetsHuggingfaceListCreateUrl = () => {
-
-
-
-
-  return `/model-hub/datasets/huggingface/list/`
-}
-
-export const modelHubDatasetsHuggingfaceListCreate = async (huggingFaceDatasetListRequestApi: HuggingFaceDatasetListRequestApi, options?: RequestInit): Promise<modelHubDatasetsHuggingfaceListCreateResponse> => {
-
-  return apiMutator<modelHubDatasetsHuggingfaceListCreateResponse>(getModelHubDatasetsHuggingfaceListCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      huggingFaceDatasetListRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDatasetsAddApiColumnCreateResponse200 = {
-  data: DynamicColumnCreateResponseApi
-  status: 200
-}
-
-export type modelHubDatasetsAddApiColumnCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDatasetsAddApiColumnCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDatasetsAddApiColumnCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDatasetsAddApiColumnCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDatasetsAddApiColumnCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDatasetsAddApiColumnCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDatasetsAddApiColumnCreateResponseSuccess = (modelHubDatasetsAddApiColumnCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDatasetsAddApiColumnCreateResponseError = (modelHubDatasetsAddApiColumnCreateResponse400 | modelHubDatasetsAddApiColumnCreateResponse403 | modelHubDatasetsAddApiColumnCreateResponse404 | modelHubDatasetsAddApiColumnCreateResponse409 | modelHubDatasetsAddApiColumnCreateResponse500 | modelHubDatasetsAddApiColumnCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDatasetsAddApiColumnCreateResponse = (modelHubDatasetsAddApiColumnCreateResponseSuccess | modelHubDatasetsAddApiColumnCreateResponseError)
-
-export const getModelHubDatasetsAddApiColumnCreateUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/datasets/${datasetId}/add-api-column/`
-}
-
-export const modelHubDatasetsAddApiColumnCreate = async (datasetId: string,
-    addApiColumnRequestApi: AddApiColumnRequestApi, options?: RequestInit): Promise<modelHubDatasetsAddApiColumnCreateResponse> => {
-
-  return apiMutator<modelHubDatasetsAddApiColumnCreateResponse>(getModelHubDatasetsAddApiColumnCreateUrl(datasetId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      addApiColumnRequestApi,)
   }
 );}
 
@@ -29197,6 +28404,73 @@ export const modelHubDatasetsAddVectorDbColumnCreate = async (datasetId: string,
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       vectorDBColumnRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDatasetsAddApiColumnCreateResponse200 = {
+  data: DynamicColumnCreateResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsAddApiColumnCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsAddApiColumnCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsAddApiColumnCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsAddApiColumnCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsAddApiColumnCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsAddApiColumnCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsAddApiColumnCreateResponseSuccess = (modelHubDatasetsAddApiColumnCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsAddApiColumnCreateResponseError = (modelHubDatasetsAddApiColumnCreateResponse400 | modelHubDatasetsAddApiColumnCreateResponse403 | modelHubDatasetsAddApiColumnCreateResponse404 | modelHubDatasetsAddApiColumnCreateResponse409 | modelHubDatasetsAddApiColumnCreateResponse500 | modelHubDatasetsAddApiColumnCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsAddApiColumnCreateResponse = (modelHubDatasetsAddApiColumnCreateResponseSuccess | modelHubDatasetsAddApiColumnCreateResponseError)
+
+export const getModelHubDatasetsAddApiColumnCreateUrl = (datasetId: string,) => {
+
+
+
+
+  return `/model-hub/datasets/${datasetId}/add-api-column/`
+}
+
+export const modelHubDatasetsAddApiColumnCreate = async (datasetId: string,
+    addApiColumnRequestApi: AddApiColumnRequestApi, options?: RequestInit): Promise<modelHubDatasetsAddApiColumnCreateResponse> => {
+
+  return apiMutator<modelHubDatasetsAddApiColumnCreateResponse>(getModelHubDatasetsAddApiColumnCreateUrl(datasetId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      addApiColumnRequestApi,)
   }
 );}
 
@@ -30082,6 +29356,731 @@ export const modelHubDatasetsPreviewCreate = async (datasetId: string,
 
 
 
+export type modelHubDatasetsCompareGetEvalsListCreateResponse200 = {
+  data: CompareEvalListResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsCompareGetEvalsListCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsCompareGetEvalsListCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsCompareGetEvalsListCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsCompareGetEvalsListCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsCompareGetEvalsListCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsCompareGetEvalsListCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsCompareGetEvalsListCreateResponseSuccess = (modelHubDatasetsCompareGetEvalsListCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsCompareGetEvalsListCreateResponseError = (modelHubDatasetsCompareGetEvalsListCreateResponse400 | modelHubDatasetsCompareGetEvalsListCreateResponse403 | modelHubDatasetsCompareGetEvalsListCreateResponse404 | modelHubDatasetsCompareGetEvalsListCreateResponse409 | modelHubDatasetsCompareGetEvalsListCreateResponse500 | modelHubDatasetsCompareGetEvalsListCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsCompareGetEvalsListCreateResponse = (modelHubDatasetsCompareGetEvalsListCreateResponseSuccess | modelHubDatasetsCompareGetEvalsListCreateResponseError)
+
+export const getModelHubDatasetsCompareGetEvalsListCreateUrl = () => {
+
+
+
+
+  return `/model-hub/datasets/compare/get-evals-list/`
+}
+
+export const modelHubDatasetsCompareGetEvalsListCreate = async (compareEvalsListRequestApi: CompareEvalsListRequestApi, options?: RequestInit): Promise<modelHubDatasetsCompareGetEvalsListCreateResponse> => {
+
+  return apiMutator<modelHubDatasetsCompareGetEvalsListCreateResponse>(getModelHubDatasetsCompareGetEvalsListCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      compareEvalsListRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDatasetsComparePreviewRunEvalCreateResponse200 = {
+  data: EvalPreviewResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsComparePreviewRunEvalCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsComparePreviewRunEvalCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsComparePreviewRunEvalCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsComparePreviewRunEvalCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsComparePreviewRunEvalCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsComparePreviewRunEvalCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsComparePreviewRunEvalCreateResponseSuccess = (modelHubDatasetsComparePreviewRunEvalCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsComparePreviewRunEvalCreateResponseError = (modelHubDatasetsComparePreviewRunEvalCreateResponse400 | modelHubDatasetsComparePreviewRunEvalCreateResponse403 | modelHubDatasetsComparePreviewRunEvalCreateResponse404 | modelHubDatasetsComparePreviewRunEvalCreateResponse409 | modelHubDatasetsComparePreviewRunEvalCreateResponse500 | modelHubDatasetsComparePreviewRunEvalCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsComparePreviewRunEvalCreateResponse = (modelHubDatasetsComparePreviewRunEvalCreateResponseSuccess | modelHubDatasetsComparePreviewRunEvalCreateResponseError)
+
+export const getModelHubDatasetsComparePreviewRunEvalCreateUrl = () => {
+
+
+
+
+  return `/model-hub/datasets/compare/preview-run-eval/`
+}
+
+export const modelHubDatasetsComparePreviewRunEvalCreate = async (comparePreviewRunEvalRequestApi: ComparePreviewRunEvalRequestApi, options?: RequestInit): Promise<modelHubDatasetsComparePreviewRunEvalCreateResponse> => {
+
+  return apiMutator<modelHubDatasetsComparePreviewRunEvalCreateResponse>(getModelHubDatasetsComparePreviewRunEvalCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      comparePreviewRunEvalRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDatasetsDeleteCompareReadResponse200 = {
+  data: CompareDatasetRowResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsDeleteCompareReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsDeleteCompareReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsDeleteCompareReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsDeleteCompareReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsDeleteCompareReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsDeleteCompareReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsDeleteCompareReadResponseSuccess = (modelHubDatasetsDeleteCompareReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsDeleteCompareReadResponseError = (modelHubDatasetsDeleteCompareReadResponse400 | modelHubDatasetsDeleteCompareReadResponse403 | modelHubDatasetsDeleteCompareReadResponse404 | modelHubDatasetsDeleteCompareReadResponse409 | modelHubDatasetsDeleteCompareReadResponse500 | modelHubDatasetsDeleteCompareReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsDeleteCompareReadResponse = (modelHubDatasetsDeleteCompareReadResponseSuccess | modelHubDatasetsDeleteCompareReadResponseError)
+
+export const getModelHubDatasetsDeleteCompareReadUrl = (compareId: string,) => {
+
+
+
+
+  return `/model-hub/datasets/delete-compare/${compareId}/`
+}
+
+export const modelHubDatasetsDeleteCompareRead = async (compareId: string, options?: RequestInit): Promise<modelHubDatasetsDeleteCompareReadResponse> => {
+
+  return apiMutator<modelHubDatasetsDeleteCompareReadResponse>(getModelHubDatasetsDeleteCompareReadUrl(compareId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDatasetsDeleteCompareDeleteResponse200 = {
+  data: CompareDatasetDeleteResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsDeleteCompareDeleteResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsDeleteCompareDeleteResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsDeleteCompareDeleteResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsDeleteCompareDeleteResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsDeleteCompareDeleteResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsDeleteCompareDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsDeleteCompareDeleteResponseSuccess = (modelHubDatasetsDeleteCompareDeleteResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsDeleteCompareDeleteResponseError = (modelHubDatasetsDeleteCompareDeleteResponse400 | modelHubDatasetsDeleteCompareDeleteResponse403 | modelHubDatasetsDeleteCompareDeleteResponse404 | modelHubDatasetsDeleteCompareDeleteResponse409 | modelHubDatasetsDeleteCompareDeleteResponse500 | modelHubDatasetsDeleteCompareDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsDeleteCompareDeleteResponse = (modelHubDatasetsDeleteCompareDeleteResponseSuccess | modelHubDatasetsDeleteCompareDeleteResponseError)
+
+export const getModelHubDatasetsDeleteCompareDeleteUrl = (compareId: string,) => {
+
+
+
+
+  return `/model-hub/datasets/delete-compare/${compareId}/`
+}
+
+export const modelHubDatasetsDeleteCompareDelete = async (compareId: string, options?: RequestInit): Promise<modelHubDatasetsDeleteCompareDeleteResponse> => {
+
+  return apiMutator<modelHubDatasetsDeleteCompareDeleteResponse>(getModelHubDatasetsDeleteCompareDeleteUrl(compareId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type modelHubDatasetsExplanationSummaryReadResponse200 = {
+  data: DatasetExplanationSummaryResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsExplanationSummaryReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsExplanationSummaryReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsExplanationSummaryReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsExplanationSummaryReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsExplanationSummaryReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsExplanationSummaryReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsExplanationSummaryReadResponseSuccess = (modelHubDatasetsExplanationSummaryReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsExplanationSummaryReadResponseError = (modelHubDatasetsExplanationSummaryReadResponse400 | modelHubDatasetsExplanationSummaryReadResponse403 | modelHubDatasetsExplanationSummaryReadResponse404 | modelHubDatasetsExplanationSummaryReadResponse409 | modelHubDatasetsExplanationSummaryReadResponse500 | modelHubDatasetsExplanationSummaryReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsExplanationSummaryReadResponse = (modelHubDatasetsExplanationSummaryReadResponseSuccess | modelHubDatasetsExplanationSummaryReadResponseError)
+
+export const getModelHubDatasetsExplanationSummaryReadUrl = (datasetId: string,) => {
+
+
+
+
+  return `/model-hub/datasets/explanation-summary/${datasetId}/`
+}
+
+export const modelHubDatasetsExplanationSummaryRead = async (datasetId: string, options?: RequestInit): Promise<modelHubDatasetsExplanationSummaryReadResponse> => {
+
+  return apiMutator<modelHubDatasetsExplanationSummaryReadResponse>(getModelHubDatasetsExplanationSummaryReadUrl(datasetId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDatasetsExplanationSummaryRefreshCreateResponse200 = {
+  data: DatasetExplanationSummaryResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsExplanationSummaryRefreshCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsExplanationSummaryRefreshCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsExplanationSummaryRefreshCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsExplanationSummaryRefreshCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsExplanationSummaryRefreshCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsExplanationSummaryRefreshCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsExplanationSummaryRefreshCreateResponseSuccess = (modelHubDatasetsExplanationSummaryRefreshCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsExplanationSummaryRefreshCreateResponseError = (modelHubDatasetsExplanationSummaryRefreshCreateResponse400 | modelHubDatasetsExplanationSummaryRefreshCreateResponse403 | modelHubDatasetsExplanationSummaryRefreshCreateResponse404 | modelHubDatasetsExplanationSummaryRefreshCreateResponse409 | modelHubDatasetsExplanationSummaryRefreshCreateResponse500 | modelHubDatasetsExplanationSummaryRefreshCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsExplanationSummaryRefreshCreateResponse = (modelHubDatasetsExplanationSummaryRefreshCreateResponseSuccess | modelHubDatasetsExplanationSummaryRefreshCreateResponseError)
+
+export const getModelHubDatasetsExplanationSummaryRefreshCreateUrl = (datasetId: string,) => {
+
+
+
+
+  return `/model-hub/datasets/explanation-summary/${datasetId}/refresh/`
+}
+
+export const modelHubDatasetsExplanationSummaryRefreshCreate = async (datasetId: string,
+    modelHubEmptyRequestApi: ModelHubEmptyRequestApi, options?: RequestInit): Promise<modelHubDatasetsExplanationSummaryRefreshCreateResponse> => {
+
+  return apiMutator<modelHubDatasetsExplanationSummaryRefreshCreateResponse>(getModelHubDatasetsExplanationSummaryRefreshCreateUrl(datasetId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      modelHubEmptyRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDatasetsGetBaseColumnsListResponse200 = {
+  data: BaseColumnsResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsGetBaseColumnsListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsGetBaseColumnsListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsGetBaseColumnsListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsGetBaseColumnsListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsGetBaseColumnsListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsGetBaseColumnsListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsGetBaseColumnsListResponseSuccess = (modelHubDatasetsGetBaseColumnsListResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsGetBaseColumnsListResponseError = (modelHubDatasetsGetBaseColumnsListResponse400 | modelHubDatasetsGetBaseColumnsListResponse403 | modelHubDatasetsGetBaseColumnsListResponse404 | modelHubDatasetsGetBaseColumnsListResponse409 | modelHubDatasetsGetBaseColumnsListResponse500 | modelHubDatasetsGetBaseColumnsListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsGetBaseColumnsListResponse = (modelHubDatasetsGetBaseColumnsListResponseSuccess | modelHubDatasetsGetBaseColumnsListResponseError)
+
+export const getModelHubDatasetsGetBaseColumnsListUrl = () => {
+
+
+
+
+  return `/model-hub/datasets/get-base-columns/`
+}
+
+export const modelHubDatasetsGetBaseColumnsList = async ( options?: RequestInit): Promise<modelHubDatasetsGetBaseColumnsListResponse> => {
+
+  return apiMutator<modelHubDatasetsGetBaseColumnsListResponse>(getModelHubDatasetsGetBaseColumnsListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDatasetsGetCompareRowReadResponse200 = {
+  data: CompareDatasetRowResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsGetCompareRowReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsGetCompareRowReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsGetCompareRowReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsGetCompareRowReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsGetCompareRowReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsGetCompareRowReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsGetCompareRowReadResponseSuccess = (modelHubDatasetsGetCompareRowReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsGetCompareRowReadResponseError = (modelHubDatasetsGetCompareRowReadResponse400 | modelHubDatasetsGetCompareRowReadResponse403 | modelHubDatasetsGetCompareRowReadResponse404 | modelHubDatasetsGetCompareRowReadResponse409 | modelHubDatasetsGetCompareRowReadResponse500 | modelHubDatasetsGetCompareRowReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsGetCompareRowReadResponse = (modelHubDatasetsGetCompareRowReadResponseSuccess | modelHubDatasetsGetCompareRowReadResponseError)
+
+export const getModelHubDatasetsGetCompareRowReadUrl = (compareId: string,
+    rowId: string,) => {
+
+
+
+
+  return `/model-hub/datasets/get-compare-row/${compareId}/${rowId}/`
+}
+
+export const modelHubDatasetsGetCompareRowRead = async (compareId: string,
+    rowId: string, options?: RequestInit): Promise<modelHubDatasetsGetCompareRowReadResponse> => {
+
+  return apiMutator<modelHubDatasetsGetCompareRowReadResponse>(getModelHubDatasetsGetCompareRowReadUrl(compareId,rowId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDatasetsGetCompareRowDeleteResponse200 = {
+  data: CompareDatasetDeleteResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsGetCompareRowDeleteResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsGetCompareRowDeleteResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsGetCompareRowDeleteResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsGetCompareRowDeleteResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsGetCompareRowDeleteResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsGetCompareRowDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsGetCompareRowDeleteResponseSuccess = (modelHubDatasetsGetCompareRowDeleteResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsGetCompareRowDeleteResponseError = (modelHubDatasetsGetCompareRowDeleteResponse400 | modelHubDatasetsGetCompareRowDeleteResponse403 | modelHubDatasetsGetCompareRowDeleteResponse404 | modelHubDatasetsGetCompareRowDeleteResponse409 | modelHubDatasetsGetCompareRowDeleteResponse500 | modelHubDatasetsGetCompareRowDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsGetCompareRowDeleteResponse = (modelHubDatasetsGetCompareRowDeleteResponseSuccess | modelHubDatasetsGetCompareRowDeleteResponseError)
+
+export const getModelHubDatasetsGetCompareRowDeleteUrl = (compareId: string,
+    rowId: string,) => {
+
+
+
+
+  return `/model-hub/datasets/get-compare-row/${compareId}/${rowId}/`
+}
+
+export const modelHubDatasetsGetCompareRowDelete = async (compareId: string,
+    rowId: string, options?: RequestInit): Promise<modelHubDatasetsGetCompareRowDeleteResponse> => {
+
+  return apiMutator<modelHubDatasetsGetCompareRowDeleteResponse>(getModelHubDatasetsGetCompareRowDeleteUrl(compareId,rowId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type modelHubDatasetsHuggingfaceDetailCreateResponse200 = {
+  data: HuggingFaceDatasetDetailResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsHuggingfaceDetailCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsHuggingfaceDetailCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsHuggingfaceDetailCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsHuggingfaceDetailCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsHuggingfaceDetailCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsHuggingfaceDetailCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsHuggingfaceDetailCreateResponseSuccess = (modelHubDatasetsHuggingfaceDetailCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsHuggingfaceDetailCreateResponseError = (modelHubDatasetsHuggingfaceDetailCreateResponse400 | modelHubDatasetsHuggingfaceDetailCreateResponse403 | modelHubDatasetsHuggingfaceDetailCreateResponse404 | modelHubDatasetsHuggingfaceDetailCreateResponse409 | modelHubDatasetsHuggingfaceDetailCreateResponse500 | modelHubDatasetsHuggingfaceDetailCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsHuggingfaceDetailCreateResponse = (modelHubDatasetsHuggingfaceDetailCreateResponseSuccess | modelHubDatasetsHuggingfaceDetailCreateResponseError)
+
+export const getModelHubDatasetsHuggingfaceDetailCreateUrl = () => {
+
+
+
+
+  return `/model-hub/datasets/huggingface/detail/`
+}
+
+export const modelHubDatasetsHuggingfaceDetailCreate = async (huggingFaceDatasetDetailRequestApi: HuggingFaceDatasetDetailRequestApi, options?: RequestInit): Promise<modelHubDatasetsHuggingfaceDetailCreateResponse> => {
+
+  return apiMutator<modelHubDatasetsHuggingfaceDetailCreateResponse>(getModelHubDatasetsHuggingfaceDetailCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      huggingFaceDatasetDetailRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDatasetsHuggingfaceListCreateResponse200 = {
+  data: HuggingFaceDatasetListResponseApi
+  status: 200
+}
+
+export type modelHubDatasetsHuggingfaceListCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDatasetsHuggingfaceListCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDatasetsHuggingfaceListCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDatasetsHuggingfaceListCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDatasetsHuggingfaceListCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDatasetsHuggingfaceListCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDatasetsHuggingfaceListCreateResponseSuccess = (modelHubDatasetsHuggingfaceListCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDatasetsHuggingfaceListCreateResponseError = (modelHubDatasetsHuggingfaceListCreateResponse400 | modelHubDatasetsHuggingfaceListCreateResponse403 | modelHubDatasetsHuggingfaceListCreateResponse404 | modelHubDatasetsHuggingfaceListCreateResponse409 | modelHubDatasetsHuggingfaceListCreateResponse500 | modelHubDatasetsHuggingfaceListCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDatasetsHuggingfaceListCreateResponse = (modelHubDatasetsHuggingfaceListCreateResponseSuccess | modelHubDatasetsHuggingfaceListCreateResponseError)
+
+export const getModelHubDatasetsHuggingfaceListCreateUrl = () => {
+
+
+
+
+  return `/model-hub/datasets/huggingface/list/`
+}
+
+export const modelHubDatasetsHuggingfaceListCreate = async (huggingFaceDatasetListRequestApi: HuggingFaceDatasetListRequestApi, options?: RequestInit): Promise<modelHubDatasetsHuggingfaceListCreateResponse> => {
+
+  return apiMutator<modelHubDatasetsHuggingfaceListCreateResponse>(getModelHubDatasetsHuggingfaceListCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      huggingFaceDatasetListRequestApi,)
+  }
+);}
+
+
+
 export type modelHubDeleteEvalTemplateCreateResponse200 = {
   data: ModelHubStringResultResponseApi
   status: 200
@@ -30143,1571 +30142,6 @@ export const modelHubDeleteEvalTemplateCreate = async (deleteEvalTemplateApi: De
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       deleteEvalTemplateApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsAddAsNewCreateResponse200 = {
-  data: DatasetCopyResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsAddAsNewCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsAddAsNewCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsAddAsNewCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsAddAsNewCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsAddAsNewCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsAddAsNewCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsAddAsNewCreateResponseSuccess = (modelHubDevelopsAddAsNewCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsAddAsNewCreateResponseError = (modelHubDevelopsAddAsNewCreateResponse400 | modelHubDevelopsAddAsNewCreateResponse403 | modelHubDevelopsAddAsNewCreateResponse404 | modelHubDevelopsAddAsNewCreateResponse409 | modelHubDevelopsAddAsNewCreateResponse500 | modelHubDevelopsAddAsNewCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsAddAsNewCreateResponse = (modelHubDevelopsAddAsNewCreateResponseSuccess | modelHubDevelopsAddAsNewCreateResponseError)
-
-export const getModelHubDevelopsAddAsNewCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/add-as-new/`
-}
-
-export const modelHubDevelopsAddAsNewCreate = async (addAsNewDatasetRequestApi: AddAsNewDatasetRequestApi, options?: RequestInit): Promise<modelHubDevelopsAddAsNewCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsAddAsNewCreateResponse>(getModelHubDevelopsAddAsNewCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      addAsNewDatasetRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsAddRowsFromFileCreateResponse200 = {
-  data: DevelopDatasetMessageResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsAddRowsFromFileCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsAddRowsFromFileCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsAddRowsFromFileCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsAddRowsFromFileCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsAddRowsFromFileCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsAddRowsFromFileCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsAddRowsFromFileCreateResponseSuccess = (modelHubDevelopsAddRowsFromFileCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsAddRowsFromFileCreateResponseError = (modelHubDevelopsAddRowsFromFileCreateResponse400 | modelHubDevelopsAddRowsFromFileCreateResponse403 | modelHubDevelopsAddRowsFromFileCreateResponse404 | modelHubDevelopsAddRowsFromFileCreateResponse409 | modelHubDevelopsAddRowsFromFileCreateResponse500 | modelHubDevelopsAddRowsFromFileCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsAddRowsFromFileCreateResponse = (modelHubDevelopsAddRowsFromFileCreateResponseSuccess | modelHubDevelopsAddRowsFromFileCreateResponseError)
-
-export const getModelHubDevelopsAddRowsFromFileCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/add_rows_from_file/`
-}
-
-export const modelHubDevelopsAddRowsFromFileCreate = async (addRowsFromFileRequestApi: NonReadonly<AddRowsFromFileRequestApi>, options?: RequestInit): Promise<modelHubDevelopsAddRowsFromFileCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsAddRowsFromFileCreateResponse>(getModelHubDevelopsAddRowsFromFileCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      addRowsFromFileRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsAddRowsSdkCreateResponse200 = {
-  data: DatasetSdkRowsResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsAddRowsSdkCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsAddRowsSdkCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsAddRowsSdkCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsAddRowsSdkCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsAddRowsSdkCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsAddRowsSdkCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsAddRowsSdkCreateResponseSuccess = (modelHubDevelopsAddRowsSdkCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsAddRowsSdkCreateResponseError = (modelHubDevelopsAddRowsSdkCreateResponse400 | modelHubDevelopsAddRowsSdkCreateResponse403 | modelHubDevelopsAddRowsSdkCreateResponse404 | modelHubDevelopsAddRowsSdkCreateResponse409 | modelHubDevelopsAddRowsSdkCreateResponse500 | modelHubDevelopsAddRowsSdkCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsAddRowsSdkCreateResponse = (modelHubDevelopsAddRowsSdkCreateResponseSuccess | modelHubDevelopsAddRowsSdkCreateResponseError)
-
-export const getModelHubDevelopsAddRowsSdkCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/add_rows_sdk/`
-}
-
-export const modelHubDevelopsAddRowsSdkCreate = async (datasetSdkRowsRequestApi: DatasetSdkRowsRequestApi, options?: RequestInit): Promise<modelHubDevelopsAddRowsSdkCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsAddRowsSdkCreateResponse>(getModelHubDevelopsAddRowsSdkCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      datasetSdkRowsRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsAddRunPromptColumnCreateResponse200 = {
-  data: DevelopDatasetMessageResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsAddRunPromptColumnCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsAddRunPromptColumnCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsAddRunPromptColumnCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsAddRunPromptColumnCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsAddRunPromptColumnCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsAddRunPromptColumnCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsAddRunPromptColumnCreateResponseSuccess = (modelHubDevelopsAddRunPromptColumnCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsAddRunPromptColumnCreateResponseError = (modelHubDevelopsAddRunPromptColumnCreateResponse400 | modelHubDevelopsAddRunPromptColumnCreateResponse403 | modelHubDevelopsAddRunPromptColumnCreateResponse404 | modelHubDevelopsAddRunPromptColumnCreateResponse409 | modelHubDevelopsAddRunPromptColumnCreateResponse500 | modelHubDevelopsAddRunPromptColumnCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsAddRunPromptColumnCreateResponse = (modelHubDevelopsAddRunPromptColumnCreateResponseSuccess | modelHubDevelopsAddRunPromptColumnCreateResponseError)
-
-export const getModelHubDevelopsAddRunPromptColumnCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/add_run_prompt_column/`
-}
-
-export const modelHubDevelopsAddRunPromptColumnCreate = async (addRunPromptApi: AddRunPromptApi, options?: RequestInit): Promise<modelHubDevelopsAddRunPromptColumnCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsAddRunPromptColumnCreateResponse>(getModelHubDevelopsAddRunPromptColumnCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      addRunPromptApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsCloneDatasetCreateResponse200 = {
-  data: DatasetCopyResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsCloneDatasetCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsCloneDatasetCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsCloneDatasetCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsCloneDatasetCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsCloneDatasetCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsCloneDatasetCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsCloneDatasetCreateResponseSuccess = (modelHubDevelopsCloneDatasetCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsCloneDatasetCreateResponseError = (modelHubDevelopsCloneDatasetCreateResponse400 | modelHubDevelopsCloneDatasetCreateResponse403 | modelHubDevelopsCloneDatasetCreateResponse404 | modelHubDevelopsCloneDatasetCreateResponse409 | modelHubDevelopsCloneDatasetCreateResponse500 | modelHubDevelopsCloneDatasetCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsCloneDatasetCreateResponse = (modelHubDevelopsCloneDatasetCreateResponseSuccess | modelHubDevelopsCloneDatasetCreateResponseError)
-
-export const getModelHubDevelopsCloneDatasetCreateUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/develops/clone-dataset/${datasetId}/`
-}
-
-export const modelHubDevelopsCloneDatasetCreate = async (datasetId: string,
-    cloneDatasetRequestApi: CloneDatasetRequestApi, options?: RequestInit): Promise<modelHubDevelopsCloneDatasetCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsCloneDatasetCreateResponse>(getModelHubDevelopsCloneDatasetCreateUrl(datasetId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      cloneDatasetRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse200 = {
-  data: DatasetCreateStartedResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseSuccess = (modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseError = (modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse400 | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse403 | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse404 | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse409 | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse500 | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse = (modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseSuccess | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseError)
-
-export const getModelHubDevelopsCreateDatasetFromHuggingfaceCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/create-dataset-from-huggingface/`
-}
-
-export const modelHubDevelopsCreateDatasetFromHuggingfaceCreate = async (huggingFaceDatasetCreateRequestApi: HuggingFaceDatasetCreateRequestApi, options?: RequestInit): Promise<modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse>(getModelHubDevelopsCreateDatasetFromHuggingfaceCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      huggingFaceDatasetCreateRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse200 = {
-  data: LocalFileDatasetCreateStartedResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponseSuccess = (modelHubDevelopsCreateDatasetFromLocalFileCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponseError = (modelHubDevelopsCreateDatasetFromLocalFileCreateResponse400 | modelHubDevelopsCreateDatasetFromLocalFileCreateResponse403 | modelHubDevelopsCreateDatasetFromLocalFileCreateResponse404 | modelHubDevelopsCreateDatasetFromLocalFileCreateResponse409 | modelHubDevelopsCreateDatasetFromLocalFileCreateResponse500 | modelHubDevelopsCreateDatasetFromLocalFileCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse = (modelHubDevelopsCreateDatasetFromLocalFileCreateResponseSuccess | modelHubDevelopsCreateDatasetFromLocalFileCreateResponseError)
-
-export const getModelHubDevelopsCreateDatasetFromLocalFileCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/create-dataset-from-local-file/`
-}
-
-export const modelHubDevelopsCreateDatasetFromLocalFileCreate = async (createDatasetFromLocalFileRequestApi: NonReadonly<CreateDatasetFromLocalFileRequestApi>, options?: RequestInit): Promise<modelHubDevelopsCreateDatasetFromLocalFileCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsCreateDatasetFromLocalFileCreateResponse>(getModelHubDevelopsCreateDatasetFromLocalFileCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      createDatasetFromLocalFileRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsCreateDatasetManuallyCreateResponse200 = {
-  data: ManualDatasetCreateResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsCreateDatasetManuallyCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsCreateDatasetManuallyCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsCreateDatasetManuallyCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsCreateDatasetManuallyCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsCreateDatasetManuallyCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsCreateDatasetManuallyCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsCreateDatasetManuallyCreateResponseSuccess = (modelHubDevelopsCreateDatasetManuallyCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsCreateDatasetManuallyCreateResponseError = (modelHubDevelopsCreateDatasetManuallyCreateResponse400 | modelHubDevelopsCreateDatasetManuallyCreateResponse403 | modelHubDevelopsCreateDatasetManuallyCreateResponse404 | modelHubDevelopsCreateDatasetManuallyCreateResponse409 | modelHubDevelopsCreateDatasetManuallyCreateResponse500 | modelHubDevelopsCreateDatasetManuallyCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsCreateDatasetManuallyCreateResponse = (modelHubDevelopsCreateDatasetManuallyCreateResponseSuccess | modelHubDevelopsCreateDatasetManuallyCreateResponseError)
-
-export const getModelHubDevelopsCreateDatasetManuallyCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/create-dataset-manually/`
-}
-
-export const modelHubDevelopsCreateDatasetManuallyCreate = async (manualDatasetCreateRequestApi: ManualDatasetCreateRequestApi, options?: RequestInit): Promise<modelHubDevelopsCreateDatasetManuallyCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsCreateDatasetManuallyCreateResponse>(getModelHubDevelopsCreateDatasetManuallyCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      manualDatasetCreateRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsCreateEmptyDatasetCreateResponse200 = {
-  data: DatasetCreateStartedResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsCreateEmptyDatasetCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsCreateEmptyDatasetCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsCreateEmptyDatasetCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsCreateEmptyDatasetCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsCreateEmptyDatasetCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsCreateEmptyDatasetCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsCreateEmptyDatasetCreateResponseSuccess = (modelHubDevelopsCreateEmptyDatasetCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsCreateEmptyDatasetCreateResponseError = (modelHubDevelopsCreateEmptyDatasetCreateResponse400 | modelHubDevelopsCreateEmptyDatasetCreateResponse403 | modelHubDevelopsCreateEmptyDatasetCreateResponse404 | modelHubDevelopsCreateEmptyDatasetCreateResponse409 | modelHubDevelopsCreateEmptyDatasetCreateResponse500 | modelHubDevelopsCreateEmptyDatasetCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsCreateEmptyDatasetCreateResponse = (modelHubDevelopsCreateEmptyDatasetCreateResponseSuccess | modelHubDevelopsCreateEmptyDatasetCreateResponseError)
-
-export const getModelHubDevelopsCreateEmptyDatasetCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/create-empty-dataset/`
-}
-
-export const modelHubDevelopsCreateEmptyDatasetCreate = async (createEmptyDatasetRequestApi: CreateEmptyDatasetRequestApi, options?: RequestInit): Promise<modelHubDevelopsCreateEmptyDatasetCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsCreateEmptyDatasetCreateResponse>(getModelHubDevelopsCreateEmptyDatasetCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      createEmptyDatasetRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsCreateSyntheticDatasetCreateResponse200 = {
-  data: SyntheticDatasetCreateStartedResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsCreateSyntheticDatasetCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsCreateSyntheticDatasetCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsCreateSyntheticDatasetCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsCreateSyntheticDatasetCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsCreateSyntheticDatasetCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsCreateSyntheticDatasetCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsCreateSyntheticDatasetCreateResponseSuccess = (modelHubDevelopsCreateSyntheticDatasetCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsCreateSyntheticDatasetCreateResponseError = (modelHubDevelopsCreateSyntheticDatasetCreateResponse400 | modelHubDevelopsCreateSyntheticDatasetCreateResponse403 | modelHubDevelopsCreateSyntheticDatasetCreateResponse404 | modelHubDevelopsCreateSyntheticDatasetCreateResponse409 | modelHubDevelopsCreateSyntheticDatasetCreateResponse500 | modelHubDevelopsCreateSyntheticDatasetCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsCreateSyntheticDatasetCreateResponse = (modelHubDevelopsCreateSyntheticDatasetCreateResponseSuccess | modelHubDevelopsCreateSyntheticDatasetCreateResponseError)
-
-export const getModelHubDevelopsCreateSyntheticDatasetCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/create-synthetic-dataset/`
-}
-
-export const modelHubDevelopsCreateSyntheticDatasetCreate = async (syntheticDatasetCreationApi: SyntheticDatasetCreationApi, options?: RequestInit): Promise<modelHubDevelopsCreateSyntheticDatasetCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsCreateSyntheticDatasetCreateResponse>(getModelHubDevelopsCreateSyntheticDatasetCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      syntheticDatasetCreationApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsDatasetCreationProgressReadResponse200 = {
-  data: DatasetCreationProgressResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsDatasetCreationProgressReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsDatasetCreationProgressReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsDatasetCreationProgressReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsDatasetCreationProgressReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsDatasetCreationProgressReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsDatasetCreationProgressReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsDatasetCreationProgressReadResponseSuccess = (modelHubDevelopsDatasetCreationProgressReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsDatasetCreationProgressReadResponseError = (modelHubDevelopsDatasetCreationProgressReadResponse400 | modelHubDevelopsDatasetCreationProgressReadResponse403 | modelHubDevelopsDatasetCreationProgressReadResponse404 | modelHubDevelopsDatasetCreationProgressReadResponse409 | modelHubDevelopsDatasetCreationProgressReadResponse500 | modelHubDevelopsDatasetCreationProgressReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsDatasetCreationProgressReadResponse = (modelHubDevelopsDatasetCreationProgressReadResponseSuccess | modelHubDevelopsDatasetCreationProgressReadResponseError)
-
-export const getModelHubDevelopsDatasetCreationProgressReadUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/develops/dataset-creation-progress/${datasetId}/`
-}
-
-/**
- * API endpoint to check the progress of dataset creation from file upload
- */
-export const modelHubDevelopsDatasetCreationProgressRead = async (datasetId: string, options?: RequestInit): Promise<modelHubDevelopsDatasetCreationProgressReadResponse> => {
-
-  return apiMutator<modelHubDevelopsDatasetCreationProgressReadResponse>(getModelHubDevelopsDatasetCreationProgressReadUrl(datasetId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDevelopsDeleteDatasetDeleteResponse204 = {
-  data: void
-  status: 204
-}
-
-export type modelHubDevelopsDeleteDatasetDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 204>
-}
-
-export type modelHubDevelopsDeleteDatasetDeleteResponseSuccess = (modelHubDevelopsDeleteDatasetDeleteResponse204) & {
-  headers: Headers;
-};
-export type modelHubDevelopsDeleteDatasetDeleteResponseError = (modelHubDevelopsDeleteDatasetDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsDeleteDatasetDeleteResponse = (modelHubDevelopsDeleteDatasetDeleteResponseSuccess | modelHubDevelopsDeleteDatasetDeleteResponseError)
-
-export const getModelHubDevelopsDeleteDatasetDeleteUrl = () => {
-
-
-
-
-  return `/model-hub/develops/delete_dataset/`
-}
-
-export const modelHubDevelopsDeleteDatasetDelete = async ( options?: RequestInit): Promise<modelHubDevelopsDeleteDatasetDeleteResponse> => {
-
-  return apiMutator<modelHubDevelopsDeleteDatasetDeleteResponse>(getModelHubDevelopsDeleteDatasetDeleteUrl(),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
-export type modelHubDevelopsEditRunPromptColumnCreateResponse200 = {
-  data: DevelopDatasetMessageResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsEditRunPromptColumnCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsEditRunPromptColumnCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsEditRunPromptColumnCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsEditRunPromptColumnCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsEditRunPromptColumnCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsEditRunPromptColumnCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsEditRunPromptColumnCreateResponseSuccess = (modelHubDevelopsEditRunPromptColumnCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsEditRunPromptColumnCreateResponseError = (modelHubDevelopsEditRunPromptColumnCreateResponse400 | modelHubDevelopsEditRunPromptColumnCreateResponse403 | modelHubDevelopsEditRunPromptColumnCreateResponse404 | modelHubDevelopsEditRunPromptColumnCreateResponse409 | modelHubDevelopsEditRunPromptColumnCreateResponse500 | modelHubDevelopsEditRunPromptColumnCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsEditRunPromptColumnCreateResponse = (modelHubDevelopsEditRunPromptColumnCreateResponseSuccess | modelHubDevelopsEditRunPromptColumnCreateResponseError)
-
-export const getModelHubDevelopsEditRunPromptColumnCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/edit_run_prompt_column/`
-}
-
-export const modelHubDevelopsEditRunPromptColumnCreate = async (editRunPromptColumnApi: EditRunPromptColumnApi, options?: RequestInit): Promise<modelHubDevelopsEditRunPromptColumnCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsEditRunPromptColumnCreateResponse>(getModelHubDevelopsEditRunPromptColumnCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      editRunPromptColumnApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsGetCellDataCreateResponse200 = {
-  data: DatasetCellDataResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsGetCellDataCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsGetCellDataCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsGetCellDataCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsGetCellDataCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsGetCellDataCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsGetCellDataCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsGetCellDataCreateResponseSuccess = (modelHubDevelopsGetCellDataCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsGetCellDataCreateResponseError = (modelHubDevelopsGetCellDataCreateResponse400 | modelHubDevelopsGetCellDataCreateResponse403 | modelHubDevelopsGetCellDataCreateResponse404 | modelHubDevelopsGetCellDataCreateResponse409 | modelHubDevelopsGetCellDataCreateResponse500 | modelHubDevelopsGetCellDataCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsGetCellDataCreateResponse = (modelHubDevelopsGetCellDataCreateResponseSuccess | modelHubDevelopsGetCellDataCreateResponseError)
-
-export const getModelHubDevelopsGetCellDataCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/get-cell-data/`
-}
-
-export const modelHubDevelopsGetCellDataCreate = async (datasetCellDataRequestApi: DatasetCellDataRequestApi, options?: RequestInit): Promise<modelHubDevelopsGetCellDataCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsGetCellDataCreateResponse>(getModelHubDevelopsGetCellDataCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      datasetCellDataRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsGetDatasetsNamesListResponse200 = {
-  data: DatasetNamesResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsGetDatasetsNamesListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsGetDatasetsNamesListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsGetDatasetsNamesListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsGetDatasetsNamesListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsGetDatasetsNamesListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsGetDatasetsNamesListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsGetDatasetsNamesListResponseSuccess = (modelHubDevelopsGetDatasetsNamesListResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsGetDatasetsNamesListResponseError = (modelHubDevelopsGetDatasetsNamesListResponse400 | modelHubDevelopsGetDatasetsNamesListResponse403 | modelHubDevelopsGetDatasetsNamesListResponse404 | modelHubDevelopsGetDatasetsNamesListResponse409 | modelHubDevelopsGetDatasetsNamesListResponse500 | modelHubDevelopsGetDatasetsNamesListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsGetDatasetsNamesListResponse = (modelHubDevelopsGetDatasetsNamesListResponseSuccess | modelHubDevelopsGetDatasetsNamesListResponseError)
-
-export const getModelHubDevelopsGetDatasetsNamesListUrl = () => {
-
-
-
-
-  return `/model-hub/develops/get-datasets-names/`
-}
-
-export const modelHubDevelopsGetDatasetsNamesList = async ( options?: RequestInit): Promise<modelHubDevelopsGetDatasetsNamesListResponse> => {
-
-  return apiMutator<modelHubDevelopsGetDatasetsNamesListResponse>(getModelHubDevelopsGetDatasetsNamesListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDevelopsGetDatasetsListResponse200 = {
-  data: DatasetListResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsGetDatasetsListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsGetDatasetsListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsGetDatasetsListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsGetDatasetsListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsGetDatasetsListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsGetDatasetsListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsGetDatasetsListResponseSuccess = (modelHubDevelopsGetDatasetsListResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsGetDatasetsListResponseError = (modelHubDevelopsGetDatasetsListResponse400 | modelHubDevelopsGetDatasetsListResponse403 | modelHubDevelopsGetDatasetsListResponse404 | modelHubDevelopsGetDatasetsListResponse409 | modelHubDevelopsGetDatasetsListResponse500 | modelHubDevelopsGetDatasetsListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsGetDatasetsListResponse = (modelHubDevelopsGetDatasetsListResponseSuccess | modelHubDevelopsGetDatasetsListResponseError)
-
-export const getModelHubDevelopsGetDatasetsListUrl = (params?: ModelHubDevelopsGetDatasetsListParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/develops/get-datasets/?${stringifiedParams}` : `/model-hub/develops/get-datasets/`
-}
-
-export const modelHubDevelopsGetDatasetsList = async (params?: ModelHubDevelopsGetDatasetsListParams, options?: RequestInit): Promise<modelHubDevelopsGetDatasetsListResponse> => {
-
-  return apiMutator<modelHubDevelopsGetDatasetsListResponse>(getModelHubDevelopsGetDatasetsListUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDevelopsGetDerivedDatasetsReadResponse200 = {
-  data: DatasetExplanationSummaryResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsGetDerivedDatasetsReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsGetDerivedDatasetsReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsGetDerivedDatasetsReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsGetDerivedDatasetsReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsGetDerivedDatasetsReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsGetDerivedDatasetsReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsGetDerivedDatasetsReadResponseSuccess = (modelHubDevelopsGetDerivedDatasetsReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsGetDerivedDatasetsReadResponseError = (modelHubDevelopsGetDerivedDatasetsReadResponse400 | modelHubDevelopsGetDerivedDatasetsReadResponse403 | modelHubDevelopsGetDerivedDatasetsReadResponse404 | modelHubDevelopsGetDerivedDatasetsReadResponse409 | modelHubDevelopsGetDerivedDatasetsReadResponse500 | modelHubDevelopsGetDerivedDatasetsReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsGetDerivedDatasetsReadResponse = (modelHubDevelopsGetDerivedDatasetsReadResponseSuccess | modelHubDevelopsGetDerivedDatasetsReadResponseError)
-
-export const getModelHubDevelopsGetDerivedDatasetsReadUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/develops/get-derived-datasets/${datasetId}/`
-}
-
-export const modelHubDevelopsGetDerivedDatasetsRead = async (datasetId: string, options?: RequestInit): Promise<modelHubDevelopsGetDerivedDatasetsReadResponse> => {
-
-  return apiMutator<modelHubDevelopsGetDerivedDatasetsReadResponse>(getModelHubDevelopsGetDerivedDatasetsReadUrl(datasetId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse200 = {
-  data: HuggingFaceDatasetConfigResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseSuccess = (modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseError = (modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse400 | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse403 | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse404 | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse409 | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse500 | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse = (modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseSuccess | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseError)
-
-export const getModelHubDevelopsGetHuggingfaceDatasetConfigCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/get-huggingface-dataset-config/`
-}
-
-export const modelHubDevelopsGetHuggingfaceDatasetConfigCreate = async (huggingFaceDatasetConfigRequestApi: HuggingFaceDatasetConfigRequestApi, options?: RequestInit): Promise<modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse>(getModelHubDevelopsGetHuggingfaceDatasetConfigCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      huggingFaceDatasetConfigRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsGetRowDiffCreateResponse200 = {
-  data: ExperimentRowDiffResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsGetRowDiffCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsGetRowDiffCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsGetRowDiffCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsGetRowDiffCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsGetRowDiffCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsGetRowDiffCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsGetRowDiffCreateResponseSuccess = (modelHubDevelopsGetRowDiffCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsGetRowDiffCreateResponseError = (modelHubDevelopsGetRowDiffCreateResponse400 | modelHubDevelopsGetRowDiffCreateResponse403 | modelHubDevelopsGetRowDiffCreateResponse404 | modelHubDevelopsGetRowDiffCreateResponse409 | modelHubDevelopsGetRowDiffCreateResponse500 | modelHubDevelopsGetRowDiffCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsGetRowDiffCreateResponse = (modelHubDevelopsGetRowDiffCreateResponseSuccess | modelHubDevelopsGetRowDiffCreateResponseError)
-
-export const getModelHubDevelopsGetRowDiffCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/get-row-diff/`
-}
-
-export const modelHubDevelopsGetRowDiffCreate = async (datasetRowDiffRequestApi: DatasetRowDiffRequestApi, options?: RequestInit): Promise<modelHubDevelopsGetRowDiffCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsGetRowDiffCreateResponse>(getModelHubDevelopsGetRowDiffCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      datasetRowDiffRequestApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsGetFunctionListListResponse200 = {
-  data: EvalFunctionListResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsGetFunctionListListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsGetFunctionListListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsGetFunctionListListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsGetFunctionListListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsGetFunctionListListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsGetFunctionListListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsGetFunctionListListResponseSuccess = (modelHubDevelopsGetFunctionListListResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsGetFunctionListListResponseError = (modelHubDevelopsGetFunctionListListResponse400 | modelHubDevelopsGetFunctionListListResponse403 | modelHubDevelopsGetFunctionListListResponse404 | modelHubDevelopsGetFunctionListListResponse409 | modelHubDevelopsGetFunctionListListResponse500 | modelHubDevelopsGetFunctionListListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsGetFunctionListListResponse = (modelHubDevelopsGetFunctionListListResponseSuccess | modelHubDevelopsGetFunctionListListResponseError)
-
-export const getModelHubDevelopsGetFunctionListListUrl = () => {
-
-
-
-
-  return `/model-hub/develops/get_function_list/`
-}
-
-export const modelHubDevelopsGetFunctionListList = async ( options?: RequestInit): Promise<modelHubDevelopsGetFunctionListListResponse> => {
-
-  return apiMutator<modelHubDevelopsGetFunctionListListResponse>(getModelHubDevelopsGetFunctionListListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDevelopsPreviewRunPromptColumnCreateResponse200 = {
-  data: RunPromptColumnPreviewResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsPreviewRunPromptColumnCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsPreviewRunPromptColumnCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsPreviewRunPromptColumnCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsPreviewRunPromptColumnCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsPreviewRunPromptColumnCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsPreviewRunPromptColumnCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsPreviewRunPromptColumnCreateResponseSuccess = (modelHubDevelopsPreviewRunPromptColumnCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsPreviewRunPromptColumnCreateResponseError = (modelHubDevelopsPreviewRunPromptColumnCreateResponse400 | modelHubDevelopsPreviewRunPromptColumnCreateResponse403 | modelHubDevelopsPreviewRunPromptColumnCreateResponse404 | modelHubDevelopsPreviewRunPromptColumnCreateResponse409 | modelHubDevelopsPreviewRunPromptColumnCreateResponse500 | modelHubDevelopsPreviewRunPromptColumnCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsPreviewRunPromptColumnCreateResponse = (modelHubDevelopsPreviewRunPromptColumnCreateResponseSuccess | modelHubDevelopsPreviewRunPromptColumnCreateResponseError)
-
-export const getModelHubDevelopsPreviewRunPromptColumnCreateUrl = () => {
-
-
-
-
-  return `/model-hub/develops/preview_run_prompt_column/`
-}
-
-export const modelHubDevelopsPreviewRunPromptColumnCreate = async (previewRunPromptApi: PreviewRunPromptApi, options?: RequestInit): Promise<modelHubDevelopsPreviewRunPromptColumnCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsPreviewRunPromptColumnCreateResponse>(getModelHubDevelopsPreviewRunPromptColumnCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      previewRunPromptApi,)
-  }
-);}
-
-
-
-export type modelHubDevelopsProviderStatusListResponse200 = {
-  data: ProviderStatusResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsProviderStatusListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsProviderStatusListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsProviderStatusListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsProviderStatusListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsProviderStatusListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsProviderStatusListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsProviderStatusListResponseSuccess = (modelHubDevelopsProviderStatusListResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsProviderStatusListResponseError = (modelHubDevelopsProviderStatusListResponse400 | modelHubDevelopsProviderStatusListResponse403 | modelHubDevelopsProviderStatusListResponse404 | modelHubDevelopsProviderStatusListResponse409 | modelHubDevelopsProviderStatusListResponse500 | modelHubDevelopsProviderStatusListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsProviderStatusListResponse = (modelHubDevelopsProviderStatusListResponseSuccess | modelHubDevelopsProviderStatusListResponseError)
-
-export const getModelHubDevelopsProviderStatusListUrl = () => {
-
-
-
-
-  return `/model-hub/develops/provider-status/`
-}
-
-export const modelHubDevelopsProviderStatusList = async ( options?: RequestInit): Promise<modelHubDevelopsProviderStatusListResponse> => {
-
-  return apiMutator<modelHubDevelopsProviderStatusListResponse>(getModelHubDevelopsProviderStatusListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse200 = {
-  data: RunPromptColumnConfigResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponseSuccess = (modelHubDevelopsRetrieveRunPromptColumnConfigListResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponseError = (modelHubDevelopsRetrieveRunPromptColumnConfigListResponse400 | modelHubDevelopsRetrieveRunPromptColumnConfigListResponse403 | modelHubDevelopsRetrieveRunPromptColumnConfigListResponse404 | modelHubDevelopsRetrieveRunPromptColumnConfigListResponse409 | modelHubDevelopsRetrieveRunPromptColumnConfigListResponse500 | modelHubDevelopsRetrieveRunPromptColumnConfigListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse = (modelHubDevelopsRetrieveRunPromptColumnConfigListResponseSuccess | modelHubDevelopsRetrieveRunPromptColumnConfigListResponseError)
-
-export const getModelHubDevelopsRetrieveRunPromptColumnConfigListUrl = () => {
-
-
-
-
-  return `/model-hub/develops/retrieve_run_prompt_column_config/`
-}
-
-export const modelHubDevelopsRetrieveRunPromptColumnConfigList = async ( options?: RequestInit): Promise<modelHubDevelopsRetrieveRunPromptColumnConfigListResponse> => {
-
-  return apiMutator<modelHubDevelopsRetrieveRunPromptColumnConfigListResponse>(getModelHubDevelopsRetrieveRunPromptColumnConfigListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDevelopsRetrieveRunPromptOptionsListResponse200 = {
-  data: RunPromptOptionsResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsRetrieveRunPromptOptionsListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsRetrieveRunPromptOptionsListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsRetrieveRunPromptOptionsListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsRetrieveRunPromptOptionsListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsRetrieveRunPromptOptionsListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsRetrieveRunPromptOptionsListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsRetrieveRunPromptOptionsListResponseSuccess = (modelHubDevelopsRetrieveRunPromptOptionsListResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsRetrieveRunPromptOptionsListResponseError = (modelHubDevelopsRetrieveRunPromptOptionsListResponse400 | modelHubDevelopsRetrieveRunPromptOptionsListResponse403 | modelHubDevelopsRetrieveRunPromptOptionsListResponse404 | modelHubDevelopsRetrieveRunPromptOptionsListResponse409 | modelHubDevelopsRetrieveRunPromptOptionsListResponse500 | modelHubDevelopsRetrieveRunPromptOptionsListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsRetrieveRunPromptOptionsListResponse = (modelHubDevelopsRetrieveRunPromptOptionsListResponseSuccess | modelHubDevelopsRetrieveRunPromptOptionsListResponseError)
-
-export const getModelHubDevelopsRetrieveRunPromptOptionsListUrl = () => {
-
-
-
-
-  return `/model-hub/develops/retrieve_run_prompt_options/`
-}
-
-export const modelHubDevelopsRetrieveRunPromptOptionsList = async ( options?: RequestInit): Promise<modelHubDevelopsRetrieveRunPromptOptionsListResponse> => {
-
-  return apiMutator<modelHubDevelopsRetrieveRunPromptOptionsListResponse>(getModelHubDevelopsRetrieveRunPromptOptionsListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
   }
 );}
 
@@ -31999,73 +30433,6 @@ export const modelHubDevelopsAddMultipleStaticColumnsCreate = async (datasetId: 
 
 
 
-export type modelHubDevelopsAddRowsCreateResponse200 = {
-  data: DevelopDatasetMessageResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsAddRowsCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsAddRowsCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsAddRowsCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsAddRowsCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsAddRowsCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsAddRowsCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsAddRowsCreateResponseSuccess = (modelHubDevelopsAddRowsCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsAddRowsCreateResponseError = (modelHubDevelopsAddRowsCreateResponse400 | modelHubDevelopsAddRowsCreateResponse403 | modelHubDevelopsAddRowsCreateResponse404 | modelHubDevelopsAddRowsCreateResponse409 | modelHubDevelopsAddRowsCreateResponse500 | modelHubDevelopsAddRowsCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsAddRowsCreateResponse = (modelHubDevelopsAddRowsCreateResponseSuccess | modelHubDevelopsAddRowsCreateResponseError)
-
-export const getModelHubDevelopsAddRowsCreateUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/develops/${datasetId}/add_rows/`
-}
-
-export const modelHubDevelopsAddRowsCreate = async (datasetId: string,
-    datasetAddRowsRequestApi: DatasetAddRowsRequestApi, options?: RequestInit): Promise<modelHubDevelopsAddRowsCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsAddRowsCreateResponse>(getModelHubDevelopsAddRowsCreateUrl(datasetId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      datasetAddRowsRequestApi,)
-  }
-);}
-
-
-
 export type modelHubDevelopsAddRowsFromExistingDatasetCreateResponse200 = {
   data: DatasetRowsImportedResponseApi
   status: 200
@@ -32195,6 +30562,73 @@ export const modelHubDevelopsAddRowsFromHuggingfaceCreate = async (datasetId: st
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       huggingFaceAddRowsRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsAddRowsCreateResponse200 = {
+  data: DevelopDatasetMessageResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsAddRowsCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsAddRowsCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsAddRowsCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsAddRowsCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsAddRowsCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsAddRowsCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsAddRowsCreateResponseSuccess = (modelHubDevelopsAddRowsCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsAddRowsCreateResponseError = (modelHubDevelopsAddRowsCreateResponse400 | modelHubDevelopsAddRowsCreateResponse403 | modelHubDevelopsAddRowsCreateResponse404 | modelHubDevelopsAddRowsCreateResponse409 | modelHubDevelopsAddRowsCreateResponse500 | modelHubDevelopsAddRowsCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsAddRowsCreateResponse = (modelHubDevelopsAddRowsCreateResponseSuccess | modelHubDevelopsAddRowsCreateResponseError)
+
+export const getModelHubDevelopsAddRowsCreateUrl = (datasetId: string,) => {
+
+
+
+
+  return `/model-hub/develops/${datasetId}/add_rows/`
+}
+
+export const modelHubDevelopsAddRowsCreate = async (datasetId: string,
+    datasetAddRowsRequestApi: DatasetAddRowsRequestApi, options?: RequestInit): Promise<modelHubDevelopsAddRowsCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsAddRowsCreateResponse>(getModelHubDevelopsAddRowsCreateUrl(datasetId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      datasetAddRowsRequestApi,)
   }
 );}
 
@@ -32835,151 +31269,6 @@ export const modelHubDevelopsExtractJsonColumnCreate = async (datasetId: string,
 
 
 
-export type modelHubDevelopsGetDatasetTableListResponse200 = {
-  data: DatasetTableResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsGetDatasetTableListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsGetDatasetTableListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsGetDatasetTableListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsGetDatasetTableListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsGetDatasetTableListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsGetDatasetTableListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsGetDatasetTableListResponseSuccess = (modelHubDevelopsGetDatasetTableListResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsGetDatasetTableListResponseError = (modelHubDevelopsGetDatasetTableListResponse400 | modelHubDevelopsGetDatasetTableListResponse403 | modelHubDevelopsGetDatasetTableListResponse404 | modelHubDevelopsGetDatasetTableListResponse409 | modelHubDevelopsGetDatasetTableListResponse500 | modelHubDevelopsGetDatasetTableListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsGetDatasetTableListResponse = (modelHubDevelopsGetDatasetTableListResponseSuccess | modelHubDevelopsGetDatasetTableListResponseError)
-
-export const getModelHubDevelopsGetDatasetTableListUrl = (datasetId: string,
-    params?: ModelHubDevelopsGetDatasetTableListParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/develops/${datasetId}/get-dataset-table/?${stringifiedParams}` : `/model-hub/develops/${datasetId}/get-dataset-table/`
-}
-
-export const modelHubDevelopsGetDatasetTableList = async (datasetId: string,
-    params?: ModelHubDevelopsGetDatasetTableListParams, options?: RequestInit): Promise<modelHubDevelopsGetDatasetTableListResponse> => {
-
-  return apiMutator<modelHubDevelopsGetDatasetTableListResponse>(getModelHubDevelopsGetDatasetTableListUrl(datasetId,params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubDevelopsGetRowDataCreateResponse200 = {
-  data: DatasetRowDataResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsGetRowDataCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsGetRowDataCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsGetRowDataCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsGetRowDataCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsGetRowDataCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsGetRowDataCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsGetRowDataCreateResponseSuccess = (modelHubDevelopsGetRowDataCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsGetRowDataCreateResponseError = (modelHubDevelopsGetRowDataCreateResponse400 | modelHubDevelopsGetRowDataCreateResponse403 | modelHubDevelopsGetRowDataCreateResponse404 | modelHubDevelopsGetRowDataCreateResponse409 | modelHubDevelopsGetRowDataCreateResponse500 | modelHubDevelopsGetRowDataCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsGetRowDataCreateResponse = (modelHubDevelopsGetRowDataCreateResponseSuccess | modelHubDevelopsGetRowDataCreateResponseError)
-
-export const getModelHubDevelopsGetRowDataCreateUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/develops/${datasetId}/get-row-data/`
-}
-
-export const modelHubDevelopsGetRowDataCreate = async (datasetId: string,
-    datasetRowDataRequestApi: DatasetRowDataRequestApi, options?: RequestInit): Promise<modelHubDevelopsGetRowDataCreateResponse> => {
-
-  return apiMutator<modelHubDevelopsGetRowDataCreateResponse>(getModelHubDevelopsGetRowDataCreateUrl(datasetId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      datasetRowDataRequestApi,)
-  }
-);}
-
-
-
 export type modelHubDevelopsGetEvalStructureReadResponse200 = {
   data: EvalStructureResponseApi
   status: 200
@@ -33120,6 +31409,151 @@ export const modelHubDevelopsGetEvalsListList = async (datasetId: string, option
     method: 'GET'
 
 
+  }
+);}
+
+
+
+export type modelHubDevelopsGetDatasetTableListResponse200 = {
+  data: DatasetTableResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsGetDatasetTableListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsGetDatasetTableListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsGetDatasetTableListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsGetDatasetTableListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsGetDatasetTableListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsGetDatasetTableListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsGetDatasetTableListResponseSuccess = (modelHubDevelopsGetDatasetTableListResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsGetDatasetTableListResponseError = (modelHubDevelopsGetDatasetTableListResponse400 | modelHubDevelopsGetDatasetTableListResponse403 | modelHubDevelopsGetDatasetTableListResponse404 | modelHubDevelopsGetDatasetTableListResponse409 | modelHubDevelopsGetDatasetTableListResponse500 | modelHubDevelopsGetDatasetTableListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsGetDatasetTableListResponse = (modelHubDevelopsGetDatasetTableListResponseSuccess | modelHubDevelopsGetDatasetTableListResponseError)
+
+export const getModelHubDevelopsGetDatasetTableListUrl = (datasetId: string,
+    params?: ModelHubDevelopsGetDatasetTableListParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/develops/${datasetId}/get-dataset-table/?${stringifiedParams}` : `/model-hub/develops/${datasetId}/get-dataset-table/`
+}
+
+export const modelHubDevelopsGetDatasetTableList = async (datasetId: string,
+    params?: ModelHubDevelopsGetDatasetTableListParams, options?: RequestInit): Promise<modelHubDevelopsGetDatasetTableListResponse> => {
+
+  return apiMutator<modelHubDevelopsGetDatasetTableListResponse>(getModelHubDevelopsGetDatasetTableListUrl(datasetId,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDevelopsGetRowDataCreateResponse200 = {
+  data: DatasetRowDataResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsGetRowDataCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsGetRowDataCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsGetRowDataCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsGetRowDataCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsGetRowDataCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsGetRowDataCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsGetRowDataCreateResponseSuccess = (modelHubDevelopsGetRowDataCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsGetRowDataCreateResponseError = (modelHubDevelopsGetRowDataCreateResponse400 | modelHubDevelopsGetRowDataCreateResponse403 | modelHubDevelopsGetRowDataCreateResponse404 | modelHubDevelopsGetRowDataCreateResponse409 | modelHubDevelopsGetRowDataCreateResponse500 | modelHubDevelopsGetRowDataCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsGetRowDataCreateResponse = (modelHubDevelopsGetRowDataCreateResponseSuccess | modelHubDevelopsGetRowDataCreateResponseError)
+
+export const getModelHubDevelopsGetRowDataCreateUrl = (datasetId: string,) => {
+
+
+
+
+  return `/model-hub/develops/${datasetId}/get-row-data/`
+}
+
+export const modelHubDevelopsGetRowDataCreate = async (datasetId: string,
+    datasetRowDataRequestApi: DatasetRowDataRequestApi, options?: RequestInit): Promise<modelHubDevelopsGetRowDataCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsGetRowDataCreateResponse>(getModelHubDevelopsGetRowDataCreateUrl(datasetId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      datasetRowDataRequestApi,)
   }
 );}
 
@@ -33401,73 +31835,6 @@ export const modelHubDevelopsSyntheticConfigList = async (datasetId: string, opt
 
 
 
-export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse200 = {
-  data: SyntheticDatasetUpdateResponseApi
-  status: 200
-}
-
-export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubDevelopsUpdateSyntheticConfigUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubDevelopsUpdateSyntheticConfigUpdateResponseSuccess = (modelHubDevelopsUpdateSyntheticConfigUpdateResponse200) & {
-  headers: Headers;
-};
-export type modelHubDevelopsUpdateSyntheticConfigUpdateResponseError = (modelHubDevelopsUpdateSyntheticConfigUpdateResponse400 | modelHubDevelopsUpdateSyntheticConfigUpdateResponse403 | modelHubDevelopsUpdateSyntheticConfigUpdateResponse404 | modelHubDevelopsUpdateSyntheticConfigUpdateResponse409 | modelHubDevelopsUpdateSyntheticConfigUpdateResponse500 | modelHubDevelopsUpdateSyntheticConfigUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse = (modelHubDevelopsUpdateSyntheticConfigUpdateResponseSuccess | modelHubDevelopsUpdateSyntheticConfigUpdateResponseError)
-
-export const getModelHubDevelopsUpdateSyntheticConfigUpdateUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/develops/${datasetId}/update-synthetic-config/`
-}
-
-export const modelHubDevelopsUpdateSyntheticConfigUpdate = async (datasetId: string,
-    syntheticDatasetConfigApi: SyntheticDatasetConfigApi, options?: RequestInit): Promise<modelHubDevelopsUpdateSyntheticConfigUpdateResponse> => {
-
-  return apiMutator<modelHubDevelopsUpdateSyntheticConfigUpdateResponse>(getModelHubDevelopsUpdateSyntheticConfigUpdateUrl(datasetId),
-  {
-    ...options,
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      syntheticDatasetConfigApi,)
-  }
-);}
-
-
-
 export type modelHubDevelopsUpdateCellValueCreateResponse200 = {
   data: DevelopDatasetMessageResponseApi
   status: 200
@@ -33673,6 +32040,73 @@ export const modelHubDevelopsUpdateColumnTypeUpdate = async (datasetId: string,
 
 
 
+export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse200 = {
+  data: SyntheticDatasetUpdateResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsUpdateSyntheticConfigUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsUpdateSyntheticConfigUpdateResponseSuccess = (modelHubDevelopsUpdateSyntheticConfigUpdateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsUpdateSyntheticConfigUpdateResponseError = (modelHubDevelopsUpdateSyntheticConfigUpdateResponse400 | modelHubDevelopsUpdateSyntheticConfigUpdateResponse403 | modelHubDevelopsUpdateSyntheticConfigUpdateResponse404 | modelHubDevelopsUpdateSyntheticConfigUpdateResponse409 | modelHubDevelopsUpdateSyntheticConfigUpdateResponse500 | modelHubDevelopsUpdateSyntheticConfigUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsUpdateSyntheticConfigUpdateResponse = (modelHubDevelopsUpdateSyntheticConfigUpdateResponseSuccess | modelHubDevelopsUpdateSyntheticConfigUpdateResponseError)
+
+export const getModelHubDevelopsUpdateSyntheticConfigUpdateUrl = (datasetId: string,) => {
+
+
+
+
+  return `/model-hub/develops/${datasetId}/update-synthetic-config/`
+}
+
+export const modelHubDevelopsUpdateSyntheticConfigUpdate = async (datasetId: string,
+    syntheticDatasetConfigApi: SyntheticDatasetConfigApi, options?: RequestInit): Promise<modelHubDevelopsUpdateSyntheticConfigUpdateResponse> => {
+
+  return apiMutator<modelHubDevelopsUpdateSyntheticConfigUpdateResponse>(getModelHubDevelopsUpdateSyntheticConfigUpdateUrl(datasetId),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      syntheticDatasetConfigApi,)
+  }
+);}
+
+
+
 export type modelHubDevelopsCreateDatasetCreateResponse200 = {
   data: DevelopDatasetMessageResponseApi
   status: 200
@@ -33795,6 +32229,1571 @@ export const getModelHubDevelopsGetExperimentDatasetTableListUrl = (experimentDa
 export const modelHubDevelopsGetExperimentDatasetTableList = async (experimentDatasetId: string, options?: RequestInit): Promise<modelHubDevelopsGetExperimentDatasetTableListResponse> => {
 
   return apiMutator<modelHubDevelopsGetExperimentDatasetTableListResponse>(getModelHubDevelopsGetExperimentDatasetTableListUrl(experimentDatasetId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDevelopsAddRowsFromFileCreateResponse200 = {
+  data: DevelopDatasetMessageResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsAddRowsFromFileCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsAddRowsFromFileCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsAddRowsFromFileCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsAddRowsFromFileCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsAddRowsFromFileCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsAddRowsFromFileCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsAddRowsFromFileCreateResponseSuccess = (modelHubDevelopsAddRowsFromFileCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsAddRowsFromFileCreateResponseError = (modelHubDevelopsAddRowsFromFileCreateResponse400 | modelHubDevelopsAddRowsFromFileCreateResponse403 | modelHubDevelopsAddRowsFromFileCreateResponse404 | modelHubDevelopsAddRowsFromFileCreateResponse409 | modelHubDevelopsAddRowsFromFileCreateResponse500 | modelHubDevelopsAddRowsFromFileCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsAddRowsFromFileCreateResponse = (modelHubDevelopsAddRowsFromFileCreateResponseSuccess | modelHubDevelopsAddRowsFromFileCreateResponseError)
+
+export const getModelHubDevelopsAddRowsFromFileCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/add_rows_from_file/`
+}
+
+export const modelHubDevelopsAddRowsFromFileCreate = async (addRowsFromFileRequestApi: NonReadonly<AddRowsFromFileRequestApi>, options?: RequestInit): Promise<modelHubDevelopsAddRowsFromFileCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsAddRowsFromFileCreateResponse>(getModelHubDevelopsAddRowsFromFileCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      addRowsFromFileRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsAddRowsSdkCreateResponse200 = {
+  data: DatasetSdkRowsResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsAddRowsSdkCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsAddRowsSdkCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsAddRowsSdkCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsAddRowsSdkCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsAddRowsSdkCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsAddRowsSdkCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsAddRowsSdkCreateResponseSuccess = (modelHubDevelopsAddRowsSdkCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsAddRowsSdkCreateResponseError = (modelHubDevelopsAddRowsSdkCreateResponse400 | modelHubDevelopsAddRowsSdkCreateResponse403 | modelHubDevelopsAddRowsSdkCreateResponse404 | modelHubDevelopsAddRowsSdkCreateResponse409 | modelHubDevelopsAddRowsSdkCreateResponse500 | modelHubDevelopsAddRowsSdkCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsAddRowsSdkCreateResponse = (modelHubDevelopsAddRowsSdkCreateResponseSuccess | modelHubDevelopsAddRowsSdkCreateResponseError)
+
+export const getModelHubDevelopsAddRowsSdkCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/add_rows_sdk/`
+}
+
+export const modelHubDevelopsAddRowsSdkCreate = async (datasetSdkRowsRequestApi: DatasetSdkRowsRequestApi, options?: RequestInit): Promise<modelHubDevelopsAddRowsSdkCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsAddRowsSdkCreateResponse>(getModelHubDevelopsAddRowsSdkCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      datasetSdkRowsRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsAddRunPromptColumnCreateResponse200 = {
+  data: DevelopDatasetMessageResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsAddRunPromptColumnCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsAddRunPromptColumnCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsAddRunPromptColumnCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsAddRunPromptColumnCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsAddRunPromptColumnCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsAddRunPromptColumnCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsAddRunPromptColumnCreateResponseSuccess = (modelHubDevelopsAddRunPromptColumnCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsAddRunPromptColumnCreateResponseError = (modelHubDevelopsAddRunPromptColumnCreateResponse400 | modelHubDevelopsAddRunPromptColumnCreateResponse403 | modelHubDevelopsAddRunPromptColumnCreateResponse404 | modelHubDevelopsAddRunPromptColumnCreateResponse409 | modelHubDevelopsAddRunPromptColumnCreateResponse500 | modelHubDevelopsAddRunPromptColumnCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsAddRunPromptColumnCreateResponse = (modelHubDevelopsAddRunPromptColumnCreateResponseSuccess | modelHubDevelopsAddRunPromptColumnCreateResponseError)
+
+export const getModelHubDevelopsAddRunPromptColumnCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/add_run_prompt_column/`
+}
+
+export const modelHubDevelopsAddRunPromptColumnCreate = async (addRunPromptApi: AddRunPromptApi, options?: RequestInit): Promise<modelHubDevelopsAddRunPromptColumnCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsAddRunPromptColumnCreateResponse>(getModelHubDevelopsAddRunPromptColumnCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      addRunPromptApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsAddAsNewCreateResponse200 = {
+  data: DatasetCopyResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsAddAsNewCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsAddAsNewCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsAddAsNewCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsAddAsNewCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsAddAsNewCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsAddAsNewCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsAddAsNewCreateResponseSuccess = (modelHubDevelopsAddAsNewCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsAddAsNewCreateResponseError = (modelHubDevelopsAddAsNewCreateResponse400 | modelHubDevelopsAddAsNewCreateResponse403 | modelHubDevelopsAddAsNewCreateResponse404 | modelHubDevelopsAddAsNewCreateResponse409 | modelHubDevelopsAddAsNewCreateResponse500 | modelHubDevelopsAddAsNewCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsAddAsNewCreateResponse = (modelHubDevelopsAddAsNewCreateResponseSuccess | modelHubDevelopsAddAsNewCreateResponseError)
+
+export const getModelHubDevelopsAddAsNewCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/add-as-new/`
+}
+
+export const modelHubDevelopsAddAsNewCreate = async (addAsNewDatasetRequestApi: AddAsNewDatasetRequestApi, options?: RequestInit): Promise<modelHubDevelopsAddAsNewCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsAddAsNewCreateResponse>(getModelHubDevelopsAddAsNewCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      addAsNewDatasetRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsCloneDatasetCreateResponse200 = {
+  data: DatasetCopyResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsCloneDatasetCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsCloneDatasetCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsCloneDatasetCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsCloneDatasetCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsCloneDatasetCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsCloneDatasetCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsCloneDatasetCreateResponseSuccess = (modelHubDevelopsCloneDatasetCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsCloneDatasetCreateResponseError = (modelHubDevelopsCloneDatasetCreateResponse400 | modelHubDevelopsCloneDatasetCreateResponse403 | modelHubDevelopsCloneDatasetCreateResponse404 | modelHubDevelopsCloneDatasetCreateResponse409 | modelHubDevelopsCloneDatasetCreateResponse500 | modelHubDevelopsCloneDatasetCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsCloneDatasetCreateResponse = (modelHubDevelopsCloneDatasetCreateResponseSuccess | modelHubDevelopsCloneDatasetCreateResponseError)
+
+export const getModelHubDevelopsCloneDatasetCreateUrl = (datasetId: string,) => {
+
+
+
+
+  return `/model-hub/develops/clone-dataset/${datasetId}/`
+}
+
+export const modelHubDevelopsCloneDatasetCreate = async (datasetId: string,
+    cloneDatasetRequestApi: CloneDatasetRequestApi, options?: RequestInit): Promise<modelHubDevelopsCloneDatasetCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsCloneDatasetCreateResponse>(getModelHubDevelopsCloneDatasetCreateUrl(datasetId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      cloneDatasetRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse200 = {
+  data: DatasetCreateStartedResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseSuccess = (modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseError = (modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse400 | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse403 | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse404 | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse409 | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse500 | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse = (modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseSuccess | modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponseError)
+
+export const getModelHubDevelopsCreateDatasetFromHuggingfaceCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/create-dataset-from-huggingface/`
+}
+
+export const modelHubDevelopsCreateDatasetFromHuggingfaceCreate = async (huggingFaceDatasetCreateRequestApi: HuggingFaceDatasetCreateRequestApi, options?: RequestInit): Promise<modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsCreateDatasetFromHuggingfaceCreateResponse>(getModelHubDevelopsCreateDatasetFromHuggingfaceCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      huggingFaceDatasetCreateRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse200 = {
+  data: LocalFileDatasetCreateStartedResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponseSuccess = (modelHubDevelopsCreateDatasetFromLocalFileCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponseError = (modelHubDevelopsCreateDatasetFromLocalFileCreateResponse400 | modelHubDevelopsCreateDatasetFromLocalFileCreateResponse403 | modelHubDevelopsCreateDatasetFromLocalFileCreateResponse404 | modelHubDevelopsCreateDatasetFromLocalFileCreateResponse409 | modelHubDevelopsCreateDatasetFromLocalFileCreateResponse500 | modelHubDevelopsCreateDatasetFromLocalFileCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsCreateDatasetFromLocalFileCreateResponse = (modelHubDevelopsCreateDatasetFromLocalFileCreateResponseSuccess | modelHubDevelopsCreateDatasetFromLocalFileCreateResponseError)
+
+export const getModelHubDevelopsCreateDatasetFromLocalFileCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/create-dataset-from-local-file/`
+}
+
+export const modelHubDevelopsCreateDatasetFromLocalFileCreate = async (createDatasetFromLocalFileRequestApi: NonReadonly<CreateDatasetFromLocalFileRequestApi>, options?: RequestInit): Promise<modelHubDevelopsCreateDatasetFromLocalFileCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsCreateDatasetFromLocalFileCreateResponse>(getModelHubDevelopsCreateDatasetFromLocalFileCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      createDatasetFromLocalFileRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsCreateDatasetManuallyCreateResponse200 = {
+  data: ManualDatasetCreateResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsCreateDatasetManuallyCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsCreateDatasetManuallyCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsCreateDatasetManuallyCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsCreateDatasetManuallyCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsCreateDatasetManuallyCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsCreateDatasetManuallyCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsCreateDatasetManuallyCreateResponseSuccess = (modelHubDevelopsCreateDatasetManuallyCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsCreateDatasetManuallyCreateResponseError = (modelHubDevelopsCreateDatasetManuallyCreateResponse400 | modelHubDevelopsCreateDatasetManuallyCreateResponse403 | modelHubDevelopsCreateDatasetManuallyCreateResponse404 | modelHubDevelopsCreateDatasetManuallyCreateResponse409 | modelHubDevelopsCreateDatasetManuallyCreateResponse500 | modelHubDevelopsCreateDatasetManuallyCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsCreateDatasetManuallyCreateResponse = (modelHubDevelopsCreateDatasetManuallyCreateResponseSuccess | modelHubDevelopsCreateDatasetManuallyCreateResponseError)
+
+export const getModelHubDevelopsCreateDatasetManuallyCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/create-dataset-manually/`
+}
+
+export const modelHubDevelopsCreateDatasetManuallyCreate = async (manualDatasetCreateRequestApi: ManualDatasetCreateRequestApi, options?: RequestInit): Promise<modelHubDevelopsCreateDatasetManuallyCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsCreateDatasetManuallyCreateResponse>(getModelHubDevelopsCreateDatasetManuallyCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      manualDatasetCreateRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsCreateEmptyDatasetCreateResponse200 = {
+  data: DatasetCreateStartedResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsCreateEmptyDatasetCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsCreateEmptyDatasetCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsCreateEmptyDatasetCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsCreateEmptyDatasetCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsCreateEmptyDatasetCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsCreateEmptyDatasetCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsCreateEmptyDatasetCreateResponseSuccess = (modelHubDevelopsCreateEmptyDatasetCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsCreateEmptyDatasetCreateResponseError = (modelHubDevelopsCreateEmptyDatasetCreateResponse400 | modelHubDevelopsCreateEmptyDatasetCreateResponse403 | modelHubDevelopsCreateEmptyDatasetCreateResponse404 | modelHubDevelopsCreateEmptyDatasetCreateResponse409 | modelHubDevelopsCreateEmptyDatasetCreateResponse500 | modelHubDevelopsCreateEmptyDatasetCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsCreateEmptyDatasetCreateResponse = (modelHubDevelopsCreateEmptyDatasetCreateResponseSuccess | modelHubDevelopsCreateEmptyDatasetCreateResponseError)
+
+export const getModelHubDevelopsCreateEmptyDatasetCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/create-empty-dataset/`
+}
+
+export const modelHubDevelopsCreateEmptyDatasetCreate = async (createEmptyDatasetRequestApi: CreateEmptyDatasetRequestApi, options?: RequestInit): Promise<modelHubDevelopsCreateEmptyDatasetCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsCreateEmptyDatasetCreateResponse>(getModelHubDevelopsCreateEmptyDatasetCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      createEmptyDatasetRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsCreateSyntheticDatasetCreateResponse200 = {
+  data: SyntheticDatasetCreateStartedResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsCreateSyntheticDatasetCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsCreateSyntheticDatasetCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsCreateSyntheticDatasetCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsCreateSyntheticDatasetCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsCreateSyntheticDatasetCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsCreateSyntheticDatasetCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsCreateSyntheticDatasetCreateResponseSuccess = (modelHubDevelopsCreateSyntheticDatasetCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsCreateSyntheticDatasetCreateResponseError = (modelHubDevelopsCreateSyntheticDatasetCreateResponse400 | modelHubDevelopsCreateSyntheticDatasetCreateResponse403 | modelHubDevelopsCreateSyntheticDatasetCreateResponse404 | modelHubDevelopsCreateSyntheticDatasetCreateResponse409 | modelHubDevelopsCreateSyntheticDatasetCreateResponse500 | modelHubDevelopsCreateSyntheticDatasetCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsCreateSyntheticDatasetCreateResponse = (modelHubDevelopsCreateSyntheticDatasetCreateResponseSuccess | modelHubDevelopsCreateSyntheticDatasetCreateResponseError)
+
+export const getModelHubDevelopsCreateSyntheticDatasetCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/create-synthetic-dataset/`
+}
+
+export const modelHubDevelopsCreateSyntheticDatasetCreate = async (syntheticDatasetCreationApi: SyntheticDatasetCreationApi, options?: RequestInit): Promise<modelHubDevelopsCreateSyntheticDatasetCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsCreateSyntheticDatasetCreateResponse>(getModelHubDevelopsCreateSyntheticDatasetCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      syntheticDatasetCreationApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsDatasetCreationProgressReadResponse200 = {
+  data: DatasetCreationProgressResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsDatasetCreationProgressReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsDatasetCreationProgressReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsDatasetCreationProgressReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsDatasetCreationProgressReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsDatasetCreationProgressReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsDatasetCreationProgressReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsDatasetCreationProgressReadResponseSuccess = (modelHubDevelopsDatasetCreationProgressReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsDatasetCreationProgressReadResponseError = (modelHubDevelopsDatasetCreationProgressReadResponse400 | modelHubDevelopsDatasetCreationProgressReadResponse403 | modelHubDevelopsDatasetCreationProgressReadResponse404 | modelHubDevelopsDatasetCreationProgressReadResponse409 | modelHubDevelopsDatasetCreationProgressReadResponse500 | modelHubDevelopsDatasetCreationProgressReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsDatasetCreationProgressReadResponse = (modelHubDevelopsDatasetCreationProgressReadResponseSuccess | modelHubDevelopsDatasetCreationProgressReadResponseError)
+
+export const getModelHubDevelopsDatasetCreationProgressReadUrl = (datasetId: string,) => {
+
+
+
+
+  return `/model-hub/develops/dataset-creation-progress/${datasetId}/`
+}
+
+/**
+ * API endpoint to check the progress of dataset creation from file upload
+ */
+export const modelHubDevelopsDatasetCreationProgressRead = async (datasetId: string, options?: RequestInit): Promise<modelHubDevelopsDatasetCreationProgressReadResponse> => {
+
+  return apiMutator<modelHubDevelopsDatasetCreationProgressReadResponse>(getModelHubDevelopsDatasetCreationProgressReadUrl(datasetId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDevelopsDeleteDatasetDeleteResponse204 = {
+  data: void
+  status: 204
+}
+
+export type modelHubDevelopsDeleteDatasetDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 204>
+}
+
+export type modelHubDevelopsDeleteDatasetDeleteResponseSuccess = (modelHubDevelopsDeleteDatasetDeleteResponse204) & {
+  headers: Headers;
+};
+export type modelHubDevelopsDeleteDatasetDeleteResponseError = (modelHubDevelopsDeleteDatasetDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsDeleteDatasetDeleteResponse = (modelHubDevelopsDeleteDatasetDeleteResponseSuccess | modelHubDevelopsDeleteDatasetDeleteResponseError)
+
+export const getModelHubDevelopsDeleteDatasetDeleteUrl = () => {
+
+
+
+
+  return `/model-hub/develops/delete_dataset/`
+}
+
+export const modelHubDevelopsDeleteDatasetDelete = async ( options?: RequestInit): Promise<modelHubDevelopsDeleteDatasetDeleteResponse> => {
+
+  return apiMutator<modelHubDevelopsDeleteDatasetDeleteResponse>(getModelHubDevelopsDeleteDatasetDeleteUrl(),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type modelHubDevelopsEditRunPromptColumnCreateResponse200 = {
+  data: DevelopDatasetMessageResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsEditRunPromptColumnCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsEditRunPromptColumnCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsEditRunPromptColumnCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsEditRunPromptColumnCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsEditRunPromptColumnCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsEditRunPromptColumnCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsEditRunPromptColumnCreateResponseSuccess = (modelHubDevelopsEditRunPromptColumnCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsEditRunPromptColumnCreateResponseError = (modelHubDevelopsEditRunPromptColumnCreateResponse400 | modelHubDevelopsEditRunPromptColumnCreateResponse403 | modelHubDevelopsEditRunPromptColumnCreateResponse404 | modelHubDevelopsEditRunPromptColumnCreateResponse409 | modelHubDevelopsEditRunPromptColumnCreateResponse500 | modelHubDevelopsEditRunPromptColumnCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsEditRunPromptColumnCreateResponse = (modelHubDevelopsEditRunPromptColumnCreateResponseSuccess | modelHubDevelopsEditRunPromptColumnCreateResponseError)
+
+export const getModelHubDevelopsEditRunPromptColumnCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/edit_run_prompt_column/`
+}
+
+export const modelHubDevelopsEditRunPromptColumnCreate = async (editRunPromptColumnApi: EditRunPromptColumnApi, options?: RequestInit): Promise<modelHubDevelopsEditRunPromptColumnCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsEditRunPromptColumnCreateResponse>(getModelHubDevelopsEditRunPromptColumnCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      editRunPromptColumnApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsGetFunctionListListResponse200 = {
+  data: EvalFunctionListResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsGetFunctionListListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsGetFunctionListListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsGetFunctionListListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsGetFunctionListListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsGetFunctionListListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsGetFunctionListListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsGetFunctionListListResponseSuccess = (modelHubDevelopsGetFunctionListListResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsGetFunctionListListResponseError = (modelHubDevelopsGetFunctionListListResponse400 | modelHubDevelopsGetFunctionListListResponse403 | modelHubDevelopsGetFunctionListListResponse404 | modelHubDevelopsGetFunctionListListResponse409 | modelHubDevelopsGetFunctionListListResponse500 | modelHubDevelopsGetFunctionListListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsGetFunctionListListResponse = (modelHubDevelopsGetFunctionListListResponseSuccess | modelHubDevelopsGetFunctionListListResponseError)
+
+export const getModelHubDevelopsGetFunctionListListUrl = () => {
+
+
+
+
+  return `/model-hub/develops/get_function_list/`
+}
+
+export const modelHubDevelopsGetFunctionListList = async ( options?: RequestInit): Promise<modelHubDevelopsGetFunctionListListResponse> => {
+
+  return apiMutator<modelHubDevelopsGetFunctionListListResponse>(getModelHubDevelopsGetFunctionListListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDevelopsGetCellDataCreateResponse200 = {
+  data: DatasetCellDataResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsGetCellDataCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsGetCellDataCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsGetCellDataCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsGetCellDataCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsGetCellDataCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsGetCellDataCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsGetCellDataCreateResponseSuccess = (modelHubDevelopsGetCellDataCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsGetCellDataCreateResponseError = (modelHubDevelopsGetCellDataCreateResponse400 | modelHubDevelopsGetCellDataCreateResponse403 | modelHubDevelopsGetCellDataCreateResponse404 | modelHubDevelopsGetCellDataCreateResponse409 | modelHubDevelopsGetCellDataCreateResponse500 | modelHubDevelopsGetCellDataCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsGetCellDataCreateResponse = (modelHubDevelopsGetCellDataCreateResponseSuccess | modelHubDevelopsGetCellDataCreateResponseError)
+
+export const getModelHubDevelopsGetCellDataCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/get-cell-data/`
+}
+
+export const modelHubDevelopsGetCellDataCreate = async (datasetCellDataRequestApi: DatasetCellDataRequestApi, options?: RequestInit): Promise<modelHubDevelopsGetCellDataCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsGetCellDataCreateResponse>(getModelHubDevelopsGetCellDataCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      datasetCellDataRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsGetDatasetsNamesListResponse200 = {
+  data: DatasetNamesResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsGetDatasetsNamesListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsGetDatasetsNamesListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsGetDatasetsNamesListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsGetDatasetsNamesListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsGetDatasetsNamesListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsGetDatasetsNamesListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsGetDatasetsNamesListResponseSuccess = (modelHubDevelopsGetDatasetsNamesListResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsGetDatasetsNamesListResponseError = (modelHubDevelopsGetDatasetsNamesListResponse400 | modelHubDevelopsGetDatasetsNamesListResponse403 | modelHubDevelopsGetDatasetsNamesListResponse404 | modelHubDevelopsGetDatasetsNamesListResponse409 | modelHubDevelopsGetDatasetsNamesListResponse500 | modelHubDevelopsGetDatasetsNamesListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsGetDatasetsNamesListResponse = (modelHubDevelopsGetDatasetsNamesListResponseSuccess | modelHubDevelopsGetDatasetsNamesListResponseError)
+
+export const getModelHubDevelopsGetDatasetsNamesListUrl = () => {
+
+
+
+
+  return `/model-hub/develops/get-datasets-names/`
+}
+
+export const modelHubDevelopsGetDatasetsNamesList = async ( options?: RequestInit): Promise<modelHubDevelopsGetDatasetsNamesListResponse> => {
+
+  return apiMutator<modelHubDevelopsGetDatasetsNamesListResponse>(getModelHubDevelopsGetDatasetsNamesListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDevelopsGetDatasetsListResponse200 = {
+  data: DatasetListResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsGetDatasetsListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsGetDatasetsListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsGetDatasetsListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsGetDatasetsListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsGetDatasetsListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsGetDatasetsListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsGetDatasetsListResponseSuccess = (modelHubDevelopsGetDatasetsListResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsGetDatasetsListResponseError = (modelHubDevelopsGetDatasetsListResponse400 | modelHubDevelopsGetDatasetsListResponse403 | modelHubDevelopsGetDatasetsListResponse404 | modelHubDevelopsGetDatasetsListResponse409 | modelHubDevelopsGetDatasetsListResponse500 | modelHubDevelopsGetDatasetsListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsGetDatasetsListResponse = (modelHubDevelopsGetDatasetsListResponseSuccess | modelHubDevelopsGetDatasetsListResponseError)
+
+export const getModelHubDevelopsGetDatasetsListUrl = (params?: ModelHubDevelopsGetDatasetsListParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/develops/get-datasets/?${stringifiedParams}` : `/model-hub/develops/get-datasets/`
+}
+
+export const modelHubDevelopsGetDatasetsList = async (params?: ModelHubDevelopsGetDatasetsListParams, options?: RequestInit): Promise<modelHubDevelopsGetDatasetsListResponse> => {
+
+  return apiMutator<modelHubDevelopsGetDatasetsListResponse>(getModelHubDevelopsGetDatasetsListUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDevelopsGetDerivedDatasetsReadResponse200 = {
+  data: DatasetExplanationSummaryResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsGetDerivedDatasetsReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsGetDerivedDatasetsReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsGetDerivedDatasetsReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsGetDerivedDatasetsReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsGetDerivedDatasetsReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsGetDerivedDatasetsReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsGetDerivedDatasetsReadResponseSuccess = (modelHubDevelopsGetDerivedDatasetsReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsGetDerivedDatasetsReadResponseError = (modelHubDevelopsGetDerivedDatasetsReadResponse400 | modelHubDevelopsGetDerivedDatasetsReadResponse403 | modelHubDevelopsGetDerivedDatasetsReadResponse404 | modelHubDevelopsGetDerivedDatasetsReadResponse409 | modelHubDevelopsGetDerivedDatasetsReadResponse500 | modelHubDevelopsGetDerivedDatasetsReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsGetDerivedDatasetsReadResponse = (modelHubDevelopsGetDerivedDatasetsReadResponseSuccess | modelHubDevelopsGetDerivedDatasetsReadResponseError)
+
+export const getModelHubDevelopsGetDerivedDatasetsReadUrl = (datasetId: string,) => {
+
+
+
+
+  return `/model-hub/develops/get-derived-datasets/${datasetId}/`
+}
+
+export const modelHubDevelopsGetDerivedDatasetsRead = async (datasetId: string, options?: RequestInit): Promise<modelHubDevelopsGetDerivedDatasetsReadResponse> => {
+
+  return apiMutator<modelHubDevelopsGetDerivedDatasetsReadResponse>(getModelHubDevelopsGetDerivedDatasetsReadUrl(datasetId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse200 = {
+  data: HuggingFaceDatasetConfigResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseSuccess = (modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseError = (modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse400 | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse403 | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse404 | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse409 | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse500 | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse = (modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseSuccess | modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponseError)
+
+export const getModelHubDevelopsGetHuggingfaceDatasetConfigCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/get-huggingface-dataset-config/`
+}
+
+export const modelHubDevelopsGetHuggingfaceDatasetConfigCreate = async (huggingFaceDatasetConfigRequestApi: HuggingFaceDatasetConfigRequestApi, options?: RequestInit): Promise<modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsGetHuggingfaceDatasetConfigCreateResponse>(getModelHubDevelopsGetHuggingfaceDatasetConfigCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      huggingFaceDatasetConfigRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsGetRowDiffCreateResponse200 = {
+  data: ExperimentRowDiffResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsGetRowDiffCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsGetRowDiffCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsGetRowDiffCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsGetRowDiffCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsGetRowDiffCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsGetRowDiffCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsGetRowDiffCreateResponseSuccess = (modelHubDevelopsGetRowDiffCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsGetRowDiffCreateResponseError = (modelHubDevelopsGetRowDiffCreateResponse400 | modelHubDevelopsGetRowDiffCreateResponse403 | modelHubDevelopsGetRowDiffCreateResponse404 | modelHubDevelopsGetRowDiffCreateResponse409 | modelHubDevelopsGetRowDiffCreateResponse500 | modelHubDevelopsGetRowDiffCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsGetRowDiffCreateResponse = (modelHubDevelopsGetRowDiffCreateResponseSuccess | modelHubDevelopsGetRowDiffCreateResponseError)
+
+export const getModelHubDevelopsGetRowDiffCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/get-row-diff/`
+}
+
+export const modelHubDevelopsGetRowDiffCreate = async (datasetRowDiffRequestApi: DatasetRowDiffRequestApi, options?: RequestInit): Promise<modelHubDevelopsGetRowDiffCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsGetRowDiffCreateResponse>(getModelHubDevelopsGetRowDiffCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      datasetRowDiffRequestApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsPreviewRunPromptColumnCreateResponse200 = {
+  data: RunPromptColumnPreviewResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsPreviewRunPromptColumnCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsPreviewRunPromptColumnCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsPreviewRunPromptColumnCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsPreviewRunPromptColumnCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsPreviewRunPromptColumnCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsPreviewRunPromptColumnCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsPreviewRunPromptColumnCreateResponseSuccess = (modelHubDevelopsPreviewRunPromptColumnCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsPreviewRunPromptColumnCreateResponseError = (modelHubDevelopsPreviewRunPromptColumnCreateResponse400 | modelHubDevelopsPreviewRunPromptColumnCreateResponse403 | modelHubDevelopsPreviewRunPromptColumnCreateResponse404 | modelHubDevelopsPreviewRunPromptColumnCreateResponse409 | modelHubDevelopsPreviewRunPromptColumnCreateResponse500 | modelHubDevelopsPreviewRunPromptColumnCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsPreviewRunPromptColumnCreateResponse = (modelHubDevelopsPreviewRunPromptColumnCreateResponseSuccess | modelHubDevelopsPreviewRunPromptColumnCreateResponseError)
+
+export const getModelHubDevelopsPreviewRunPromptColumnCreateUrl = () => {
+
+
+
+
+  return `/model-hub/develops/preview_run_prompt_column/`
+}
+
+export const modelHubDevelopsPreviewRunPromptColumnCreate = async (previewRunPromptApi: PreviewRunPromptApi, options?: RequestInit): Promise<modelHubDevelopsPreviewRunPromptColumnCreateResponse> => {
+
+  return apiMutator<modelHubDevelopsPreviewRunPromptColumnCreateResponse>(getModelHubDevelopsPreviewRunPromptColumnCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      previewRunPromptApi,)
+  }
+);}
+
+
+
+export type modelHubDevelopsProviderStatusListResponse200 = {
+  data: ProviderStatusResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsProviderStatusListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsProviderStatusListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsProviderStatusListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsProviderStatusListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsProviderStatusListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsProviderStatusListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsProviderStatusListResponseSuccess = (modelHubDevelopsProviderStatusListResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsProviderStatusListResponseError = (modelHubDevelopsProviderStatusListResponse400 | modelHubDevelopsProviderStatusListResponse403 | modelHubDevelopsProviderStatusListResponse404 | modelHubDevelopsProviderStatusListResponse409 | modelHubDevelopsProviderStatusListResponse500 | modelHubDevelopsProviderStatusListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsProviderStatusListResponse = (modelHubDevelopsProviderStatusListResponseSuccess | modelHubDevelopsProviderStatusListResponseError)
+
+export const getModelHubDevelopsProviderStatusListUrl = () => {
+
+
+
+
+  return `/model-hub/develops/provider-status/`
+}
+
+export const modelHubDevelopsProviderStatusList = async ( options?: RequestInit): Promise<modelHubDevelopsProviderStatusListResponse> => {
+
+  return apiMutator<modelHubDevelopsProviderStatusListResponse>(getModelHubDevelopsProviderStatusListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse200 = {
+  data: RunPromptColumnConfigResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponseSuccess = (modelHubDevelopsRetrieveRunPromptColumnConfigListResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponseError = (modelHubDevelopsRetrieveRunPromptColumnConfigListResponse400 | modelHubDevelopsRetrieveRunPromptColumnConfigListResponse403 | modelHubDevelopsRetrieveRunPromptColumnConfigListResponse404 | modelHubDevelopsRetrieveRunPromptColumnConfigListResponse409 | modelHubDevelopsRetrieveRunPromptColumnConfigListResponse500 | modelHubDevelopsRetrieveRunPromptColumnConfigListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsRetrieveRunPromptColumnConfigListResponse = (modelHubDevelopsRetrieveRunPromptColumnConfigListResponseSuccess | modelHubDevelopsRetrieveRunPromptColumnConfigListResponseError)
+
+export const getModelHubDevelopsRetrieveRunPromptColumnConfigListUrl = () => {
+
+
+
+
+  return `/model-hub/develops/retrieve_run_prompt_column_config/`
+}
+
+export const modelHubDevelopsRetrieveRunPromptColumnConfigList = async ( options?: RequestInit): Promise<modelHubDevelopsRetrieveRunPromptColumnConfigListResponse> => {
+
+  return apiMutator<modelHubDevelopsRetrieveRunPromptColumnConfigListResponse>(getModelHubDevelopsRetrieveRunPromptColumnConfigListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubDevelopsRetrieveRunPromptOptionsListResponse200 = {
+  data: RunPromptOptionsResponseApi
+  status: 200
+}
+
+export type modelHubDevelopsRetrieveRunPromptOptionsListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubDevelopsRetrieveRunPromptOptionsListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubDevelopsRetrieveRunPromptOptionsListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubDevelopsRetrieveRunPromptOptionsListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubDevelopsRetrieveRunPromptOptionsListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubDevelopsRetrieveRunPromptOptionsListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubDevelopsRetrieveRunPromptOptionsListResponseSuccess = (modelHubDevelopsRetrieveRunPromptOptionsListResponse200) & {
+  headers: Headers;
+};
+export type modelHubDevelopsRetrieveRunPromptOptionsListResponseError = (modelHubDevelopsRetrieveRunPromptOptionsListResponse400 | modelHubDevelopsRetrieveRunPromptOptionsListResponse403 | modelHubDevelopsRetrieveRunPromptOptionsListResponse404 | modelHubDevelopsRetrieveRunPromptOptionsListResponse409 | modelHubDevelopsRetrieveRunPromptOptionsListResponse500 | modelHubDevelopsRetrieveRunPromptOptionsListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubDevelopsRetrieveRunPromptOptionsListResponse = (modelHubDevelopsRetrieveRunPromptOptionsListResponseSuccess | modelHubDevelopsRetrieveRunPromptOptionsListResponseError)
+
+export const getModelHubDevelopsRetrieveRunPromptOptionsListUrl = () => {
+
+
+
+
+  return `/model-hub/develops/retrieve_run_prompt_options/`
+}
+
+export const modelHubDevelopsRetrieveRunPromptOptionsList = async ( options?: RequestInit): Promise<modelHubDevelopsRetrieveRunPromptOptionsListResponse> => {
+
+  return apiMutator<modelHubDevelopsRetrieveRunPromptOptionsListResponse>(getModelHubDevelopsRetrieveRunPromptOptionsListUrl(),
   {
     ...options,
     method: 'GET'
@@ -34104,96 +34103,6 @@ export const modelHubEvalGroupsCreate = async (evalGroupApi: NonReadonly<EvalGro
 
 
 
-export type modelHubEvalGroupsApplyEvalGroupResponse201 = {
-  data: EvalGroupApi
-  status: 201
-}
-
-export type modelHubEvalGroupsApplyEvalGroupResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type modelHubEvalGroupsApplyEvalGroupResponseSuccess = (modelHubEvalGroupsApplyEvalGroupResponse201) & {
-  headers: Headers;
-};
-export type modelHubEvalGroupsApplyEvalGroupResponseError = (modelHubEvalGroupsApplyEvalGroupResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubEvalGroupsApplyEvalGroupResponse = (modelHubEvalGroupsApplyEvalGroupResponseSuccess | modelHubEvalGroupsApplyEvalGroupResponseError)
-
-export const getModelHubEvalGroupsApplyEvalGroupUrl = () => {
-
-
-
-
-  return `/model-hub/eval-groups/apply-eval-group/`
-}
-
-/**
- * ViewSet for managing EvalGroup operations.
-Provides CRUD operations with organization-level isolation.
- */
-export const modelHubEvalGroupsApplyEvalGroup = async (evalGroupApi: NonReadonly<EvalGroupApi>, options?: RequestInit): Promise<modelHubEvalGroupsApplyEvalGroupResponse> => {
-
-  return apiMutator<modelHubEvalGroupsApplyEvalGroupResponse>(getModelHubEvalGroupsApplyEvalGroupUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      evalGroupApi,)
-  }
-);}
-
-
-
-export type modelHubEvalGroupsEditEvalListResponse201 = {
-  data: EvalGroupApi
-  status: 201
-}
-
-export type modelHubEvalGroupsEditEvalListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type modelHubEvalGroupsEditEvalListResponseSuccess = (modelHubEvalGroupsEditEvalListResponse201) & {
-  headers: Headers;
-};
-export type modelHubEvalGroupsEditEvalListResponseError = (modelHubEvalGroupsEditEvalListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubEvalGroupsEditEvalListResponse = (modelHubEvalGroupsEditEvalListResponseSuccess | modelHubEvalGroupsEditEvalListResponseError)
-
-export const getModelHubEvalGroupsEditEvalListUrl = () => {
-
-
-
-
-  return `/model-hub/eval-groups/edit-eval-list/`
-}
-
-/**
- * ViewSet for managing EvalGroup operations.
-Provides CRUD operations with organization-level isolation.
- */
-export const modelHubEvalGroupsEditEvalList = async (evalGroupApi: NonReadonly<EvalGroupApi>, options?: RequestInit): Promise<modelHubEvalGroupsEditEvalListResponse> => {
-
-  return apiMutator<modelHubEvalGroupsEditEvalListResponse>(getModelHubEvalGroupsEditEvalListUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      evalGroupApi,)
-  }
-);}
-
-
-
 export type modelHubEvalGroupsReadResponse200 = {
   data: EvalGroupApi
   status: 200
@@ -34365,6 +34274,96 @@ export const modelHubEvalGroupsDelete = async (id: string, options?: RequestInit
     method: 'DELETE'
 
 
+  }
+);}
+
+
+
+export type modelHubEvalGroupsApplyEvalGroupResponse201 = {
+  data: EvalGroupApi
+  status: 201
+}
+
+export type modelHubEvalGroupsApplyEvalGroupResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type modelHubEvalGroupsApplyEvalGroupResponseSuccess = (modelHubEvalGroupsApplyEvalGroupResponse201) & {
+  headers: Headers;
+};
+export type modelHubEvalGroupsApplyEvalGroupResponseError = (modelHubEvalGroupsApplyEvalGroupResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubEvalGroupsApplyEvalGroupResponse = (modelHubEvalGroupsApplyEvalGroupResponseSuccess | modelHubEvalGroupsApplyEvalGroupResponseError)
+
+export const getModelHubEvalGroupsApplyEvalGroupUrl = () => {
+
+
+
+
+  return `/model-hub/eval-groups/apply-eval-group/`
+}
+
+/**
+ * ViewSet for managing EvalGroup operations.
+Provides CRUD operations with organization-level isolation.
+ */
+export const modelHubEvalGroupsApplyEvalGroup = async (evalGroupApi: NonReadonly<EvalGroupApi>, options?: RequestInit): Promise<modelHubEvalGroupsApplyEvalGroupResponse> => {
+
+  return apiMutator<modelHubEvalGroupsApplyEvalGroupResponse>(getModelHubEvalGroupsApplyEvalGroupUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      evalGroupApi,)
+  }
+);}
+
+
+
+export type modelHubEvalGroupsEditEvalListResponse201 = {
+  data: EvalGroupApi
+  status: 201
+}
+
+export type modelHubEvalGroupsEditEvalListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type modelHubEvalGroupsEditEvalListResponseSuccess = (modelHubEvalGroupsEditEvalListResponse201) & {
+  headers: Headers;
+};
+export type modelHubEvalGroupsEditEvalListResponseError = (modelHubEvalGroupsEditEvalListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubEvalGroupsEditEvalListResponse = (modelHubEvalGroupsEditEvalListResponseSuccess | modelHubEvalGroupsEditEvalListResponseError)
+
+export const getModelHubEvalGroupsEditEvalListUrl = () => {
+
+
+
+
+  return `/model-hub/eval-groups/edit-eval-list/`
+}
+
+/**
+ * ViewSet for managing EvalGroup operations.
+Provides CRUD operations with organization-level isolation.
+ */
+export const modelHubEvalGroupsEditEvalList = async (evalGroupApi: NonReadonly<EvalGroupApi>, options?: RequestInit): Promise<modelHubEvalGroupsEditEvalListResponse> => {
+
+  return apiMutator<modelHubEvalGroupsEditEvalListResponse>(getModelHubEvalGroupsEditEvalListUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      evalGroupApi,)
   }
 );}
 
@@ -34891,434 +34890,6 @@ export const modelHubEvalTemplateCreateCreate = async (evalTemplateApi: EvalTemp
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       evalTemplateApi,)
-  }
-);}
-
-
-
-export type modelHubEvalTemplatesBulkDeleteCreateResponse200 = {
-  data: EvalTemplateBulkDeleteResponseApi
-  status: 200
-}
-
-export type modelHubEvalTemplatesBulkDeleteCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubEvalTemplatesBulkDeleteCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubEvalTemplatesBulkDeleteCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubEvalTemplatesBulkDeleteCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubEvalTemplatesBulkDeleteCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubEvalTemplatesBulkDeleteCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubEvalTemplatesBulkDeleteCreateResponseSuccess = (modelHubEvalTemplatesBulkDeleteCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubEvalTemplatesBulkDeleteCreateResponseError = (modelHubEvalTemplatesBulkDeleteCreateResponse400 | modelHubEvalTemplatesBulkDeleteCreateResponse403 | modelHubEvalTemplatesBulkDeleteCreateResponse404 | modelHubEvalTemplatesBulkDeleteCreateResponse409 | modelHubEvalTemplatesBulkDeleteCreateResponse500 | modelHubEvalTemplatesBulkDeleteCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubEvalTemplatesBulkDeleteCreateResponse = (modelHubEvalTemplatesBulkDeleteCreateResponseSuccess | modelHubEvalTemplatesBulkDeleteCreateResponseError)
-
-export const getModelHubEvalTemplatesBulkDeleteCreateUrl = () => {
-
-
-
-
-  return `/model-hub/eval-templates/bulk-delete/`
-}
-
-/**
- * Soft-delete multiple eval templates. Only user-owned templates can be deleted.
- * @summary POST /model-hub/eval-templates/bulk-delete/
- */
-export const modelHubEvalTemplatesBulkDeleteCreate = async (evalTemplateBulkDeleteRequestApi: EvalTemplateBulkDeleteRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesBulkDeleteCreateResponse> => {
-
-  return apiMutator<modelHubEvalTemplatesBulkDeleteCreateResponse>(getModelHubEvalTemplatesBulkDeleteCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      evalTemplateBulkDeleteRequestApi,)
-  }
-);}
-
-
-
-export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse200 = {
-  data: CompositeEvalExecuteResponseApi
-  status: 200
-}
-
-export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseSuccess = (modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseError = (modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse400 | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse403 | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse404 | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse409 | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse500 | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse = (modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseSuccess | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseError)
-
-export const getModelHubEvalTemplatesCompositeExecuteAdhocCreateUrl = () => {
-
-
-
-
-  return `/model-hub/eval-templates/composite/execute-adhoc/`
-}
-
-/**
- * Execute a composite eval configuration without persisting it. Used by
-the eval create page so users can test a composite (selected children +
-aggregation settings) before clicking Save. Builds an unsaved parent
-template and unsaved child links in memory and reuses
-`execute_composite_children_sync` so semantics match the persisted path.
- * @summary POST /model-hub/eval-templates/composite/execute-adhoc/
- */
-export const modelHubEvalTemplatesCompositeExecuteAdhocCreate = async (compositeEvalAdhocExecuteRequestApi: CompositeEvalAdhocExecuteRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse> => {
-
-  return apiMutator<modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse>(getModelHubEvalTemplatesCompositeExecuteAdhocCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      compositeEvalAdhocExecuteRequestApi,)
-  }
-);}
-
-
-
-export type modelHubEvalTemplatesCreateCompositeCreateResponse200 = {
-  data: CompositeEvalCreateResponseApi
-  status: 200
-}
-
-export type modelHubEvalTemplatesCreateCompositeCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubEvalTemplatesCreateCompositeCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubEvalTemplatesCreateCompositeCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubEvalTemplatesCreateCompositeCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubEvalTemplatesCreateCompositeCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubEvalTemplatesCreateCompositeCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubEvalTemplatesCreateCompositeCreateResponseSuccess = (modelHubEvalTemplatesCreateCompositeCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubEvalTemplatesCreateCompositeCreateResponseError = (modelHubEvalTemplatesCreateCompositeCreateResponse400 | modelHubEvalTemplatesCreateCompositeCreateResponse403 | modelHubEvalTemplatesCreateCompositeCreateResponse404 | modelHubEvalTemplatesCreateCompositeCreateResponse409 | modelHubEvalTemplatesCreateCompositeCreateResponse500 | modelHubEvalTemplatesCreateCompositeCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubEvalTemplatesCreateCompositeCreateResponse = (modelHubEvalTemplatesCreateCompositeCreateResponseSuccess | modelHubEvalTemplatesCreateCompositeCreateResponseError)
-
-export const getModelHubEvalTemplatesCreateCompositeCreateUrl = () => {
-
-
-
-
-  return `/model-hub/eval-templates/create-composite/`
-}
-
-/**
- * Create a composite eval from a list of existing eval template IDs.
- * @summary POST /model-hub/eval-templates/create-composite/
- */
-export const modelHubEvalTemplatesCreateCompositeCreate = async (compositeEvalCreateRequestApi: CompositeEvalCreateRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesCreateCompositeCreateResponse> => {
-
-  return apiMutator<modelHubEvalTemplatesCreateCompositeCreateResponse>(getModelHubEvalTemplatesCreateCompositeCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      compositeEvalCreateRequestApi,)
-  }
-);}
-
-
-
-export type modelHubEvalTemplatesCreateV2CreateResponse200 = {
-  data: EvalTemplateCreateResponseApi
-  status: 200
-}
-
-export type modelHubEvalTemplatesCreateV2CreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubEvalTemplatesCreateV2CreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubEvalTemplatesCreateV2CreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubEvalTemplatesCreateV2CreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubEvalTemplatesCreateV2CreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubEvalTemplatesCreateV2CreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubEvalTemplatesCreateV2CreateResponseSuccess = (modelHubEvalTemplatesCreateV2CreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubEvalTemplatesCreateV2CreateResponseError = (modelHubEvalTemplatesCreateV2CreateResponse400 | modelHubEvalTemplatesCreateV2CreateResponse403 | modelHubEvalTemplatesCreateV2CreateResponse404 | modelHubEvalTemplatesCreateV2CreateResponse409 | modelHubEvalTemplatesCreateV2CreateResponse500 | modelHubEvalTemplatesCreateV2CreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubEvalTemplatesCreateV2CreateResponse = (modelHubEvalTemplatesCreateV2CreateResponseSuccess | modelHubEvalTemplatesCreateV2CreateResponseError)
-
-export const getModelHubEvalTemplatesCreateV2CreateUrl = () => {
-
-
-
-
-  return `/model-hub/eval-templates/create-v2/`
-}
-
-/**
- * Create a single eval template with the revamped schema.
-Supports the new scoring fields (pass_threshold, choice_scores, output_type_normalized).
- * @summary POST /model-hub/eval-templates/create-v2/
- */
-export const modelHubEvalTemplatesCreateV2Create = async (evalTemplateCreateV2RequestApi: EvalTemplateCreateV2RequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesCreateV2CreateResponse> => {
-
-  return apiMutator<modelHubEvalTemplatesCreateV2CreateResponse>(getModelHubEvalTemplatesCreateV2CreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      evalTemplateCreateV2RequestApi,)
-  }
-);}
-
-
-
-export type modelHubEvalTemplatesListChartsCreateResponse200 = {
-  data: EvalTemplateListChartsResponseApi
-  status: 200
-}
-
-export type modelHubEvalTemplatesListChartsCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubEvalTemplatesListChartsCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubEvalTemplatesListChartsCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubEvalTemplatesListChartsCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubEvalTemplatesListChartsCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubEvalTemplatesListChartsCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubEvalTemplatesListChartsCreateResponseSuccess = (modelHubEvalTemplatesListChartsCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubEvalTemplatesListChartsCreateResponseError = (modelHubEvalTemplatesListChartsCreateResponse400 | modelHubEvalTemplatesListChartsCreateResponse403 | modelHubEvalTemplatesListChartsCreateResponse404 | modelHubEvalTemplatesListChartsCreateResponse409 | modelHubEvalTemplatesListChartsCreateResponse500 | modelHubEvalTemplatesListChartsCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubEvalTemplatesListChartsCreateResponse = (modelHubEvalTemplatesListChartsCreateResponseSuccess | modelHubEvalTemplatesListChartsCreateResponseError)
-
-export const getModelHubEvalTemplatesListChartsCreateUrl = () => {
-
-
-
-
-  return `/model-hub/eval-templates/list-charts/`
-}
-
-/**
- * Returns 30-day chart data (run counts + error rates) for a list of template IDs.
-Uses ClickHouse for fast analytics. Called separately from the list API so the
-table renders instantly while charts load async.
- * @summary POST /model-hub/eval-templates/list-charts/
- */
-export const modelHubEvalTemplatesListChartsCreate = async (evalTemplateListChartsRequestApi: EvalTemplateListChartsRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesListChartsCreateResponse> => {
-
-  return apiMutator<modelHubEvalTemplatesListChartsCreateResponse>(getModelHubEvalTemplatesListChartsCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      evalTemplateListChartsRequestApi,)
-  }
-);}
-
-
-
-export type modelHubEvalTemplatesListCreateResponse200 = {
-  data: EvalTemplateListResponseApi
-  status: 200
-}
-
-export type modelHubEvalTemplatesListCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubEvalTemplatesListCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubEvalTemplatesListCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubEvalTemplatesListCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubEvalTemplatesListCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubEvalTemplatesListCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubEvalTemplatesListCreateResponseSuccess = (modelHubEvalTemplatesListCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubEvalTemplatesListCreateResponseError = (modelHubEvalTemplatesListCreateResponse400 | modelHubEvalTemplatesListCreateResponse403 | modelHubEvalTemplatesListCreateResponse404 | modelHubEvalTemplatesListCreateResponse409 | modelHubEvalTemplatesListCreateResponse500 | modelHubEvalTemplatesListCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubEvalTemplatesListCreateResponse = (modelHubEvalTemplatesListCreateResponseSuccess | modelHubEvalTemplatesListCreateResponseError)
-
-export const getModelHubEvalTemplatesListCreateUrl = () => {
-
-
-
-
-  return `/model-hub/eval-templates/list/`
-}
-
-/**
- * Returns paginated eval template list with filtering, search, and 30-day metrics.
-All inputs and outputs are validated with Pydantic schemas.
- * @summary POST /model-hub/eval-templates/list/
- */
-export const modelHubEvalTemplatesListCreate = async (evalListRequestApi: EvalListRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesListCreateResponse> => {
-
-  return apiMutator<modelHubEvalTemplatesListCreateResponse>(getModelHubEvalTemplatesListCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      evalListRequestApi,)
   }
 );}
 
@@ -36051,77 +35622,6 @@ export const modelHubEvalTemplatesVersionsList = async (templateId: string, opti
 
 
 
-export type modelHubEvalTemplatesVersionsCreateCreateResponse200 = {
-  data: EvalTemplateVersionResponseApi
-  status: 200
-}
-
-export type modelHubEvalTemplatesVersionsCreateCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubEvalTemplatesVersionsCreateCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubEvalTemplatesVersionsCreateCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubEvalTemplatesVersionsCreateCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubEvalTemplatesVersionsCreateCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubEvalTemplatesVersionsCreateCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubEvalTemplatesVersionsCreateCreateResponseSuccess = (modelHubEvalTemplatesVersionsCreateCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubEvalTemplatesVersionsCreateCreateResponseError = (modelHubEvalTemplatesVersionsCreateCreateResponse400 | modelHubEvalTemplatesVersionsCreateCreateResponse403 | modelHubEvalTemplatesVersionsCreateCreateResponse404 | modelHubEvalTemplatesVersionsCreateCreateResponse409 | modelHubEvalTemplatesVersionsCreateCreateResponse500 | modelHubEvalTemplatesVersionsCreateCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubEvalTemplatesVersionsCreateCreateResponse = (modelHubEvalTemplatesVersionsCreateCreateResponseSuccess | modelHubEvalTemplatesVersionsCreateCreateResponseError)
-
-export const getModelHubEvalTemplatesVersionsCreateCreateUrl = (templateId: string,) => {
-
-
-
-
-  return `/model-hub/eval-templates/${templateId}/versions/create/`
-}
-
-/**
- * Create a new version snapshot from the current template state.
- * @summary POST /model-hub/eval-templates/<id>/versions/create/
- */
-export const modelHubEvalTemplatesVersionsCreateCreate = async (templateId: string,
-    evalTemplateVersionCreateRequestApi: EvalTemplateVersionCreateRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesVersionsCreateCreateResponse> => {
-
-  return apiMutator<modelHubEvalTemplatesVersionsCreateCreateResponse>(getModelHubEvalTemplatesVersionsCreateCreateUrl(templateId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      evalTemplateVersionCreateRequestApi,)
-  }
-);}
-
-
-
 export type modelHubEvalTemplatesVersionsRestoreCreateResponse200 = {
   data: EvalTemplateVersionRestoreResponseApi
   status: 200
@@ -36264,6 +35764,505 @@ export const modelHubEvalTemplatesVersionsSetDefaultUpdate = async (templateId: 
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       modelHubEmptyRequestApi,)
+  }
+);}
+
+
+
+export type modelHubEvalTemplatesVersionsCreateCreateResponse200 = {
+  data: EvalTemplateVersionResponseApi
+  status: 200
+}
+
+export type modelHubEvalTemplatesVersionsCreateCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubEvalTemplatesVersionsCreateCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubEvalTemplatesVersionsCreateCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubEvalTemplatesVersionsCreateCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubEvalTemplatesVersionsCreateCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubEvalTemplatesVersionsCreateCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubEvalTemplatesVersionsCreateCreateResponseSuccess = (modelHubEvalTemplatesVersionsCreateCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubEvalTemplatesVersionsCreateCreateResponseError = (modelHubEvalTemplatesVersionsCreateCreateResponse400 | modelHubEvalTemplatesVersionsCreateCreateResponse403 | modelHubEvalTemplatesVersionsCreateCreateResponse404 | modelHubEvalTemplatesVersionsCreateCreateResponse409 | modelHubEvalTemplatesVersionsCreateCreateResponse500 | modelHubEvalTemplatesVersionsCreateCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubEvalTemplatesVersionsCreateCreateResponse = (modelHubEvalTemplatesVersionsCreateCreateResponseSuccess | modelHubEvalTemplatesVersionsCreateCreateResponseError)
+
+export const getModelHubEvalTemplatesVersionsCreateCreateUrl = (templateId: string,) => {
+
+
+
+
+  return `/model-hub/eval-templates/${templateId}/versions/create/`
+}
+
+/**
+ * Create a new version snapshot from the current template state.
+ * @summary POST /model-hub/eval-templates/<id>/versions/create/
+ */
+export const modelHubEvalTemplatesVersionsCreateCreate = async (templateId: string,
+    evalTemplateVersionCreateRequestApi: EvalTemplateVersionCreateRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesVersionsCreateCreateResponse> => {
+
+  return apiMutator<modelHubEvalTemplatesVersionsCreateCreateResponse>(getModelHubEvalTemplatesVersionsCreateCreateUrl(templateId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      evalTemplateVersionCreateRequestApi,)
+  }
+);}
+
+
+
+export type modelHubEvalTemplatesBulkDeleteCreateResponse200 = {
+  data: EvalTemplateBulkDeleteResponseApi
+  status: 200
+}
+
+export type modelHubEvalTemplatesBulkDeleteCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubEvalTemplatesBulkDeleteCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubEvalTemplatesBulkDeleteCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubEvalTemplatesBulkDeleteCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubEvalTemplatesBulkDeleteCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubEvalTemplatesBulkDeleteCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubEvalTemplatesBulkDeleteCreateResponseSuccess = (modelHubEvalTemplatesBulkDeleteCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubEvalTemplatesBulkDeleteCreateResponseError = (modelHubEvalTemplatesBulkDeleteCreateResponse400 | modelHubEvalTemplatesBulkDeleteCreateResponse403 | modelHubEvalTemplatesBulkDeleteCreateResponse404 | modelHubEvalTemplatesBulkDeleteCreateResponse409 | modelHubEvalTemplatesBulkDeleteCreateResponse500 | modelHubEvalTemplatesBulkDeleteCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubEvalTemplatesBulkDeleteCreateResponse = (modelHubEvalTemplatesBulkDeleteCreateResponseSuccess | modelHubEvalTemplatesBulkDeleteCreateResponseError)
+
+export const getModelHubEvalTemplatesBulkDeleteCreateUrl = () => {
+
+
+
+
+  return `/model-hub/eval-templates/bulk-delete/`
+}
+
+/**
+ * Soft-delete multiple eval templates. Only user-owned templates can be deleted.
+ * @summary POST /model-hub/eval-templates/bulk-delete/
+ */
+export const modelHubEvalTemplatesBulkDeleteCreate = async (evalTemplateBulkDeleteRequestApi: EvalTemplateBulkDeleteRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesBulkDeleteCreateResponse> => {
+
+  return apiMutator<modelHubEvalTemplatesBulkDeleteCreateResponse>(getModelHubEvalTemplatesBulkDeleteCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      evalTemplateBulkDeleteRequestApi,)
+  }
+);}
+
+
+
+export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse200 = {
+  data: CompositeEvalExecuteResponseApi
+  status: 200
+}
+
+export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseSuccess = (modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseError = (modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse400 | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse403 | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse404 | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse409 | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse500 | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse = (modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseSuccess | modelHubEvalTemplatesCompositeExecuteAdhocCreateResponseError)
+
+export const getModelHubEvalTemplatesCompositeExecuteAdhocCreateUrl = () => {
+
+
+
+
+  return `/model-hub/eval-templates/composite/execute-adhoc/`
+}
+
+/**
+ * Execute a composite eval configuration without persisting it. Used by
+the eval create page so users can test a composite (selected children +
+aggregation settings) before clicking Save. Builds an unsaved parent
+template and unsaved child links in memory and reuses
+`execute_composite_children_sync` so semantics match the persisted path.
+ * @summary POST /model-hub/eval-templates/composite/execute-adhoc/
+ */
+export const modelHubEvalTemplatesCompositeExecuteAdhocCreate = async (compositeEvalAdhocExecuteRequestApi: CompositeEvalAdhocExecuteRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse> => {
+
+  return apiMutator<modelHubEvalTemplatesCompositeExecuteAdhocCreateResponse>(getModelHubEvalTemplatesCompositeExecuteAdhocCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      compositeEvalAdhocExecuteRequestApi,)
+  }
+);}
+
+
+
+export type modelHubEvalTemplatesCreateCompositeCreateResponse200 = {
+  data: CompositeEvalCreateResponseApi
+  status: 200
+}
+
+export type modelHubEvalTemplatesCreateCompositeCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubEvalTemplatesCreateCompositeCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubEvalTemplatesCreateCompositeCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubEvalTemplatesCreateCompositeCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubEvalTemplatesCreateCompositeCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubEvalTemplatesCreateCompositeCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubEvalTemplatesCreateCompositeCreateResponseSuccess = (modelHubEvalTemplatesCreateCompositeCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubEvalTemplatesCreateCompositeCreateResponseError = (modelHubEvalTemplatesCreateCompositeCreateResponse400 | modelHubEvalTemplatesCreateCompositeCreateResponse403 | modelHubEvalTemplatesCreateCompositeCreateResponse404 | modelHubEvalTemplatesCreateCompositeCreateResponse409 | modelHubEvalTemplatesCreateCompositeCreateResponse500 | modelHubEvalTemplatesCreateCompositeCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubEvalTemplatesCreateCompositeCreateResponse = (modelHubEvalTemplatesCreateCompositeCreateResponseSuccess | modelHubEvalTemplatesCreateCompositeCreateResponseError)
+
+export const getModelHubEvalTemplatesCreateCompositeCreateUrl = () => {
+
+
+
+
+  return `/model-hub/eval-templates/create-composite/`
+}
+
+/**
+ * Create a composite eval from a list of existing eval template IDs.
+ * @summary POST /model-hub/eval-templates/create-composite/
+ */
+export const modelHubEvalTemplatesCreateCompositeCreate = async (compositeEvalCreateRequestApi: CompositeEvalCreateRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesCreateCompositeCreateResponse> => {
+
+  return apiMutator<modelHubEvalTemplatesCreateCompositeCreateResponse>(getModelHubEvalTemplatesCreateCompositeCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      compositeEvalCreateRequestApi,)
+  }
+);}
+
+
+
+export type modelHubEvalTemplatesCreateV2CreateResponse200 = {
+  data: EvalTemplateCreateResponseApi
+  status: 200
+}
+
+export type modelHubEvalTemplatesCreateV2CreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubEvalTemplatesCreateV2CreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubEvalTemplatesCreateV2CreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubEvalTemplatesCreateV2CreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubEvalTemplatesCreateV2CreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubEvalTemplatesCreateV2CreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubEvalTemplatesCreateV2CreateResponseSuccess = (modelHubEvalTemplatesCreateV2CreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubEvalTemplatesCreateV2CreateResponseError = (modelHubEvalTemplatesCreateV2CreateResponse400 | modelHubEvalTemplatesCreateV2CreateResponse403 | modelHubEvalTemplatesCreateV2CreateResponse404 | modelHubEvalTemplatesCreateV2CreateResponse409 | modelHubEvalTemplatesCreateV2CreateResponse500 | modelHubEvalTemplatesCreateV2CreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubEvalTemplatesCreateV2CreateResponse = (modelHubEvalTemplatesCreateV2CreateResponseSuccess | modelHubEvalTemplatesCreateV2CreateResponseError)
+
+export const getModelHubEvalTemplatesCreateV2CreateUrl = () => {
+
+
+
+
+  return `/model-hub/eval-templates/create-v2/`
+}
+
+/**
+ * Create a single eval template with the revamped schema.
+Supports the new scoring fields (pass_threshold, choice_scores, output_type_normalized).
+ * @summary POST /model-hub/eval-templates/create-v2/
+ */
+export const modelHubEvalTemplatesCreateV2Create = async (evalTemplateCreateV2RequestApi: EvalTemplateCreateV2RequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesCreateV2CreateResponse> => {
+
+  return apiMutator<modelHubEvalTemplatesCreateV2CreateResponse>(getModelHubEvalTemplatesCreateV2CreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      evalTemplateCreateV2RequestApi,)
+  }
+);}
+
+
+
+export type modelHubEvalTemplatesListChartsCreateResponse200 = {
+  data: EvalTemplateListChartsResponseApi
+  status: 200
+}
+
+export type modelHubEvalTemplatesListChartsCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubEvalTemplatesListChartsCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubEvalTemplatesListChartsCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubEvalTemplatesListChartsCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubEvalTemplatesListChartsCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubEvalTemplatesListChartsCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubEvalTemplatesListChartsCreateResponseSuccess = (modelHubEvalTemplatesListChartsCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubEvalTemplatesListChartsCreateResponseError = (modelHubEvalTemplatesListChartsCreateResponse400 | modelHubEvalTemplatesListChartsCreateResponse403 | modelHubEvalTemplatesListChartsCreateResponse404 | modelHubEvalTemplatesListChartsCreateResponse409 | modelHubEvalTemplatesListChartsCreateResponse500 | modelHubEvalTemplatesListChartsCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubEvalTemplatesListChartsCreateResponse = (modelHubEvalTemplatesListChartsCreateResponseSuccess | modelHubEvalTemplatesListChartsCreateResponseError)
+
+export const getModelHubEvalTemplatesListChartsCreateUrl = () => {
+
+
+
+
+  return `/model-hub/eval-templates/list-charts/`
+}
+
+/**
+ * Returns 30-day chart data (run counts + error rates) for a list of template IDs.
+Uses ClickHouse for fast analytics. Called separately from the list API so the
+table renders instantly while charts load async.
+ * @summary POST /model-hub/eval-templates/list-charts/
+ */
+export const modelHubEvalTemplatesListChartsCreate = async (evalTemplateListChartsRequestApi: EvalTemplateListChartsRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesListChartsCreateResponse> => {
+
+  return apiMutator<modelHubEvalTemplatesListChartsCreateResponse>(getModelHubEvalTemplatesListChartsCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      evalTemplateListChartsRequestApi,)
+  }
+);}
+
+
+
+export type modelHubEvalTemplatesListCreateResponse200 = {
+  data: EvalTemplateListResponseApi
+  status: 200
+}
+
+export type modelHubEvalTemplatesListCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubEvalTemplatesListCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubEvalTemplatesListCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubEvalTemplatesListCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubEvalTemplatesListCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubEvalTemplatesListCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubEvalTemplatesListCreateResponseSuccess = (modelHubEvalTemplatesListCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubEvalTemplatesListCreateResponseError = (modelHubEvalTemplatesListCreateResponse400 | modelHubEvalTemplatesListCreateResponse403 | modelHubEvalTemplatesListCreateResponse404 | modelHubEvalTemplatesListCreateResponse409 | modelHubEvalTemplatesListCreateResponse500 | modelHubEvalTemplatesListCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubEvalTemplatesListCreateResponse = (modelHubEvalTemplatesListCreateResponseSuccess | modelHubEvalTemplatesListCreateResponseError)
+
+export const getModelHubEvalTemplatesListCreateUrl = () => {
+
+
+
+
+  return `/model-hub/eval-templates/list/`
+}
+
+/**
+ * Returns paginated eval template list with filtering, search, and 30-day metrics.
+All inputs and outputs are validated with Pydantic schemas.
+ * @summary POST /model-hub/eval-templates/list/
+ */
+export const modelHubEvalTemplatesListCreate = async (evalListRequestApi: EvalListRequestApi, options?: RequestInit): Promise<modelHubEvalTemplatesListCreateResponse> => {
+
+  return apiMutator<modelHubEvalTemplatesListCreateResponse>(getModelHubEvalTemplatesListCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      evalListRequestApi,)
   }
 );}
 
@@ -36649,6 +36648,542 @@ export const modelHubExperimentsUpdate = async (experimentsTableUpdateApi: Exper
 
 
 
+export type modelHubExperimentsReadResponse200 = {
+  data: ExperimentTableRowsResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsReadResponseSuccess = (modelHubExperimentsReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsReadResponseError = (modelHubExperimentsReadResponse400 | modelHubExperimentsReadResponse403 | modelHubExperimentsReadResponse404 | modelHubExperimentsReadResponse409 | modelHubExperimentsReadResponse500 | modelHubExperimentsReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsReadResponse = (modelHubExperimentsReadResponseSuccess | modelHubExperimentsReadResponseError)
+
+export const getModelHubExperimentsReadUrl = (experimentId: string,
+    rowId: string,) => {
+
+
+
+
+  return `/model-hub/experiments/${experimentId}/${rowId}/`
+}
+
+export const modelHubExperimentsRead = async (experimentId: string,
+    rowId: string, options?: RequestInit): Promise<modelHubExperimentsReadResponse> => {
+
+  return apiMutator<modelHubExperimentsReadResponse>(getModelHubExperimentsReadUrl(experimentId,rowId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubExperimentsAddEvalCreateResponse200 = {
+  data: ExperimentAddEvalResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsAddEvalCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsAddEvalCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsAddEvalCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsAddEvalCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsAddEvalCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsAddEvalCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsAddEvalCreateResponseSuccess = (modelHubExperimentsAddEvalCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsAddEvalCreateResponseError = (modelHubExperimentsAddEvalCreateResponse400 | modelHubExperimentsAddEvalCreateResponse403 | modelHubExperimentsAddEvalCreateResponse404 | modelHubExperimentsAddEvalCreateResponse409 | modelHubExperimentsAddEvalCreateResponse500 | modelHubExperimentsAddEvalCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsAddEvalCreateResponse = (modelHubExperimentsAddEvalCreateResponseSuccess | modelHubExperimentsAddEvalCreateResponseError)
+
+export const getModelHubExperimentsAddEvalCreateUrl = (experimentId: string,) => {
+
+
+
+
+  return `/model-hub/experiments/${experimentId}/add-eval/`
+}
+
+export const modelHubExperimentsAddEvalCreate = async (experimentId: string,
+    userEvalMutationRequestApi: UserEvalMutationRequestApi, options?: RequestInit): Promise<modelHubExperimentsAddEvalCreateResponse> => {
+
+  return apiMutator<modelHubExperimentsAddEvalCreateResponse>(getModelHubExperimentsAddEvalCreateUrl(experimentId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      userEvalMutationRequestApi,)
+  }
+);}
+
+
+
+export type modelHubExperimentsCompareExperimentsCreateResponse200 = {
+  data: ExperimentDatasetComparisonResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsCompareExperimentsCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsCompareExperimentsCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsCompareExperimentsCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsCompareExperimentsCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsCompareExperimentsCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsCompareExperimentsCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsCompareExperimentsCreateResponseSuccess = (modelHubExperimentsCompareExperimentsCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsCompareExperimentsCreateResponseError = (modelHubExperimentsCompareExperimentsCreateResponse400 | modelHubExperimentsCompareExperimentsCreateResponse403 | modelHubExperimentsCompareExperimentsCreateResponse404 | modelHubExperimentsCompareExperimentsCreateResponse409 | modelHubExperimentsCompareExperimentsCreateResponse500 | modelHubExperimentsCompareExperimentsCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsCompareExperimentsCreateResponse = (modelHubExperimentsCompareExperimentsCreateResponseSuccess | modelHubExperimentsCompareExperimentsCreateResponseError)
+
+export const getModelHubExperimentsCompareExperimentsCreateUrl = (experimentId: string,) => {
+
+
+
+
+  return `/model-hub/experiments/${experimentId}/compare-experiments/`
+}
+
+export const modelHubExperimentsCompareExperimentsCreate = async (experimentId: string,
+    experimentComparisonWeightsRequestApi: ExperimentComparisonWeightsRequestApi, options?: RequestInit): Promise<modelHubExperimentsCompareExperimentsCreateResponse> => {
+
+  return apiMutator<modelHubExperimentsCompareExperimentsCreateResponse>(getModelHubExperimentsCompareExperimentsCreateUrl(experimentId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      experimentComparisonWeightsRequestApi,)
+  }
+);}
+
+
+
+export type modelHubExperimentsComparisonsListResponse200 = {
+  data: ExperimentComparisonDetailsResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsComparisonsListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsComparisonsListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsComparisonsListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsComparisonsListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsComparisonsListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsComparisonsListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsComparisonsListResponseSuccess = (modelHubExperimentsComparisonsListResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsComparisonsListResponseError = (modelHubExperimentsComparisonsListResponse400 | modelHubExperimentsComparisonsListResponse403 | modelHubExperimentsComparisonsListResponse404 | modelHubExperimentsComparisonsListResponse409 | modelHubExperimentsComparisonsListResponse500 | modelHubExperimentsComparisonsListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsComparisonsListResponse = (modelHubExperimentsComparisonsListResponseSuccess | modelHubExperimentsComparisonsListResponseError)
+
+export const getModelHubExperimentsComparisonsListUrl = (experimentId: string,) => {
+
+
+
+
+  return `/model-hub/experiments/${experimentId}/comparisons/`
+}
+
+export const modelHubExperimentsComparisonsList = async (experimentId: string, options?: RequestInit): Promise<modelHubExperimentsComparisonsListResponse> => {
+
+  return apiMutator<modelHubExperimentsComparisonsListResponse>(getModelHubExperimentsComparisonsListUrl(experimentId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubExperimentsDownloadListResponse200 = {
+  data: Blob
+  status: 200
+}
+
+export type modelHubExperimentsDownloadListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsDownloadListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsDownloadListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsDownloadListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsDownloadListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsDownloadListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsDownloadListResponseSuccess = (modelHubExperimentsDownloadListResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsDownloadListResponseError = (modelHubExperimentsDownloadListResponse400 | modelHubExperimentsDownloadListResponse403 | modelHubExperimentsDownloadListResponse404 | modelHubExperimentsDownloadListResponse409 | modelHubExperimentsDownloadListResponse500 | modelHubExperimentsDownloadListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsDownloadListResponse = (modelHubExperimentsDownloadListResponseSuccess | modelHubExperimentsDownloadListResponseError)
+
+export const getModelHubExperimentsDownloadListUrl = (experimentId: string,) => {
+
+
+
+
+  return `/model-hub/experiments/${experimentId}/download/`
+}
+
+export const modelHubExperimentsDownloadList = async (experimentId: string, options?: RequestInit): Promise<modelHubExperimentsDownloadListResponse> => {
+
+  return apiMutator<modelHubExperimentsDownloadListResponse>(getModelHubExperimentsDownloadListUrl(experimentId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubExperimentsEvaluationsStatsListResponse200 = {
+  data: ExperimentEvaluationStatsResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsEvaluationsStatsListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsEvaluationsStatsListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsEvaluationsStatsListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsEvaluationsStatsListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsEvaluationsStatsListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsEvaluationsStatsListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsEvaluationsStatsListResponseSuccess = (modelHubExperimentsEvaluationsStatsListResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsEvaluationsStatsListResponseError = (modelHubExperimentsEvaluationsStatsListResponse400 | modelHubExperimentsEvaluationsStatsListResponse403 | modelHubExperimentsEvaluationsStatsListResponse404 | modelHubExperimentsEvaluationsStatsListResponse409 | modelHubExperimentsEvaluationsStatsListResponse500 | modelHubExperimentsEvaluationsStatsListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsEvaluationsStatsListResponse = (modelHubExperimentsEvaluationsStatsListResponseSuccess | modelHubExperimentsEvaluationsStatsListResponseError)
+
+export const getModelHubExperimentsEvaluationsStatsListUrl = (experimentId: string,
+    evaluationId: string,) => {
+
+
+
+
+  return `/model-hub/experiments/${experimentId}/evaluations/${evaluationId}/stats/`
+}
+
+export const modelHubExperimentsEvaluationsStatsList = async (experimentId: string,
+    evaluationId: string, options?: RequestInit): Promise<modelHubExperimentsEvaluationsStatsListResponse> => {
+
+  return apiMutator<modelHubExperimentsEvaluationsStatsListResponse>(getModelHubExperimentsEvaluationsStatsListUrl(experimentId,evaluationId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubExperimentsRunEvaluationsCreateResponse200 = {
+  data: ExperimentMessageResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsRunEvaluationsCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsRunEvaluationsCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsRunEvaluationsCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsRunEvaluationsCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsRunEvaluationsCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsRunEvaluationsCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsRunEvaluationsCreateResponseSuccess = (modelHubExperimentsRunEvaluationsCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsRunEvaluationsCreateResponseError = (modelHubExperimentsRunEvaluationsCreateResponse400 | modelHubExperimentsRunEvaluationsCreateResponse403 | modelHubExperimentsRunEvaluationsCreateResponse404 | modelHubExperimentsRunEvaluationsCreateResponse409 | modelHubExperimentsRunEvaluationsCreateResponse500 | modelHubExperimentsRunEvaluationsCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsRunEvaluationsCreateResponse = (modelHubExperimentsRunEvaluationsCreateResponseSuccess | modelHubExperimentsRunEvaluationsCreateResponseError)
+
+export const getModelHubExperimentsRunEvaluationsCreateUrl = (experimentId: string,) => {
+
+
+
+
+  return `/model-hub/experiments/${experimentId}/run-evaluations/`
+}
+
+/**
+ * Request body format:
+{
+    "eval_template_ids": ["uuid1", "uuid2", ...]
+}
+ */
+export const modelHubExperimentsRunEvaluationsCreate = async (experimentId: string,
+    experimentAdditionalEvaluationsRequestApi: ExperimentAdditionalEvaluationsRequestApi, options?: RequestInit): Promise<modelHubExperimentsRunEvaluationsCreateResponse> => {
+
+  return apiMutator<modelHubExperimentsRunEvaluationsCreateResponse>(getModelHubExperimentsRunEvaluationsCreateUrl(experimentId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      experimentAdditionalEvaluationsRequestApi,)
+  }
+);}
+
+
+
+export type modelHubExperimentsStatsListResponse200 = {
+  data: ExperimentStatsResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsStatsListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsStatsListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsStatsListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsStatsListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsStatsListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsStatsListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsStatsListResponseSuccess = (modelHubExperimentsStatsListResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsStatsListResponseError = (modelHubExperimentsStatsListResponse400 | modelHubExperimentsStatsListResponse403 | modelHubExperimentsStatsListResponse404 | modelHubExperimentsStatsListResponse409 | modelHubExperimentsStatsListResponse500 | modelHubExperimentsStatsListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsStatsListResponse = (modelHubExperimentsStatsListResponseSuccess | modelHubExperimentsStatsListResponseError)
+
+export const getModelHubExperimentsStatsListUrl = (experimentId: string,) => {
+
+
+
+
+  return `/model-hub/experiments/${experimentId}/stats/`
+}
+
+export const modelHubExperimentsStatsList = async (experimentId: string, options?: RequestInit): Promise<modelHubExperimentsStatsListResponse> => {
+
+  return apiMutator<modelHubExperimentsStatsListResponse>(getModelHubExperimentsStatsListUrl(experimentId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type modelHubExperimentsDataListResponse200 = {
   data: ModelHubExperimentsDataList200
   status: 200
@@ -36867,377 +37402,6 @@ export const modelHubExperimentsV2Create = async (experimentCreateV2Api: Experim
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       experimentCreateV2Api,)
-  }
-);}
-
-
-
-export type modelHubExperimentsV2DeleteDeleteResponse204 = {
-  data: void
-  status: 204
-}
-
-export type modelHubExperimentsV2DeleteDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 204>
-}
-
-export type modelHubExperimentsV2DeleteDeleteResponseSuccess = (modelHubExperimentsV2DeleteDeleteResponse204) & {
-  headers: Headers;
-};
-export type modelHubExperimentsV2DeleteDeleteResponseError = (modelHubExperimentsV2DeleteDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsV2DeleteDeleteResponse = (modelHubExperimentsV2DeleteDeleteResponseSuccess | modelHubExperimentsV2DeleteDeleteResponseError)
-
-export const getModelHubExperimentsV2DeleteDeleteUrl = () => {
-
-
-
-
-  return `/model-hub/experiments/v2/delete/`
-}
-
-/**
- * V2 delete: org-scoped, cancels workflows, cleans up columns & EDTs.
- */
-export const modelHubExperimentsV2DeleteDelete = async ( options?: RequestInit): Promise<modelHubExperimentsV2DeleteDeleteResponse> => {
-
-  return apiMutator<modelHubExperimentsV2DeleteDeleteResponse>(getModelHubExperimentsV2DeleteDeleteUrl(),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
-export type modelHubExperimentsV2ListListResponse200 = {
-  data: ModelHubExperimentsV2ListList200
-  status: 200
-}
-
-export type modelHubExperimentsV2ListListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type modelHubExperimentsV2ListListResponseSuccess = (modelHubExperimentsV2ListListResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsV2ListListResponseError = (modelHubExperimentsV2ListListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsV2ListListResponse = (modelHubExperimentsV2ListListResponseSuccess | modelHubExperimentsV2ListListResponseError)
-
-export const getModelHubExperimentsV2ListListUrl = (params?: ModelHubExperimentsV2ListListParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/experiments/v2/list/?${stringifiedParams}` : `/model-hub/experiments/v2/list/`
-}
-
-/**
- * V2 experiment list with filtering, search, and pagination.
- */
-export const modelHubExperimentsV2ListList = async (params?: ModelHubExperimentsV2ListListParams, options?: RequestInit): Promise<modelHubExperimentsV2ListListResponse> => {
-
-  return apiMutator<modelHubExperimentsV2ListListResponse>(getModelHubExperimentsV2ListListUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubExperimentsV2ReRunCreateResponse200 = {
-  data: ExperimentStringResultResponseApi
-  status: 200
-}
-
-export type modelHubExperimentsV2ReRunCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsV2ReRunCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsV2ReRunCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsV2ReRunCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsV2ReRunCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsV2ReRunCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubExperimentsV2ReRunCreateResponseSuccess = (modelHubExperimentsV2ReRunCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsV2ReRunCreateResponseError = (modelHubExperimentsV2ReRunCreateResponse400 | modelHubExperimentsV2ReRunCreateResponse403 | modelHubExperimentsV2ReRunCreateResponse404 | modelHubExperimentsV2ReRunCreateResponse409 | modelHubExperimentsV2ReRunCreateResponse500 | modelHubExperimentsV2ReRunCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsV2ReRunCreateResponse = (modelHubExperimentsV2ReRunCreateResponseSuccess | modelHubExperimentsV2ReRunCreateResponseError)
-
-export const getModelHubExperimentsV2ReRunCreateUrl = () => {
-
-
-
-
-  return `/model-hub/experiments/v2/re-run/`
-}
-
-/**
- * No manual workflow cancel needed — Temporal's TERMINATE_IF_RUNNING ID
-reuse policy automatically cancels any running workflow with the same ID.
-Cell reset is handled by the workflow itself (cleanup + setup activities).
- * @summary V2 re-run: org-scoped, uses V2 Temporal workflow.
- */
-export const modelHubExperimentsV2ReRunCreate = async (experimentRerunRequestApi: ExperimentRerunRequestApi, options?: RequestInit): Promise<modelHubExperimentsV2ReRunCreateResponse> => {
-
-  return apiMutator<modelHubExperimentsV2ReRunCreateResponse>(getModelHubExperimentsV2ReRunCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      experimentRerunRequestApi,)
-  }
-);}
-
-
-
-export type modelHubExperimentsV2RowDiffCreateResponse200 = {
-  data: ExperimentRowDiffResponseApi
-  status: 200
-}
-
-export type modelHubExperimentsV2RowDiffCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsV2RowDiffCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsV2RowDiffCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsV2RowDiffCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsV2RowDiffCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsV2RowDiffCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubExperimentsV2RowDiffCreateResponseSuccess = (modelHubExperimentsV2RowDiffCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsV2RowDiffCreateResponseError = (modelHubExperimentsV2RowDiffCreateResponse400 | modelHubExperimentsV2RowDiffCreateResponse403 | modelHubExperimentsV2RowDiffCreateResponse404 | modelHubExperimentsV2RowDiffCreateResponse409 | modelHubExperimentsV2RowDiffCreateResponse500 | modelHubExperimentsV2RowDiffCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsV2RowDiffCreateResponse = (modelHubExperimentsV2RowDiffCreateResponseSuccess | modelHubExperimentsV2RowDiffCreateResponseError)
-
-export const getModelHubExperimentsV2RowDiffCreateUrl = () => {
-
-
-
-
-  return `/model-hub/experiments/v2/row-diff/`
-}
-
-export const modelHubExperimentsV2RowDiffCreate = async (datasetRowDiffRequestApi: DatasetRowDiffRequestApi, options?: RequestInit): Promise<modelHubExperimentsV2RowDiffCreateResponse> => {
-
-  return apiMutator<modelHubExperimentsV2RowDiffCreateResponse>(getModelHubExperimentsV2RowDiffCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      datasetRowDiffRequestApi,)
-  }
-);}
-
-
-
-export type modelHubExperimentsV2SuggestNameReadResponse200 = {
-  data: ExperimentNameSuggestionResponseApi
-  status: 200
-}
-
-export type modelHubExperimentsV2SuggestNameReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsV2SuggestNameReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsV2SuggestNameReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsV2SuggestNameReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsV2SuggestNameReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsV2SuggestNameReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubExperimentsV2SuggestNameReadResponseSuccess = (modelHubExperimentsV2SuggestNameReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsV2SuggestNameReadResponseError = (modelHubExperimentsV2SuggestNameReadResponse400 | modelHubExperimentsV2SuggestNameReadResponse403 | modelHubExperimentsV2SuggestNameReadResponse404 | modelHubExperimentsV2SuggestNameReadResponse409 | modelHubExperimentsV2SuggestNameReadResponse500 | modelHubExperimentsV2SuggestNameReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsV2SuggestNameReadResponse = (modelHubExperimentsV2SuggestNameReadResponseSuccess | modelHubExperimentsV2SuggestNameReadResponseError)
-
-export const getModelHubExperimentsV2SuggestNameReadUrl = (datasetId: string,) => {
-
-
-
-
-  return `/model-hub/experiments/v2/suggest-name/${datasetId}/`
-}
-
-/**
- * Generate a suggested experiment name for a dataset.
- */
-export const modelHubExperimentsV2SuggestNameRead = async (datasetId: string, options?: RequestInit): Promise<modelHubExperimentsV2SuggestNameReadResponse> => {
-
-  return apiMutator<modelHubExperimentsV2SuggestNameReadResponse>(getModelHubExperimentsV2SuggestNameReadUrl(datasetId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubExperimentsV2ValidateNameListResponse200 = {
-  data: ExperimentNameValidationResponseApi
-  status: 200
-}
-
-export type modelHubExperimentsV2ValidateNameListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsV2ValidateNameListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsV2ValidateNameListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsV2ValidateNameListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsV2ValidateNameListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsV2ValidateNameListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubExperimentsV2ValidateNameListResponseSuccess = (modelHubExperimentsV2ValidateNameListResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsV2ValidateNameListResponseError = (modelHubExperimentsV2ValidateNameListResponse400 | modelHubExperimentsV2ValidateNameListResponse403 | modelHubExperimentsV2ValidateNameListResponse404 | modelHubExperimentsV2ValidateNameListResponse409 | modelHubExperimentsV2ValidateNameListResponse500 | modelHubExperimentsV2ValidateNameListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsV2ValidateNameListResponse = (modelHubExperimentsV2ValidateNameListResponseSuccess | modelHubExperimentsV2ValidateNameListResponseError)
-
-export const getModelHubExperimentsV2ValidateNameListUrl = () => {
-
-
-
-
-  return `/model-hub/experiments/v2/validate-name/`
-}
-
-/**
- * Validate that an experiment name is unique within a dataset.
- */
-export const modelHubExperimentsV2ValidateNameList = async ( options?: RequestInit): Promise<modelHubExperimentsV2ValidateNameListResponse> => {
-
-  return apiMutator<modelHubExperimentsV2ValidateNameListResponse>(getModelHubExperimentsV2ValidateNameListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
   }
 );}
 
@@ -38413,532 +38577,367 @@ export const modelHubExperimentsV2StopCreate = async (experimentId: string,
 
 
 
-export type modelHubExperimentsReadResponse200 = {
-  data: ExperimentTableRowsResponseApi
-  status: 200
+export type modelHubExperimentsV2DeleteDeleteResponse204 = {
+  data: void
+  status: 204
 }
 
-export type modelHubExperimentsReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsReadResponseDefault = {
+export type modelHubExperimentsV2DeleteDeleteResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+  status: Exclude<HTTPStatusCodes, 204>
 }
 
-export type modelHubExperimentsReadResponseSuccess = (modelHubExperimentsReadResponse200) & {
+export type modelHubExperimentsV2DeleteDeleteResponseSuccess = (modelHubExperimentsV2DeleteDeleteResponse204) & {
   headers: Headers;
 };
-export type modelHubExperimentsReadResponseError = (modelHubExperimentsReadResponse400 | modelHubExperimentsReadResponse403 | modelHubExperimentsReadResponse404 | modelHubExperimentsReadResponse409 | modelHubExperimentsReadResponse500 | modelHubExperimentsReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsReadResponse = (modelHubExperimentsReadResponseSuccess | modelHubExperimentsReadResponseError)
-
-export const getModelHubExperimentsReadUrl = (experimentId: string,
-    rowId: string,) => {
-
-
-
-
-  return `/model-hub/experiments/${experimentId}/${rowId}/`
-}
-
-export const modelHubExperimentsRead = async (experimentId: string,
-    rowId: string, options?: RequestInit): Promise<modelHubExperimentsReadResponse> => {
-
-  return apiMutator<modelHubExperimentsReadResponse>(getModelHubExperimentsReadUrl(experimentId,rowId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubExperimentsAddEvalCreateResponse200 = {
-  data: ExperimentAddEvalResponseApi
-  status: 200
-}
-
-export type modelHubExperimentsAddEvalCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsAddEvalCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsAddEvalCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsAddEvalCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsAddEvalCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsAddEvalCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubExperimentsAddEvalCreateResponseSuccess = (modelHubExperimentsAddEvalCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsAddEvalCreateResponseError = (modelHubExperimentsAddEvalCreateResponse400 | modelHubExperimentsAddEvalCreateResponse403 | modelHubExperimentsAddEvalCreateResponse404 | modelHubExperimentsAddEvalCreateResponse409 | modelHubExperimentsAddEvalCreateResponse500 | modelHubExperimentsAddEvalCreateResponseDefault) & {
+export type modelHubExperimentsV2DeleteDeleteResponseError = (modelHubExperimentsV2DeleteDeleteResponseDefault) & {
   headers: Headers;
 };
 
-export type modelHubExperimentsAddEvalCreateResponse = (modelHubExperimentsAddEvalCreateResponseSuccess | modelHubExperimentsAddEvalCreateResponseError)
+export type modelHubExperimentsV2DeleteDeleteResponse = (modelHubExperimentsV2DeleteDeleteResponseSuccess | modelHubExperimentsV2DeleteDeleteResponseError)
 
-export const getModelHubExperimentsAddEvalCreateUrl = (experimentId: string,) => {
+export const getModelHubExperimentsV2DeleteDeleteUrl = () => {
 
 
 
 
-  return `/model-hub/experiments/${experimentId}/add-eval/`
-}
-
-export const modelHubExperimentsAddEvalCreate = async (experimentId: string,
-    userEvalMutationRequestApi: UserEvalMutationRequestApi, options?: RequestInit): Promise<modelHubExperimentsAddEvalCreateResponse> => {
-
-  return apiMutator<modelHubExperimentsAddEvalCreateResponse>(getModelHubExperimentsAddEvalCreateUrl(experimentId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      userEvalMutationRequestApi,)
-  }
-);}
-
-
-
-export type modelHubExperimentsCompareExperimentsCreateResponse200 = {
-  data: ExperimentDatasetComparisonResponseApi
-  status: 200
-}
-
-export type modelHubExperimentsCompareExperimentsCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsCompareExperimentsCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsCompareExperimentsCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsCompareExperimentsCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsCompareExperimentsCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsCompareExperimentsCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubExperimentsCompareExperimentsCreateResponseSuccess = (modelHubExperimentsCompareExperimentsCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsCompareExperimentsCreateResponseError = (modelHubExperimentsCompareExperimentsCreateResponse400 | modelHubExperimentsCompareExperimentsCreateResponse403 | modelHubExperimentsCompareExperimentsCreateResponse404 | modelHubExperimentsCompareExperimentsCreateResponse409 | modelHubExperimentsCompareExperimentsCreateResponse500 | modelHubExperimentsCompareExperimentsCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsCompareExperimentsCreateResponse = (modelHubExperimentsCompareExperimentsCreateResponseSuccess | modelHubExperimentsCompareExperimentsCreateResponseError)
-
-export const getModelHubExperimentsCompareExperimentsCreateUrl = (experimentId: string,) => {
-
-
-
-
-  return `/model-hub/experiments/${experimentId}/compare-experiments/`
-}
-
-export const modelHubExperimentsCompareExperimentsCreate = async (experimentId: string,
-    experimentComparisonWeightsRequestApi: ExperimentComparisonWeightsRequestApi, options?: RequestInit): Promise<modelHubExperimentsCompareExperimentsCreateResponse> => {
-
-  return apiMutator<modelHubExperimentsCompareExperimentsCreateResponse>(getModelHubExperimentsCompareExperimentsCreateUrl(experimentId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      experimentComparisonWeightsRequestApi,)
-  }
-);}
-
-
-
-export type modelHubExperimentsComparisonsListResponse200 = {
-  data: ExperimentComparisonDetailsResponseApi
-  status: 200
-}
-
-export type modelHubExperimentsComparisonsListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsComparisonsListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsComparisonsListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsComparisonsListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsComparisonsListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsComparisonsListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubExperimentsComparisonsListResponseSuccess = (modelHubExperimentsComparisonsListResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsComparisonsListResponseError = (modelHubExperimentsComparisonsListResponse400 | modelHubExperimentsComparisonsListResponse403 | modelHubExperimentsComparisonsListResponse404 | modelHubExperimentsComparisonsListResponse409 | modelHubExperimentsComparisonsListResponse500 | modelHubExperimentsComparisonsListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsComparisonsListResponse = (modelHubExperimentsComparisonsListResponseSuccess | modelHubExperimentsComparisonsListResponseError)
-
-export const getModelHubExperimentsComparisonsListUrl = (experimentId: string,) => {
-
-
-
-
-  return `/model-hub/experiments/${experimentId}/comparisons/`
-}
-
-export const modelHubExperimentsComparisonsList = async (experimentId: string, options?: RequestInit): Promise<modelHubExperimentsComparisonsListResponse> => {
-
-  return apiMutator<modelHubExperimentsComparisonsListResponse>(getModelHubExperimentsComparisonsListUrl(experimentId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubExperimentsDownloadListResponse200 = {
-  data: Blob
-  status: 200
-}
-
-export type modelHubExperimentsDownloadListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsDownloadListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsDownloadListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsDownloadListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsDownloadListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsDownloadListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubExperimentsDownloadListResponseSuccess = (modelHubExperimentsDownloadListResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsDownloadListResponseError = (modelHubExperimentsDownloadListResponse400 | modelHubExperimentsDownloadListResponse403 | modelHubExperimentsDownloadListResponse404 | modelHubExperimentsDownloadListResponse409 | modelHubExperimentsDownloadListResponse500 | modelHubExperimentsDownloadListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsDownloadListResponse = (modelHubExperimentsDownloadListResponseSuccess | modelHubExperimentsDownloadListResponseError)
-
-export const getModelHubExperimentsDownloadListUrl = (experimentId: string,) => {
-
-
-
-
-  return `/model-hub/experiments/${experimentId}/download/`
-}
-
-export const modelHubExperimentsDownloadList = async (experimentId: string, options?: RequestInit): Promise<modelHubExperimentsDownloadListResponse> => {
-
-  return apiMutator<modelHubExperimentsDownloadListResponse>(getModelHubExperimentsDownloadListUrl(experimentId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubExperimentsEvaluationsStatsListResponse200 = {
-  data: ExperimentEvaluationStatsResponseApi
-  status: 200
-}
-
-export type modelHubExperimentsEvaluationsStatsListResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsEvaluationsStatsListResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsEvaluationsStatsListResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsEvaluationsStatsListResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsEvaluationsStatsListResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsEvaluationsStatsListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubExperimentsEvaluationsStatsListResponseSuccess = (modelHubExperimentsEvaluationsStatsListResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsEvaluationsStatsListResponseError = (modelHubExperimentsEvaluationsStatsListResponse400 | modelHubExperimentsEvaluationsStatsListResponse403 | modelHubExperimentsEvaluationsStatsListResponse404 | modelHubExperimentsEvaluationsStatsListResponse409 | modelHubExperimentsEvaluationsStatsListResponse500 | modelHubExperimentsEvaluationsStatsListResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsEvaluationsStatsListResponse = (modelHubExperimentsEvaluationsStatsListResponseSuccess | modelHubExperimentsEvaluationsStatsListResponseError)
-
-export const getModelHubExperimentsEvaluationsStatsListUrl = (experimentId: string,
-    evaluationId: string,) => {
-
-
-
-
-  return `/model-hub/experiments/${experimentId}/evaluations/${evaluationId}/stats/`
-}
-
-export const modelHubExperimentsEvaluationsStatsList = async (experimentId: string,
-    evaluationId: string, options?: RequestInit): Promise<modelHubExperimentsEvaluationsStatsListResponse> => {
-
-  return apiMutator<modelHubExperimentsEvaluationsStatsListResponse>(getModelHubExperimentsEvaluationsStatsListUrl(experimentId,evaluationId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubExperimentsRunEvaluationsCreateResponse200 = {
-  data: ExperimentMessageResponseApi
-  status: 200
-}
-
-export type modelHubExperimentsRunEvaluationsCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubExperimentsRunEvaluationsCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubExperimentsRunEvaluationsCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubExperimentsRunEvaluationsCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubExperimentsRunEvaluationsCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubExperimentsRunEvaluationsCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubExperimentsRunEvaluationsCreateResponseSuccess = (modelHubExperimentsRunEvaluationsCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubExperimentsRunEvaluationsCreateResponseError = (modelHubExperimentsRunEvaluationsCreateResponse400 | modelHubExperimentsRunEvaluationsCreateResponse403 | modelHubExperimentsRunEvaluationsCreateResponse404 | modelHubExperimentsRunEvaluationsCreateResponse409 | modelHubExperimentsRunEvaluationsCreateResponse500 | modelHubExperimentsRunEvaluationsCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubExperimentsRunEvaluationsCreateResponse = (modelHubExperimentsRunEvaluationsCreateResponseSuccess | modelHubExperimentsRunEvaluationsCreateResponseError)
-
-export const getModelHubExperimentsRunEvaluationsCreateUrl = (experimentId: string,) => {
-
-
-
-
-  return `/model-hub/experiments/${experimentId}/run-evaluations/`
+  return `/model-hub/experiments/v2/delete/`
 }
 
 /**
- * Request body format:
-{
-    "eval_template_ids": ["uuid1", "uuid2", ...]
-}
+ * V2 delete: org-scoped, cancels workflows, cleans up columns & EDTs.
  */
-export const modelHubExperimentsRunEvaluationsCreate = async (experimentId: string,
-    experimentAdditionalEvaluationsRequestApi: ExperimentAdditionalEvaluationsRequestApi, options?: RequestInit): Promise<modelHubExperimentsRunEvaluationsCreateResponse> => {
+export const modelHubExperimentsV2DeleteDelete = async ( options?: RequestInit): Promise<modelHubExperimentsV2DeleteDeleteResponse> => {
 
-  return apiMutator<modelHubExperimentsRunEvaluationsCreateResponse>(getModelHubExperimentsRunEvaluationsCreateUrl(experimentId),
+  return apiMutator<modelHubExperimentsV2DeleteDeleteResponse>(getModelHubExperimentsV2DeleteDeleteUrl(),
   {
     ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      experimentAdditionalEvaluationsRequestApi,)
+    method: 'DELETE'
+
+
   }
 );}
 
 
 
-export type modelHubExperimentsStatsListResponse200 = {
-  data: ExperimentStatsResponseApi
+export type modelHubExperimentsV2ListListResponse200 = {
+  data: ModelHubExperimentsV2ListList200
   status: 200
 }
 
-export type modelHubExperimentsStatsListResponse400 = {
+export type modelHubExperimentsV2ListListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type modelHubExperimentsV2ListListResponseSuccess = (modelHubExperimentsV2ListListResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsV2ListListResponseError = (modelHubExperimentsV2ListListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsV2ListListResponse = (modelHubExperimentsV2ListListResponseSuccess | modelHubExperimentsV2ListListResponseError)
+
+export const getModelHubExperimentsV2ListListUrl = (params?: ModelHubExperimentsV2ListListParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/experiments/v2/list/?${stringifiedParams}` : `/model-hub/experiments/v2/list/`
+}
+
+/**
+ * V2 experiment list with filtering, search, and pagination.
+ */
+export const modelHubExperimentsV2ListList = async (params?: ModelHubExperimentsV2ListListParams, options?: RequestInit): Promise<modelHubExperimentsV2ListListResponse> => {
+
+  return apiMutator<modelHubExperimentsV2ListListResponse>(getModelHubExperimentsV2ListListUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubExperimentsV2ReRunCreateResponse200 = {
+  data: ExperimentStringResultResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsV2ReRunCreateResponse400 = {
   data: ModelHubErrorResponseApi
   status: 400
 }
 
-export type modelHubExperimentsStatsListResponse403 = {
+export type modelHubExperimentsV2ReRunCreateResponse403 = {
   data: ModelHubErrorResponseApi
   status: 403
 }
 
-export type modelHubExperimentsStatsListResponse404 = {
+export type modelHubExperimentsV2ReRunCreateResponse404 = {
   data: ModelHubErrorResponseApi
   status: 404
 }
 
-export type modelHubExperimentsStatsListResponse409 = {
+export type modelHubExperimentsV2ReRunCreateResponse409 = {
   data: ModelHubErrorResponseApi
   status: 409
 }
 
-export type modelHubExperimentsStatsListResponse500 = {
+export type modelHubExperimentsV2ReRunCreateResponse500 = {
   data: ModelHubErrorResponseApi
   status: 500
 }
 
-export type modelHubExperimentsStatsListResponseDefault = {
+export type modelHubExperimentsV2ReRunCreateResponseDefault = {
   data: ManagementAPIErrorResponseApi
   status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
 }
 
-export type modelHubExperimentsStatsListResponseSuccess = (modelHubExperimentsStatsListResponse200) & {
+export type modelHubExperimentsV2ReRunCreateResponseSuccess = (modelHubExperimentsV2ReRunCreateResponse200) & {
   headers: Headers;
 };
-export type modelHubExperimentsStatsListResponseError = (modelHubExperimentsStatsListResponse400 | modelHubExperimentsStatsListResponse403 | modelHubExperimentsStatsListResponse404 | modelHubExperimentsStatsListResponse409 | modelHubExperimentsStatsListResponse500 | modelHubExperimentsStatsListResponseDefault) & {
+export type modelHubExperimentsV2ReRunCreateResponseError = (modelHubExperimentsV2ReRunCreateResponse400 | modelHubExperimentsV2ReRunCreateResponse403 | modelHubExperimentsV2ReRunCreateResponse404 | modelHubExperimentsV2ReRunCreateResponse409 | modelHubExperimentsV2ReRunCreateResponse500 | modelHubExperimentsV2ReRunCreateResponseDefault) & {
   headers: Headers;
 };
 
-export type modelHubExperimentsStatsListResponse = (modelHubExperimentsStatsListResponseSuccess | modelHubExperimentsStatsListResponseError)
+export type modelHubExperimentsV2ReRunCreateResponse = (modelHubExperimentsV2ReRunCreateResponseSuccess | modelHubExperimentsV2ReRunCreateResponseError)
 
-export const getModelHubExperimentsStatsListUrl = (experimentId: string,) => {
-
-
+export const getModelHubExperimentsV2ReRunCreateUrl = () => {
 
 
-  return `/model-hub/experiments/${experimentId}/stats/`
+
+
+  return `/model-hub/experiments/v2/re-run/`
 }
 
-export const modelHubExperimentsStatsList = async (experimentId: string, options?: RequestInit): Promise<modelHubExperimentsStatsListResponse> => {
+/**
+ * No manual workflow cancel needed — Temporal's TERMINATE_IF_RUNNING ID
+reuse policy automatically cancels any running workflow with the same ID.
+Cell reset is handled by the workflow itself (cleanup + setup activities).
+ * @summary V2 re-run: org-scoped, uses V2 Temporal workflow.
+ */
+export const modelHubExperimentsV2ReRunCreate = async (experimentRerunRequestApi: ExperimentRerunRequestApi, options?: RequestInit): Promise<modelHubExperimentsV2ReRunCreateResponse> => {
 
-  return apiMutator<modelHubExperimentsStatsListResponse>(getModelHubExperimentsStatsListUrl(experimentId),
+  return apiMutator<modelHubExperimentsV2ReRunCreateResponse>(getModelHubExperimentsV2ReRunCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      experimentRerunRequestApi,)
+  }
+);}
+
+
+
+export type modelHubExperimentsV2RowDiffCreateResponse200 = {
+  data: ExperimentRowDiffResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsV2RowDiffCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsV2RowDiffCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsV2RowDiffCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsV2RowDiffCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsV2RowDiffCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsV2RowDiffCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsV2RowDiffCreateResponseSuccess = (modelHubExperimentsV2RowDiffCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsV2RowDiffCreateResponseError = (modelHubExperimentsV2RowDiffCreateResponse400 | modelHubExperimentsV2RowDiffCreateResponse403 | modelHubExperimentsV2RowDiffCreateResponse404 | modelHubExperimentsV2RowDiffCreateResponse409 | modelHubExperimentsV2RowDiffCreateResponse500 | modelHubExperimentsV2RowDiffCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsV2RowDiffCreateResponse = (modelHubExperimentsV2RowDiffCreateResponseSuccess | modelHubExperimentsV2RowDiffCreateResponseError)
+
+export const getModelHubExperimentsV2RowDiffCreateUrl = () => {
+
+
+
+
+  return `/model-hub/experiments/v2/row-diff/`
+}
+
+export const modelHubExperimentsV2RowDiffCreate = async (datasetRowDiffRequestApi: DatasetRowDiffRequestApi, options?: RequestInit): Promise<modelHubExperimentsV2RowDiffCreateResponse> => {
+
+  return apiMutator<modelHubExperimentsV2RowDiffCreateResponse>(getModelHubExperimentsV2RowDiffCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      datasetRowDiffRequestApi,)
+  }
+);}
+
+
+
+export type modelHubExperimentsV2SuggestNameReadResponse200 = {
+  data: ExperimentNameSuggestionResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsV2SuggestNameReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsV2SuggestNameReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsV2SuggestNameReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsV2SuggestNameReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsV2SuggestNameReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsV2SuggestNameReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsV2SuggestNameReadResponseSuccess = (modelHubExperimentsV2SuggestNameReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsV2SuggestNameReadResponseError = (modelHubExperimentsV2SuggestNameReadResponse400 | modelHubExperimentsV2SuggestNameReadResponse403 | modelHubExperimentsV2SuggestNameReadResponse404 | modelHubExperimentsV2SuggestNameReadResponse409 | modelHubExperimentsV2SuggestNameReadResponse500 | modelHubExperimentsV2SuggestNameReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsV2SuggestNameReadResponse = (modelHubExperimentsV2SuggestNameReadResponseSuccess | modelHubExperimentsV2SuggestNameReadResponseError)
+
+export const getModelHubExperimentsV2SuggestNameReadUrl = (datasetId: string,) => {
+
+
+
+
+  return `/model-hub/experiments/v2/suggest-name/${datasetId}/`
+}
+
+/**
+ * Generate a suggested experiment name for a dataset.
+ */
+export const modelHubExperimentsV2SuggestNameRead = async (datasetId: string, options?: RequestInit): Promise<modelHubExperimentsV2SuggestNameReadResponse> => {
+
+  return apiMutator<modelHubExperimentsV2SuggestNameReadResponse>(getModelHubExperimentsV2SuggestNameReadUrl(datasetId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubExperimentsV2ValidateNameListResponse200 = {
+  data: ExperimentNameValidationResponseApi
+  status: 200
+}
+
+export type modelHubExperimentsV2ValidateNameListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubExperimentsV2ValidateNameListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubExperimentsV2ValidateNameListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubExperimentsV2ValidateNameListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubExperimentsV2ValidateNameListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubExperimentsV2ValidateNameListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubExperimentsV2ValidateNameListResponseSuccess = (modelHubExperimentsV2ValidateNameListResponse200) & {
+  headers: Headers;
+};
+export type modelHubExperimentsV2ValidateNameListResponseError = (modelHubExperimentsV2ValidateNameListResponse400 | modelHubExperimentsV2ValidateNameListResponse403 | modelHubExperimentsV2ValidateNameListResponse404 | modelHubExperimentsV2ValidateNameListResponse409 | modelHubExperimentsV2ValidateNameListResponse500 | modelHubExperimentsV2ValidateNameListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubExperimentsV2ValidateNameListResponse = (modelHubExperimentsV2ValidateNameListResponseSuccess | modelHubExperimentsV2ValidateNameListResponseError)
+
+export const getModelHubExperimentsV2ValidateNameListUrl = () => {
+
+
+
+
+  return `/model-hub/experiments/v2/validate-name/`
+}
+
+/**
+ * Validate that an experiment name is unique within a dataset.
+ */
+export const modelHubExperimentsV2ValidateNameList = async ( options?: RequestInit): Promise<modelHubExperimentsV2ValidateNameListResponse> => {
+
+  return apiMutator<modelHubExperimentsV2ValidateNameListResponse>(getModelHubExperimentsV2ValidateNameListUrl(),
   {
     ...options,
     method: 'GET'
@@ -39030,237 +39029,6 @@ export const getModelHubFeedbackCreateUrl = () => {
 export const modelHubFeedbackCreate = async (feedbackApi: NonReadonly<FeedbackApi>, options?: RequestInit): Promise<modelHubFeedbackCreateResponse> => {
 
   return apiMutator<modelHubFeedbackCreateResponse>(getModelHubFeedbackCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      feedbackApi,)
-  }
-);}
-
-
-
-export type modelHubFeedbackGetFeedbackDetailsResponse200 = {
-  data: FeedbackDetailsResponseApi
-  status: 200
-}
-
-export type modelHubFeedbackGetFeedbackDetailsResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubFeedbackGetFeedbackDetailsResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubFeedbackGetFeedbackDetailsResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubFeedbackGetFeedbackDetailsResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubFeedbackGetFeedbackDetailsResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubFeedbackGetFeedbackDetailsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubFeedbackGetFeedbackDetailsResponseSuccess = (modelHubFeedbackGetFeedbackDetailsResponse200) & {
-  headers: Headers;
-};
-export type modelHubFeedbackGetFeedbackDetailsResponseError = (modelHubFeedbackGetFeedbackDetailsResponse400 | modelHubFeedbackGetFeedbackDetailsResponse403 | modelHubFeedbackGetFeedbackDetailsResponse404 | modelHubFeedbackGetFeedbackDetailsResponse409 | modelHubFeedbackGetFeedbackDetailsResponse500 | modelHubFeedbackGetFeedbackDetailsResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubFeedbackGetFeedbackDetailsResponse = (modelHubFeedbackGetFeedbackDetailsResponseSuccess | modelHubFeedbackGetFeedbackDetailsResponseError)
-
-export const getModelHubFeedbackGetFeedbackDetailsUrl = (params?: ModelHubFeedbackGetFeedbackDetailsParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/feedback/get-feedback-details/?${stringifiedParams}` : `/model-hub/feedback/get-feedback-details/`
-}
-
-/**
- * Get feedback details based on filters like user_eval_metric_id, row_id, etc.
- */
-export const modelHubFeedbackGetFeedbackDetails = async (params?: ModelHubFeedbackGetFeedbackDetailsParams, options?: RequestInit): Promise<modelHubFeedbackGetFeedbackDetailsResponse> => {
-
-  return apiMutator<modelHubFeedbackGetFeedbackDetailsResponse>(getModelHubFeedbackGetFeedbackDetailsUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubFeedbackGetFeedbackSummaryResponse200 = {
-  data: ModelHubFeedbackGetFeedbackSummary200
-  status: 200
-}
-
-export type modelHubFeedbackGetFeedbackSummaryResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type modelHubFeedbackGetFeedbackSummaryResponseSuccess = (modelHubFeedbackGetFeedbackSummaryResponse200) & {
-  headers: Headers;
-};
-export type modelHubFeedbackGetFeedbackSummaryResponseError = (modelHubFeedbackGetFeedbackSummaryResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubFeedbackGetFeedbackSummaryResponse = (modelHubFeedbackGetFeedbackSummaryResponseSuccess | modelHubFeedbackGetFeedbackSummaryResponseError)
-
-export const getModelHubFeedbackGetFeedbackSummaryUrl = (params?: ModelHubFeedbackGetFeedbackSummaryParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/feedback/get-feedback-summary/?${stringifiedParams}` : `/model-hub/feedback/get-feedback-summary/`
-}
-
-/**
- * Get summary statistics for feedback on a specific metric
- */
-export const modelHubFeedbackGetFeedbackSummary = async (params?: ModelHubFeedbackGetFeedbackSummaryParams, options?: RequestInit): Promise<modelHubFeedbackGetFeedbackSummaryResponse> => {
-
-  return apiMutator<modelHubFeedbackGetFeedbackSummaryResponse>(getModelHubFeedbackGetFeedbackSummaryUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubFeedbackGetTemplateResponse200 = {
-  data: FeedbackTemplateResponseApi
-  status: 200
-}
-
-export type modelHubFeedbackGetTemplateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type modelHubFeedbackGetTemplateResponseSuccess = (modelHubFeedbackGetTemplateResponse200) & {
-  headers: Headers;
-};
-export type modelHubFeedbackGetTemplateResponseError = (modelHubFeedbackGetTemplateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubFeedbackGetTemplateResponse = (modelHubFeedbackGetTemplateResponseSuccess | modelHubFeedbackGetTemplateResponseError)
-
-export const getModelHubFeedbackGetTemplateUrl = (params?: ModelHubFeedbackGetTemplateParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/feedback/get_template/?${stringifiedParams}` : `/model-hub/feedback/get_template/`
-}
-
-/**
- * Get evaluation template details based on user_eval_metric_id.
- */
-export const modelHubFeedbackGetTemplate = async (params?: ModelHubFeedbackGetTemplateParams, options?: RequestInit): Promise<modelHubFeedbackGetTemplateResponse> => {
-
-  return apiMutator<modelHubFeedbackGetTemplateResponse>(getModelHubFeedbackGetTemplateUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubFeedbackSubmitFeedbackActionResponse201 = {
-  data: FeedbackApi
-  status: 201
-}
-
-export type modelHubFeedbackSubmitFeedbackActionResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type modelHubFeedbackSubmitFeedbackActionResponseSuccess = (modelHubFeedbackSubmitFeedbackActionResponse201) & {
-  headers: Headers;
-};
-export type modelHubFeedbackSubmitFeedbackActionResponseError = (modelHubFeedbackSubmitFeedbackActionResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubFeedbackSubmitFeedbackActionResponse = (modelHubFeedbackSubmitFeedbackActionResponseSuccess | modelHubFeedbackSubmitFeedbackActionResponseError)
-
-export const getModelHubFeedbackSubmitFeedbackActionUrl = () => {
-
-
-
-
-  return `/model-hub/feedback/submit-feedback/`
-}
-
-/**
- * Submit feedback action for re-tuning or re-calculating metrics
- */
-export const modelHubFeedbackSubmitFeedbackAction = async (feedbackApi: NonReadonly<FeedbackApi>, options?: RequestInit): Promise<modelHubFeedbackSubmitFeedbackActionResponse> => {
-
-  return apiMutator<modelHubFeedbackSubmitFeedbackActionResponse>(getModelHubFeedbackSubmitFeedbackActionUrl(),
   {
     ...options,
     method: 'POST',
@@ -39431,6 +39199,237 @@ export const modelHubFeedbackDelete = async (id: string, options?: RequestInit):
     method: 'DELETE'
 
 
+  }
+);}
+
+
+
+export type modelHubFeedbackGetTemplateResponse200 = {
+  data: FeedbackTemplateResponseApi
+  status: 200
+}
+
+export type modelHubFeedbackGetTemplateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type modelHubFeedbackGetTemplateResponseSuccess = (modelHubFeedbackGetTemplateResponse200) & {
+  headers: Headers;
+};
+export type modelHubFeedbackGetTemplateResponseError = (modelHubFeedbackGetTemplateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubFeedbackGetTemplateResponse = (modelHubFeedbackGetTemplateResponseSuccess | modelHubFeedbackGetTemplateResponseError)
+
+export const getModelHubFeedbackGetTemplateUrl = (params?: ModelHubFeedbackGetTemplateParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/feedback/get_template/?${stringifiedParams}` : `/model-hub/feedback/get_template/`
+}
+
+/**
+ * Get evaluation template details based on user_eval_metric_id.
+ */
+export const modelHubFeedbackGetTemplate = async (params?: ModelHubFeedbackGetTemplateParams, options?: RequestInit): Promise<modelHubFeedbackGetTemplateResponse> => {
+
+  return apiMutator<modelHubFeedbackGetTemplateResponse>(getModelHubFeedbackGetTemplateUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubFeedbackGetFeedbackDetailsResponse200 = {
+  data: FeedbackDetailsResponseApi
+  status: 200
+}
+
+export type modelHubFeedbackGetFeedbackDetailsResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubFeedbackGetFeedbackDetailsResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubFeedbackGetFeedbackDetailsResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubFeedbackGetFeedbackDetailsResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubFeedbackGetFeedbackDetailsResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubFeedbackGetFeedbackDetailsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubFeedbackGetFeedbackDetailsResponseSuccess = (modelHubFeedbackGetFeedbackDetailsResponse200) & {
+  headers: Headers;
+};
+export type modelHubFeedbackGetFeedbackDetailsResponseError = (modelHubFeedbackGetFeedbackDetailsResponse400 | modelHubFeedbackGetFeedbackDetailsResponse403 | modelHubFeedbackGetFeedbackDetailsResponse404 | modelHubFeedbackGetFeedbackDetailsResponse409 | modelHubFeedbackGetFeedbackDetailsResponse500 | modelHubFeedbackGetFeedbackDetailsResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubFeedbackGetFeedbackDetailsResponse = (modelHubFeedbackGetFeedbackDetailsResponseSuccess | modelHubFeedbackGetFeedbackDetailsResponseError)
+
+export const getModelHubFeedbackGetFeedbackDetailsUrl = (params?: ModelHubFeedbackGetFeedbackDetailsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/feedback/get-feedback-details/?${stringifiedParams}` : `/model-hub/feedback/get-feedback-details/`
+}
+
+/**
+ * Get feedback details based on filters like user_eval_metric_id, row_id, etc.
+ */
+export const modelHubFeedbackGetFeedbackDetails = async (params?: ModelHubFeedbackGetFeedbackDetailsParams, options?: RequestInit): Promise<modelHubFeedbackGetFeedbackDetailsResponse> => {
+
+  return apiMutator<modelHubFeedbackGetFeedbackDetailsResponse>(getModelHubFeedbackGetFeedbackDetailsUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubFeedbackGetFeedbackSummaryResponse200 = {
+  data: ModelHubFeedbackGetFeedbackSummary200
+  status: 200
+}
+
+export type modelHubFeedbackGetFeedbackSummaryResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type modelHubFeedbackGetFeedbackSummaryResponseSuccess = (modelHubFeedbackGetFeedbackSummaryResponse200) & {
+  headers: Headers;
+};
+export type modelHubFeedbackGetFeedbackSummaryResponseError = (modelHubFeedbackGetFeedbackSummaryResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubFeedbackGetFeedbackSummaryResponse = (modelHubFeedbackGetFeedbackSummaryResponseSuccess | modelHubFeedbackGetFeedbackSummaryResponseError)
+
+export const getModelHubFeedbackGetFeedbackSummaryUrl = (params?: ModelHubFeedbackGetFeedbackSummaryParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/feedback/get-feedback-summary/?${stringifiedParams}` : `/model-hub/feedback/get-feedback-summary/`
+}
+
+/**
+ * Get summary statistics for feedback on a specific metric
+ */
+export const modelHubFeedbackGetFeedbackSummary = async (params?: ModelHubFeedbackGetFeedbackSummaryParams, options?: RequestInit): Promise<modelHubFeedbackGetFeedbackSummaryResponse> => {
+
+  return apiMutator<modelHubFeedbackGetFeedbackSummaryResponse>(getModelHubFeedbackGetFeedbackSummaryUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubFeedbackSubmitFeedbackActionResponse201 = {
+  data: FeedbackApi
+  status: 201
+}
+
+export type modelHubFeedbackSubmitFeedbackActionResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type modelHubFeedbackSubmitFeedbackActionResponseSuccess = (modelHubFeedbackSubmitFeedbackActionResponse201) & {
+  headers: Headers;
+};
+export type modelHubFeedbackSubmitFeedbackActionResponseError = (modelHubFeedbackSubmitFeedbackActionResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubFeedbackSubmitFeedbackActionResponse = (modelHubFeedbackSubmitFeedbackActionResponseSuccess | modelHubFeedbackSubmitFeedbackActionResponseError)
+
+export const getModelHubFeedbackSubmitFeedbackActionUrl = () => {
+
+
+
+
+  return `/model-hub/feedback/submit-feedback/`
+}
+
+/**
+ * Submit feedback action for re-tuning or re-calculating metrics
+ */
+export const modelHubFeedbackSubmitFeedbackAction = async (feedbackApi: NonReadonly<FeedbackApi>, options?: RequestInit): Promise<modelHubFeedbackSubmitFeedbackActionResponse> => {
+
+  return apiMutator<modelHubFeedbackSubmitFeedbackActionResponse>(getModelHubFeedbackSubmitFeedbackActionUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      feedbackApi,)
   }
 );}
 
@@ -40593,86 +40592,6 @@ export const modelHubKbCreate = async (knowledgeBaseCreateApi: NonReadonly<Knowl
 
 
 
-export type modelHubKbSupportedEmbeddingModelsResponse200 = {
-  data: KnowledgeBaseEmbeddingModelsResponseApi
-  status: 200
-}
-
-export type modelHubKbSupportedEmbeddingModelsResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubKbSupportedEmbeddingModelsResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubKbSupportedEmbeddingModelsResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubKbSupportedEmbeddingModelsResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubKbSupportedEmbeddingModelsResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubKbSupportedEmbeddingModelsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubKbSupportedEmbeddingModelsResponseSuccess = (modelHubKbSupportedEmbeddingModelsResponse200) & {
-  headers: Headers;
-};
-export type modelHubKbSupportedEmbeddingModelsResponseError = (modelHubKbSupportedEmbeddingModelsResponse400 | modelHubKbSupportedEmbeddingModelsResponse403 | modelHubKbSupportedEmbeddingModelsResponse404 | modelHubKbSupportedEmbeddingModelsResponse409 | modelHubKbSupportedEmbeddingModelsResponse500 | modelHubKbSupportedEmbeddingModelsResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubKbSupportedEmbeddingModelsResponse = (modelHubKbSupportedEmbeddingModelsResponseSuccess | modelHubKbSupportedEmbeddingModelsResponseError)
-
-export const getModelHubKbSupportedEmbeddingModelsUrl = (params?: ModelHubKbSupportedEmbeddingModelsParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/kb/supported_embedding_models/?${stringifiedParams}` : `/model-hub/kb/supported_embedding_models/`
-}
-
-/**
- * Get all supported embedding models.
- * @summary Get supported embedding models.
- */
-export const modelHubKbSupportedEmbeddingModels = async (params?: ModelHubKbSupportedEmbeddingModelsParams, options?: RequestInit): Promise<modelHubKbSupportedEmbeddingModelsResponse> => {
-
-  return apiMutator<modelHubKbSupportedEmbeddingModelsResponse>(getModelHubKbSupportedEmbeddingModelsUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type modelHubKbReadResponse200 = {
   data: KnowledgeBaseResponseApi
   status: 200
@@ -40946,6 +40865,86 @@ export const modelHubKbDelete = async (id: string, options?: RequestInit): Promi
   {
     ...options,
     method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type modelHubKbSupportedEmbeddingModelsResponse200 = {
+  data: KnowledgeBaseEmbeddingModelsResponseApi
+  status: 200
+}
+
+export type modelHubKbSupportedEmbeddingModelsResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubKbSupportedEmbeddingModelsResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubKbSupportedEmbeddingModelsResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubKbSupportedEmbeddingModelsResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubKbSupportedEmbeddingModelsResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubKbSupportedEmbeddingModelsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubKbSupportedEmbeddingModelsResponseSuccess = (modelHubKbSupportedEmbeddingModelsResponse200) & {
+  headers: Headers;
+};
+export type modelHubKbSupportedEmbeddingModelsResponseError = (modelHubKbSupportedEmbeddingModelsResponse400 | modelHubKbSupportedEmbeddingModelsResponse403 | modelHubKbSupportedEmbeddingModelsResponse404 | modelHubKbSupportedEmbeddingModelsResponse409 | modelHubKbSupportedEmbeddingModelsResponse500 | modelHubKbSupportedEmbeddingModelsResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubKbSupportedEmbeddingModelsResponse = (modelHubKbSupportedEmbeddingModelsResponseSuccess | modelHubKbSupportedEmbeddingModelsResponseError)
+
+export const getModelHubKbSupportedEmbeddingModelsUrl = (params?: ModelHubKbSupportedEmbeddingModelsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/kb/supported-embedding-models?${stringifiedParams}` : `/model-hub/kb/supported-embedding-models`
+}
+
+/**
+ * Get all supported embedding models.
+ * @summary Get supported embedding models.
+ */
+export const modelHubKbSupportedEmbeddingModels = async (params?: ModelHubKbSupportedEmbeddingModelsParams, options?: RequestInit): Promise<modelHubKbSupportedEmbeddingModelsResponse> => {
+
+  return apiMutator<modelHubKbSupportedEmbeddingModelsResponse>(getModelHubKbSupportedEmbeddingModelsUrl(params),
+  {
+    ...options,
+    method: 'GET'
 
 
   }
@@ -41594,6 +41593,86 @@ export const modelHubOptimisationList = async (params?: ModelHubOptimisationList
 
 
 
+export type modelHubOptimisationReadResponse200 = {
+  data: OptimizationDatasetGetApi
+  status: 200
+}
+
+export type modelHubOptimisationReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type modelHubOptimisationReadResponseSuccess = (modelHubOptimisationReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubOptimisationReadResponseError = (modelHubOptimisationReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubOptimisationReadResponse = (modelHubOptimisationReadResponseSuccess | modelHubOptimisationReadResponseError)
+
+export const getModelHubOptimisationReadUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/optimisation/${id}/`
+}
+
+export const modelHubOptimisationRead = async (id: string, options?: RequestInit): Promise<modelHubOptimisationReadResponse> => {
+
+  return apiMutator<modelHubOptimisationReadResponse>(getModelHubOptimisationReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubOptimisationDetailsReadResponse200 = {
+  data: OptimizationDetailApi
+  status: 200
+}
+
+export type modelHubOptimisationDetailsReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type modelHubOptimisationDetailsReadResponseSuccess = (modelHubOptimisationDetailsReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubOptimisationDetailsReadResponseError = (modelHubOptimisationDetailsReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubOptimisationDetailsReadResponse = (modelHubOptimisationDetailsReadResponseSuccess | modelHubOptimisationDetailsReadResponseError)
+
+export const getModelHubOptimisationDetailsReadUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/optimisation/${id}/details/`
+}
+
+export const modelHubOptimisationDetailsRead = async (id: string, options?: RequestInit): Promise<modelHubOptimisationDetailsReadResponse> => {
+
+  return apiMutator<modelHubOptimisationDetailsReadResponse>(getModelHubOptimisationDetailsReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type modelHubOptimisationCreateCreateResponse200 = {
   data: ModelHubStringResultResponseApi
   status: 200
@@ -41860,86 +41939,6 @@ export const modelHubOptimisationUpdateUpdate = async (id: string,
 
 
 
-export type modelHubOptimisationReadResponse200 = {
-  data: OptimizationDatasetGetApi
-  status: 200
-}
-
-export type modelHubOptimisationReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type modelHubOptimisationReadResponseSuccess = (modelHubOptimisationReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubOptimisationReadResponseError = (modelHubOptimisationReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubOptimisationReadResponse = (modelHubOptimisationReadResponseSuccess | modelHubOptimisationReadResponseError)
-
-export const getModelHubOptimisationReadUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/optimisation/${id}/`
-}
-
-export const modelHubOptimisationRead = async (id: string, options?: RequestInit): Promise<modelHubOptimisationReadResponse> => {
-
-  return apiMutator<modelHubOptimisationReadResponse>(getModelHubOptimisationReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubOptimisationDetailsReadResponse200 = {
-  data: OptimizationDetailApi
-  status: 200
-}
-
-export type modelHubOptimisationDetailsReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type modelHubOptimisationDetailsReadResponseSuccess = (modelHubOptimisationDetailsReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubOptimisationDetailsReadResponseError = (modelHubOptimisationDetailsReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubOptimisationDetailsReadResponse = (modelHubOptimisationDetailsReadResponseSuccess | modelHubOptimisationDetailsReadResponseError)
-
-export const getModelHubOptimisationDetailsReadUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/optimisation/${id}/details/`
-}
-
-export const modelHubOptimisationDetailsRead = async (id: string, options?: RequestInit): Promise<modelHubOptimisationDetailsReadResponse> => {
-
-  return apiMutator<modelHubOptimisationDetailsReadResponse>(getModelHubOptimisationDetailsReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type modelHubOptimizeDatasetListResponse200 = {
   data: ModelHubOptimizeDatasetList200
   status: 200
@@ -41986,137 +41985,6 @@ export const modelHubOptimizeDatasetList = async (params?: ModelHubOptimizeDatas
     method: 'GET'
 
 
-  }
-);}
-
-
-
-export type modelHubOptimizeDatasetKbReadResponse200 = {
-  data: OptimizeDatasetKnowledgeBaseDetailResponseApi
-  status: 200
-}
-
-export type modelHubOptimizeDatasetKbReadResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubOptimizeDatasetKbReadResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubOptimizeDatasetKbReadResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubOptimizeDatasetKbReadResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubOptimizeDatasetKbReadResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubOptimizeDatasetKbReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubOptimizeDatasetKbReadResponseSuccess = (modelHubOptimizeDatasetKbReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubOptimizeDatasetKbReadResponseError = (modelHubOptimizeDatasetKbReadResponse400 | modelHubOptimizeDatasetKbReadResponse403 | modelHubOptimizeDatasetKbReadResponse404 | modelHubOptimizeDatasetKbReadResponse409 | modelHubOptimizeDatasetKbReadResponse500 | modelHubOptimizeDatasetKbReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubOptimizeDatasetKbReadResponse = (modelHubOptimizeDatasetKbReadResponseSuccess | modelHubOptimizeDatasetKbReadResponseError)
-
-export const getModelHubOptimizeDatasetKbReadUrl = (optimId: string,) => {
-
-
-
-
-  return `/model-hub/optimize-dataset/kb/${optimId}/`
-}
-
-export const modelHubOptimizeDatasetKbRead = async (optimId: string, options?: RequestInit): Promise<modelHubOptimizeDatasetKbReadResponse> => {
-
-  return apiMutator<modelHubOptimizeDatasetKbReadResponse>(getModelHubOptimizeDatasetKbReadUrl(optimId),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse200 = {
-  data: OptimizeDatasetKnowledgeBaseCreateResponseApi
-  status: 200
-}
-
-export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubOptimizeDatasetKnowledgeBaseCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubOptimizeDatasetKnowledgeBaseCreateResponseSuccess = (modelHubOptimizeDatasetKnowledgeBaseCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubOptimizeDatasetKnowledgeBaseCreateResponseError = (modelHubOptimizeDatasetKnowledgeBaseCreateResponse400 | modelHubOptimizeDatasetKnowledgeBaseCreateResponse403 | modelHubOptimizeDatasetKnowledgeBaseCreateResponse404 | modelHubOptimizeDatasetKnowledgeBaseCreateResponse409 | modelHubOptimizeDatasetKnowledgeBaseCreateResponse500 | modelHubOptimizeDatasetKnowledgeBaseCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse = (modelHubOptimizeDatasetKnowledgeBaseCreateResponseSuccess | modelHubOptimizeDatasetKnowledgeBaseCreateResponseError)
-
-export const getModelHubOptimizeDatasetKnowledgeBaseCreateUrl = () => {
-
-
-
-
-  return `/model-hub/optimize-dataset/knowledge-base/`
-}
-
-export const modelHubOptimizeDatasetKnowledgeBaseCreate = async (optimizeDatasetKnowledgeBaseRequestApi: OptimizeDatasetKnowledgeBaseRequestApi, options?: RequestInit): Promise<modelHubOptimizeDatasetKnowledgeBaseCreateResponse> => {
-
-  return apiMutator<modelHubOptimizeDatasetKnowledgeBaseCreateResponse>(getModelHubOptimizeDatasetKnowledgeBaseCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      optimizeDatasetKnowledgeBaseRequestApi,)
   }
 );}
 
@@ -42867,6 +42735,137 @@ export const modelHubOptimizeDatasetRightAnswersCreate = async (modelId: string,
 
 
 
+export type modelHubOptimizeDatasetKbReadResponse200 = {
+  data: OptimizeDatasetKnowledgeBaseDetailResponseApi
+  status: 200
+}
+
+export type modelHubOptimizeDatasetKbReadResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubOptimizeDatasetKbReadResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubOptimizeDatasetKbReadResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubOptimizeDatasetKbReadResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubOptimizeDatasetKbReadResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubOptimizeDatasetKbReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubOptimizeDatasetKbReadResponseSuccess = (modelHubOptimizeDatasetKbReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubOptimizeDatasetKbReadResponseError = (modelHubOptimizeDatasetKbReadResponse400 | modelHubOptimizeDatasetKbReadResponse403 | modelHubOptimizeDatasetKbReadResponse404 | modelHubOptimizeDatasetKbReadResponse409 | modelHubOptimizeDatasetKbReadResponse500 | modelHubOptimizeDatasetKbReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubOptimizeDatasetKbReadResponse = (modelHubOptimizeDatasetKbReadResponseSuccess | modelHubOptimizeDatasetKbReadResponseError)
+
+export const getModelHubOptimizeDatasetKbReadUrl = (optimId: string,) => {
+
+
+
+
+  return `/model-hub/optimize-dataset/kb/${optimId}/`
+}
+
+export const modelHubOptimizeDatasetKbRead = async (optimId: string, options?: RequestInit): Promise<modelHubOptimizeDatasetKbReadResponse> => {
+
+  return apiMutator<modelHubOptimizeDatasetKbReadResponse>(getModelHubOptimizeDatasetKbReadUrl(optimId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse200 = {
+  data: OptimizeDatasetKnowledgeBaseCreateResponseApi
+  status: 200
+}
+
+export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubOptimizeDatasetKnowledgeBaseCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubOptimizeDatasetKnowledgeBaseCreateResponseSuccess = (modelHubOptimizeDatasetKnowledgeBaseCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubOptimizeDatasetKnowledgeBaseCreateResponseError = (modelHubOptimizeDatasetKnowledgeBaseCreateResponse400 | modelHubOptimizeDatasetKnowledgeBaseCreateResponse403 | modelHubOptimizeDatasetKnowledgeBaseCreateResponse404 | modelHubOptimizeDatasetKnowledgeBaseCreateResponse409 | modelHubOptimizeDatasetKnowledgeBaseCreateResponse500 | modelHubOptimizeDatasetKnowledgeBaseCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubOptimizeDatasetKnowledgeBaseCreateResponse = (modelHubOptimizeDatasetKnowledgeBaseCreateResponseSuccess | modelHubOptimizeDatasetKnowledgeBaseCreateResponseError)
+
+export const getModelHubOptimizeDatasetKnowledgeBaseCreateUrl = () => {
+
+
+
+
+  return `/model-hub/optimize-dataset/knowledge-base/`
+}
+
+export const modelHubOptimizeDatasetKnowledgeBaseCreate = async (optimizeDatasetKnowledgeBaseRequestApi: OptimizeDatasetKnowledgeBaseRequestApi, options?: RequestInit): Promise<modelHubOptimizeDatasetKnowledgeBaseCreateResponse> => {
+
+  return apiMutator<modelHubOptimizeDatasetKnowledgeBaseCreateResponse>(getModelHubOptimizeDatasetKnowledgeBaseCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      optimizeDatasetKnowledgeBaseRequestApi,)
+  }
+);}
+
+
+
 export type modelHubOrganizationsUsersListResponse200 = {
   data: ModelHubOrganizationsUsersList200
   status: 200
@@ -43022,6 +43021,73 @@ export const modelHubOverviewList = async ( options?: RequestInit): Promise<mode
     method: 'GET'
 
 
+  }
+);}
+
+
+
+export type modelHubPerformanceCreateResponse200 = {
+  data: ModelHubPerformanceCreate200
+  status: 200
+}
+
+export type modelHubPerformanceCreateResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubPerformanceCreateResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubPerformanceCreateResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubPerformanceCreateResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubPerformanceCreateResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubPerformanceCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubPerformanceCreateResponseSuccess = (modelHubPerformanceCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubPerformanceCreateResponseError = (modelHubPerformanceCreateResponse400 | modelHubPerformanceCreateResponse403 | modelHubPerformanceCreateResponse404 | modelHubPerformanceCreateResponse409 | modelHubPerformanceCreateResponse500 | modelHubPerformanceCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPerformanceCreateResponse = (modelHubPerformanceCreateResponseSuccess | modelHubPerformanceCreateResponseError)
+
+export const getModelHubPerformanceCreateUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/performance/${id}/`
+}
+
+export const modelHubPerformanceCreate = async (id: string,
+    performanceQueryRequestApi: PerformanceQueryRequestApi, options?: RequestInit): Promise<modelHubPerformanceCreateResponse> => {
+
+  return apiMutator<modelHubPerformanceCreateResponse>(getModelHubPerformanceCreateUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      performanceQueryRequestApi,)
   }
 );}
 
@@ -43492,73 +43558,6 @@ export const modelHubPerformanceTagDistributionCreate = async (modelId: string,
 
 
 
-export type modelHubPerformanceCreateResponse200 = {
-  data: ModelHubPerformanceCreate200
-  status: 200
-}
-
-export type modelHubPerformanceCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubPerformanceCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubPerformanceCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubPerformanceCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubPerformanceCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubPerformanceCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubPerformanceCreateResponseSuccess = (modelHubPerformanceCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubPerformanceCreateResponseError = (modelHubPerformanceCreateResponse400 | modelHubPerformanceCreateResponse403 | modelHubPerformanceCreateResponse404 | modelHubPerformanceCreateResponse409 | modelHubPerformanceCreateResponse500 | modelHubPerformanceCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPerformanceCreateResponse = (modelHubPerformanceCreateResponseSuccess | modelHubPerformanceCreateResponseError)
-
-export const getModelHubPerformanceCreateUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/performance/${id}/`
-}
-
-export const modelHubPerformanceCreate = async (id: string,
-    performanceQueryRequestApi: PerformanceQueryRequestApi, options?: RequestInit): Promise<modelHubPerformanceCreateResponse> => {
-
-  return apiMutator<modelHubPerformanceCreateResponse>(getModelHubPerformanceCreateUrl(id),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      performanceQueryRequestApi,)
-  }
-);}
-
-
-
 export type modelHubPromptBaseTemplatesListResponse200 = {
   data: ModelHubPromptBaseTemplatesList200
   status: 200
@@ -43652,60 +43651,6 @@ export const modelHubPromptBaseTemplatesCreate = async (promptBaseTemplateApi: N
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       promptBaseTemplateApi,)
-  }
-);}
-
-
-
-export type modelHubPromptBaseTemplatesGetAllCategoriesResponse200 = {
-  data: ModelHubPromptBaseTemplatesGetAllCategories200
-  status: 200
-}
-
-export type modelHubPromptBaseTemplatesGetAllCategoriesResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type modelHubPromptBaseTemplatesGetAllCategoriesResponseSuccess = (modelHubPromptBaseTemplatesGetAllCategoriesResponse200) & {
-  headers: Headers;
-};
-export type modelHubPromptBaseTemplatesGetAllCategoriesResponseError = (modelHubPromptBaseTemplatesGetAllCategoriesResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptBaseTemplatesGetAllCategoriesResponse = (modelHubPromptBaseTemplatesGetAllCategoriesResponseSuccess | modelHubPromptBaseTemplatesGetAllCategoriesResponseError)
-
-export const getModelHubPromptBaseTemplatesGetAllCategoriesUrl = (params?: ModelHubPromptBaseTemplatesGetAllCategoriesParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/prompt-base-templates/get-all-categories/?${stringifiedParams}` : `/model-hub/prompt-base-templates/get-all-categories/`
-}
-
-/**
- * Get all categories for the user's organization
- */
-export const modelHubPromptBaseTemplatesGetAllCategories = async (params?: ModelHubPromptBaseTemplatesGetAllCategoriesParams, options?: RequestInit): Promise<modelHubPromptBaseTemplatesGetAllCategoriesResponse> => {
-
-  return apiMutator<modelHubPromptBaseTemplatesGetAllCategoriesResponse>(getModelHubPromptBaseTemplatesGetAllCategoriesUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
   }
 );}
 
@@ -43880,6 +43825,60 @@ export const modelHubPromptBaseTemplatesDelete = async (id: string, options?: Re
   {
     ...options,
     method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type modelHubPromptBaseTemplatesGetAllCategoriesResponse200 = {
+  data: ModelHubPromptBaseTemplatesGetAllCategories200
+  status: 200
+}
+
+export type modelHubPromptBaseTemplatesGetAllCategoriesResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type modelHubPromptBaseTemplatesGetAllCategoriesResponseSuccess = (modelHubPromptBaseTemplatesGetAllCategoriesResponse200) & {
+  headers: Headers;
+};
+export type modelHubPromptBaseTemplatesGetAllCategoriesResponseError = (modelHubPromptBaseTemplatesGetAllCategoriesResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptBaseTemplatesGetAllCategoriesResponse = (modelHubPromptBaseTemplatesGetAllCategoriesResponseSuccess | modelHubPromptBaseTemplatesGetAllCategoriesResponseError)
+
+export const getModelHubPromptBaseTemplatesGetAllCategoriesUrl = (params?: ModelHubPromptBaseTemplatesGetAllCategoriesParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/prompt-base-templates/get-all-categories/?${stringifiedParams}` : `/model-hub/prompt-base-templates/get-all-categories/`
+}
+
+/**
+ * Get all categories for the user's organization
+ */
+export const modelHubPromptBaseTemplatesGetAllCategories = async (params?: ModelHubPromptBaseTemplatesGetAllCategoriesParams, options?: RequestInit): Promise<modelHubPromptBaseTemplatesGetAllCategoriesResponse> => {
+
+  return apiMutator<modelHubPromptBaseTemplatesGetAllCategoriesResponse>(getModelHubPromptBaseTemplatesGetAllCategoriesUrl(params),
+  {
+    ...options,
+    method: 'GET'
 
 
   }
@@ -44303,6 +44302,46 @@ export const modelHubPromptHistoryExecutionsList = async (params?: ModelHubPromp
 
 
 
+export type modelHubPromptHistoryExecutionsReadResponse200 = {
+  data: PromptHistoryExecutionApi
+  status: 200
+}
+
+export type modelHubPromptHistoryExecutionsReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type modelHubPromptHistoryExecutionsReadResponseSuccess = (modelHubPromptHistoryExecutionsReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubPromptHistoryExecutionsReadResponseError = (modelHubPromptHistoryExecutionsReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptHistoryExecutionsReadResponse = (modelHubPromptHistoryExecutionsReadResponseSuccess | modelHubPromptHistoryExecutionsReadResponseError)
+
+export const getModelHubPromptHistoryExecutionsReadUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/prompt-history-executions/${id}/`
+}
+
+export const modelHubPromptHistoryExecutionsRead = async (id: string, options?: RequestInit): Promise<modelHubPromptHistoryExecutionsReadResponse> => {
+
+  return apiMutator<modelHubPromptHistoryExecutionsReadResponse>(getModelHubPromptHistoryExecutionsReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type modelHubPromptHistoryExecutionsGetExecutionDetailsResponse200 = {
   data: ModelHubPromptHistoryExecutionsGetExecutionDetails200
   status: 200
@@ -44349,46 +44388,6 @@ export const modelHubPromptHistoryExecutionsGetExecutionDetails = async (executi
     params?: ModelHubPromptHistoryExecutionsGetExecutionDetailsParams, options?: RequestInit): Promise<modelHubPromptHistoryExecutionsGetExecutionDetailsResponse> => {
 
   return apiMutator<modelHubPromptHistoryExecutionsGetExecutionDetailsResponse>(getModelHubPromptHistoryExecutionsGetExecutionDetailsUrl(executionId,params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubPromptHistoryExecutionsReadResponse200 = {
-  data: PromptHistoryExecutionApi
-  status: 200
-}
-
-export type modelHubPromptHistoryExecutionsReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type modelHubPromptHistoryExecutionsReadResponseSuccess = (modelHubPromptHistoryExecutionsReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubPromptHistoryExecutionsReadResponseError = (modelHubPromptHistoryExecutionsReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptHistoryExecutionsReadResponse = (modelHubPromptHistoryExecutionsReadResponseSuccess | modelHubPromptHistoryExecutionsReadResponseError)
-
-export const getModelHubPromptHistoryExecutionsReadUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/prompt-history-executions/${id}/`
-}
-
-export const modelHubPromptHistoryExecutionsRead = async (id: string, options?: RequestInit): Promise<modelHubPromptHistoryExecutionsReadResponse> => {
-
-  return apiMutator<modelHubPromptHistoryExecutionsReadResponse>(getModelHubPromptHistoryExecutionsReadUrl(id),
   {
     ...options,
     method: 'GET'
@@ -44530,6 +44529,342 @@ export const getModelHubPromptLabelsCreateUrl = () => {
 export const modelHubPromptLabelsCreate = async (promptLabelApi: NonReadonly<PromptLabelApi>, options?: RequestInit): Promise<modelHubPromptLabelsCreateResponse> => {
 
   return apiMutator<modelHubPromptLabelsCreateResponse>(getModelHubPromptLabelsCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      promptLabelApi,)
+  }
+);}
+
+
+
+export type modelHubPromptLabelsReadResponse200 = {
+  data: PromptLabelApi
+  status: 200
+}
+
+export type modelHubPromptLabelsReadResponse400 = {
+  data: ModelHubTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubPromptLabelsReadResponse403 = {
+  data: ModelHubTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubPromptLabelsReadResponse404 = {
+  data: ModelHubTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubPromptLabelsReadResponse409 = {
+  data: ModelHubTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubPromptLabelsReadResponse500 = {
+  data: ModelHubTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubPromptLabelsReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubPromptLabelsReadResponseSuccess = (modelHubPromptLabelsReadResponse200) & {
+  headers: Headers;
+};
+export type modelHubPromptLabelsReadResponseError = (modelHubPromptLabelsReadResponse400 | modelHubPromptLabelsReadResponse403 | modelHubPromptLabelsReadResponse404 | modelHubPromptLabelsReadResponse409 | modelHubPromptLabelsReadResponse500 | modelHubPromptLabelsReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptLabelsReadResponse = (modelHubPromptLabelsReadResponseSuccess | modelHubPromptLabelsReadResponseError)
+
+export const getModelHubPromptLabelsReadUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/prompt-labels/${id}/`
+}
+
+export const modelHubPromptLabelsRead = async (id: string, options?: RequestInit): Promise<modelHubPromptLabelsReadResponse> => {
+
+  return apiMutator<modelHubPromptLabelsReadResponse>(getModelHubPromptLabelsReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type modelHubPromptLabelsUpdateResponse200 = {
+  data: PromptLabelApi
+  status: 200
+}
+
+export type modelHubPromptLabelsUpdateResponse400 = {
+  data: ModelHubTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubPromptLabelsUpdateResponse403 = {
+  data: ModelHubTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubPromptLabelsUpdateResponse404 = {
+  data: ModelHubTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubPromptLabelsUpdateResponse409 = {
+  data: ModelHubTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubPromptLabelsUpdateResponse500 = {
+  data: ModelHubTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubPromptLabelsUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubPromptLabelsUpdateResponseSuccess = (modelHubPromptLabelsUpdateResponse200) & {
+  headers: Headers;
+};
+export type modelHubPromptLabelsUpdateResponseError = (modelHubPromptLabelsUpdateResponse400 | modelHubPromptLabelsUpdateResponse403 | modelHubPromptLabelsUpdateResponse404 | modelHubPromptLabelsUpdateResponse409 | modelHubPromptLabelsUpdateResponse500 | modelHubPromptLabelsUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptLabelsUpdateResponse = (modelHubPromptLabelsUpdateResponseSuccess | modelHubPromptLabelsUpdateResponseError)
+
+export const getModelHubPromptLabelsUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/prompt-labels/${id}/`
+}
+
+export const modelHubPromptLabelsUpdate = async (id: string,
+    promptLabelApi: NonReadonly<PromptLabelApi>, options?: RequestInit): Promise<modelHubPromptLabelsUpdateResponse> => {
+
+  return apiMutator<modelHubPromptLabelsUpdateResponse>(getModelHubPromptLabelsUpdateUrl(id),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      promptLabelApi,)
+  }
+);}
+
+
+
+export type modelHubPromptLabelsPartialUpdateResponse200 = {
+  data: PromptLabelApi
+  status: 200
+}
+
+export type modelHubPromptLabelsPartialUpdateResponse400 = {
+  data: ModelHubTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubPromptLabelsPartialUpdateResponse403 = {
+  data: ModelHubTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubPromptLabelsPartialUpdateResponse404 = {
+  data: ModelHubTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubPromptLabelsPartialUpdateResponse409 = {
+  data: ModelHubTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubPromptLabelsPartialUpdateResponse500 = {
+  data: ModelHubTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubPromptLabelsPartialUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubPromptLabelsPartialUpdateResponseSuccess = (modelHubPromptLabelsPartialUpdateResponse200) & {
+  headers: Headers;
+};
+export type modelHubPromptLabelsPartialUpdateResponseError = (modelHubPromptLabelsPartialUpdateResponse400 | modelHubPromptLabelsPartialUpdateResponse403 | modelHubPromptLabelsPartialUpdateResponse404 | modelHubPromptLabelsPartialUpdateResponse409 | modelHubPromptLabelsPartialUpdateResponse500 | modelHubPromptLabelsPartialUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptLabelsPartialUpdateResponse = (modelHubPromptLabelsPartialUpdateResponseSuccess | modelHubPromptLabelsPartialUpdateResponseError)
+
+export const getModelHubPromptLabelsPartialUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/prompt-labels/${id}/`
+}
+
+export const modelHubPromptLabelsPartialUpdate = async (id: string,
+    promptLabelApi: NonReadonly<PromptLabelApi>, options?: RequestInit): Promise<modelHubPromptLabelsPartialUpdateResponse> => {
+
+  return apiMutator<modelHubPromptLabelsPartialUpdateResponse>(getModelHubPromptLabelsPartialUpdateUrl(id),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      promptLabelApi,)
+  }
+);}
+
+
+
+export type modelHubPromptLabelsDeleteResponse204 = {
+  data: void
+  status: 204
+}
+
+export type modelHubPromptLabelsDeleteResponse400 = {
+  data: ModelHubTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubPromptLabelsDeleteResponse403 = {
+  data: ModelHubTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubPromptLabelsDeleteResponse404 = {
+  data: ModelHubTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubPromptLabelsDeleteResponse409 = {
+  data: ModelHubTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubPromptLabelsDeleteResponse500 = {
+  data: ModelHubTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubPromptLabelsDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 204 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubPromptLabelsDeleteResponseSuccess = (modelHubPromptLabelsDeleteResponse204) & {
+  headers: Headers;
+};
+export type modelHubPromptLabelsDeleteResponseError = (modelHubPromptLabelsDeleteResponse400 | modelHubPromptLabelsDeleteResponse403 | modelHubPromptLabelsDeleteResponse404 | modelHubPromptLabelsDeleteResponse409 | modelHubPromptLabelsDeleteResponse500 | modelHubPromptLabelsDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptLabelsDeleteResponse = (modelHubPromptLabelsDeleteResponseSuccess | modelHubPromptLabelsDeleteResponseError)
+
+export const getModelHubPromptLabelsDeleteUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/prompt-labels/${id}/`
+}
+
+export const modelHubPromptLabelsDelete = async (id: string, options?: RequestInit): Promise<modelHubPromptLabelsDeleteResponse> => {
+
+  return apiMutator<modelHubPromptLabelsDeleteResponse>(getModelHubPromptLabelsDeleteUrl(id),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type modelHubPromptLabelsAssignLabelByIdResponse201 = {
+  data: PromptLabelApi
+  status: 201
+}
+
+export type modelHubPromptLabelsAssignLabelByIdResponse400 = {
+  data: ModelHubTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubPromptLabelsAssignLabelByIdResponse403 = {
+  data: ModelHubTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubPromptLabelsAssignLabelByIdResponse404 = {
+  data: ModelHubTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubPromptLabelsAssignLabelByIdResponse409 = {
+  data: ModelHubTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubPromptLabelsAssignLabelByIdResponse500 = {
+  data: ModelHubTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubPromptLabelsAssignLabelByIdResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubPromptLabelsAssignLabelByIdResponseSuccess = (modelHubPromptLabelsAssignLabelByIdResponse201) & {
+  headers: Headers;
+};
+export type modelHubPromptLabelsAssignLabelByIdResponseError = (modelHubPromptLabelsAssignLabelByIdResponse400 | modelHubPromptLabelsAssignLabelByIdResponse403 | modelHubPromptLabelsAssignLabelByIdResponse404 | modelHubPromptLabelsAssignLabelByIdResponse409 | modelHubPromptLabelsAssignLabelByIdResponse500 | modelHubPromptLabelsAssignLabelByIdResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptLabelsAssignLabelByIdResponse = (modelHubPromptLabelsAssignLabelByIdResponseSuccess | modelHubPromptLabelsAssignLabelByIdResponseError)
+
+export const getModelHubPromptLabelsAssignLabelByIdUrl = (templateId: string,
+    labelId: string,) => {
+
+
+
+
+  return `/model-hub/prompt-labels/${templateId}/${labelId}/assign-label-by-id/`
+}
+
+/**
+ * Assign a label to a specific version by template name and version name.
+ */
+export const modelHubPromptLabelsAssignLabelById = async (templateId: string,
+    labelId: string,
+    promptLabelApi: NonReadonly<PromptLabelApi>, options?: RequestInit): Promise<modelHubPromptLabelsAssignLabelByIdResponse> => {
+
+  return apiMutator<modelHubPromptLabelsAssignLabelByIdResponse>(getModelHubPromptLabelsAssignLabelByIdUrl(templateId,labelId),
   {
     ...options,
     method: 'POST',
@@ -44976,342 +45311,6 @@ export const modelHubPromptLabelsTemplateLabels = async (params?: ModelHubPrompt
 
 
 
-export type modelHubPromptLabelsReadResponse200 = {
-  data: PromptLabelApi
-  status: 200
-}
-
-export type modelHubPromptLabelsReadResponse400 = {
-  data: ModelHubTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubPromptLabelsReadResponse403 = {
-  data: ModelHubTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubPromptLabelsReadResponse404 = {
-  data: ModelHubTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubPromptLabelsReadResponse409 = {
-  data: ModelHubTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubPromptLabelsReadResponse500 = {
-  data: ModelHubTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubPromptLabelsReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubPromptLabelsReadResponseSuccess = (modelHubPromptLabelsReadResponse200) & {
-  headers: Headers;
-};
-export type modelHubPromptLabelsReadResponseError = (modelHubPromptLabelsReadResponse400 | modelHubPromptLabelsReadResponse403 | modelHubPromptLabelsReadResponse404 | modelHubPromptLabelsReadResponse409 | modelHubPromptLabelsReadResponse500 | modelHubPromptLabelsReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptLabelsReadResponse = (modelHubPromptLabelsReadResponseSuccess | modelHubPromptLabelsReadResponseError)
-
-export const getModelHubPromptLabelsReadUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/prompt-labels/${id}/`
-}
-
-export const modelHubPromptLabelsRead = async (id: string, options?: RequestInit): Promise<modelHubPromptLabelsReadResponse> => {
-
-  return apiMutator<modelHubPromptLabelsReadResponse>(getModelHubPromptLabelsReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubPromptLabelsUpdateResponse200 = {
-  data: PromptLabelApi
-  status: 200
-}
-
-export type modelHubPromptLabelsUpdateResponse400 = {
-  data: ModelHubTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubPromptLabelsUpdateResponse403 = {
-  data: ModelHubTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubPromptLabelsUpdateResponse404 = {
-  data: ModelHubTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubPromptLabelsUpdateResponse409 = {
-  data: ModelHubTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubPromptLabelsUpdateResponse500 = {
-  data: ModelHubTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubPromptLabelsUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubPromptLabelsUpdateResponseSuccess = (modelHubPromptLabelsUpdateResponse200) & {
-  headers: Headers;
-};
-export type modelHubPromptLabelsUpdateResponseError = (modelHubPromptLabelsUpdateResponse400 | modelHubPromptLabelsUpdateResponse403 | modelHubPromptLabelsUpdateResponse404 | modelHubPromptLabelsUpdateResponse409 | modelHubPromptLabelsUpdateResponse500 | modelHubPromptLabelsUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptLabelsUpdateResponse = (modelHubPromptLabelsUpdateResponseSuccess | modelHubPromptLabelsUpdateResponseError)
-
-export const getModelHubPromptLabelsUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/prompt-labels/${id}/`
-}
-
-export const modelHubPromptLabelsUpdate = async (id: string,
-    promptLabelApi: NonReadonly<PromptLabelApi>, options?: RequestInit): Promise<modelHubPromptLabelsUpdateResponse> => {
-
-  return apiMutator<modelHubPromptLabelsUpdateResponse>(getModelHubPromptLabelsUpdateUrl(id),
-  {
-    ...options,
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      promptLabelApi,)
-  }
-);}
-
-
-
-export type modelHubPromptLabelsPartialUpdateResponse200 = {
-  data: PromptLabelApi
-  status: 200
-}
-
-export type modelHubPromptLabelsPartialUpdateResponse400 = {
-  data: ModelHubTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubPromptLabelsPartialUpdateResponse403 = {
-  data: ModelHubTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubPromptLabelsPartialUpdateResponse404 = {
-  data: ModelHubTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubPromptLabelsPartialUpdateResponse409 = {
-  data: ModelHubTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubPromptLabelsPartialUpdateResponse500 = {
-  data: ModelHubTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubPromptLabelsPartialUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubPromptLabelsPartialUpdateResponseSuccess = (modelHubPromptLabelsPartialUpdateResponse200) & {
-  headers: Headers;
-};
-export type modelHubPromptLabelsPartialUpdateResponseError = (modelHubPromptLabelsPartialUpdateResponse400 | modelHubPromptLabelsPartialUpdateResponse403 | modelHubPromptLabelsPartialUpdateResponse404 | modelHubPromptLabelsPartialUpdateResponse409 | modelHubPromptLabelsPartialUpdateResponse500 | modelHubPromptLabelsPartialUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptLabelsPartialUpdateResponse = (modelHubPromptLabelsPartialUpdateResponseSuccess | modelHubPromptLabelsPartialUpdateResponseError)
-
-export const getModelHubPromptLabelsPartialUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/prompt-labels/${id}/`
-}
-
-export const modelHubPromptLabelsPartialUpdate = async (id: string,
-    promptLabelApi: NonReadonly<PromptLabelApi>, options?: RequestInit): Promise<modelHubPromptLabelsPartialUpdateResponse> => {
-
-  return apiMutator<modelHubPromptLabelsPartialUpdateResponse>(getModelHubPromptLabelsPartialUpdateUrl(id),
-  {
-    ...options,
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      promptLabelApi,)
-  }
-);}
-
-
-
-export type modelHubPromptLabelsDeleteResponse204 = {
-  data: void
-  status: 204
-}
-
-export type modelHubPromptLabelsDeleteResponse400 = {
-  data: ModelHubTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubPromptLabelsDeleteResponse403 = {
-  data: ModelHubTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubPromptLabelsDeleteResponse404 = {
-  data: ModelHubTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubPromptLabelsDeleteResponse409 = {
-  data: ModelHubTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubPromptLabelsDeleteResponse500 = {
-  data: ModelHubTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubPromptLabelsDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 204 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubPromptLabelsDeleteResponseSuccess = (modelHubPromptLabelsDeleteResponse204) & {
-  headers: Headers;
-};
-export type modelHubPromptLabelsDeleteResponseError = (modelHubPromptLabelsDeleteResponse400 | modelHubPromptLabelsDeleteResponse403 | modelHubPromptLabelsDeleteResponse404 | modelHubPromptLabelsDeleteResponse409 | modelHubPromptLabelsDeleteResponse500 | modelHubPromptLabelsDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptLabelsDeleteResponse = (modelHubPromptLabelsDeleteResponseSuccess | modelHubPromptLabelsDeleteResponseError)
-
-export const getModelHubPromptLabelsDeleteUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/prompt-labels/${id}/`
-}
-
-export const modelHubPromptLabelsDelete = async (id: string, options?: RequestInit): Promise<modelHubPromptLabelsDeleteResponse> => {
-
-  return apiMutator<modelHubPromptLabelsDeleteResponse>(getModelHubPromptLabelsDeleteUrl(id),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
-export type modelHubPromptLabelsAssignLabelByIdResponse201 = {
-  data: PromptLabelApi
-  status: 201
-}
-
-export type modelHubPromptLabelsAssignLabelByIdResponse400 = {
-  data: ModelHubTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubPromptLabelsAssignLabelByIdResponse403 = {
-  data: ModelHubTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubPromptLabelsAssignLabelByIdResponse404 = {
-  data: ModelHubTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubPromptLabelsAssignLabelByIdResponse409 = {
-  data: ModelHubTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubPromptLabelsAssignLabelByIdResponse500 = {
-  data: ModelHubTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubPromptLabelsAssignLabelByIdResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubPromptLabelsAssignLabelByIdResponseSuccess = (modelHubPromptLabelsAssignLabelByIdResponse201) & {
-  headers: Headers;
-};
-export type modelHubPromptLabelsAssignLabelByIdResponseError = (modelHubPromptLabelsAssignLabelByIdResponse400 | modelHubPromptLabelsAssignLabelByIdResponse403 | modelHubPromptLabelsAssignLabelByIdResponse404 | modelHubPromptLabelsAssignLabelByIdResponse409 | modelHubPromptLabelsAssignLabelByIdResponse500 | modelHubPromptLabelsAssignLabelByIdResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptLabelsAssignLabelByIdResponse = (modelHubPromptLabelsAssignLabelByIdResponseSuccess | modelHubPromptLabelsAssignLabelByIdResponseError)
-
-export const getModelHubPromptLabelsAssignLabelByIdUrl = (templateId: string,
-    labelId: string,) => {
-
-
-
-
-  return `/model-hub/prompt-labels/${templateId}/${labelId}/assign-label-by-id/`
-}
-
-/**
- * Assign a label to a specific version by template name and version name.
- */
-export const modelHubPromptLabelsAssignLabelById = async (templateId: string,
-    labelId: string,
-    promptLabelApi: NonReadonly<PromptLabelApi>, options?: RequestInit): Promise<modelHubPromptLabelsAssignLabelByIdResponse> => {
-
-  return apiMutator<modelHubPromptLabelsAssignLabelByIdResponse>(getModelHubPromptLabelsAssignLabelByIdUrl(templateId,labelId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      promptLabelApi,)
-  }
-);}
-
-
-
 export type modelHubPromptTemplatesListResponse200 = {
   data: ModelHubPromptTemplatesList200
   status: 200
@@ -45393,399 +45392,6 @@ export const getModelHubPromptTemplatesCreateUrl = () => {
 export const modelHubPromptTemplatesCreate = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesCreateResponse> => {
 
   return apiMutator<modelHubPromptTemplatesCreateResponse>(getModelHubPromptTemplatesCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      promptTemplateApi,)
-  }
-);}
-
-
-
-export type modelHubPromptTemplatesAnalyzePromptResponse201 = {
-  data: PromptTemplateApi
-  status: 201
-}
-
-export type modelHubPromptTemplatesAnalyzePromptResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type modelHubPromptTemplatesAnalyzePromptResponseSuccess = (modelHubPromptTemplatesAnalyzePromptResponse201) & {
-  headers: Headers;
-};
-export type modelHubPromptTemplatesAnalyzePromptResponseError = (modelHubPromptTemplatesAnalyzePromptResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptTemplatesAnalyzePromptResponse = (modelHubPromptTemplatesAnalyzePromptResponseSuccess | modelHubPromptTemplatesAnalyzePromptResponseError)
-
-export const getModelHubPromptTemplatesAnalyzePromptUrl = () => {
-
-
-
-
-  return `/model-hub/prompt-templates/analyze-prompt/`
-}
-
-export const modelHubPromptTemplatesAnalyzePrompt = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesAnalyzePromptResponse> => {
-
-  return apiMutator<modelHubPromptTemplatesAnalyzePromptResponse>(getModelHubPromptTemplatesAnalyzePromptUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      promptTemplateApi,)
-  }
-);}
-
-
-
-export type modelHubPromptTemplatesBulkDeleteResponse201 = {
-  data: PromptTemplateApi
-  status: 201
-}
-
-export type modelHubPromptTemplatesBulkDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type modelHubPromptTemplatesBulkDeleteResponseSuccess = (modelHubPromptTemplatesBulkDeleteResponse201) & {
-  headers: Headers;
-};
-export type modelHubPromptTemplatesBulkDeleteResponseError = (modelHubPromptTemplatesBulkDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptTemplatesBulkDeleteResponse = (modelHubPromptTemplatesBulkDeleteResponseSuccess | modelHubPromptTemplatesBulkDeleteResponseError)
-
-export const getModelHubPromptTemplatesBulkDeleteUrl = () => {
-
-
-
-
-  return `/model-hub/prompt-templates/bulk-delete/`
-}
-
-/**
- * Bulk delete prompt templates
- */
-export const modelHubPromptTemplatesBulkDelete = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesBulkDeleteResponse> => {
-
-  return apiMutator<modelHubPromptTemplatesBulkDeleteResponse>(getModelHubPromptTemplatesBulkDeleteUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      promptTemplateApi,)
-  }
-);}
-
-
-
-export type modelHubPromptTemplatesCreateDraftResponse201 = {
-  data: PromptTemplateApi
-  status: 201
-}
-
-export type modelHubPromptTemplatesCreateDraftResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type modelHubPromptTemplatesCreateDraftResponseSuccess = (modelHubPromptTemplatesCreateDraftResponse201) & {
-  headers: Headers;
-};
-export type modelHubPromptTemplatesCreateDraftResponseError = (modelHubPromptTemplatesCreateDraftResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptTemplatesCreateDraftResponse = (modelHubPromptTemplatesCreateDraftResponseSuccess | modelHubPromptTemplatesCreateDraftResponseError)
-
-export const getModelHubPromptTemplatesCreateDraftUrl = () => {
-
-
-
-
-  return `/model-hub/prompt-templates/create-draft/`
-}
-
-/**
- * Create a draft version of the PromptTemplate and return its details.
- */
-export const modelHubPromptTemplatesCreateDraft = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesCreateDraftResponse> => {
-
-  return apiMutator<modelHubPromptTemplatesCreateDraftResponse>(getModelHubPromptTemplatesCreateDraftUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      promptTemplateApi,)
-  }
-);}
-
-
-
-export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse200 = {
-  data: DerivedVariableDetailResponseApi
-  status: 200
-}
-
-export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse400 = {
-  data: ModelHubErrorResponseApi
-  status: 400
-}
-
-export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse403 = {
-  data: ModelHubErrorResponseApi
-  status: 403
-}
-
-export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse404 = {
-  data: ModelHubErrorResponseApi
-  status: 404
-}
-
-export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse409 = {
-  data: ModelHubErrorResponseApi
-  status: 409
-}
-
-export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse500 = {
-  data: ModelHubErrorResponseApi
-  status: 500
-}
-
-export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseSuccess = (modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseError = (modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse400 | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse403 | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse404 | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse409 | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse500 | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse = (modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseSuccess | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseError)
-
-export const getModelHubPromptTemplatesDerivedVariablesPreviewCreateUrl = () => {
-
-
-
-
-  return `/model-hub/prompt-templates/derived-variables/preview/`
-}
-
-/**
- * Useful for showing what variables would be extracted before running.
-
-Request body:
-    - content: JSON string or object to analyze
-    - column_name: Name for the variable prefix
- * @summary Preview derived variables from JSON content without saving.
- */
-export const modelHubPromptTemplatesDerivedVariablesPreviewCreate = async (derivedVariablePreviewRequestApi: DerivedVariablePreviewRequestApi, options?: RequestInit): Promise<modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse> => {
-
-  return apiMutator<modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse>(getModelHubPromptTemplatesDerivedVariablesPreviewCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      derivedVariablePreviewRequestApi,)
-  }
-);}
-
-
-
-export type modelHubPromptTemplatesGeneratePromptResponse201 = {
-  data: PromptTemplateApi
-  status: 201
-}
-
-export type modelHubPromptTemplatesGeneratePromptResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type modelHubPromptTemplatesGeneratePromptResponseSuccess = (modelHubPromptTemplatesGeneratePromptResponse201) & {
-  headers: Headers;
-};
-export type modelHubPromptTemplatesGeneratePromptResponseError = (modelHubPromptTemplatesGeneratePromptResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptTemplatesGeneratePromptResponse = (modelHubPromptTemplatesGeneratePromptResponseSuccess | modelHubPromptTemplatesGeneratePromptResponseError)
-
-export const getModelHubPromptTemplatesGeneratePromptUrl = () => {
-
-
-
-
-  return `/model-hub/prompt-templates/generate-prompt/`
-}
-
-export const modelHubPromptTemplatesGeneratePrompt = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesGeneratePromptResponse> => {
-
-  return apiMutator<modelHubPromptTemplatesGeneratePromptResponse>(getModelHubPromptTemplatesGeneratePromptUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      promptTemplateApi,)
-  }
-);}
-
-
-
-export type modelHubPromptTemplatesGenerateVariablesResponse201 = {
-  data: PromptTemplateApi
-  status: 201
-}
-
-export type modelHubPromptTemplatesGenerateVariablesResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type modelHubPromptTemplatesGenerateVariablesResponseSuccess = (modelHubPromptTemplatesGenerateVariablesResponse201) & {
-  headers: Headers;
-};
-export type modelHubPromptTemplatesGenerateVariablesResponseError = (modelHubPromptTemplatesGenerateVariablesResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptTemplatesGenerateVariablesResponse = (modelHubPromptTemplatesGenerateVariablesResponseSuccess | modelHubPromptTemplatesGenerateVariablesResponseError)
-
-export const getModelHubPromptTemplatesGenerateVariablesUrl = () => {
-
-
-
-
-  return `/model-hub/prompt-templates/generate-variables/`
-}
-
-/**
- * Expected payload:
-{
-    "prompt_name": "string",
-    "prompt_instructions": "list/array" ,
-    "variable_names": ["string"],
-    "variable_count": "int",
-    "generation_type": "prompt"
-}
- * @summary Generate synthetic data for prompt variables using the SyntheticDataAgent.
- */
-export const modelHubPromptTemplatesGenerateVariables = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesGenerateVariablesResponse> => {
-
-  return apiMutator<modelHubPromptTemplatesGenerateVariablesResponse>(getModelHubPromptTemplatesGenerateVariablesUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      promptTemplateApi,)
-  }
-);}
-
-
-
-export type modelHubPromptTemplatesGetTemplateByNameResponse200 = {
-  data: ModelHubPromptTemplatesGetTemplateByName200
-  status: 200
-}
-
-export type modelHubPromptTemplatesGetTemplateByNameResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type modelHubPromptTemplatesGetTemplateByNameResponseSuccess = (modelHubPromptTemplatesGetTemplateByNameResponse200) & {
-  headers: Headers;
-};
-export type modelHubPromptTemplatesGetTemplateByNameResponseError = (modelHubPromptTemplatesGetTemplateByNameResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptTemplatesGetTemplateByNameResponse = (modelHubPromptTemplatesGetTemplateByNameResponseSuccess | modelHubPromptTemplatesGetTemplateByNameResponseError)
-
-export const getModelHubPromptTemplatesGetTemplateByNameUrl = (params?: ModelHubPromptTemplatesGetTemplateByNameParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/prompt-templates/get-template-by-name/?${stringifiedParams}` : `/model-hub/prompt-templates/get-template-by-name/`
-}
-
-/**
- * Retrieve a prompt template by name.
-If no version is specified, returns the default version (is_default=True).
-If a version is specified, returns that specific version.
- */
-export const modelHubPromptTemplatesGetTemplateByName = async (params?: ModelHubPromptTemplatesGetTemplateByNameParams, options?: RequestInit): Promise<modelHubPromptTemplatesGetTemplateByNameResponse> => {
-
-  return apiMutator<modelHubPromptTemplatesGetTemplateByNameResponse>(getModelHubPromptTemplatesGetTemplateByNameUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type modelHubPromptTemplatesImprovePromptResponse201 = {
-  data: PromptTemplateApi
-  status: 201
-}
-
-export type modelHubPromptTemplatesImprovePromptResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type modelHubPromptTemplatesImprovePromptResponseSuccess = (modelHubPromptTemplatesImprovePromptResponse201) & {
-  headers: Headers;
-};
-export type modelHubPromptTemplatesImprovePromptResponseError = (modelHubPromptTemplatesImprovePromptResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptTemplatesImprovePromptResponse = (modelHubPromptTemplatesImprovePromptResponseSuccess | modelHubPromptTemplatesImprovePromptResponseError)
-
-export const getModelHubPromptTemplatesImprovePromptUrl = () => {
-
-
-
-
-  return `/model-hub/prompt-templates/improve-prompt/`
-}
-
-export const modelHubPromptTemplatesImprovePrompt = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesImprovePromptResponse> => {
-
-  return apiMutator<modelHubPromptTemplatesImprovePromptResponse>(getModelHubPromptTemplatesImprovePromptUrl(),
   {
     ...options,
     method: 'POST',
@@ -46400,48 +46006,6 @@ export const modelHubPromptTemplatesGetSdkCode = async (id: string,
 
 
 
-export type modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponse201 = {
-  data: PromptTemplateApi
-  status: 201
-}
-
-export type modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseSuccess = (modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponse201) & {
-  headers: Headers;
-};
-export type modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseError = (modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponse = (modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseSuccess | modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseError)
-
-export const getModelHubPromptTemplatesRunEvalsOnMultipleVersionsUrl = (id: string,) => {
-
-
-
-
-  return `/model-hub/prompt-templates/${id}/run-evals-on-multiple-versions/`
-}
-
-export const modelHubPromptTemplatesRunEvalsOnMultipleVersions = async (id: string,
-    promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponse> => {
-
-  return apiMutator<modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponse>(getModelHubPromptTemplatesRunEvalsOnMultipleVersionsUrl(id),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      promptTemplateApi,)
-  }
-);}
-
-
-
 export type modelHubPromptTemplatesRunTemplateResponse201 = {
   data: PromptTemplateApi
   status: 201
@@ -46476,6 +46040,48 @@ export const modelHubPromptTemplatesRunTemplate = async (id: string,
     promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesRunTemplateResponse> => {
 
   return apiMutator<modelHubPromptTemplatesRunTemplateResponse>(getModelHubPromptTemplatesRunTemplateUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      promptTemplateApi,)
+  }
+);}
+
+
+
+export type modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponse201 = {
+  data: PromptTemplateApi
+  status: 201
+}
+
+export type modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseSuccess = (modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponse201) & {
+  headers: Headers;
+};
+export type modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseError = (modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponse = (modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseSuccess | modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponseError)
+
+export const getModelHubPromptTemplatesRunEvalsOnMultipleVersionsUrl = (id: string,) => {
+
+
+
+
+  return `/model-hub/prompt-templates/${id}/run-evals-on-multiple-versions/`
+}
+
+export const modelHubPromptTemplatesRunEvalsOnMultipleVersions = async (id: string,
+    promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponse> => {
+
+  return apiMutator<modelHubPromptTemplatesRunEvalsOnMultipleVersionsResponse>(getModelHubPromptTemplatesRunEvalsOnMultipleVersionsUrl(id),
   {
     ...options,
     method: 'POST',
@@ -46820,6 +46426,84 @@ export const modelHubPromptTemplatesDerivedVariablesList = async (promptId: stri
 
 
 
+export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse200 = {
+  data: DerivedVariableDetailResponseApi
+  status: 200
+}
+
+export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse400 = {
+  data: ModelHubErrorResponseApi
+  status: 400
+}
+
+export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse403 = {
+  data: ModelHubErrorResponseApi
+  status: 403
+}
+
+export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse404 = {
+  data: ModelHubErrorResponseApi
+  status: 404
+}
+
+export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse409 = {
+  data: ModelHubErrorResponseApi
+  status: 409
+}
+
+export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse500 = {
+  data: ModelHubErrorResponseApi
+  status: 500
+}
+
+export type modelHubPromptTemplatesDerivedVariablesSchemaListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubPromptTemplatesDerivedVariablesSchemaListResponseSuccess = (modelHubPromptTemplatesDerivedVariablesSchemaListResponse200) & {
+  headers: Headers;
+};
+export type modelHubPromptTemplatesDerivedVariablesSchemaListResponseError = (modelHubPromptTemplatesDerivedVariablesSchemaListResponse400 | modelHubPromptTemplatesDerivedVariablesSchemaListResponse403 | modelHubPromptTemplatesDerivedVariablesSchemaListResponse404 | modelHubPromptTemplatesDerivedVariablesSchemaListResponse409 | modelHubPromptTemplatesDerivedVariablesSchemaListResponse500 | modelHubPromptTemplatesDerivedVariablesSchemaListResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse = (modelHubPromptTemplatesDerivedVariablesSchemaListResponseSuccess | modelHubPromptTemplatesDerivedVariablesSchemaListResponseError)
+
+export const getModelHubPromptTemplatesDerivedVariablesSchemaListUrl = (promptId: string,
+    columnName: string,) => {
+
+
+
+
+  return `/model-hub/prompt-templates/${promptId}/derived-variables/${columnName}/schema/`
+}
+
+/**
+ * Returns detailed schema information including types and sample values.
+
+Path params:
+    - prompt_id: UUID of the prompt template
+    - column_name: Name of the column
+
+Query params:
+    - version: Optional version filter
+ * @summary Get the schema for derived variables of a specific column.
+ */
+export const modelHubPromptTemplatesDerivedVariablesSchemaList = async (promptId: string,
+    columnName: string, options?: RequestInit): Promise<modelHubPromptTemplatesDerivedVariablesSchemaListResponse> => {
+
+  return apiMutator<modelHubPromptTemplatesDerivedVariablesSchemaListResponse>(getModelHubPromptTemplatesDerivedVariablesSchemaListUrl(promptId,columnName),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type modelHubPromptTemplatesDerivedVariablesExtractCreateResponse200 = {
   data: DerivedVariableDetailResponseApi
   status: 200
@@ -46898,79 +46582,394 @@ export const modelHubPromptTemplatesDerivedVariablesExtractCreate = async (promp
 
 
 
-export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse200 = {
+export type modelHubPromptTemplatesAnalyzePromptResponse201 = {
+  data: PromptTemplateApi
+  status: 201
+}
+
+export type modelHubPromptTemplatesAnalyzePromptResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type modelHubPromptTemplatesAnalyzePromptResponseSuccess = (modelHubPromptTemplatesAnalyzePromptResponse201) & {
+  headers: Headers;
+};
+export type modelHubPromptTemplatesAnalyzePromptResponseError = (modelHubPromptTemplatesAnalyzePromptResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptTemplatesAnalyzePromptResponse = (modelHubPromptTemplatesAnalyzePromptResponseSuccess | modelHubPromptTemplatesAnalyzePromptResponseError)
+
+export const getModelHubPromptTemplatesAnalyzePromptUrl = () => {
+
+
+
+
+  return `/model-hub/prompt-templates/analyze-prompt/`
+}
+
+export const modelHubPromptTemplatesAnalyzePrompt = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesAnalyzePromptResponse> => {
+
+  return apiMutator<modelHubPromptTemplatesAnalyzePromptResponse>(getModelHubPromptTemplatesAnalyzePromptUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      promptTemplateApi,)
+  }
+);}
+
+
+
+export type modelHubPromptTemplatesBulkDeleteResponse201 = {
+  data: PromptTemplateApi
+  status: 201
+}
+
+export type modelHubPromptTemplatesBulkDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type modelHubPromptTemplatesBulkDeleteResponseSuccess = (modelHubPromptTemplatesBulkDeleteResponse201) & {
+  headers: Headers;
+};
+export type modelHubPromptTemplatesBulkDeleteResponseError = (modelHubPromptTemplatesBulkDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptTemplatesBulkDeleteResponse = (modelHubPromptTemplatesBulkDeleteResponseSuccess | modelHubPromptTemplatesBulkDeleteResponseError)
+
+export const getModelHubPromptTemplatesBulkDeleteUrl = () => {
+
+
+
+
+  return `/model-hub/prompt-templates/bulk-delete/`
+}
+
+/**
+ * Bulk delete prompt templates
+ */
+export const modelHubPromptTemplatesBulkDelete = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesBulkDeleteResponse> => {
+
+  return apiMutator<modelHubPromptTemplatesBulkDeleteResponse>(getModelHubPromptTemplatesBulkDeleteUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      promptTemplateApi,)
+  }
+);}
+
+
+
+export type modelHubPromptTemplatesCreateDraftResponse201 = {
+  data: PromptTemplateApi
+  status: 201
+}
+
+export type modelHubPromptTemplatesCreateDraftResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type modelHubPromptTemplatesCreateDraftResponseSuccess = (modelHubPromptTemplatesCreateDraftResponse201) & {
+  headers: Headers;
+};
+export type modelHubPromptTemplatesCreateDraftResponseError = (modelHubPromptTemplatesCreateDraftResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptTemplatesCreateDraftResponse = (modelHubPromptTemplatesCreateDraftResponseSuccess | modelHubPromptTemplatesCreateDraftResponseError)
+
+export const getModelHubPromptTemplatesCreateDraftUrl = () => {
+
+
+
+
+  return `/model-hub/prompt-templates/create-draft/`
+}
+
+/**
+ * Create a draft version of the PromptTemplate and return its details.
+ */
+export const modelHubPromptTemplatesCreateDraft = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesCreateDraftResponse> => {
+
+  return apiMutator<modelHubPromptTemplatesCreateDraftResponse>(getModelHubPromptTemplatesCreateDraftUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      promptTemplateApi,)
+  }
+);}
+
+
+
+export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse200 = {
   data: DerivedVariableDetailResponseApi
   status: 200
 }
 
-export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse400 = {
+export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse400 = {
   data: ModelHubErrorResponseApi
   status: 400
 }
 
-export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse403 = {
+export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse403 = {
   data: ModelHubErrorResponseApi
   status: 403
 }
 
-export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse404 = {
+export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse404 = {
   data: ModelHubErrorResponseApi
   status: 404
 }
 
-export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse409 = {
+export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse409 = {
   data: ModelHubErrorResponseApi
   status: 409
 }
 
-export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse500 = {
+export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse500 = {
   data: ModelHubErrorResponseApi
   status: 500
 }
 
-export type modelHubPromptTemplatesDerivedVariablesSchemaListResponseDefault = {
+export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseDefault = {
   data: ManagementAPIErrorResponseApi
   status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
 }
 
-export type modelHubPromptTemplatesDerivedVariablesSchemaListResponseSuccess = (modelHubPromptTemplatesDerivedVariablesSchemaListResponse200) & {
+export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseSuccess = (modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse200) & {
   headers: Headers;
 };
-export type modelHubPromptTemplatesDerivedVariablesSchemaListResponseError = (modelHubPromptTemplatesDerivedVariablesSchemaListResponse400 | modelHubPromptTemplatesDerivedVariablesSchemaListResponse403 | modelHubPromptTemplatesDerivedVariablesSchemaListResponse404 | modelHubPromptTemplatesDerivedVariablesSchemaListResponse409 | modelHubPromptTemplatesDerivedVariablesSchemaListResponse500 | modelHubPromptTemplatesDerivedVariablesSchemaListResponseDefault) & {
+export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseError = (modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse400 | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse403 | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse404 | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse409 | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse500 | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseDefault) & {
   headers: Headers;
 };
 
-export type modelHubPromptTemplatesDerivedVariablesSchemaListResponse = (modelHubPromptTemplatesDerivedVariablesSchemaListResponseSuccess | modelHubPromptTemplatesDerivedVariablesSchemaListResponseError)
+export type modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse = (modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseSuccess | modelHubPromptTemplatesDerivedVariablesPreviewCreateResponseError)
 
-export const getModelHubPromptTemplatesDerivedVariablesSchemaListUrl = (promptId: string,
-    columnName: string,) => {
-
+export const getModelHubPromptTemplatesDerivedVariablesPreviewCreateUrl = () => {
 
 
 
-  return `/model-hub/prompt-templates/${promptId}/derived-variables/${columnName}/schema/`
+
+  return `/model-hub/prompt-templates/derived-variables/preview/`
 }
 
 /**
- * Returns detailed schema information including types and sample values.
+ * Useful for showing what variables would be extracted before running.
 
-Path params:
-    - prompt_id: UUID of the prompt template
-    - column_name: Name of the column
-
-Query params:
-    - version: Optional version filter
- * @summary Get the schema for derived variables of a specific column.
+Request body:
+    - content: JSON string or object to analyze
+    - column_name: Name for the variable prefix
+ * @summary Preview derived variables from JSON content without saving.
  */
-export const modelHubPromptTemplatesDerivedVariablesSchemaList = async (promptId: string,
-    columnName: string, options?: RequestInit): Promise<modelHubPromptTemplatesDerivedVariablesSchemaListResponse> => {
+export const modelHubPromptTemplatesDerivedVariablesPreviewCreate = async (derivedVariablePreviewRequestApi: DerivedVariablePreviewRequestApi, options?: RequestInit): Promise<modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse> => {
 
-  return apiMutator<modelHubPromptTemplatesDerivedVariablesSchemaListResponse>(getModelHubPromptTemplatesDerivedVariablesSchemaListUrl(promptId,columnName),
+  return apiMutator<modelHubPromptTemplatesDerivedVariablesPreviewCreateResponse>(getModelHubPromptTemplatesDerivedVariablesPreviewCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      derivedVariablePreviewRequestApi,)
+  }
+);}
+
+
+
+export type modelHubPromptTemplatesGeneratePromptResponse201 = {
+  data: PromptTemplateApi
+  status: 201
+}
+
+export type modelHubPromptTemplatesGeneratePromptResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type modelHubPromptTemplatesGeneratePromptResponseSuccess = (modelHubPromptTemplatesGeneratePromptResponse201) & {
+  headers: Headers;
+};
+export type modelHubPromptTemplatesGeneratePromptResponseError = (modelHubPromptTemplatesGeneratePromptResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptTemplatesGeneratePromptResponse = (modelHubPromptTemplatesGeneratePromptResponseSuccess | modelHubPromptTemplatesGeneratePromptResponseError)
+
+export const getModelHubPromptTemplatesGeneratePromptUrl = () => {
+
+
+
+
+  return `/model-hub/prompt-templates/generate-prompt/`
+}
+
+export const modelHubPromptTemplatesGeneratePrompt = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesGeneratePromptResponse> => {
+
+  return apiMutator<modelHubPromptTemplatesGeneratePromptResponse>(getModelHubPromptTemplatesGeneratePromptUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      promptTemplateApi,)
+  }
+);}
+
+
+
+export type modelHubPromptTemplatesGenerateVariablesResponse201 = {
+  data: PromptTemplateApi
+  status: 201
+}
+
+export type modelHubPromptTemplatesGenerateVariablesResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type modelHubPromptTemplatesGenerateVariablesResponseSuccess = (modelHubPromptTemplatesGenerateVariablesResponse201) & {
+  headers: Headers;
+};
+export type modelHubPromptTemplatesGenerateVariablesResponseError = (modelHubPromptTemplatesGenerateVariablesResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptTemplatesGenerateVariablesResponse = (modelHubPromptTemplatesGenerateVariablesResponseSuccess | modelHubPromptTemplatesGenerateVariablesResponseError)
+
+export const getModelHubPromptTemplatesGenerateVariablesUrl = () => {
+
+
+
+
+  return `/model-hub/prompt-templates/generate-variables/`
+}
+
+/**
+ * Expected payload:
+{
+    "prompt_name": "string",
+    "prompt_instructions": "list/array" ,
+    "variable_names": ["string"],
+    "variable_count": "int",
+    "generation_type": "prompt"
+}
+ * @summary Generate synthetic data for prompt variables using the SyntheticDataAgent.
+ */
+export const modelHubPromptTemplatesGenerateVariables = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesGenerateVariablesResponse> => {
+
+  return apiMutator<modelHubPromptTemplatesGenerateVariablesResponse>(getModelHubPromptTemplatesGenerateVariablesUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      promptTemplateApi,)
+  }
+);}
+
+
+
+export type modelHubPromptTemplatesGetTemplateByNameResponse200 = {
+  data: ModelHubPromptTemplatesGetTemplateByName200
+  status: 200
+}
+
+export type modelHubPromptTemplatesGetTemplateByNameResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type modelHubPromptTemplatesGetTemplateByNameResponseSuccess = (modelHubPromptTemplatesGetTemplateByNameResponse200) & {
+  headers: Headers;
+};
+export type modelHubPromptTemplatesGetTemplateByNameResponseError = (modelHubPromptTemplatesGetTemplateByNameResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptTemplatesGetTemplateByNameResponse = (modelHubPromptTemplatesGetTemplateByNameResponseSuccess | modelHubPromptTemplatesGetTemplateByNameResponseError)
+
+export const getModelHubPromptTemplatesGetTemplateByNameUrl = (params?: ModelHubPromptTemplatesGetTemplateByNameParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/prompt-templates/get-template-by-name/?${stringifiedParams}` : `/model-hub/prompt-templates/get-template-by-name/`
+}
+
+/**
+ * Retrieve a prompt template by name.
+If no version is specified, returns the default version (is_default=True).
+If a version is specified, returns that specific version.
+ */
+export const modelHubPromptTemplatesGetTemplateByName = async (params?: ModelHubPromptTemplatesGetTemplateByNameParams, options?: RequestInit): Promise<modelHubPromptTemplatesGetTemplateByNameResponse> => {
+
+  return apiMutator<modelHubPromptTemplatesGetTemplateByNameResponse>(getModelHubPromptTemplatesGetTemplateByNameUrl(params),
   {
     ...options,
     method: 'GET'
 
 
+  }
+);}
+
+
+
+export type modelHubPromptTemplatesImprovePromptResponse201 = {
+  data: PromptTemplateApi
+  status: 201
+}
+
+export type modelHubPromptTemplatesImprovePromptResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type modelHubPromptTemplatesImprovePromptResponseSuccess = (modelHubPromptTemplatesImprovePromptResponse201) & {
+  headers: Headers;
+};
+export type modelHubPromptTemplatesImprovePromptResponseError = (modelHubPromptTemplatesImprovePromptResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubPromptTemplatesImprovePromptResponse = (modelHubPromptTemplatesImprovePromptResponseSuccess | modelHubPromptTemplatesImprovePromptResponseError)
+
+export const getModelHubPromptTemplatesImprovePromptUrl = () => {
+
+
+
+
+  return `/model-hub/prompt-templates/improve-prompt/`
+}
+
+export const modelHubPromptTemplatesImprovePrompt = async (promptTemplateApi: NonReadonly<PromptTemplateApi>, options?: RequestInit): Promise<modelHubPromptTemplatesImprovePromptResponse> => {
+
+  return apiMutator<modelHubPromptTemplatesImprovePromptResponse>(getModelHubPromptTemplatesImprovePromptUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      promptTemplateApi,)
   }
 );}
 
@@ -47708,155 +47707,6 @@ export const modelHubScoresCreate = async (createScoreApi: CreateScoreApi, optio
 
 
 
-export type modelHubScoresBulkCreateResponse200 = {
-  data: BulkCreateScoresResponseApi
-  status: 200
-}
-
-export type modelHubScoresBulkCreateResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubScoresBulkCreateResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubScoresBulkCreateResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubScoresBulkCreateResponse409 = {
-  data: ApiTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubScoresBulkCreateResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubScoresBulkCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubScoresBulkCreateResponseSuccess = (modelHubScoresBulkCreateResponse200) & {
-  headers: Headers;
-};
-export type modelHubScoresBulkCreateResponseError = (modelHubScoresBulkCreateResponse400 | modelHubScoresBulkCreateResponse403 | modelHubScoresBulkCreateResponse404 | modelHubScoresBulkCreateResponse409 | modelHubScoresBulkCreateResponse500 | modelHubScoresBulkCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubScoresBulkCreateResponse = (modelHubScoresBulkCreateResponseSuccess | modelHubScoresBulkCreateResponseError)
-
-export const getModelHubScoresBulkCreateUrl = () => {
-
-
-
-
-  return `/model-hub/scores/bulk/`
-}
-
-/**
- * Create multiple scores on a single source (e.g. from inline annotator).
- */
-export const modelHubScoresBulkCreate = async (bulkCreateScoresApi: BulkCreateScoresApi, options?: RequestInit): Promise<modelHubScoresBulkCreateResponse> => {
-
-  return apiMutator<modelHubScoresBulkCreateResponse>(getModelHubScoresBulkCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      bulkCreateScoresApi,)
-  }
-);}
-
-
-
-export type modelHubScoresForSourceResponse200 = {
-  data: ScoreForSourceResponseApi
-  status: 200
-}
-
-export type modelHubScoresForSourceResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type modelHubScoresForSourceResponse403 = {
-  data: ApiTextErrorResponseApi
-  status: 403
-}
-
-export type modelHubScoresForSourceResponse404 = {
-  data: ApiTextErrorResponseApi
-  status: 404
-}
-
-export type modelHubScoresForSourceResponse409 = {
-  data: ApiTextErrorResponseApi
-  status: 409
-}
-
-export type modelHubScoresForSourceResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type modelHubScoresForSourceResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
-}
-
-export type modelHubScoresForSourceResponseSuccess = (modelHubScoresForSourceResponse200) & {
-  headers: Headers;
-};
-export type modelHubScoresForSourceResponseError = (modelHubScoresForSourceResponse400 | modelHubScoresForSourceResponse403 | modelHubScoresForSourceResponse404 | modelHubScoresForSourceResponse409 | modelHubScoresForSourceResponse500 | modelHubScoresForSourceResponseDefault) & {
-  headers: Headers;
-};
-
-export type modelHubScoresForSourceResponse = (modelHubScoresForSourceResponseSuccess | modelHubScoresForSourceResponseError)
-
-export const getModelHubScoresForSourceUrl = (params: ModelHubScoresForSourceParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/model-hub/scores/for-source/?${stringifiedParams}` : `/model-hub/scores/for-source/`
-}
-
-/**
- * Get all scores for a specific source.
-GET /model-hub/scores/for-source/?source_type=trace&source_id=<uuid>
- */
-export const modelHubScoresForSource = async (params: ModelHubScoresForSourceParams, options?: RequestInit): Promise<modelHubScoresForSourceResponse> => {
-
-  return apiMutator<modelHubScoresForSourceResponse>(getModelHubScoresForSourceUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type modelHubScoresReadResponse200 = {
   data: ScoreApi
   status: 200
@@ -48115,6 +47965,155 @@ export const modelHubScoresDelete = async (id: string, options?: RequestInit): P
   {
     ...options,
     method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type modelHubScoresBulkCreateResponse200 = {
+  data: BulkCreateScoresResponseApi
+  status: 200
+}
+
+export type modelHubScoresBulkCreateResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubScoresBulkCreateResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubScoresBulkCreateResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubScoresBulkCreateResponse409 = {
+  data: ApiTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubScoresBulkCreateResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubScoresBulkCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubScoresBulkCreateResponseSuccess = (modelHubScoresBulkCreateResponse200) & {
+  headers: Headers;
+};
+export type modelHubScoresBulkCreateResponseError = (modelHubScoresBulkCreateResponse400 | modelHubScoresBulkCreateResponse403 | modelHubScoresBulkCreateResponse404 | modelHubScoresBulkCreateResponse409 | modelHubScoresBulkCreateResponse500 | modelHubScoresBulkCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubScoresBulkCreateResponse = (modelHubScoresBulkCreateResponseSuccess | modelHubScoresBulkCreateResponseError)
+
+export const getModelHubScoresBulkCreateUrl = () => {
+
+
+
+
+  return `/model-hub/scores/bulk/`
+}
+
+/**
+ * Create multiple scores on a single source (e.g. from inline annotator).
+ */
+export const modelHubScoresBulkCreate = async (bulkCreateScoresApi: BulkCreateScoresApi, options?: RequestInit): Promise<modelHubScoresBulkCreateResponse> => {
+
+  return apiMutator<modelHubScoresBulkCreateResponse>(getModelHubScoresBulkCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      bulkCreateScoresApi,)
+  }
+);}
+
+
+
+export type modelHubScoresForSourceResponse200 = {
+  data: ScoreForSourceResponseApi
+  status: 200
+}
+
+export type modelHubScoresForSourceResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type modelHubScoresForSourceResponse403 = {
+  data: ApiTextErrorResponseApi
+  status: 403
+}
+
+export type modelHubScoresForSourceResponse404 = {
+  data: ApiTextErrorResponseApi
+  status: 404
+}
+
+export type modelHubScoresForSourceResponse409 = {
+  data: ApiTextErrorResponseApi
+  status: 409
+}
+
+export type modelHubScoresForSourceResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type modelHubScoresForSourceResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 409 | 500>
+}
+
+export type modelHubScoresForSourceResponseSuccess = (modelHubScoresForSourceResponse200) & {
+  headers: Headers;
+};
+export type modelHubScoresForSourceResponseError = (modelHubScoresForSourceResponse400 | modelHubScoresForSourceResponse403 | modelHubScoresForSourceResponse404 | modelHubScoresForSourceResponse409 | modelHubScoresForSourceResponse500 | modelHubScoresForSourceResponseDefault) & {
+  headers: Headers;
+};
+
+export type modelHubScoresForSourceResponse = (modelHubScoresForSourceResponseSuccess | modelHubScoresForSourceResponseError)
+
+export const getModelHubScoresForSourceUrl = (params: ModelHubScoresForSourceParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/model-hub/scores/for-source/?${stringifiedParams}` : `/model-hub/scores/for-source/`
+}
+
+/**
+ * Get all scores for a specific source.
+GET /model-hub/scores/for-source/?source_type=trace&source_id=<uuid>
+ */
+export const modelHubScoresForSource = async (params: ModelHubScoresForSourceParams, options?: RequestInit): Promise<modelHubScoresForSourceResponse> => {
+
+  return apiMutator<modelHubScoresForSourceResponse>(getModelHubScoresForSourceUrl(params),
+  {
+    ...options,
+    method: 'GET'
 
 
   }
@@ -49156,60 +49155,6 @@ export const saml2AuthAcsCreate = async (saml2AuthAcsCreateBody?: Saml2AuthAcsCr
 
 
 
-export type saml2AuthAuthCallbackListResponse302 = {
-  data: void
-  status: 302
-}
-
-export type saml2AuthAuthCallbackListResponse400 = {
-  data: SAMLErrorResponseApi
-  status: 400
-}
-
-export type saml2AuthAuthCallbackListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 302 | 400>
-}
-
-;
-export type saml2AuthAuthCallbackListResponseError = (saml2AuthAuthCallbackListResponse302 | saml2AuthAuthCallbackListResponse400 | saml2AuthAuthCallbackListResponseDefault) & {
-  headers: Headers;
-};
-
-export type saml2AuthAuthCallbackListResponse = (saml2AuthAuthCallbackListResponseError)
-
-export const getSaml2AuthAuthCallbackListUrl = (params?: Saml2AuthAuthCallbackListParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/saml2_auth/auth/callback/?${stringifiedParams}` : `/saml2_auth/auth/callback/`
-}
-
-export const saml2AuthAuthCallbackList = async (params?: Saml2AuthAuthCallbackListParams, options?: RequestInit): Promise<saml2AuthAuthCallbackListResponse> => {
-
-  return apiMutator<saml2AuthAuthCallbackListResponse>(getSaml2AuthAuthCallbackListUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type saml2AuthAuthReadResponse302 = {
   data: void
   status: 302
@@ -49266,29 +49211,29 @@ export const saml2AuthAuthRead = async (format: string,
 
 
 
-export type saml2AuthGithubCallbackListResponse302 = {
+export type saml2AuthAuthCallbackListResponse302 = {
   data: void
   status: 302
 }
 
-export type saml2AuthGithubCallbackListResponse400 = {
+export type saml2AuthAuthCallbackListResponse400 = {
   data: SAMLErrorResponseApi
   status: 400
 }
 
-export type saml2AuthGithubCallbackListResponseDefault = {
+export type saml2AuthAuthCallbackListResponseDefault = {
   data: ManagementAPIErrorResponseApi
   status: Exclude<HTTPStatusCodes, 302 | 400>
 }
 
 ;
-export type saml2AuthGithubCallbackListResponseError = (saml2AuthGithubCallbackListResponse302 | saml2AuthGithubCallbackListResponse400 | saml2AuthGithubCallbackListResponseDefault) & {
+export type saml2AuthAuthCallbackListResponseError = (saml2AuthAuthCallbackListResponse302 | saml2AuthAuthCallbackListResponse400 | saml2AuthAuthCallbackListResponseDefault) & {
   headers: Headers;
 };
 
-export type saml2AuthGithubCallbackListResponse = (saml2AuthGithubCallbackListResponseError)
+export type saml2AuthAuthCallbackListResponse = (saml2AuthAuthCallbackListResponseError)
 
-export const getSaml2AuthGithubCallbackListUrl = (params?: Saml2AuthGithubCallbackListParams,) => {
+export const getSaml2AuthAuthCallbackListUrl = (params?: Saml2AuthAuthCallbackListParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -49304,12 +49249,12 @@ export const getSaml2AuthGithubCallbackListUrl = (params?: Saml2AuthGithubCallba
 
   const stringifiedParams = normalizedParams.toString();
 
-  return stringifiedParams.length > 0 ? `/saml2_auth/github/callback/?${stringifiedParams}` : `/saml2_auth/github/callback/`
+  return stringifiedParams.length > 0 ? `/saml2_auth/auth/callback/?${stringifiedParams}` : `/saml2_auth/auth/callback/`
 }
 
-export const saml2AuthGithubCallbackList = async (params?: Saml2AuthGithubCallbackListParams, options?: RequestInit): Promise<saml2AuthGithubCallbackListResponse> => {
+export const saml2AuthAuthCallbackList = async (params?: Saml2AuthAuthCallbackListParams, options?: RequestInit): Promise<saml2AuthAuthCallbackListResponse> => {
 
-  return apiMutator<saml2AuthGithubCallbackListResponse>(getSaml2AuthGithubCallbackListUrl(params),
+  return apiMutator<saml2AuthAuthCallbackListResponse>(getSaml2AuthAuthCallbackListUrl(params),
   {
     ...options,
     method: 'GET'
@@ -49366,6 +49311,60 @@ export const saml2AuthGithubRead = async (format: string,
     params?: Saml2AuthGithubReadParams, options?: RequestInit): Promise<saml2AuthGithubReadResponse> => {
 
   return apiMutator<saml2AuthGithubReadResponse>(getSaml2AuthGithubReadUrl(format,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type saml2AuthGithubCallbackListResponse302 = {
+  data: void
+  status: 302
+}
+
+export type saml2AuthGithubCallbackListResponse400 = {
+  data: SAMLErrorResponseApi
+  status: 400
+}
+
+export type saml2AuthGithubCallbackListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 302 | 400>
+}
+
+;
+export type saml2AuthGithubCallbackListResponseError = (saml2AuthGithubCallbackListResponse302 | saml2AuthGithubCallbackListResponse400 | saml2AuthGithubCallbackListResponseDefault) & {
+  headers: Headers;
+};
+
+export type saml2AuthGithubCallbackListResponse = (saml2AuthGithubCallbackListResponseError)
+
+export const getSaml2AuthGithubCallbackListUrl = (params?: Saml2AuthGithubCallbackListParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/saml2_auth/github/callback/?${stringifiedParams}` : `/saml2_auth/github/callback/`
+}
+
+export const saml2AuthGithubCallbackList = async (params?: Saml2AuthGithubCallbackListParams, options?: RequestInit): Promise<saml2AuthGithubCallbackListResponse> => {
+
+  return apiMutator<saml2AuthGithubCallbackListResponse>(getSaml2AuthGithubCallbackListUrl(params),
   {
     ...options,
     method: 'GET'
@@ -49696,62 +49695,6 @@ export const saml2AuthIdpUploadsDelete = async (id: string, options?: RequestIni
 
 
 
-export type saml2AuthLoginListResponse200 = {
-  data: SAMLUrlResponseApi
-  status: 200
-}
-
-export type saml2AuthLoginListResponse400 = {
-  data: SAMLErrorResponseApi
-  status: 400
-}
-
-export type saml2AuthLoginListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
-}
-
-export type saml2AuthLoginListResponseSuccess = (saml2AuthLoginListResponse200) & {
-  headers: Headers;
-};
-export type saml2AuthLoginListResponseError = (saml2AuthLoginListResponse400 | saml2AuthLoginListResponseDefault) & {
-  headers: Headers;
-};
-
-export type saml2AuthLoginListResponse = (saml2AuthLoginListResponseSuccess | saml2AuthLoginListResponseError)
-
-export const getSaml2AuthLoginListUrl = (params: Saml2AuthLoginListParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/saml2_auth/login/?${stringifiedParams}` : `/saml2_auth/login/`
-}
-
-export const saml2AuthLoginList = async (params: Saml2AuthLoginListParams, options?: RequestInit): Promise<saml2AuthLoginListResponse> => {
-
-  return apiMutator<saml2AuthLoginListResponse>(getSaml2AuthLoginListUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type saml2AuthReadResponse200 = {
   data: SAMLUrlResponseApi
   status: 200
@@ -49810,29 +49753,31 @@ export const saml2AuthRead = async (format: string,
 
 
 
-export type saml2AuthMicrosoftCallbackListResponse302 = {
-  data: void
-  status: 302
+export type saml2AuthLoginListResponse200 = {
+  data: SAMLUrlResponseApi
+  status: 200
 }
 
-export type saml2AuthMicrosoftCallbackListResponse400 = {
+export type saml2AuthLoginListResponse400 = {
   data: SAMLErrorResponseApi
   status: 400
 }
 
-export type saml2AuthMicrosoftCallbackListResponseDefault = {
+export type saml2AuthLoginListResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 302 | 400>
+  status: Exclude<HTTPStatusCodes, 200 | 400>
 }
 
-;
-export type saml2AuthMicrosoftCallbackListResponseError = (saml2AuthMicrosoftCallbackListResponse302 | saml2AuthMicrosoftCallbackListResponse400 | saml2AuthMicrosoftCallbackListResponseDefault) & {
+export type saml2AuthLoginListResponseSuccess = (saml2AuthLoginListResponse200) & {
+  headers: Headers;
+};
+export type saml2AuthLoginListResponseError = (saml2AuthLoginListResponse400 | saml2AuthLoginListResponseDefault) & {
   headers: Headers;
 };
 
-export type saml2AuthMicrosoftCallbackListResponse = (saml2AuthMicrosoftCallbackListResponseError)
+export type saml2AuthLoginListResponse = (saml2AuthLoginListResponseSuccess | saml2AuthLoginListResponseError)
 
-export const getSaml2AuthMicrosoftCallbackListUrl = (params?: Saml2AuthMicrosoftCallbackListParams,) => {
+export const getSaml2AuthLoginListUrl = (params: Saml2AuthLoginListParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -49848,12 +49793,12 @@ export const getSaml2AuthMicrosoftCallbackListUrl = (params?: Saml2AuthMicrosoft
 
   const stringifiedParams = normalizedParams.toString();
 
-  return stringifiedParams.length > 0 ? `/saml2_auth/microsoft/callback/?${stringifiedParams}` : `/saml2_auth/microsoft/callback/`
+  return stringifiedParams.length > 0 ? `/saml2_auth/login/?${stringifiedParams}` : `/saml2_auth/login/`
 }
 
-export const saml2AuthMicrosoftCallbackList = async (params?: Saml2AuthMicrosoftCallbackListParams, options?: RequestInit): Promise<saml2AuthMicrosoftCallbackListResponse> => {
+export const saml2AuthLoginList = async (params: Saml2AuthLoginListParams, options?: RequestInit): Promise<saml2AuthLoginListResponse> => {
 
-  return apiMutator<saml2AuthMicrosoftCallbackListResponse>(getSaml2AuthMicrosoftCallbackListUrl(params),
+  return apiMutator<saml2AuthLoginListResponse>(getSaml2AuthLoginListUrl(params),
   {
     ...options,
     method: 'GET'
@@ -49910,6 +49855,60 @@ export const saml2AuthMicrosoftRead = async (format: string,
     params?: Saml2AuthMicrosoftReadParams, options?: RequestInit): Promise<saml2AuthMicrosoftReadResponse> => {
 
   return apiMutator<saml2AuthMicrosoftReadResponse>(getSaml2AuthMicrosoftReadUrl(format,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type saml2AuthMicrosoftCallbackListResponse302 = {
+  data: void
+  status: 302
+}
+
+export type saml2AuthMicrosoftCallbackListResponse400 = {
+  data: SAMLErrorResponseApi
+  status: 400
+}
+
+export type saml2AuthMicrosoftCallbackListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 302 | 400>
+}
+
+;
+export type saml2AuthMicrosoftCallbackListResponseError = (saml2AuthMicrosoftCallbackListResponse302 | saml2AuthMicrosoftCallbackListResponse400 | saml2AuthMicrosoftCallbackListResponseDefault) & {
+  headers: Headers;
+};
+
+export type saml2AuthMicrosoftCallbackListResponse = (saml2AuthMicrosoftCallbackListResponseError)
+
+export const getSaml2AuthMicrosoftCallbackListUrl = (params?: Saml2AuthMicrosoftCallbackListParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/saml2_auth/microsoft/callback/?${stringifiedParams}` : `/saml2_auth/microsoft/callback/`
+}
+
+export const saml2AuthMicrosoftCallbackList = async (params?: Saml2AuthMicrosoftCallbackListParams, options?: RequestInit): Promise<saml2AuthMicrosoftCallbackListResponse> => {
+
+  return apiMutator<saml2AuthMicrosoftCallbackListResponse>(getSaml2AuthMicrosoftCallbackListUrl(params),
   {
     ...options,
     method: 'GET'
@@ -50675,65 +50674,6 @@ export const simulateAgentDefinitionsDelete = async (agentDefinitionBulkDeleteRe
 
 
 
-export type simulateAgentDefinitionsCreateCreateResponse201 = {
-  data: AgentDefinitionCreateResponseApi
-  status: 201
-}
-
-export type simulateAgentDefinitionsCreateCreateResponse400 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 400
-}
-
-export type simulateAgentDefinitionsCreateCreateResponse404 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 404
-}
-
-export type simulateAgentDefinitionsCreateCreateResponse500 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 500
-}
-
-export type simulateAgentDefinitionsCreateCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201 | 400 | 404 | 500>
-}
-
-export type simulateAgentDefinitionsCreateCreateResponseSuccess = (simulateAgentDefinitionsCreateCreateResponse201) & {
-  headers: Headers;
-};
-export type simulateAgentDefinitionsCreateCreateResponseError = (simulateAgentDefinitionsCreateCreateResponse400 | simulateAgentDefinitionsCreateCreateResponse404 | simulateAgentDefinitionsCreateCreateResponse500 | simulateAgentDefinitionsCreateCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateAgentDefinitionsCreateCreateResponse = (simulateAgentDefinitionsCreateCreateResponseSuccess | simulateAgentDefinitionsCreateCreateResponseError)
-
-export const getSimulateAgentDefinitionsCreateCreateUrl = () => {
-
-
-
-
-  return `/simulate/agent-definitions/create/`
-}
-
-/**
- * Create a new agent definition with its first version.
- */
-export const simulateAgentDefinitionsCreateCreate = async (agentDefinitionCreateRequestApi: AgentDefinitionCreateRequestApi, options?: RequestInit): Promise<simulateAgentDefinitionsCreateCreateResponse> => {
-
-  return apiMutator<simulateAgentDefinitionsCreateCreateResponse>(getSimulateAgentDefinitionsCreateCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      agentDefinitionCreateRequestApi,)
-  }
-);}
-
-
-
 export type simulateAgentDefinitionsReadResponse200 = {
   data: AgentDefinitionResponseApi
   status: 200
@@ -50948,66 +50888,6 @@ export const simulateAgentDefinitionsVersionsList = async (agentId: string, opti
     method: 'GET'
 
 
-  }
-);}
-
-
-
-export type simulateAgentDefinitionsVersionsCreateCreateResponse201 = {
-  data: AgentVersionCreateResponseApi
-  status: 201
-}
-
-export type simulateAgentDefinitionsVersionsCreateCreateResponse400 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 400
-}
-
-export type simulateAgentDefinitionsVersionsCreateCreateResponse404 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 404
-}
-
-export type simulateAgentDefinitionsVersionsCreateCreateResponse500 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 500
-}
-
-export type simulateAgentDefinitionsVersionsCreateCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201 | 400 | 404 | 500>
-}
-
-export type simulateAgentDefinitionsVersionsCreateCreateResponseSuccess = (simulateAgentDefinitionsVersionsCreateCreateResponse201) & {
-  headers: Headers;
-};
-export type simulateAgentDefinitionsVersionsCreateCreateResponseError = (simulateAgentDefinitionsVersionsCreateCreateResponse400 | simulateAgentDefinitionsVersionsCreateCreateResponse404 | simulateAgentDefinitionsVersionsCreateCreateResponse500 | simulateAgentDefinitionsVersionsCreateCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateAgentDefinitionsVersionsCreateCreateResponse = (simulateAgentDefinitionsVersionsCreateCreateResponseSuccess | simulateAgentDefinitionsVersionsCreateCreateResponseError)
-
-export const getSimulateAgentDefinitionsVersionsCreateCreateUrl = (agentId: string,) => {
-
-
-
-
-  return `/simulate/agent-definitions/${agentId}/versions/create/`
-}
-
-/**
- * Create a new version of an agent definition.
- */
-export const simulateAgentDefinitionsVersionsCreateCreate = async (agentId: string,
-    agentVersionCreateRequestApi: AgentVersionCreateRequestApi, options?: RequestInit): Promise<simulateAgentDefinitionsVersionsCreateCreateResponse> => {
-
-  return apiMutator<simulateAgentDefinitionsVersionsCreateCreateResponse>(getSimulateAgentDefinitionsVersionsCreateCreateUrl(agentId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      agentVersionCreateRequestApi,)
   }
 );}
 
@@ -51357,6 +51237,125 @@ export const simulateAgentDefinitionsVersionsRestoreCreate = async (agentId: str
 
 
 
+export type simulateAgentDefinitionsVersionsCreateCreateResponse201 = {
+  data: AgentVersionCreateResponseApi
+  status: 201
+}
+
+export type simulateAgentDefinitionsVersionsCreateCreateResponse400 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 400
+}
+
+export type simulateAgentDefinitionsVersionsCreateCreateResponse404 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 404
+}
+
+export type simulateAgentDefinitionsVersionsCreateCreateResponse500 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 500
+}
+
+export type simulateAgentDefinitionsVersionsCreateCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201 | 400 | 404 | 500>
+}
+
+export type simulateAgentDefinitionsVersionsCreateCreateResponseSuccess = (simulateAgentDefinitionsVersionsCreateCreateResponse201) & {
+  headers: Headers;
+};
+export type simulateAgentDefinitionsVersionsCreateCreateResponseError = (simulateAgentDefinitionsVersionsCreateCreateResponse400 | simulateAgentDefinitionsVersionsCreateCreateResponse404 | simulateAgentDefinitionsVersionsCreateCreateResponse500 | simulateAgentDefinitionsVersionsCreateCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateAgentDefinitionsVersionsCreateCreateResponse = (simulateAgentDefinitionsVersionsCreateCreateResponseSuccess | simulateAgentDefinitionsVersionsCreateCreateResponseError)
+
+export const getSimulateAgentDefinitionsVersionsCreateCreateUrl = (agentId: string,) => {
+
+
+
+
+  return `/simulate/agent-definitions/${agentId}/versions/create/`
+}
+
+/**
+ * Create a new version of an agent definition.
+ */
+export const simulateAgentDefinitionsVersionsCreateCreate = async (agentId: string,
+    agentVersionCreateRequestApi: AgentVersionCreateRequestApi, options?: RequestInit): Promise<simulateAgentDefinitionsVersionsCreateCreateResponse> => {
+
+  return apiMutator<simulateAgentDefinitionsVersionsCreateCreateResponse>(getSimulateAgentDefinitionsVersionsCreateCreateUrl(agentId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      agentVersionCreateRequestApi,)
+  }
+);}
+
+
+
+export type simulateAgentDefinitionsCreateCreateResponse201 = {
+  data: AgentDefinitionCreateResponseApi
+  status: 201
+}
+
+export type simulateAgentDefinitionsCreateCreateResponse400 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 400
+}
+
+export type simulateAgentDefinitionsCreateCreateResponse404 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 404
+}
+
+export type simulateAgentDefinitionsCreateCreateResponse500 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 500
+}
+
+export type simulateAgentDefinitionsCreateCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201 | 400 | 404 | 500>
+}
+
+export type simulateAgentDefinitionsCreateCreateResponseSuccess = (simulateAgentDefinitionsCreateCreateResponse201) & {
+  headers: Headers;
+};
+export type simulateAgentDefinitionsCreateCreateResponseError = (simulateAgentDefinitionsCreateCreateResponse400 | simulateAgentDefinitionsCreateCreateResponse404 | simulateAgentDefinitionsCreateCreateResponse500 | simulateAgentDefinitionsCreateCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateAgentDefinitionsCreateCreateResponse = (simulateAgentDefinitionsCreateCreateResponseSuccess | simulateAgentDefinitionsCreateCreateResponseError)
+
+export const getSimulateAgentDefinitionsCreateCreateUrl = () => {
+
+
+
+
+  return `/simulate/agent-definitions/create/`
+}
+
+/**
+ * Create a new agent definition with its first version.
+ */
+export const simulateAgentDefinitionsCreateCreate = async (agentDefinitionCreateRequestApi: AgentDefinitionCreateRequestApi, options?: RequestInit): Promise<simulateAgentDefinitionsCreateCreateResponse> => {
+
+  return apiMutator<simulateAgentDefinitionsCreateCreateResponse>(getSimulateAgentDefinitionsCreateCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      agentDefinitionCreateRequestApi,)
+  }
+);}
+
+
+
 export type simulateApiAgentDefinitionOperationsListResponse200 = {
   data: SimulateApiAgentDefinitionOperationsList200
   status: 200
@@ -51464,66 +51463,6 @@ export const simulateApiAgentDefinitionOperationsCreate = async (agentDefinition
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       agentDefinitionApi,)
-  }
-);}
-
-
-
-export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse200 = {
-  data: FetchAssistantResponseApi
-  status: 200
-}
-
-export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse400 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 400
-}
-
-export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse403 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 403
-}
-
-export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse500 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 500
-}
-
-export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 500>
-}
-
-export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseSuccess = (simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse200) & {
-  headers: Headers;
-};
-export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseError = (simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse400 | simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse403 | simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse500 | simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse = (simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseSuccess | simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseError)
-
-export const getSimulateApiAgentDefinitionOperationsFetchAssistantFromProviderUrl = () => {
-
-
-
-
-  return `/simulate/api/agent-definition-operations/fetch_assistant_from_provider/`
-}
-
-/**
- * Fetches the details of agent from the provider and sends them to the client.
-It DOES NOT create a new version.
- */
-export const simulateApiAgentDefinitionOperationsFetchAssistantFromProvider = async (fetchAssistantRequestApi: FetchAssistantRequestApi, options?: RequestInit): Promise<simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse> => {
-
-  return apiMutator<simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse>(getSimulateApiAgentDefinitionOperationsFetchAssistantFromProviderUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      fetchAssistantRequestApi,)
   }
 );}
 
@@ -51738,6 +51677,66 @@ export const simulateApiAgentDefinitionOperationsDelete = async (id: string, opt
     method: 'DELETE'
 
 
+  }
+);}
+
+
+
+export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse200 = {
+  data: FetchAssistantResponseApi
+  status: 200
+}
+
+export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse400 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 400
+}
+
+export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse403 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 403
+}
+
+export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse500 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 500
+}
+
+export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 500>
+}
+
+export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseSuccess = (simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse200) & {
+  headers: Headers;
+};
+export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseError = (simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse400 | simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse403 | simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse500 | simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse = (simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseSuccess | simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponseError)
+
+export const getSimulateApiAgentDefinitionOperationsFetchAssistantFromProviderUrl = () => {
+
+
+
+
+  return `/simulate/api/agent-definition-operations/fetch_assistant_from_provider/`
+}
+
+/**
+ * Fetches the details of agent from the provider and sends them to the client.
+It DOES NOT create a new version.
+ */
+export const simulateApiAgentDefinitionOperationsFetchAssistantFromProvider = async (fetchAssistantRequestApi: FetchAssistantRequestApi, options?: RequestInit): Promise<simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse> => {
+
+  return apiMutator<simulateApiAgentDefinitionOperationsFetchAssistantFromProviderResponse>(getSimulateApiAgentDefinitionOperationsFetchAssistantFromProviderUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      fetchAssistantRequestApi,)
   }
 );}
 
@@ -53006,238 +53005,6 @@ export const simulateApiPersonasCreate = async (personaCreateApi: PersonaCreateA
 
 
 
-export type simulateApiPersonasDuplicateCreateResponse201 = {
-  data: PersonaDuplicateResponseApi
-  status: 201
-}
-
-export type simulateApiPersonasDuplicateCreateResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type simulateApiPersonasDuplicateCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201 | 400>
-}
-
-export type simulateApiPersonasDuplicateCreateResponseSuccess = (simulateApiPersonasDuplicateCreateResponse201) & {
-  headers: Headers;
-};
-export type simulateApiPersonasDuplicateCreateResponseError = (simulateApiPersonasDuplicateCreateResponse400 | simulateApiPersonasDuplicateCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateApiPersonasDuplicateCreateResponse = (simulateApiPersonasDuplicateCreateResponseSuccess | simulateApiPersonasDuplicateCreateResponseError)
-
-export const getSimulateApiPersonasDuplicateCreateUrl = (personaId: string,) => {
-
-
-
-
-  return `/simulate/api/personas/duplicate/${personaId}/`
-}
-
-/**
- * Duplicate a persona by ID
- */
-export const simulateApiPersonasDuplicateCreate = async (personaId: string,
-    personaDuplicateRequestApi: PersonaDuplicateRequestApi, options?: RequestInit): Promise<simulateApiPersonasDuplicateCreateResponse> => {
-
-  return apiMutator<simulateApiPersonasDuplicateCreateResponse>(getSimulateApiPersonasDuplicateCreateUrl(personaId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      personaDuplicateRequestApi,)
-  }
-);}
-
-
-
-export type simulateApiPersonasFieldOptionsResponse200 = {
-  data: SimulateApiPersonasFieldOptions200
-  status: 200
-}
-
-export type simulateApiPersonasFieldOptionsResponse500 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 500
-}
-
-export type simulateApiPersonasFieldOptionsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 500>
-}
-
-export type simulateApiPersonasFieldOptionsResponseSuccess = (simulateApiPersonasFieldOptionsResponse200) & {
-  headers: Headers;
-};
-export type simulateApiPersonasFieldOptionsResponseError = (simulateApiPersonasFieldOptionsResponse500 | simulateApiPersonasFieldOptionsResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateApiPersonasFieldOptionsResponse = (simulateApiPersonasFieldOptionsResponseSuccess | simulateApiPersonasFieldOptionsResponseError)
-
-export const getSimulateApiPersonasFieldOptionsUrl = (params?: SimulateApiPersonasFieldOptionsParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/simulate/api/personas/field-options/?${stringifiedParams}` : `/simulate/api/personas/field-options/`
-}
-
-/**
- * Get field options/choices for persona creation
- */
-export const simulateApiPersonasFieldOptions = async (params?: SimulateApiPersonasFieldOptionsParams, options?: RequestInit): Promise<simulateApiPersonasFieldOptionsResponse> => {
-
-  return apiMutator<simulateApiPersonasFieldOptionsResponse>(getSimulateApiPersonasFieldOptionsUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type simulateApiPersonasSystemPersonasResponse200 = {
-  data: SimulateApiPersonasSystemPersonas200
-  status: 200
-}
-
-export type simulateApiPersonasSystemPersonasResponse500 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 500
-}
-
-export type simulateApiPersonasSystemPersonasResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 500>
-}
-
-export type simulateApiPersonasSystemPersonasResponseSuccess = (simulateApiPersonasSystemPersonasResponse200) & {
-  headers: Headers;
-};
-export type simulateApiPersonasSystemPersonasResponseError = (simulateApiPersonasSystemPersonasResponse500 | simulateApiPersonasSystemPersonasResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateApiPersonasSystemPersonasResponse = (simulateApiPersonasSystemPersonasResponseSuccess | simulateApiPersonasSystemPersonasResponseError)
-
-export const getSimulateApiPersonasSystemPersonasUrl = (params?: SimulateApiPersonasSystemPersonasParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/simulate/api/personas/system/?${stringifiedParams}` : `/simulate/api/personas/system/`
-}
-
-/**
- * Get only system-level personas
- */
-export const simulateApiPersonasSystemPersonas = async (params?: SimulateApiPersonasSystemPersonasParams, options?: RequestInit): Promise<simulateApiPersonasSystemPersonasResponse> => {
-
-  return apiMutator<simulateApiPersonasSystemPersonasResponse>(getSimulateApiPersonasSystemPersonasUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type simulateApiPersonasWorkspacePersonasResponse200 = {
-  data: SimulateApiPersonasWorkspacePersonas200
-  status: 200
-}
-
-export type simulateApiPersonasWorkspacePersonasResponse400 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 400
-}
-
-export type simulateApiPersonasWorkspacePersonasResponse500 = {
-  data: ApiErrorWithDetailsResponseApi
-  status: 500
-}
-
-export type simulateApiPersonasWorkspacePersonasResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
-}
-
-export type simulateApiPersonasWorkspacePersonasResponseSuccess = (simulateApiPersonasWorkspacePersonasResponse200) & {
-  headers: Headers;
-};
-export type simulateApiPersonasWorkspacePersonasResponseError = (simulateApiPersonasWorkspacePersonasResponse400 | simulateApiPersonasWorkspacePersonasResponse500 | simulateApiPersonasWorkspacePersonasResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateApiPersonasWorkspacePersonasResponse = (simulateApiPersonasWorkspacePersonasResponseSuccess | simulateApiPersonasWorkspacePersonasResponseError)
-
-export const getSimulateApiPersonasWorkspacePersonasUrl = (params?: SimulateApiPersonasWorkspacePersonasParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/simulate/api/personas/workspace/?${stringifiedParams}` : `/simulate/api/personas/workspace/`
-}
-
-/**
- * Get only workspace-level personas
- */
-export const simulateApiPersonasWorkspacePersonas = async (params?: SimulateApiPersonasWorkspacePersonasParams, options?: RequestInit): Promise<simulateApiPersonasWorkspacePersonasResponse> => {
-
-  return apiMutator<simulateApiPersonasWorkspacePersonasResponse>(getSimulateApiPersonasWorkspacePersonasUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type simulateApiPersonasReadResponse200 = {
   data: PersonaApi
   status: 200
@@ -53534,6 +53301,238 @@ export const simulateApiPersonasDuplicate = async (id: string,
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       personaDuplicateRequestApi,)
+  }
+);}
+
+
+
+export type simulateApiPersonasDuplicateCreateResponse201 = {
+  data: PersonaDuplicateResponseApi
+  status: 201
+}
+
+export type simulateApiPersonasDuplicateCreateResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type simulateApiPersonasDuplicateCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201 | 400>
+}
+
+export type simulateApiPersonasDuplicateCreateResponseSuccess = (simulateApiPersonasDuplicateCreateResponse201) & {
+  headers: Headers;
+};
+export type simulateApiPersonasDuplicateCreateResponseError = (simulateApiPersonasDuplicateCreateResponse400 | simulateApiPersonasDuplicateCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateApiPersonasDuplicateCreateResponse = (simulateApiPersonasDuplicateCreateResponseSuccess | simulateApiPersonasDuplicateCreateResponseError)
+
+export const getSimulateApiPersonasDuplicateCreateUrl = (personaId: string,) => {
+
+
+
+
+  return `/simulate/api/personas/duplicate/${personaId}/`
+}
+
+/**
+ * Duplicate a persona by ID
+ */
+export const simulateApiPersonasDuplicateCreate = async (personaId: string,
+    personaDuplicateRequestApi: PersonaDuplicateRequestApi, options?: RequestInit): Promise<simulateApiPersonasDuplicateCreateResponse> => {
+
+  return apiMutator<simulateApiPersonasDuplicateCreateResponse>(getSimulateApiPersonasDuplicateCreateUrl(personaId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      personaDuplicateRequestApi,)
+  }
+);}
+
+
+
+export type simulateApiPersonasFieldOptionsResponse200 = {
+  data: SimulateApiPersonasFieldOptions200
+  status: 200
+}
+
+export type simulateApiPersonasFieldOptionsResponse500 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 500
+}
+
+export type simulateApiPersonasFieldOptionsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 500>
+}
+
+export type simulateApiPersonasFieldOptionsResponseSuccess = (simulateApiPersonasFieldOptionsResponse200) & {
+  headers: Headers;
+};
+export type simulateApiPersonasFieldOptionsResponseError = (simulateApiPersonasFieldOptionsResponse500 | simulateApiPersonasFieldOptionsResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateApiPersonasFieldOptionsResponse = (simulateApiPersonasFieldOptionsResponseSuccess | simulateApiPersonasFieldOptionsResponseError)
+
+export const getSimulateApiPersonasFieldOptionsUrl = (params?: SimulateApiPersonasFieldOptionsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/simulate/api/personas/field-options/?${stringifiedParams}` : `/simulate/api/personas/field-options/`
+}
+
+/**
+ * Get field options/choices for persona creation
+ */
+export const simulateApiPersonasFieldOptions = async (params?: SimulateApiPersonasFieldOptionsParams, options?: RequestInit): Promise<simulateApiPersonasFieldOptionsResponse> => {
+
+  return apiMutator<simulateApiPersonasFieldOptionsResponse>(getSimulateApiPersonasFieldOptionsUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type simulateApiPersonasSystemPersonasResponse200 = {
+  data: SimulateApiPersonasSystemPersonas200
+  status: 200
+}
+
+export type simulateApiPersonasSystemPersonasResponse500 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 500
+}
+
+export type simulateApiPersonasSystemPersonasResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 500>
+}
+
+export type simulateApiPersonasSystemPersonasResponseSuccess = (simulateApiPersonasSystemPersonasResponse200) & {
+  headers: Headers;
+};
+export type simulateApiPersonasSystemPersonasResponseError = (simulateApiPersonasSystemPersonasResponse500 | simulateApiPersonasSystemPersonasResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateApiPersonasSystemPersonasResponse = (simulateApiPersonasSystemPersonasResponseSuccess | simulateApiPersonasSystemPersonasResponseError)
+
+export const getSimulateApiPersonasSystemPersonasUrl = (params?: SimulateApiPersonasSystemPersonasParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/simulate/api/personas/system/?${stringifiedParams}` : `/simulate/api/personas/system/`
+}
+
+/**
+ * Get only system-level personas
+ */
+export const simulateApiPersonasSystemPersonas = async (params?: SimulateApiPersonasSystemPersonasParams, options?: RequestInit): Promise<simulateApiPersonasSystemPersonasResponse> => {
+
+  return apiMutator<simulateApiPersonasSystemPersonasResponse>(getSimulateApiPersonasSystemPersonasUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type simulateApiPersonasWorkspacePersonasResponse200 = {
+  data: SimulateApiPersonasWorkspacePersonas200
+  status: 200
+}
+
+export type simulateApiPersonasWorkspacePersonasResponse400 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 400
+}
+
+export type simulateApiPersonasWorkspacePersonasResponse500 = {
+  data: ApiErrorWithDetailsResponseApi
+  status: 500
+}
+
+export type simulateApiPersonasWorkspacePersonasResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
+}
+
+export type simulateApiPersonasWorkspacePersonasResponseSuccess = (simulateApiPersonasWorkspacePersonasResponse200) & {
+  headers: Headers;
+};
+export type simulateApiPersonasWorkspacePersonasResponseError = (simulateApiPersonasWorkspacePersonasResponse400 | simulateApiPersonasWorkspacePersonasResponse500 | simulateApiPersonasWorkspacePersonasResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateApiPersonasWorkspacePersonasResponse = (simulateApiPersonasWorkspacePersonasResponseSuccess | simulateApiPersonasWorkspacePersonasResponseError)
+
+export const getSimulateApiPersonasWorkspacePersonasUrl = (params?: SimulateApiPersonasWorkspacePersonasParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/simulate/api/personas/workspace/?${stringifiedParams}` : `/simulate/api/personas/workspace/`
+}
+
+/**
+ * Get only workspace-level personas
+ */
+export const simulateApiPersonasWorkspacePersonas = async (params?: SimulateApiPersonasWorkspacePersonasParams, options?: RequestInit): Promise<simulateApiPersonasWorkspacePersonasResponse> => {
+
+  return apiMutator<simulateApiPersonasWorkspacePersonasResponse>(getSimulateApiPersonasWorkspacePersonasUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
   }
 );}
 
@@ -54762,171 +54761,6 @@ Query Parameters:
 export const simulateRunTestsList = async (params?: SimulateRunTestsListParams, options?: RequestInit): Promise<simulateRunTestsListResponse> => {
 
   return apiMutator<simulateRunTestsListResponse>(getSimulateRunTestsListUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type simulateRunTestsActiveListResponse200 = {
-  data: AllActiveTestsApi
-  status: 200
-}
-
-export type simulateRunTestsActiveListResponse404 = {
-  data: ErrorResponseApi
-  status: 404
-}
-
-export type simulateRunTestsActiveListResponse500 = {
-  data: ErrorResponseApi
-  status: 500
-}
-
-export type simulateRunTestsActiveListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 404 | 500>
-}
-
-export type simulateRunTestsActiveListResponseSuccess = (simulateRunTestsActiveListResponse200) & {
-  headers: Headers;
-};
-export type simulateRunTestsActiveListResponseError = (simulateRunTestsActiveListResponse404 | simulateRunTestsActiveListResponse500 | simulateRunTestsActiveListResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateRunTestsActiveListResponse = (simulateRunTestsActiveListResponseSuccess | simulateRunTestsActiveListResponseError)
-
-export const getSimulateRunTestsActiveListUrl = () => {
-
-
-
-
-  return `/simulate/run-tests/active/`
-}
-
-/**
- * Get all active tests
- */
-export const simulateRunTestsActiveList = async ( options?: RequestInit): Promise<simulateRunTestsActiveListResponse> => {
-
-  return apiMutator<simulateRunTestsActiveListResponse>(getSimulateRunTestsActiveListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type simulateRunTestsCreateCreateResponse201 = {
-  data: RunTestResponseApi
-  status: 201
-}
-
-export type simulateRunTestsCreateCreateResponse400 = {
-  data: RunTestErrorResponseApi
-  status: 400
-}
-
-export type simulateRunTestsCreateCreateResponse404 = {
-  data: RunTestErrorResponseApi
-  status: 404
-}
-
-export type simulateRunTestsCreateCreateResponse500 = {
-  data: RunTestErrorResponseApi
-  status: 500
-}
-
-export type simulateRunTestsCreateCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201 | 400 | 404 | 500>
-}
-
-export type simulateRunTestsCreateCreateResponseSuccess = (simulateRunTestsCreateCreateResponse201) & {
-  headers: Headers;
-};
-export type simulateRunTestsCreateCreateResponseError = (simulateRunTestsCreateCreateResponse400 | simulateRunTestsCreateCreateResponse404 | simulateRunTestsCreateCreateResponse500 | simulateRunTestsCreateCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateRunTestsCreateCreateResponse = (simulateRunTestsCreateCreateResponseSuccess | simulateRunTestsCreateCreateResponseError)
-
-export const getSimulateRunTestsCreateCreateUrl = () => {
-
-
-
-
-  return `/simulate/run-tests/create/`
-}
-
-/**
- * Create a new RunTest
- */
-export const simulateRunTestsCreateCreate = async (createRunTestApi: CreateRunTestApi, options?: RequestInit): Promise<simulateRunTestsCreateCreateResponse> => {
-
-  return apiMutator<simulateRunTestsCreateCreateResponse>(getSimulateRunTestsCreateCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      createRunTestApi,)
-  }
-);}
-
-
-
-export type simulateRunTestsGetIdByNameReadResponse200 = {
-  data: RunTestNameResponseApi
-  status: 200
-}
-
-export type simulateRunTestsGetIdByNameReadResponse400 = {
-  data: ApiTextErrorResponseApi
-  status: 400
-}
-
-export type simulateRunTestsGetIdByNameReadResponse500 = {
-  data: ApiTextErrorResponseApi
-  status: 500
-}
-
-export type simulateRunTestsGetIdByNameReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
-}
-
-export type simulateRunTestsGetIdByNameReadResponseSuccess = (simulateRunTestsGetIdByNameReadResponse200) & {
-  headers: Headers;
-};
-export type simulateRunTestsGetIdByNameReadResponseError = (simulateRunTestsGetIdByNameReadResponse400 | simulateRunTestsGetIdByNameReadResponse500 | simulateRunTestsGetIdByNameReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateRunTestsGetIdByNameReadResponse = (simulateRunTestsGetIdByNameReadResponseSuccess | simulateRunTestsGetIdByNameReadResponseError)
-
-export const getSimulateRunTestsGetIdByNameReadUrl = (runTestName: string,) => {
-
-
-
-
-  return `/simulate/run-tests/get-id-by-name/${runTestName}/`
-}
-
-/**
- * API View to get the id of a run test by name
- */
-export const simulateRunTestsGetIdByNameRead = async (runTestName: string, options?: RequestInit): Promise<simulateRunTestsGetIdByNameReadResponse> => {
-
-  return apiMutator<simulateRunTestsGetIdByNameReadResponse>(getSimulateRunTestsGetIdByNameReadUrl(runTestName),
   {
     ...options,
     method: 'GET'
@@ -56264,6 +56098,171 @@ export const simulateRunTestsStatusList = async (runTestId: string, options?: Re
 
 
 
+export type simulateRunTestsActiveListResponse200 = {
+  data: AllActiveTestsApi
+  status: 200
+}
+
+export type simulateRunTestsActiveListResponse404 = {
+  data: ErrorResponseApi
+  status: 404
+}
+
+export type simulateRunTestsActiveListResponse500 = {
+  data: ErrorResponseApi
+  status: 500
+}
+
+export type simulateRunTestsActiveListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 404 | 500>
+}
+
+export type simulateRunTestsActiveListResponseSuccess = (simulateRunTestsActiveListResponse200) & {
+  headers: Headers;
+};
+export type simulateRunTestsActiveListResponseError = (simulateRunTestsActiveListResponse404 | simulateRunTestsActiveListResponse500 | simulateRunTestsActiveListResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateRunTestsActiveListResponse = (simulateRunTestsActiveListResponseSuccess | simulateRunTestsActiveListResponseError)
+
+export const getSimulateRunTestsActiveListUrl = () => {
+
+
+
+
+  return `/simulate/run-tests/active/`
+}
+
+/**
+ * Get all active tests
+ */
+export const simulateRunTestsActiveList = async ( options?: RequestInit): Promise<simulateRunTestsActiveListResponse> => {
+
+  return apiMutator<simulateRunTestsActiveListResponse>(getSimulateRunTestsActiveListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type simulateRunTestsCreateCreateResponse201 = {
+  data: RunTestResponseApi
+  status: 201
+}
+
+export type simulateRunTestsCreateCreateResponse400 = {
+  data: RunTestErrorResponseApi
+  status: 400
+}
+
+export type simulateRunTestsCreateCreateResponse404 = {
+  data: RunTestErrorResponseApi
+  status: 404
+}
+
+export type simulateRunTestsCreateCreateResponse500 = {
+  data: RunTestErrorResponseApi
+  status: 500
+}
+
+export type simulateRunTestsCreateCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201 | 400 | 404 | 500>
+}
+
+export type simulateRunTestsCreateCreateResponseSuccess = (simulateRunTestsCreateCreateResponse201) & {
+  headers: Headers;
+};
+export type simulateRunTestsCreateCreateResponseError = (simulateRunTestsCreateCreateResponse400 | simulateRunTestsCreateCreateResponse404 | simulateRunTestsCreateCreateResponse500 | simulateRunTestsCreateCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateRunTestsCreateCreateResponse = (simulateRunTestsCreateCreateResponseSuccess | simulateRunTestsCreateCreateResponseError)
+
+export const getSimulateRunTestsCreateCreateUrl = () => {
+
+
+
+
+  return `/simulate/run-tests/create/`
+}
+
+/**
+ * Create a new RunTest
+ */
+export const simulateRunTestsCreateCreate = async (createRunTestApi: CreateRunTestApi, options?: RequestInit): Promise<simulateRunTestsCreateCreateResponse> => {
+
+  return apiMutator<simulateRunTestsCreateCreateResponse>(getSimulateRunTestsCreateCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      createRunTestApi,)
+  }
+);}
+
+
+
+export type simulateRunTestsGetIdByNameReadResponse200 = {
+  data: RunTestNameResponseApi
+  status: 200
+}
+
+export type simulateRunTestsGetIdByNameReadResponse400 = {
+  data: ApiTextErrorResponseApi
+  status: 400
+}
+
+export type simulateRunTestsGetIdByNameReadResponse500 = {
+  data: ApiTextErrorResponseApi
+  status: 500
+}
+
+export type simulateRunTestsGetIdByNameReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
+}
+
+export type simulateRunTestsGetIdByNameReadResponseSuccess = (simulateRunTestsGetIdByNameReadResponse200) & {
+  headers: Headers;
+};
+export type simulateRunTestsGetIdByNameReadResponseError = (simulateRunTestsGetIdByNameReadResponse400 | simulateRunTestsGetIdByNameReadResponse500 | simulateRunTestsGetIdByNameReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateRunTestsGetIdByNameReadResponse = (simulateRunTestsGetIdByNameReadResponseSuccess | simulateRunTestsGetIdByNameReadResponseError)
+
+export const getSimulateRunTestsGetIdByNameReadUrl = (runTestName: string,) => {
+
+
+
+
+  return `/simulate/run-tests/get-id-by-name/${runTestName}/`
+}
+
+/**
+ * API View to get the id of a run test by name
+ */
+export const simulateRunTestsGetIdByNameRead = async (runTestName: string, options?: RequestInit): Promise<simulateRunTestsGetIdByNameReadResponse> => {
+
+  return apiMutator<simulateRunTestsGetIdByNameReadResponse>(getSimulateRunTestsGetIdByNameReadUrl(runTestName),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type simulateScenariosListResponse200 = {
   data: ScenarioListResponseApi
   status: 200
@@ -56319,126 +56318,6 @@ export const getSimulateScenariosListUrl = (params?: SimulateScenariosListParams
 export const simulateScenariosList = async (params?: SimulateScenariosListParams, options?: RequestInit): Promise<simulateScenariosListResponse> => {
 
   return apiMutator<simulateScenariosListResponse>(getSimulateScenariosListUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type simulateScenariosCreateCreateResponse202 = {
-  data: ScenarioCreateResponseApi
-  status: 202
-}
-
-export type simulateScenariosCreateCreateResponse400 = {
-  data: ScenarioErrorResponseApi
-  status: 400
-}
-
-export type simulateScenariosCreateCreateResponse500 = {
-  data: ScenarioErrorResponseApi
-  status: 500
-}
-
-export type simulateScenariosCreateCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 202 | 400 | 500>
-}
-
-export type simulateScenariosCreateCreateResponseSuccess = (simulateScenariosCreateCreateResponse202) & {
-  headers: Headers;
-};
-export type simulateScenariosCreateCreateResponseError = (simulateScenariosCreateCreateResponse400 | simulateScenariosCreateCreateResponse500 | simulateScenariosCreateCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateScenariosCreateCreateResponse = (simulateScenariosCreateCreateResponseSuccess | simulateScenariosCreateCreateResponseError)
-
-export const getSimulateScenariosCreateCreateUrl = () => {
-
-
-
-
-  return `/simulate/scenarios/create/`
-}
-
-/**
- * Creates a new scenario (dataset, script, or graph kind). Returns 202 with processing status.
- * @summary Create scenario
- */
-export const simulateScenariosCreateCreate = async (scenarioCreateRequestApi: ScenarioCreateRequestApi, options?: RequestInit): Promise<simulateScenariosCreateCreateResponse> => {
-
-  return apiMutator<simulateScenariosCreateCreateResponse>(getSimulateScenariosCreateCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      scenarioCreateRequestApi,)
-  }
-);}
-
-
-
-export type simulateScenariosGetColumnsListResponse200 = {
-  data: ScenarioListResponseApi
-  status: 200
-}
-
-export type simulateScenariosGetColumnsListResponse404 = {
-  data: ScenarioErrorResponseApi
-  status: 404
-}
-
-export type simulateScenariosGetColumnsListResponse500 = {
-  data: ScenarioErrorResponseApi
-  status: 500
-}
-
-export type simulateScenariosGetColumnsListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 404 | 500>
-}
-
-export type simulateScenariosGetColumnsListResponseSuccess = (simulateScenariosGetColumnsListResponse200) & {
-  headers: Headers;
-};
-export type simulateScenariosGetColumnsListResponseError = (simulateScenariosGetColumnsListResponse404 | simulateScenariosGetColumnsListResponse500 | simulateScenariosGetColumnsListResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateScenariosGetColumnsListResponse = (simulateScenariosGetColumnsListResponseSuccess | simulateScenariosGetColumnsListResponseError)
-
-export const getSimulateScenariosGetColumnsListUrl = (params?: SimulateScenariosGetColumnsListParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/simulate/scenarios/get-columns/?${stringifiedParams}` : `/simulate/scenarios/get-columns/`
-}
-
-/**
- * Returns a paginated list of scenarios for the user's organization.
- * @summary List scenarios
- */
-export const simulateScenariosGetColumnsList = async (params?: SimulateScenariosGetColumnsListParams, options?: RequestInit): Promise<simulateScenariosGetColumnsListResponse> => {
-
-  return apiMutator<simulateScenariosGetColumnsListResponse>(getSimulateScenariosGetColumnsListUrl(params),
   {
     ...options,
     method: 'GET'
@@ -56801,6 +56680,126 @@ export const simulateScenariosPromptsUpdate = async (scenarioId: string,
 
 
 
+export type simulateScenariosCreateCreateResponse202 = {
+  data: ScenarioCreateResponseApi
+  status: 202
+}
+
+export type simulateScenariosCreateCreateResponse400 = {
+  data: ScenarioErrorResponseApi
+  status: 400
+}
+
+export type simulateScenariosCreateCreateResponse500 = {
+  data: ScenarioErrorResponseApi
+  status: 500
+}
+
+export type simulateScenariosCreateCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 202 | 400 | 500>
+}
+
+export type simulateScenariosCreateCreateResponseSuccess = (simulateScenariosCreateCreateResponse202) & {
+  headers: Headers;
+};
+export type simulateScenariosCreateCreateResponseError = (simulateScenariosCreateCreateResponse400 | simulateScenariosCreateCreateResponse500 | simulateScenariosCreateCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateScenariosCreateCreateResponse = (simulateScenariosCreateCreateResponseSuccess | simulateScenariosCreateCreateResponseError)
+
+export const getSimulateScenariosCreateCreateUrl = () => {
+
+
+
+
+  return `/simulate/scenarios/create/`
+}
+
+/**
+ * Creates a new scenario (dataset, script, or graph kind). Returns 202 with processing status.
+ * @summary Create scenario
+ */
+export const simulateScenariosCreateCreate = async (scenarioCreateRequestApi: ScenarioCreateRequestApi, options?: RequestInit): Promise<simulateScenariosCreateCreateResponse> => {
+
+  return apiMutator<simulateScenariosCreateCreateResponse>(getSimulateScenariosCreateCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      scenarioCreateRequestApi,)
+  }
+);}
+
+
+
+export type simulateScenariosGetColumnsListResponse200 = {
+  data: ScenarioListResponseApi
+  status: 200
+}
+
+export type simulateScenariosGetColumnsListResponse404 = {
+  data: ScenarioErrorResponseApi
+  status: 404
+}
+
+export type simulateScenariosGetColumnsListResponse500 = {
+  data: ScenarioErrorResponseApi
+  status: 500
+}
+
+export type simulateScenariosGetColumnsListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 404 | 500>
+}
+
+export type simulateScenariosGetColumnsListResponseSuccess = (simulateScenariosGetColumnsListResponse200) & {
+  headers: Headers;
+};
+export type simulateScenariosGetColumnsListResponseError = (simulateScenariosGetColumnsListResponse404 | simulateScenariosGetColumnsListResponse500 | simulateScenariosGetColumnsListResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateScenariosGetColumnsListResponse = (simulateScenariosGetColumnsListResponseSuccess | simulateScenariosGetColumnsListResponseError)
+
+export const getSimulateScenariosGetColumnsListUrl = (params?: SimulateScenariosGetColumnsListParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/simulate/scenarios/get-columns/?${stringifiedParams}` : `/simulate/scenarios/get-columns/`
+}
+
+/**
+ * Returns a paginated list of scenarios for the user's organization.
+ * @summary List scenarios
+ */
+export const simulateScenariosGetColumnsList = async (params?: SimulateScenariosGetColumnsListParams, options?: RequestInit): Promise<simulateScenariosGetColumnsListResponse> => {
+
+  return apiMutator<simulateScenariosGetColumnsListResponse>(getSimulateScenariosGetColumnsListUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type simulateSimulatorAgentsListResponse200 = {
   data: SimulatorAgentListResponseApi
   status: 200
@@ -56849,55 +56848,6 @@ export const simulateSimulatorAgentsList = async ( options?: RequestInit): Promi
     method: 'GET'
 
 
-  }
-);}
-
-
-
-export type simulateSimulatorAgentsCreateCreateResponse201 = {
-  data: SimulatorAgentApi
-  status: 201
-}
-
-export type simulateSimulatorAgentsCreateCreateResponse400 = {
-  data: SimulatorAgentValidationErrorResponseApi
-  status: 400
-}
-
-export type simulateSimulatorAgentsCreateCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201 | 400>
-}
-
-export type simulateSimulatorAgentsCreateCreateResponseSuccess = (simulateSimulatorAgentsCreateCreateResponse201) & {
-  headers: Headers;
-};
-export type simulateSimulatorAgentsCreateCreateResponseError = (simulateSimulatorAgentsCreateCreateResponse400 | simulateSimulatorAgentsCreateCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type simulateSimulatorAgentsCreateCreateResponse = (simulateSimulatorAgentsCreateCreateResponseSuccess | simulateSimulatorAgentsCreateCreateResponseError)
-
-export const getSimulateSimulatorAgentsCreateCreateUrl = () => {
-
-
-
-
-  return `/simulate/simulator-agents/create/`
-}
-
-/**
- * Create a new simulator agent
- */
-export const simulateSimulatorAgentsCreateCreate = async (simulatorAgentApi: NonReadonly<SimulatorAgentApi>, options?: RequestInit): Promise<simulateSimulatorAgentsCreateCreateResponse> => {
-
-  return apiMutator<simulateSimulatorAgentsCreateCreateResponse>(getSimulateSimulatorAgentsCreateCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      simulatorAgentApi,)
   }
 );}
 
@@ -57051,6 +57001,55 @@ export const simulateSimulatorAgentsEditUpdate = async (agentId: string,
   {
     ...options,
     method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      simulatorAgentApi,)
+  }
+);}
+
+
+
+export type simulateSimulatorAgentsCreateCreateResponse201 = {
+  data: SimulatorAgentApi
+  status: 201
+}
+
+export type simulateSimulatorAgentsCreateCreateResponse400 = {
+  data: SimulatorAgentValidationErrorResponseApi
+  status: 400
+}
+
+export type simulateSimulatorAgentsCreateCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201 | 400>
+}
+
+export type simulateSimulatorAgentsCreateCreateResponseSuccess = (simulateSimulatorAgentsCreateCreateResponse201) & {
+  headers: Headers;
+};
+export type simulateSimulatorAgentsCreateCreateResponseError = (simulateSimulatorAgentsCreateCreateResponse400 | simulateSimulatorAgentsCreateCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type simulateSimulatorAgentsCreateCreateResponse = (simulateSimulatorAgentsCreateCreateResponseSuccess | simulateSimulatorAgentsCreateCreateResponseError)
+
+export const getSimulateSimulatorAgentsCreateCreateUrl = () => {
+
+
+
+
+  return `/simulate/simulator-agents/create/`
+}
+
+/**
+ * Create a new simulator agent
+ */
+export const simulateSimulatorAgentsCreateCreate = async (simulatorAgentApi: NonReadonly<SimulatorAgentApi>, options?: RequestInit): Promise<simulateSimulatorAgentsCreateCreateResponse> => {
+
+  return apiMutator<simulateSimulatorAgentsCreateCreateResponse>(getSimulateSimulatorAgentsCreateCreateUrl(),
+  {
+    ...options,
+    method: 'POST',
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       simulatorAgentApi,)
@@ -58160,6 +58159,170 @@ export const tracerCustomEvalConfigCreate = async (customEvalConfigApi: NonReado
 
 
 
+export type tracerCustomEvalConfigReadResponse200 = {
+  data: CustomEvalConfigApi
+  status: 200
+}
+
+export type tracerCustomEvalConfigReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerCustomEvalConfigReadResponseSuccess = (tracerCustomEvalConfigReadResponse200) & {
+  headers: Headers;
+};
+export type tracerCustomEvalConfigReadResponseError = (tracerCustomEvalConfigReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerCustomEvalConfigReadResponse = (tracerCustomEvalConfigReadResponseSuccess | tracerCustomEvalConfigReadResponseError)
+
+export const getTracerCustomEvalConfigReadUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/custom-eval-config/${id}/`
+}
+
+export const tracerCustomEvalConfigRead = async (id: string, options?: RequestInit): Promise<tracerCustomEvalConfigReadResponse> => {
+
+  return apiMutator<tracerCustomEvalConfigReadResponse>(getTracerCustomEvalConfigReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerCustomEvalConfigUpdateResponse200 = {
+  data: CustomEvalConfigApi
+  status: 200
+}
+
+export type tracerCustomEvalConfigUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerCustomEvalConfigUpdateResponseSuccess = (tracerCustomEvalConfigUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerCustomEvalConfigUpdateResponseError = (tracerCustomEvalConfigUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerCustomEvalConfigUpdateResponse = (tracerCustomEvalConfigUpdateResponseSuccess | tracerCustomEvalConfigUpdateResponseError)
+
+export const getTracerCustomEvalConfigUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/custom-eval-config/${id}/`
+}
+
+export const tracerCustomEvalConfigUpdate = async (id: string,
+    customEvalConfigApi: NonReadonly<CustomEvalConfigApi>, options?: RequestInit): Promise<tracerCustomEvalConfigUpdateResponse> => {
+
+  return apiMutator<tracerCustomEvalConfigUpdateResponse>(getTracerCustomEvalConfigUpdateUrl(id),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      customEvalConfigApi,)
+  }
+);}
+
+
+
+export type tracerCustomEvalConfigPartialUpdateResponse200 = {
+  data: CustomEvalConfigApi
+  status: 200
+}
+
+export type tracerCustomEvalConfigPartialUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerCustomEvalConfigPartialUpdateResponseSuccess = (tracerCustomEvalConfigPartialUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerCustomEvalConfigPartialUpdateResponseError = (tracerCustomEvalConfigPartialUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerCustomEvalConfigPartialUpdateResponse = (tracerCustomEvalConfigPartialUpdateResponseSuccess | tracerCustomEvalConfigPartialUpdateResponseError)
+
+export const getTracerCustomEvalConfigPartialUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/custom-eval-config/${id}/`
+}
+
+export const tracerCustomEvalConfigPartialUpdate = async (id: string,
+    customEvalConfigApi: NonReadonly<CustomEvalConfigApi>, options?: RequestInit): Promise<tracerCustomEvalConfigPartialUpdateResponse> => {
+
+  return apiMutator<tracerCustomEvalConfigPartialUpdateResponse>(getTracerCustomEvalConfigPartialUpdateUrl(id),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      customEvalConfigApi,)
+  }
+);}
+
+
+
+export type tracerCustomEvalConfigDeleteResponse204 = {
+  data: void
+  status: 204
+}
+
+export type tracerCustomEvalConfigDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 204>
+}
+
+export type tracerCustomEvalConfigDeleteResponseSuccess = (tracerCustomEvalConfigDeleteResponse204) & {
+  headers: Headers;
+};
+export type tracerCustomEvalConfigDeleteResponseError = (tracerCustomEvalConfigDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerCustomEvalConfigDeleteResponse = (tracerCustomEvalConfigDeleteResponseSuccess | tracerCustomEvalConfigDeleteResponseError)
+
+export const getTracerCustomEvalConfigDeleteUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/custom-eval-config/${id}/`
+}
+
+export const tracerCustomEvalConfigDelete = async (id: string, options?: RequestInit): Promise<tracerCustomEvalConfigDeleteResponse> => {
+
+  return apiMutator<tracerCustomEvalConfigDeleteResponse>(getTracerCustomEvalConfigDeleteUrl(id),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
 export type tracerCustomEvalConfigCheckExistsResponse201 = {
   data: CustomEvalConfigApi
   status: 201
@@ -58337,170 +58500,6 @@ export const tracerCustomEvalConfigRunEvaluation = async (customEvalConfigApi: N
 
 
 
-export type tracerCustomEvalConfigReadResponse200 = {
-  data: CustomEvalConfigApi
-  status: 200
-}
-
-export type tracerCustomEvalConfigReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerCustomEvalConfigReadResponseSuccess = (tracerCustomEvalConfigReadResponse200) & {
-  headers: Headers;
-};
-export type tracerCustomEvalConfigReadResponseError = (tracerCustomEvalConfigReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerCustomEvalConfigReadResponse = (tracerCustomEvalConfigReadResponseSuccess | tracerCustomEvalConfigReadResponseError)
-
-export const getTracerCustomEvalConfigReadUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/custom-eval-config/${id}/`
-}
-
-export const tracerCustomEvalConfigRead = async (id: string, options?: RequestInit): Promise<tracerCustomEvalConfigReadResponse> => {
-
-  return apiMutator<tracerCustomEvalConfigReadResponse>(getTracerCustomEvalConfigReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerCustomEvalConfigUpdateResponse200 = {
-  data: CustomEvalConfigApi
-  status: 200
-}
-
-export type tracerCustomEvalConfigUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerCustomEvalConfigUpdateResponseSuccess = (tracerCustomEvalConfigUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerCustomEvalConfigUpdateResponseError = (tracerCustomEvalConfigUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerCustomEvalConfigUpdateResponse = (tracerCustomEvalConfigUpdateResponseSuccess | tracerCustomEvalConfigUpdateResponseError)
-
-export const getTracerCustomEvalConfigUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/custom-eval-config/${id}/`
-}
-
-export const tracerCustomEvalConfigUpdate = async (id: string,
-    customEvalConfigApi: NonReadonly<CustomEvalConfigApi>, options?: RequestInit): Promise<tracerCustomEvalConfigUpdateResponse> => {
-
-  return apiMutator<tracerCustomEvalConfigUpdateResponse>(getTracerCustomEvalConfigUpdateUrl(id),
-  {
-    ...options,
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      customEvalConfigApi,)
-  }
-);}
-
-
-
-export type tracerCustomEvalConfigPartialUpdateResponse200 = {
-  data: CustomEvalConfigApi
-  status: 200
-}
-
-export type tracerCustomEvalConfigPartialUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerCustomEvalConfigPartialUpdateResponseSuccess = (tracerCustomEvalConfigPartialUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerCustomEvalConfigPartialUpdateResponseError = (tracerCustomEvalConfigPartialUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerCustomEvalConfigPartialUpdateResponse = (tracerCustomEvalConfigPartialUpdateResponseSuccess | tracerCustomEvalConfigPartialUpdateResponseError)
-
-export const getTracerCustomEvalConfigPartialUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/custom-eval-config/${id}/`
-}
-
-export const tracerCustomEvalConfigPartialUpdate = async (id: string,
-    customEvalConfigApi: NonReadonly<CustomEvalConfigApi>, options?: RequestInit): Promise<tracerCustomEvalConfigPartialUpdateResponse> => {
-
-  return apiMutator<tracerCustomEvalConfigPartialUpdateResponse>(getTracerCustomEvalConfigPartialUpdateUrl(id),
-  {
-    ...options,
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      customEvalConfigApi,)
-  }
-);}
-
-
-
-export type tracerCustomEvalConfigDeleteResponse204 = {
-  data: void
-  status: 204
-}
-
-export type tracerCustomEvalConfigDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 204>
-}
-
-export type tracerCustomEvalConfigDeleteResponseSuccess = (tracerCustomEvalConfigDeleteResponse204) & {
-  headers: Headers;
-};
-export type tracerCustomEvalConfigDeleteResponseError = (tracerCustomEvalConfigDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerCustomEvalConfigDeleteResponse = (tracerCustomEvalConfigDeleteResponseSuccess | tracerCustomEvalConfigDeleteResponseError)
-
-export const getTracerCustomEvalConfigDeleteUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/custom-eval-config/${id}/`
-}
-
-export const tracerCustomEvalConfigDelete = async (id: string, options?: RequestInit): Promise<tracerCustomEvalConfigDeleteResponse> => {
-
-  return apiMutator<tracerCustomEvalConfigDeleteResponse>(getTracerCustomEvalConfigDeleteUrl(id),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
 export type tracerDashboardListResponse200 = {
   data: TracerDashboardList200
   status: 200
@@ -58593,267 +58592,6 @@ export const tracerDashboardCreate = async (dashboardCreateUpdateApi: DashboardC
 
 
 
-export type tracerDashboardFilterValuesResponse200 = {
-  data: DashboardFilterValuesResponseApi
-  status: 200
-}
-
-export type tracerDashboardFilterValuesResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerDashboardFilterValuesResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerDashboardFilterValuesResponse503 = {
-  data: ApiErrorResponseApi
-  status: 503
-}
-
-export type tracerDashboardFilterValuesResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
-}
-
-export type tracerDashboardFilterValuesResponseSuccess = (tracerDashboardFilterValuesResponse200) & {
-  headers: Headers;
-};
-export type tracerDashboardFilterValuesResponseError = (tracerDashboardFilterValuesResponse400 | tracerDashboardFilterValuesResponse500 | tracerDashboardFilterValuesResponse503 | tracerDashboardFilterValuesResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerDashboardFilterValuesResponse = (tracerDashboardFilterValuesResponseSuccess | tracerDashboardFilterValuesResponseError)
-
-export const getTracerDashboardFilterValuesUrl = (params: TracerDashboardFilterValuesParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/dashboard/filter_values/?${stringifiedParams}` : `/tracer/dashboard/filter_values/`
-}
-
-/**
- * Return distinct values for a given metric/attribute, for filter value picker.
- */
-export const tracerDashboardFilterValues = async (params: TracerDashboardFilterValuesParams, options?: RequestInit): Promise<tracerDashboardFilterValuesResponse> => {
-
-  return apiMutator<tracerDashboardFilterValuesResponse>(getTracerDashboardFilterValuesUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerDashboardMetricsResponse200 = {
-  data: DashboardMetricsCatalogResponseApi
-  status: 200
-}
-
-export type tracerDashboardMetricsResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerDashboardMetricsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
-}
-
-export type tracerDashboardMetricsResponseSuccess = (tracerDashboardMetricsResponse200) & {
-  headers: Headers;
-};
-export type tracerDashboardMetricsResponseError = (tracerDashboardMetricsResponse400 | tracerDashboardMetricsResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerDashboardMetricsResponse = (tracerDashboardMetricsResponseSuccess | tracerDashboardMetricsResponseError)
-
-export const getTracerDashboardMetricsUrl = (params?: TracerDashboardMetricsParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/dashboard/metrics/?${stringifiedParams}` : `/tracer/dashboard/metrics/`
-}
-
-/**
- * Backward compat: if ``workflow`` param is provided, return only
-that source's metrics in the old grouped format.
- * @summary Return all available metrics across traces and datasets.
- */
-export const tracerDashboardMetrics = async (params?: TracerDashboardMetricsParams, options?: RequestInit): Promise<tracerDashboardMetricsResponse> => {
-
-  return apiMutator<tracerDashboardMetricsResponse>(getTracerDashboardMetricsUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerDashboardQueryResponse200 = {
-  data: DashboardQueryApiResponseApi
-  status: 200
-}
-
-export type tracerDashboardQueryResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerDashboardQueryResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerDashboardQueryResponse503 = {
-  data: ApiErrorResponseApi
-  status: 503
-}
-
-export type tracerDashboardQueryResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
-}
-
-export type tracerDashboardQueryResponseSuccess = (tracerDashboardQueryResponse200) & {
-  headers: Headers;
-};
-export type tracerDashboardQueryResponseError = (tracerDashboardQueryResponse400 | tracerDashboardQueryResponse500 | tracerDashboardQueryResponse503 | tracerDashboardQueryResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerDashboardQueryResponse = (tracerDashboardQueryResponseSuccess | tracerDashboardQueryResponseError)
-
-export const getTracerDashboardQueryUrl = (params?: TracerDashboardQueryParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/dashboard/query/?${stringifiedParams}` : `/tracer/dashboard/query/`
-}
-
-/**
- * Each metric carries a ``source`` field ("traces" or "datasets").
-Metrics are partitioned by source and dispatched to the appropriate
-query builder.  Results are merged into a single response.
-
-Each metric is validated against the canonical query contract before
-it reaches any query builder.
- * @summary Execute a widget query and return chart data.
- */
-export const tracerDashboardQuery = async (dashboardQueryApi: DashboardQueryApi,
-    params?: TracerDashboardQueryParams, options?: RequestInit): Promise<tracerDashboardQueryResponse> => {
-
-  return apiMutator<tracerDashboardQueryResponse>(getTracerDashboardQueryUrl(params),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      dashboardQueryApi,)
-  }
-);}
-
-
-
-export type tracerDashboardSimulationAgentsResponse200 = {
-  data: TracerDashboardSimulationAgents200
-  status: 200
-}
-
-export type tracerDashboardSimulationAgentsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerDashboardSimulationAgentsResponseSuccess = (tracerDashboardSimulationAgentsResponse200) & {
-  headers: Headers;
-};
-export type tracerDashboardSimulationAgentsResponseError = (tracerDashboardSimulationAgentsResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerDashboardSimulationAgentsResponse = (tracerDashboardSimulationAgentsResponseSuccess | tracerDashboardSimulationAgentsResponseError)
-
-export const getTracerDashboardSimulationAgentsUrl = (params?: TracerDashboardSimulationAgentsParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/dashboard/simulation-agents/?${stringifiedParams}` : `/tracer/dashboard/simulation-agents/`
-}
-
-/**
- * Return simulation agents with their observability project links.
- */
-export const tracerDashboardSimulationAgents = async (params?: TracerDashboardSimulationAgentsParams, options?: RequestInit): Promise<tracerDashboardSimulationAgentsResponse> => {
-
-  return apiMutator<tracerDashboardSimulationAgentsResponse>(getTracerDashboardSimulationAgentsUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type tracerDashboardWidgetsListResponse200 = {
   data: TracerDashboardWidgetsList200
   status: 200
@@ -58938,124 +58676,6 @@ export const tracerDashboardWidgetsCreate = async (dashboardPk: string,
     dashboardWidgetApi: NonReadonly<DashboardWidgetApi>, options?: RequestInit): Promise<tracerDashboardWidgetsCreateResponse> => {
 
   return apiMutator<tracerDashboardWidgetsCreateResponse>(getTracerDashboardWidgetsCreateUrl(dashboardPk),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      dashboardWidgetApi,)
-  }
-);}
-
-
-
-export type tracerDashboardWidgetsPreviewQueryResponse200 = {
-  data: DashboardQueryApiResponseApi
-  status: 200
-}
-
-export type tracerDashboardWidgetsPreviewQueryResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerDashboardWidgetsPreviewQueryResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerDashboardWidgetsPreviewQueryResponse503 = {
-  data: ApiErrorResponseApi
-  status: 503
-}
-
-export type tracerDashboardWidgetsPreviewQueryResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
-}
-
-export type tracerDashboardWidgetsPreviewQueryResponseSuccess = (tracerDashboardWidgetsPreviewQueryResponse200) & {
-  headers: Headers;
-};
-export type tracerDashboardWidgetsPreviewQueryResponseError = (tracerDashboardWidgetsPreviewQueryResponse400 | tracerDashboardWidgetsPreviewQueryResponse500 | tracerDashboardWidgetsPreviewQueryResponse503 | tracerDashboardWidgetsPreviewQueryResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerDashboardWidgetsPreviewQueryResponse = (tracerDashboardWidgetsPreviewQueryResponseSuccess | tracerDashboardWidgetsPreviewQueryResponseError)
-
-export const getTracerDashboardWidgetsPreviewQueryUrl = (dashboardPk: string,
-    params?: TracerDashboardWidgetsPreviewQueryParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/dashboard/${dashboardPk}/widgets/preview/?${stringifiedParams}` : `/tracer/dashboard/${dashboardPk}/widgets/preview/`
-}
-
-/**
- * Execute an ad-hoc query_config without saving, for live preview.
- */
-export const tracerDashboardWidgetsPreviewQuery = async (dashboardPk: string,
-    dashboardPreviewQueryApi: DashboardPreviewQueryApi,
-    params?: TracerDashboardWidgetsPreviewQueryParams, options?: RequestInit): Promise<tracerDashboardWidgetsPreviewQueryResponse> => {
-
-  return apiMutator<tracerDashboardWidgetsPreviewQueryResponse>(getTracerDashboardWidgetsPreviewQueryUrl(dashboardPk,params),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      dashboardPreviewQueryApi,)
-  }
-);}
-
-
-
-export type tracerDashboardWidgetsReorderResponse201 = {
-  data: DashboardWidgetApi
-  status: 201
-}
-
-export type tracerDashboardWidgetsReorderResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type tracerDashboardWidgetsReorderResponseSuccess = (tracerDashboardWidgetsReorderResponse201) & {
-  headers: Headers;
-};
-export type tracerDashboardWidgetsReorderResponseError = (tracerDashboardWidgetsReorderResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerDashboardWidgetsReorderResponse = (tracerDashboardWidgetsReorderResponseSuccess | tracerDashboardWidgetsReorderResponseError)
-
-export const getTracerDashboardWidgetsReorderUrl = (dashboardPk: string,) => {
-
-
-
-
-  return `/tracer/dashboard/${dashboardPk}/widgets/reorder/`
-}
-
-/**
- * Batch update widget positions.
- */
-export const tracerDashboardWidgetsReorder = async (dashboardPk: string,
-    dashboardWidgetApi: NonReadonly<DashboardWidgetApi>, options?: RequestInit): Promise<tracerDashboardWidgetsReorderResponse> => {
-
-  return apiMutator<tracerDashboardWidgetsReorderResponse>(getTracerDashboardWidgetsReorderUrl(dashboardPk),
   {
     ...options,
     method: 'POST',
@@ -59361,6 +58981,124 @@ export const tracerDashboardWidgetsExecuteQuery = async (dashboardPk: string,
 
 
 
+export type tracerDashboardWidgetsPreviewQueryResponse200 = {
+  data: DashboardQueryApiResponseApi
+  status: 200
+}
+
+export type tracerDashboardWidgetsPreviewQueryResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerDashboardWidgetsPreviewQueryResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerDashboardWidgetsPreviewQueryResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
+export type tracerDashboardWidgetsPreviewQueryResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
+}
+
+export type tracerDashboardWidgetsPreviewQueryResponseSuccess = (tracerDashboardWidgetsPreviewQueryResponse200) & {
+  headers: Headers;
+};
+export type tracerDashboardWidgetsPreviewQueryResponseError = (tracerDashboardWidgetsPreviewQueryResponse400 | tracerDashboardWidgetsPreviewQueryResponse500 | tracerDashboardWidgetsPreviewQueryResponse503 | tracerDashboardWidgetsPreviewQueryResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerDashboardWidgetsPreviewQueryResponse = (tracerDashboardWidgetsPreviewQueryResponseSuccess | tracerDashboardWidgetsPreviewQueryResponseError)
+
+export const getTracerDashboardWidgetsPreviewQueryUrl = (dashboardPk: string,
+    params?: TracerDashboardWidgetsPreviewQueryParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/dashboard/${dashboardPk}/widgets/preview/?${stringifiedParams}` : `/tracer/dashboard/${dashboardPk}/widgets/preview/`
+}
+
+/**
+ * Execute an ad-hoc query_config without saving, for live preview.
+ */
+export const tracerDashboardWidgetsPreviewQuery = async (dashboardPk: string,
+    dashboardPreviewQueryApi: DashboardPreviewQueryApi,
+    params?: TracerDashboardWidgetsPreviewQueryParams, options?: RequestInit): Promise<tracerDashboardWidgetsPreviewQueryResponse> => {
+
+  return apiMutator<tracerDashboardWidgetsPreviewQueryResponse>(getTracerDashboardWidgetsPreviewQueryUrl(dashboardPk,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      dashboardPreviewQueryApi,)
+  }
+);}
+
+
+
+export type tracerDashboardWidgetsReorderResponse201 = {
+  data: DashboardWidgetApi
+  status: 201
+}
+
+export type tracerDashboardWidgetsReorderResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type tracerDashboardWidgetsReorderResponseSuccess = (tracerDashboardWidgetsReorderResponse201) & {
+  headers: Headers;
+};
+export type tracerDashboardWidgetsReorderResponseError = (tracerDashboardWidgetsReorderResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerDashboardWidgetsReorderResponse = (tracerDashboardWidgetsReorderResponseSuccess | tracerDashboardWidgetsReorderResponseError)
+
+export const getTracerDashboardWidgetsReorderUrl = (dashboardPk: string,) => {
+
+
+
+
+  return `/tracer/dashboard/${dashboardPk}/widgets/reorder/`
+}
+
+/**
+ * Batch update widget positions.
+ */
+export const tracerDashboardWidgetsReorder = async (dashboardPk: string,
+    dashboardWidgetApi: NonReadonly<DashboardWidgetApi>, options?: RequestInit): Promise<tracerDashboardWidgetsReorderResponse> => {
+
+  return apiMutator<tracerDashboardWidgetsReorderResponse>(getTracerDashboardWidgetsReorderUrl(dashboardPk),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      dashboardWidgetApi,)
+  }
+);}
+
+
+
 export type tracerDashboardReadResponse200 = {
   data: DashboardDetailApi
   status: 200
@@ -59525,6 +59263,267 @@ export const tracerDashboardDelete = async (id: string, options?: RequestInit): 
 
 
 
+export type tracerDashboardFilterValuesResponse200 = {
+  data: DashboardFilterValuesResponseApi
+  status: 200
+}
+
+export type tracerDashboardFilterValuesResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerDashboardFilterValuesResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerDashboardFilterValuesResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
+export type tracerDashboardFilterValuesResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
+}
+
+export type tracerDashboardFilterValuesResponseSuccess = (tracerDashboardFilterValuesResponse200) & {
+  headers: Headers;
+};
+export type tracerDashboardFilterValuesResponseError = (tracerDashboardFilterValuesResponse400 | tracerDashboardFilterValuesResponse500 | tracerDashboardFilterValuesResponse503 | tracerDashboardFilterValuesResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerDashboardFilterValuesResponse = (tracerDashboardFilterValuesResponseSuccess | tracerDashboardFilterValuesResponseError)
+
+export const getTracerDashboardFilterValuesUrl = (params: TracerDashboardFilterValuesParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/dashboard/filter_values/?${stringifiedParams}` : `/tracer/dashboard/filter_values/`
+}
+
+/**
+ * Return distinct values for a given metric/attribute, for filter value picker.
+ */
+export const tracerDashboardFilterValues = async (params: TracerDashboardFilterValuesParams, options?: RequestInit): Promise<tracerDashboardFilterValuesResponse> => {
+
+  return apiMutator<tracerDashboardFilterValuesResponse>(getTracerDashboardFilterValuesUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerDashboardMetricsResponse200 = {
+  data: DashboardMetricsCatalogResponseApi
+  status: 200
+}
+
+export type tracerDashboardMetricsResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerDashboardMetricsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400>
+}
+
+export type tracerDashboardMetricsResponseSuccess = (tracerDashboardMetricsResponse200) & {
+  headers: Headers;
+};
+export type tracerDashboardMetricsResponseError = (tracerDashboardMetricsResponse400 | tracerDashboardMetricsResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerDashboardMetricsResponse = (tracerDashboardMetricsResponseSuccess | tracerDashboardMetricsResponseError)
+
+export const getTracerDashboardMetricsUrl = (params?: TracerDashboardMetricsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/dashboard/metrics/?${stringifiedParams}` : `/tracer/dashboard/metrics/`
+}
+
+/**
+ * Backward compat: if ``workflow`` param is provided, return only
+that source's metrics in the old grouped format.
+ * @summary Return all available metrics across traces and datasets.
+ */
+export const tracerDashboardMetrics = async (params?: TracerDashboardMetricsParams, options?: RequestInit): Promise<tracerDashboardMetricsResponse> => {
+
+  return apiMutator<tracerDashboardMetricsResponse>(getTracerDashboardMetricsUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerDashboardQueryResponse200 = {
+  data: DashboardQueryApiResponseApi
+  status: 200
+}
+
+export type tracerDashboardQueryResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerDashboardQueryResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerDashboardQueryResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
+export type tracerDashboardQueryResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
+}
+
+export type tracerDashboardQueryResponseSuccess = (tracerDashboardQueryResponse200) & {
+  headers: Headers;
+};
+export type tracerDashboardQueryResponseError = (tracerDashboardQueryResponse400 | tracerDashboardQueryResponse500 | tracerDashboardQueryResponse503 | tracerDashboardQueryResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerDashboardQueryResponse = (tracerDashboardQueryResponseSuccess | tracerDashboardQueryResponseError)
+
+export const getTracerDashboardQueryUrl = (params?: TracerDashboardQueryParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/dashboard/query/?${stringifiedParams}` : `/tracer/dashboard/query/`
+}
+
+/**
+ * Each metric carries a ``source`` field ("traces" or "datasets").
+Metrics are partitioned by source and dispatched to the appropriate
+query builder.  Results are merged into a single response.
+
+Each metric is validated against the canonical query contract before
+it reaches any query builder.
+ * @summary Execute a widget query and return chart data.
+ */
+export const tracerDashboardQuery = async (dashboardQueryApi: DashboardQueryApi,
+    params?: TracerDashboardQueryParams, options?: RequestInit): Promise<tracerDashboardQueryResponse> => {
+
+  return apiMutator<tracerDashboardQueryResponse>(getTracerDashboardQueryUrl(params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      dashboardQueryApi,)
+  }
+);}
+
+
+
+export type tracerDashboardSimulationAgentsResponse200 = {
+  data: TracerDashboardSimulationAgents200
+  status: 200
+}
+
+export type tracerDashboardSimulationAgentsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerDashboardSimulationAgentsResponseSuccess = (tracerDashboardSimulationAgentsResponse200) & {
+  headers: Headers;
+};
+export type tracerDashboardSimulationAgentsResponseError = (tracerDashboardSimulationAgentsResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerDashboardSimulationAgentsResponse = (tracerDashboardSimulationAgentsResponseSuccess | tracerDashboardSimulationAgentsResponseError)
+
+export const getTracerDashboardSimulationAgentsUrl = (params?: TracerDashboardSimulationAgentsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/dashboard/simulation-agents/?${stringifiedParams}` : `/tracer/dashboard/simulation-agents/`
+}
+
+/**
+ * Return simulation agents with their observability project links.
+ */
+export const tracerDashboardSimulationAgents = async (params?: TracerDashboardSimulationAgentsParams, options?: RequestInit): Promise<tracerDashboardSimulationAgentsResponse> => {
+
+  return apiMutator<tracerDashboardSimulationAgentsResponse>(getTracerDashboardSimulationAgentsUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type tracerDatasetListResponse200 = {
   data: TracerDatasetList200
   status: 200
@@ -59606,88 +59605,6 @@ export const getTracerDatasetCreateUrl = () => {
 export const tracerDatasetCreate = async (observeDatasetApi: NonReadonly<ObserveDatasetApi>, options?: RequestInit): Promise<tracerDatasetCreateResponse> => {
 
   return apiMutator<tracerDatasetCreateResponse>(getTracerDatasetCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      observeDatasetApi,)
-  }
-);}
-
-
-
-export type tracerDatasetAddToExistingDatasetResponse201 = {
-  data: ObserveDatasetApi
-  status: 201
-}
-
-export type tracerDatasetAddToExistingDatasetResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type tracerDatasetAddToExistingDatasetResponseSuccess = (tracerDatasetAddToExistingDatasetResponse201) & {
-  headers: Headers;
-};
-export type tracerDatasetAddToExistingDatasetResponseError = (tracerDatasetAddToExistingDatasetResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerDatasetAddToExistingDatasetResponse = (tracerDatasetAddToExistingDatasetResponseSuccess | tracerDatasetAddToExistingDatasetResponseError)
-
-export const getTracerDatasetAddToExistingDatasetUrl = () => {
-
-
-
-
-  return `/tracer/dataset/add_to_existing_dataset/`
-}
-
-export const tracerDatasetAddToExistingDataset = async (observeDatasetApi: NonReadonly<ObserveDatasetApi>, options?: RequestInit): Promise<tracerDatasetAddToExistingDatasetResponse> => {
-
-  return apiMutator<tracerDatasetAddToExistingDatasetResponse>(getTracerDatasetAddToExistingDatasetUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      observeDatasetApi,)
-  }
-);}
-
-
-
-export type tracerDatasetAddToNewDatasetResponse201 = {
-  data: ObserveDatasetApi
-  status: 201
-}
-
-export type tracerDatasetAddToNewDatasetResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type tracerDatasetAddToNewDatasetResponseSuccess = (tracerDatasetAddToNewDatasetResponse201) & {
-  headers: Headers;
-};
-export type tracerDatasetAddToNewDatasetResponseError = (tracerDatasetAddToNewDatasetResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerDatasetAddToNewDatasetResponse = (tracerDatasetAddToNewDatasetResponseSuccess | tracerDatasetAddToNewDatasetResponseError)
-
-export const getTracerDatasetAddToNewDatasetUrl = () => {
-
-
-
-
-  return `/tracer/dataset/add_to_new_dataset/`
-}
-
-export const tracerDatasetAddToNewDataset = async (observeDatasetApi: NonReadonly<ObserveDatasetApi>, options?: RequestInit): Promise<tracerDatasetAddToNewDatasetResponse> => {
-
-  return apiMutator<tracerDatasetAddToNewDatasetResponse>(getTracerDatasetAddToNewDatasetUrl(),
   {
     ...options,
     method: 'POST',
@@ -59863,6 +59780,88 @@ export const tracerDatasetDelete = async (id: string, options?: RequestInit): Pr
 
 
 
+export type tracerDatasetAddToExistingDatasetResponse201 = {
+  data: ObserveDatasetApi
+  status: 201
+}
+
+export type tracerDatasetAddToExistingDatasetResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type tracerDatasetAddToExistingDatasetResponseSuccess = (tracerDatasetAddToExistingDatasetResponse201) & {
+  headers: Headers;
+};
+export type tracerDatasetAddToExistingDatasetResponseError = (tracerDatasetAddToExistingDatasetResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerDatasetAddToExistingDatasetResponse = (tracerDatasetAddToExistingDatasetResponseSuccess | tracerDatasetAddToExistingDatasetResponseError)
+
+export const getTracerDatasetAddToExistingDatasetUrl = () => {
+
+
+
+
+  return `/tracer/dataset/add_to_existing_dataset/`
+}
+
+export const tracerDatasetAddToExistingDataset = async (observeDatasetApi: NonReadonly<ObserveDatasetApi>, options?: RequestInit): Promise<tracerDatasetAddToExistingDatasetResponse> => {
+
+  return apiMutator<tracerDatasetAddToExistingDatasetResponse>(getTracerDatasetAddToExistingDatasetUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      observeDatasetApi,)
+  }
+);}
+
+
+
+export type tracerDatasetAddToNewDatasetResponse201 = {
+  data: ObserveDatasetApi
+  status: 201
+}
+
+export type tracerDatasetAddToNewDatasetResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type tracerDatasetAddToNewDatasetResponseSuccess = (tracerDatasetAddToNewDatasetResponse201) & {
+  headers: Headers;
+};
+export type tracerDatasetAddToNewDatasetResponseError = (tracerDatasetAddToNewDatasetResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerDatasetAddToNewDatasetResponse = (tracerDatasetAddToNewDatasetResponseSuccess | tracerDatasetAddToNewDatasetResponseError)
+
+export const getTracerDatasetAddToNewDatasetUrl = () => {
+
+
+
+
+  return `/tracer/dataset/add_to_new_dataset/`
+}
+
+export const tracerDatasetAddToNewDataset = async (observeDatasetApi: NonReadonly<ObserveDatasetApi>, options?: RequestInit): Promise<tracerDatasetAddToNewDatasetResponse> => {
+
+  return apiMutator<tracerDatasetAddToNewDatasetResponse>(getTracerDatasetAddToNewDatasetUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      observeDatasetApi,)
+  }
+);}
+
+
+
 export type tracerEvalTaskListResponse200 = {
   data: TracerEvalTaskList200
   status: 200
@@ -59960,6 +59959,170 @@ export const tracerEvalTaskCreate = async (evalTaskApi: NonReadonly<EvalTaskApi>
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       evalTaskApi,)
+  }
+);}
+
+
+
+export type tracerEvalTaskReadResponse200 = {
+  data: EvalTaskApi
+  status: 200
+}
+
+export type tracerEvalTaskReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerEvalTaskReadResponseSuccess = (tracerEvalTaskReadResponse200) & {
+  headers: Headers;
+};
+export type tracerEvalTaskReadResponseError = (tracerEvalTaskReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerEvalTaskReadResponse = (tracerEvalTaskReadResponseSuccess | tracerEvalTaskReadResponseError)
+
+export const getTracerEvalTaskReadUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/eval-task/${id}/`
+}
+
+export const tracerEvalTaskRead = async (id: string, options?: RequestInit): Promise<tracerEvalTaskReadResponse> => {
+
+  return apiMutator<tracerEvalTaskReadResponse>(getTracerEvalTaskReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerEvalTaskUpdateResponse200 = {
+  data: EvalTaskApi
+  status: 200
+}
+
+export type tracerEvalTaskUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerEvalTaskUpdateResponseSuccess = (tracerEvalTaskUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerEvalTaskUpdateResponseError = (tracerEvalTaskUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerEvalTaskUpdateResponse = (tracerEvalTaskUpdateResponseSuccess | tracerEvalTaskUpdateResponseError)
+
+export const getTracerEvalTaskUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/eval-task/${id}/`
+}
+
+export const tracerEvalTaskUpdate = async (id: string,
+    evalTaskApi: NonReadonly<EvalTaskApi>, options?: RequestInit): Promise<tracerEvalTaskUpdateResponse> => {
+
+  return apiMutator<tracerEvalTaskUpdateResponse>(getTracerEvalTaskUpdateUrl(id),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      evalTaskApi,)
+  }
+);}
+
+
+
+export type tracerEvalTaskPartialUpdateResponse200 = {
+  data: EvalTaskApi
+  status: 200
+}
+
+export type tracerEvalTaskPartialUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerEvalTaskPartialUpdateResponseSuccess = (tracerEvalTaskPartialUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerEvalTaskPartialUpdateResponseError = (tracerEvalTaskPartialUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerEvalTaskPartialUpdateResponse = (tracerEvalTaskPartialUpdateResponseSuccess | tracerEvalTaskPartialUpdateResponseError)
+
+export const getTracerEvalTaskPartialUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/eval-task/${id}/`
+}
+
+export const tracerEvalTaskPartialUpdate = async (id: string,
+    evalTaskApi: NonReadonly<EvalTaskApi>, options?: RequestInit): Promise<tracerEvalTaskPartialUpdateResponse> => {
+
+  return apiMutator<tracerEvalTaskPartialUpdateResponse>(getTracerEvalTaskPartialUpdateUrl(id),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      evalTaskApi,)
+  }
+);}
+
+
+
+export type tracerEvalTaskDeleteResponse204 = {
+  data: void
+  status: 204
+}
+
+export type tracerEvalTaskDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 204>
+}
+
+export type tracerEvalTaskDeleteResponseSuccess = (tracerEvalTaskDeleteResponse204) & {
+  headers: Headers;
+};
+export type tracerEvalTaskDeleteResponseError = (tracerEvalTaskDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerEvalTaskDeleteResponse = (tracerEvalTaskDeleteResponseSuccess | tracerEvalTaskDeleteResponseError)
+
+export const getTracerEvalTaskDeleteUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/eval-task/${id}/`
+}
+
+export const tracerEvalTaskDelete = async (id: string, options?: RequestInit): Promise<tracerEvalTaskDeleteResponse> => {
+
+  return apiMutator<tracerEvalTaskDeleteResponse>(getTracerEvalTaskDeleteUrl(id),
+  {
+    ...options,
+    method: 'DELETE'
+
+
   }
 );}
 
@@ -60153,70 +60316,6 @@ export const tracerEvalTaskGetUsage = async (params?: TracerEvalTaskGetUsagePara
 
 
 
-export type tracerEvalTaskListEvalTasksResponse200 = {
-  data: EvalTaskApi[]
-  status: 200
-}
-
-export type tracerEvalTaskListEvalTasksResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerEvalTaskListEvalTasksResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerEvalTaskListEvalTasksResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
-}
-
-export type tracerEvalTaskListEvalTasksResponseSuccess = (tracerEvalTaskListEvalTasksResponse200) & {
-  headers: Headers;
-};
-export type tracerEvalTaskListEvalTasksResponseError = (tracerEvalTaskListEvalTasksResponse400 | tracerEvalTaskListEvalTasksResponse500 | tracerEvalTaskListEvalTasksResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerEvalTaskListEvalTasksResponse = (tracerEvalTaskListEvalTasksResponseSuccess | tracerEvalTaskListEvalTasksResponseError)
-
-export const getTracerEvalTaskListEvalTasksUrl = (params?: TracerEvalTaskListEvalTasksParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/eval-task/list_eval_tasks/?${stringifiedParams}` : `/tracer/eval-task/list_eval_tasks/`
-}
-
-/**
- * List Eval Tasks filtered
- */
-export const tracerEvalTaskListEvalTasks = async (params?: TracerEvalTaskListEvalTasksParams, options?: RequestInit): Promise<tracerEvalTaskListEvalTasksResponse> => {
-
-  return apiMutator<tracerEvalTaskListEvalTasksResponse>(getTracerEvalTaskListEvalTasksUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type tracerEvalTaskListEvalTasksWithProjectNameResponse200 = {
   data: EvalTaskApi[]
   status: 200
@@ -60271,6 +60370,70 @@ export const getTracerEvalTaskListEvalTasksWithProjectNameUrl = (params?: Tracer
 export const tracerEvalTaskListEvalTasksWithProjectName = async (params?: TracerEvalTaskListEvalTasksWithProjectNameParams, options?: RequestInit): Promise<tracerEvalTaskListEvalTasksWithProjectNameResponse> => {
 
   return apiMutator<tracerEvalTaskListEvalTasksWithProjectNameResponse>(getTracerEvalTaskListEvalTasksWithProjectNameUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerEvalTaskListEvalTasksResponse200 = {
+  data: EvalTaskApi[]
+  status: 200
+}
+
+export type tracerEvalTaskListEvalTasksResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskListEvalTasksResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerEvalTaskListEvalTasksResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
+}
+
+export type tracerEvalTaskListEvalTasksResponseSuccess = (tracerEvalTaskListEvalTasksResponse200) & {
+  headers: Headers;
+};
+export type tracerEvalTaskListEvalTasksResponseError = (tracerEvalTaskListEvalTasksResponse400 | tracerEvalTaskListEvalTasksResponse500 | tracerEvalTaskListEvalTasksResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerEvalTaskListEvalTasksResponse = (tracerEvalTaskListEvalTasksResponseSuccess | tracerEvalTaskListEvalTasksResponseError)
+
+export const getTracerEvalTaskListEvalTasksUrl = (params?: TracerEvalTaskListEvalTasksParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/eval-task/list_eval_tasks/?${stringifiedParams}` : `/tracer/eval-task/list_eval_tasks/`
+}
+
+/**
+ * List Eval Tasks filtered
+ */
+export const tracerEvalTaskListEvalTasks = async (params?: TracerEvalTaskListEvalTasksParams, options?: RequestInit): Promise<tracerEvalTaskListEvalTasksResponse> => {
+
+  return apiMutator<tracerEvalTaskListEvalTasksResponse>(getTracerEvalTaskListEvalTasksUrl(params),
   {
     ...options,
     method: 'GET'
@@ -60514,170 +60677,6 @@ export const tracerEvalTaskUpdateEvalTask = async (evalTaskUpdateRequestApi: Eva
 
 
 
-export type tracerEvalTaskReadResponse200 = {
-  data: EvalTaskApi
-  status: 200
-}
-
-export type tracerEvalTaskReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerEvalTaskReadResponseSuccess = (tracerEvalTaskReadResponse200) & {
-  headers: Headers;
-};
-export type tracerEvalTaskReadResponseError = (tracerEvalTaskReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerEvalTaskReadResponse = (tracerEvalTaskReadResponseSuccess | tracerEvalTaskReadResponseError)
-
-export const getTracerEvalTaskReadUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/eval-task/${id}/`
-}
-
-export const tracerEvalTaskRead = async (id: string, options?: RequestInit): Promise<tracerEvalTaskReadResponse> => {
-
-  return apiMutator<tracerEvalTaskReadResponse>(getTracerEvalTaskReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerEvalTaskUpdateResponse200 = {
-  data: EvalTaskApi
-  status: 200
-}
-
-export type tracerEvalTaskUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerEvalTaskUpdateResponseSuccess = (tracerEvalTaskUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerEvalTaskUpdateResponseError = (tracerEvalTaskUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerEvalTaskUpdateResponse = (tracerEvalTaskUpdateResponseSuccess | tracerEvalTaskUpdateResponseError)
-
-export const getTracerEvalTaskUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/eval-task/${id}/`
-}
-
-export const tracerEvalTaskUpdate = async (id: string,
-    evalTaskApi: NonReadonly<EvalTaskApi>, options?: RequestInit): Promise<tracerEvalTaskUpdateResponse> => {
-
-  return apiMutator<tracerEvalTaskUpdateResponse>(getTracerEvalTaskUpdateUrl(id),
-  {
-    ...options,
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      evalTaskApi,)
-  }
-);}
-
-
-
-export type tracerEvalTaskPartialUpdateResponse200 = {
-  data: EvalTaskApi
-  status: 200
-}
-
-export type tracerEvalTaskPartialUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerEvalTaskPartialUpdateResponseSuccess = (tracerEvalTaskPartialUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerEvalTaskPartialUpdateResponseError = (tracerEvalTaskPartialUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerEvalTaskPartialUpdateResponse = (tracerEvalTaskPartialUpdateResponseSuccess | tracerEvalTaskPartialUpdateResponseError)
-
-export const getTracerEvalTaskPartialUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/eval-task/${id}/`
-}
-
-export const tracerEvalTaskPartialUpdate = async (id: string,
-    evalTaskApi: NonReadonly<EvalTaskApi>, options?: RequestInit): Promise<tracerEvalTaskPartialUpdateResponse> => {
-
-  return apiMutator<tracerEvalTaskPartialUpdateResponse>(getTracerEvalTaskPartialUpdateUrl(id),
-  {
-    ...options,
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      evalTaskApi,)
-  }
-);}
-
-
-
-export type tracerEvalTaskDeleteResponse204 = {
-  data: void
-  status: 204
-}
-
-export type tracerEvalTaskDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 204>
-}
-
-export type tracerEvalTaskDeleteResponseSuccess = (tracerEvalTaskDeleteResponse204) & {
-  headers: Headers;
-};
-export type tracerEvalTaskDeleteResponseError = (tracerEvalTaskDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerEvalTaskDeleteResponse = (tracerEvalTaskDeleteResponseSuccess | tracerEvalTaskDeleteResponseError)
-
-export const getTracerEvalTaskDeleteUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/eval-task/${id}/`
-}
-
-export const tracerEvalTaskDelete = async (id: string, options?: RequestInit): Promise<tracerEvalTaskDeleteResponse> => {
-
-  return apiMutator<tracerEvalTaskDeleteResponse>(getTracerEvalTaskDeleteUrl(id),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
 export type tracerFeedIntegrationsLinearTeamsListResponse200 = {
   data: LinearTeamsResponseApi
   status: 200
@@ -60807,80 +60806,6 @@ export const getTracerFeedIssuesListUrl = (params?: TracerFeedIssuesListParams,)
 export const tracerFeedIssuesList = async (params?: TracerFeedIssuesListParams, options?: RequestInit): Promise<tracerFeedIssuesListResponse> => {
 
   return apiMutator<tracerFeedIssuesListResponse>(getTracerFeedIssuesListUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerFeedIssuesStatsListResponse200 = {
-  data: FeedStatsApiResponseApi
-  status: 200
-}
-
-export type tracerFeedIssuesStatsListResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerFeedIssuesStatsListResponse403 = {
-  data: ApiErrorResponseApi
-  status: 403
-}
-
-export type tracerFeedIssuesStatsListResponse404 = {
-  data: ApiErrorResponseApi
-  status: 404
-}
-
-export type tracerFeedIssuesStatsListResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerFeedIssuesStatsListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 500>
-}
-
-export type tracerFeedIssuesStatsListResponseSuccess = (tracerFeedIssuesStatsListResponse200) & {
-  headers: Headers;
-};
-export type tracerFeedIssuesStatsListResponseError = (tracerFeedIssuesStatsListResponse400 | tracerFeedIssuesStatsListResponse403 | tracerFeedIssuesStatsListResponse404 | tracerFeedIssuesStatsListResponse500 | tracerFeedIssuesStatsListResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerFeedIssuesStatsListResponse = (tracerFeedIssuesStatsListResponseSuccess | tracerFeedIssuesStatsListResponseError)
-
-export const getTracerFeedIssuesStatsListUrl = (params?: TracerFeedIssuesStatsListParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/feed/issues/stats/?${stringifiedParams}` : `/tracer/feed/issues/stats/`
-}
-
-/**
- * GET /tracer/feed/issues/stats/ — top stats bar totals.
- */
-export const tracerFeedIssuesStatsList = async (params?: TracerFeedIssuesStatsListParams, options?: RequestInit): Promise<tracerFeedIssuesStatsListResponse> => {
-
-  return apiMutator<tracerFeedIssuesStatsListResponse>(getTracerFeedIssuesStatsListUrl(params),
   {
     ...options,
     method: 'GET'
@@ -61550,6 +61475,80 @@ export const tracerFeedIssuesTrendsList = async (clusterId: string,
 
 
 
+export type tracerFeedIssuesStatsListResponse200 = {
+  data: FeedStatsApiResponseApi
+  status: 200
+}
+
+export type tracerFeedIssuesStatsListResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerFeedIssuesStatsListResponse403 = {
+  data: ApiErrorResponseApi
+  status: 403
+}
+
+export type tracerFeedIssuesStatsListResponse404 = {
+  data: ApiErrorResponseApi
+  status: 404
+}
+
+export type tracerFeedIssuesStatsListResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerFeedIssuesStatsListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 403 | 404 | 500>
+}
+
+export type tracerFeedIssuesStatsListResponseSuccess = (tracerFeedIssuesStatsListResponse200) & {
+  headers: Headers;
+};
+export type tracerFeedIssuesStatsListResponseError = (tracerFeedIssuesStatsListResponse400 | tracerFeedIssuesStatsListResponse403 | tracerFeedIssuesStatsListResponse404 | tracerFeedIssuesStatsListResponse500 | tracerFeedIssuesStatsListResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerFeedIssuesStatsListResponse = (tracerFeedIssuesStatsListResponseSuccess | tracerFeedIssuesStatsListResponseError)
+
+export const getTracerFeedIssuesStatsListUrl = (params?: TracerFeedIssuesStatsListParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/feed/issues/stats/?${stringifiedParams}` : `/tracer/feed/issues/stats/`
+}
+
+/**
+ * GET /tracer/feed/issues/stats/ — top stats bar totals.
+ */
+export const tracerFeedIssuesStatsList = async (params?: TracerFeedIssuesStatsListParams, options?: RequestInit): Promise<tracerFeedIssuesStatsListResponse> => {
+
+  return apiMutator<tracerFeedIssuesStatsListResponse>(getTracerFeedIssuesStatsListUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type tracerGetAnnotationLabelsListResponse200 = {
   data: GetAnnotationLabelsResponseApi
   status: 200
@@ -61852,104 +61851,6 @@ export const tracerObservabilityProviderCreate = async (observabilityProviderApi
 
 
 
-export type tracerObservabilityProviderVerifyApiKeyResponse200 = {
-  data: VerifyResponseApi
-  status: 200
-}
-
-export type tracerObservabilityProviderVerifyApiKeyResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerObservabilityProviderVerifyApiKeyResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
-}
-
-export type tracerObservabilityProviderVerifyApiKeyResponseSuccess = (tracerObservabilityProviderVerifyApiKeyResponse200) & {
-  headers: Headers;
-};
-export type tracerObservabilityProviderVerifyApiKeyResponseError = (tracerObservabilityProviderVerifyApiKeyResponse400 | tracerObservabilityProviderVerifyApiKeyResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerObservabilityProviderVerifyApiKeyResponse = (tracerObservabilityProviderVerifyApiKeyResponseSuccess | tracerObservabilityProviderVerifyApiKeyResponseError)
-
-export const getTracerObservabilityProviderVerifyApiKeyUrl = () => {
-
-
-
-
-  return `/tracer/observability-provider/verify_api_key/`
-}
-
-/**
- * API endpoints for managing Observability Providers.
- */
-export const tracerObservabilityProviderVerifyApiKey = async (verifyApiKeyRequestApi: VerifyApiKeyRequestApi, options?: RequestInit): Promise<tracerObservabilityProviderVerifyApiKeyResponse> => {
-
-  return apiMutator<tracerObservabilityProviderVerifyApiKeyResponse>(getTracerObservabilityProviderVerifyApiKeyUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      verifyApiKeyRequestApi,)
-  }
-);}
-
-
-
-export type tracerObservabilityProviderVerifyAssistantIdResponse200 = {
-  data: VerifyResponseApi
-  status: 200
-}
-
-export type tracerObservabilityProviderVerifyAssistantIdResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerObservabilityProviderVerifyAssistantIdResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
-}
-
-export type tracerObservabilityProviderVerifyAssistantIdResponseSuccess = (tracerObservabilityProviderVerifyAssistantIdResponse200) & {
-  headers: Headers;
-};
-export type tracerObservabilityProviderVerifyAssistantIdResponseError = (tracerObservabilityProviderVerifyAssistantIdResponse400 | tracerObservabilityProviderVerifyAssistantIdResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerObservabilityProviderVerifyAssistantIdResponse = (tracerObservabilityProviderVerifyAssistantIdResponseSuccess | tracerObservabilityProviderVerifyAssistantIdResponseError)
-
-export const getTracerObservabilityProviderVerifyAssistantIdUrl = () => {
-
-
-
-
-  return `/tracer/observability-provider/verify_assistant_id/`
-}
-
-/**
- * API endpoints for managing Observability Providers.
- */
-export const tracerObservabilityProviderVerifyAssistantId = async (verifyAssistantIdRequestApi: VerifyAssistantIdRequestApi, options?: RequestInit): Promise<tracerObservabilityProviderVerifyAssistantIdResponse> => {
-
-  return apiMutator<tracerObservabilityProviderVerifyAssistantIdResponse>(getTracerObservabilityProviderVerifyAssistantIdUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      verifyAssistantIdRequestApi,)
-  }
-);}
-
-
-
 export type tracerObservabilityProviderReadResponse200 = {
   data: ObservabilityProviderApi
   status: 200
@@ -62126,6 +62027,104 @@ export const tracerObservabilityProviderDelete = async (id: string, options?: Re
 
 
 
+export type tracerObservabilityProviderVerifyApiKeyResponse200 = {
+  data: VerifyResponseApi
+  status: 200
+}
+
+export type tracerObservabilityProviderVerifyApiKeyResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservabilityProviderVerifyApiKeyResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400>
+}
+
+export type tracerObservabilityProviderVerifyApiKeyResponseSuccess = (tracerObservabilityProviderVerifyApiKeyResponse200) & {
+  headers: Headers;
+};
+export type tracerObservabilityProviderVerifyApiKeyResponseError = (tracerObservabilityProviderVerifyApiKeyResponse400 | tracerObservabilityProviderVerifyApiKeyResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerObservabilityProviderVerifyApiKeyResponse = (tracerObservabilityProviderVerifyApiKeyResponseSuccess | tracerObservabilityProviderVerifyApiKeyResponseError)
+
+export const getTracerObservabilityProviderVerifyApiKeyUrl = () => {
+
+
+
+
+  return `/tracer/observability-provider/verify_api_key/`
+}
+
+/**
+ * API endpoints for managing Observability Providers.
+ */
+export const tracerObservabilityProviderVerifyApiKey = async (verifyApiKeyRequestApi: VerifyApiKeyRequestApi, options?: RequestInit): Promise<tracerObservabilityProviderVerifyApiKeyResponse> => {
+
+  return apiMutator<tracerObservabilityProviderVerifyApiKeyResponse>(getTracerObservabilityProviderVerifyApiKeyUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      verifyApiKeyRequestApi,)
+  }
+);}
+
+
+
+export type tracerObservabilityProviderVerifyAssistantIdResponse200 = {
+  data: VerifyResponseApi
+  status: 200
+}
+
+export type tracerObservabilityProviderVerifyAssistantIdResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservabilityProviderVerifyAssistantIdResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400>
+}
+
+export type tracerObservabilityProviderVerifyAssistantIdResponseSuccess = (tracerObservabilityProviderVerifyAssistantIdResponse200) & {
+  headers: Headers;
+};
+export type tracerObservabilityProviderVerifyAssistantIdResponseError = (tracerObservabilityProviderVerifyAssistantIdResponse400 | tracerObservabilityProviderVerifyAssistantIdResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerObservabilityProviderVerifyAssistantIdResponse = (tracerObservabilityProviderVerifyAssistantIdResponseSuccess | tracerObservabilityProviderVerifyAssistantIdResponseError)
+
+export const getTracerObservabilityProviderVerifyAssistantIdUrl = () => {
+
+
+
+
+  return `/tracer/observability-provider/verify_assistant_id/`
+}
+
+/**
+ * API endpoints for managing Observability Providers.
+ */
+export const tracerObservabilityProviderVerifyAssistantId = async (verifyAssistantIdRequestApi: VerifyAssistantIdRequestApi, options?: RequestInit): Promise<tracerObservabilityProviderVerifyAssistantIdResponse> => {
+
+  return apiMutator<tracerObservabilityProviderVerifyAssistantIdResponse>(getTracerObservabilityProviderVerifyAssistantIdUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      verifyAssistantIdRequestApi,)
+  }
+);}
+
+
+
 export type tracerObservationSpanListResponse200 = {
   data: TracerObservationSpanList200
   status: 200
@@ -62213,6 +62212,185 @@ export const tracerObservationSpanCreate = async (observationSpanApi: NonReadonl
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       observationSpanApi,)
+  }
+);}
+
+
+
+export type tracerObservationSpanReadResponse200 = {
+  data: ObservationSpanApi
+  status: 200
+}
+
+export type tracerObservationSpanReadResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservationSpanReadResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerObservationSpanReadResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
+export type tracerObservationSpanReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
+}
+
+export type tracerObservationSpanReadResponseSuccess = (tracerObservationSpanReadResponse200) & {
+  headers: Headers;
+};
+export type tracerObservationSpanReadResponseError = (tracerObservationSpanReadResponse400 | tracerObservationSpanReadResponse500 | tracerObservationSpanReadResponse503 | tracerObservationSpanReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerObservationSpanReadResponse = (tracerObservationSpanReadResponseSuccess | tracerObservationSpanReadResponseError)
+
+export const getTracerObservationSpanReadUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/observation-span/${id}/`
+}
+
+export const tracerObservationSpanRead = async (id: string, options?: RequestInit): Promise<tracerObservationSpanReadResponse> => {
+
+  return apiMutator<tracerObservationSpanReadResponse>(getTracerObservationSpanReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerObservationSpanUpdateResponse200 = {
+  data: ObservationSpanApi
+  status: 200
+}
+
+export type tracerObservationSpanUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerObservationSpanUpdateResponseSuccess = (tracerObservationSpanUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerObservationSpanUpdateResponseError = (tracerObservationSpanUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerObservationSpanUpdateResponse = (tracerObservationSpanUpdateResponseSuccess | tracerObservationSpanUpdateResponseError)
+
+export const getTracerObservationSpanUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/observation-span/${id}/`
+}
+
+export const tracerObservationSpanUpdate = async (id: string,
+    observationSpanApi: NonReadonly<ObservationSpanApi>, options?: RequestInit): Promise<tracerObservationSpanUpdateResponse> => {
+
+  return apiMutator<tracerObservationSpanUpdateResponse>(getTracerObservationSpanUpdateUrl(id),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      observationSpanApi,)
+  }
+);}
+
+
+
+export type tracerObservationSpanPartialUpdateResponse200 = {
+  data: ObservationSpanApi
+  status: 200
+}
+
+export type tracerObservationSpanPartialUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerObservationSpanPartialUpdateResponseSuccess = (tracerObservationSpanPartialUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerObservationSpanPartialUpdateResponseError = (tracerObservationSpanPartialUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerObservationSpanPartialUpdateResponse = (tracerObservationSpanPartialUpdateResponseSuccess | tracerObservationSpanPartialUpdateResponseError)
+
+export const getTracerObservationSpanPartialUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/observation-span/${id}/`
+}
+
+export const tracerObservationSpanPartialUpdate = async (id: string,
+    observationSpanApi: NonReadonly<ObservationSpanApi>, options?: RequestInit): Promise<tracerObservationSpanPartialUpdateResponse> => {
+
+  return apiMutator<tracerObservationSpanPartialUpdateResponse>(getTracerObservationSpanPartialUpdateUrl(id),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      observationSpanApi,)
+  }
+);}
+
+
+
+export type tracerObservationSpanDeleteResponse204 = {
+  data: void
+  status: 204
+}
+
+export type tracerObservationSpanDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 204>
+}
+
+export type tracerObservationSpanDeleteResponseSuccess = (tracerObservationSpanDeleteResponse204) & {
+  headers: Headers;
+};
+export type tracerObservationSpanDeleteResponseError = (tracerObservationSpanDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerObservationSpanDeleteResponse = (tracerObservationSpanDeleteResponseSuccess | tracerObservationSpanDeleteResponseError)
+
+export const getTracerObservationSpanDeleteUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/observation-span/${id}/`
+}
+
+export const tracerObservationSpanDelete = async (id: string, options?: RequestInit): Promise<tracerObservationSpanDeleteResponse> => {
+
+  return apiMutator<tracerObservationSpanDeleteResponse>(getTracerObservationSpanDeleteUrl(id),
+  {
+    ...options,
+    method: 'DELETE'
+
+
   }
 );}
 
@@ -62724,25 +62902,40 @@ export const tracerObservationSpanGetSpanAttributesList = async (params: TracerO
 
 
 export type tracerObservationSpanGetSpansExportDataResponse200 = {
-  data: TracerObservationSpanGetSpansExportData200
+  data: string
   status: 200
+}
+
+export type tracerObservationSpanGetSpansExportDataResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservationSpanGetSpansExportDataResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerObservationSpanGetSpansExportDataResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
 }
 
 export type tracerObservationSpanGetSpansExportDataResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerObservationSpanGetSpansExportDataResponseSuccess = (tracerObservationSpanGetSpansExportDataResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanGetSpansExportDataResponseError = (tracerObservationSpanGetSpansExportDataResponseDefault) & {
+export type tracerObservationSpanGetSpansExportDataResponseError = (tracerObservationSpanGetSpansExportDataResponse400 | tracerObservationSpanGetSpansExportDataResponse500 | tracerObservationSpanGetSpansExportDataResponse503 | tracerObservationSpanGetSpansExportDataResponseDefault) & {
   headers: Headers;
 };
 
 export type tracerObservationSpanGetSpansExportDataResponse = (tracerObservationSpanGetSpansExportDataResponseSuccess | tracerObservationSpanGetSpansExportDataResponseError)
 
-export const getTracerObservationSpanGetSpansExportDataUrl = (params?: TracerObservationSpanGetSpansExportDataParams,) => {
+export const getTracerObservationSpanGetSpansExportDataUrl = (params: TracerObservationSpanGetSpansExportDataParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -62761,7 +62954,7 @@ export const getTracerObservationSpanGetSpansExportDataUrl = (params?: TracerObs
   return stringifiedParams.length > 0 ? `/tracer/observation-span/get_spans_export_data/?${stringifiedParams}` : `/tracer/observation-span/get_spans_export_data/`
 }
 
-export const tracerObservationSpanGetSpansExportData = async (params?: TracerObservationSpanGetSpansExportDataParams, options?: RequestInit): Promise<tracerObservationSpanGetSpansExportDataResponse> => {
+export const tracerObservationSpanGetSpansExportData = async (params: TracerObservationSpanGetSpansExportDataParams, options?: RequestInit): Promise<tracerObservationSpanGetSpansExportDataResponse> => {
 
   return apiMutator<tracerObservationSpanGetSpansExportDataResponse>(getTracerObservationSpanGetSpansExportDataUrl(params),
   {
@@ -62884,6 +63077,77 @@ export const tracerObservationSpanGetTraceIdByIndexSpansAsObserve = async (param
 
 
 
+export type tracerObservationSpanListSpansObserveResponse200 = {
+  data: SpanObserveListResponseApi
+  status: 200
+}
+
+export type tracerObservationSpanListSpansObserveResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservationSpanListSpansObserveResponse422 = {
+  data: PageDepthExceededErrorApi
+  status: 422
+}
+
+export type tracerObservationSpanListSpansObserveResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerObservationSpanListSpansObserveResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
+export type tracerObservationSpanListSpansObserveResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
+}
+
+export type tracerObservationSpanListSpansObserveResponseSuccess = (tracerObservationSpanListSpansObserveResponse200) & {
+  headers: Headers;
+};
+export type tracerObservationSpanListSpansObserveResponseError = (tracerObservationSpanListSpansObserveResponse400 | tracerObservationSpanListSpansObserveResponse422 | tracerObservationSpanListSpansObserveResponse500 | tracerObservationSpanListSpansObserveResponse503 | tracerObservationSpanListSpansObserveResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerObservationSpanListSpansObserveResponse = (tracerObservationSpanListSpansObserveResponseSuccess | tracerObservationSpanListSpansObserveResponseError)
+
+export const getTracerObservationSpanListSpansObserveUrl = (params?: TracerObservationSpanListSpansObserveParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/observation-span/list_spans_observe/?${stringifiedParams}` : `/tracer/observation-span/list_spans_observe/`
+}
+
+export const tracerObservationSpanListSpansObserve = async (params?: TracerObservationSpanListSpansObserveParams, options?: RequestInit): Promise<tracerObservationSpanListSpansObserveResponse> => {
+
+  return apiMutator<tracerObservationSpanListSpansObserveResponse>(getTracerObservationSpanListSpansObserveUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type tracerObservationSpanListSpansResponse200 = {
   data: SpanPrototypeListResponseApi
   status: 200
@@ -62948,77 +63212,6 @@ export const getTracerObservationSpanListSpansUrl = (params: TracerObservationSp
 export const tracerObservationSpanListSpans = async (params: TracerObservationSpanListSpansParams, options?: RequestInit): Promise<tracerObservationSpanListSpansResponse> => {
 
   return apiMutator<tracerObservationSpanListSpansResponse>(getTracerObservationSpanListSpansUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerObservationSpanListSpansObserveResponse200 = {
-  data: SpanObserveListResponseApi
-  status: 200
-}
-
-export type tracerObservationSpanListSpansObserveResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerObservationSpanListSpansObserveResponse422 = {
-  data: PageDepthExceededErrorApi
-  status: 422
-}
-
-export type tracerObservationSpanListSpansObserveResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerObservationSpanListSpansObserveResponse503 = {
-  data: ApiErrorResponseApi
-  status: 503
-}
-
-export type tracerObservationSpanListSpansObserveResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
-}
-
-export type tracerObservationSpanListSpansObserveResponseSuccess = (tracerObservationSpanListSpansObserveResponse200) & {
-  headers: Headers;
-};
-export type tracerObservationSpanListSpansObserveResponseError = (tracerObservationSpanListSpansObserveResponse400 | tracerObservationSpanListSpansObserveResponse422 | tracerObservationSpanListSpansObserveResponse500 | tracerObservationSpanListSpansObserveResponse503 | tracerObservationSpanListSpansObserveResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerObservationSpanListSpansObserveResponse = (tracerObservationSpanListSpansObserveResponseSuccess | tracerObservationSpanListSpansObserveResponseError)
-
-export const getTracerObservationSpanListSpansObserveUrl = (params?: TracerObservationSpanListSpansObserveParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/observation-span/list_spans_observe/?${stringifiedParams}` : `/tracer/observation-span/list_spans_observe/`
-}
-
-export const tracerObservationSpanListSpansObserve = async (params?: TracerObservationSpanListSpansObserveParams, options?: RequestInit): Promise<tracerObservationSpanListSpansObserveResponse> => {
-
-  return apiMutator<tracerObservationSpanListSpansObserveResponse>(getTracerObservationSpanListSpansObserveUrl(params),
   {
     ...options,
     method: 'GET'
@@ -63139,47 +63332,6 @@ export const tracerObservationSpanRootSpans = async (params: TracerObservationSp
 
 
 
-export type tracerObservationSpanSubmitFeedbackResponse201 = {
-  data: ObservationSpanApi
-  status: 201
-}
-
-export type tracerObservationSpanSubmitFeedbackResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
-}
-
-export type tracerObservationSpanSubmitFeedbackResponseSuccess = (tracerObservationSpanSubmitFeedbackResponse201) & {
-  headers: Headers;
-};
-export type tracerObservationSpanSubmitFeedbackResponseError = (tracerObservationSpanSubmitFeedbackResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerObservationSpanSubmitFeedbackResponse = (tracerObservationSpanSubmitFeedbackResponseSuccess | tracerObservationSpanSubmitFeedbackResponseError)
-
-export const getTracerObservationSpanSubmitFeedbackUrl = () => {
-
-
-
-
-  return `/tracer/observation-span/submit_feedback/`
-}
-
-export const tracerObservationSpanSubmitFeedback = async (observationSpanApi: NonReadonly<ObservationSpanApi>, options?: RequestInit): Promise<tracerObservationSpanSubmitFeedbackResponse> => {
-
-  return apiMutator<tracerObservationSpanSubmitFeedbackResponse>(getTracerObservationSpanSubmitFeedbackUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      observationSpanApi,)
-  }
-);}
-
-
-
 export type tracerObservationSpanSubmitFeedbackActionTypeResponse201 = {
   data: ObservationSpanApi
   status: 201
@@ -63210,6 +63362,47 @@ export const getTracerObservationSpanSubmitFeedbackActionTypeUrl = () => {
 export const tracerObservationSpanSubmitFeedbackActionType = async (observationSpanApi: NonReadonly<ObservationSpanApi>, options?: RequestInit): Promise<tracerObservationSpanSubmitFeedbackActionTypeResponse> => {
 
   return apiMutator<tracerObservationSpanSubmitFeedbackActionTypeResponse>(getTracerObservationSpanSubmitFeedbackActionTypeUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      observationSpanApi,)
+  }
+);}
+
+
+
+export type tracerObservationSpanSubmitFeedbackResponse201 = {
+  data: ObservationSpanApi
+  status: 201
+}
+
+export type tracerObservationSpanSubmitFeedbackResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 201>
+}
+
+export type tracerObservationSpanSubmitFeedbackResponseSuccess = (tracerObservationSpanSubmitFeedbackResponse201) & {
+  headers: Headers;
+};
+export type tracerObservationSpanSubmitFeedbackResponseError = (tracerObservationSpanSubmitFeedbackResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerObservationSpanSubmitFeedbackResponse = (tracerObservationSpanSubmitFeedbackResponseSuccess | tracerObservationSpanSubmitFeedbackResponseError)
+
+export const getTracerObservationSpanSubmitFeedbackUrl = () => {
+
+
+
+
+  return `/tracer/observation-span/submit_feedback/`
+}
+
+export const tracerObservationSpanSubmitFeedback = async (observationSpanApi: NonReadonly<ObservationSpanApi>, options?: RequestInit): Promise<tracerObservationSpanSubmitFeedbackResponse> => {
+
+  return apiMutator<tracerObservationSpanSubmitFeedbackResponse>(getTracerObservationSpanSubmitFeedbackUrl(),
   {
     ...options,
     method: 'POST',
@@ -63260,185 +63453,6 @@ export const tracerObservationSpanUpdateTags = async (observationSpanApi: NonRea
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       observationSpanApi,)
-  }
-);}
-
-
-
-export type tracerObservationSpanReadResponse200 = {
-  data: ObservationSpanApi
-  status: 200
-}
-
-export type tracerObservationSpanReadResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerObservationSpanReadResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerObservationSpanReadResponse503 = {
-  data: ApiErrorResponseApi
-  status: 503
-}
-
-export type tracerObservationSpanReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
-}
-
-export type tracerObservationSpanReadResponseSuccess = (tracerObservationSpanReadResponse200) & {
-  headers: Headers;
-};
-export type tracerObservationSpanReadResponseError = (tracerObservationSpanReadResponse400 | tracerObservationSpanReadResponse500 | tracerObservationSpanReadResponse503 | tracerObservationSpanReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerObservationSpanReadResponse = (tracerObservationSpanReadResponseSuccess | tracerObservationSpanReadResponseError)
-
-export const getTracerObservationSpanReadUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/observation-span/${id}/`
-}
-
-export const tracerObservationSpanRead = async (id: string, options?: RequestInit): Promise<tracerObservationSpanReadResponse> => {
-
-  return apiMutator<tracerObservationSpanReadResponse>(getTracerObservationSpanReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerObservationSpanUpdateResponse200 = {
-  data: ObservationSpanApi
-  status: 200
-}
-
-export type tracerObservationSpanUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerObservationSpanUpdateResponseSuccess = (tracerObservationSpanUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerObservationSpanUpdateResponseError = (tracerObservationSpanUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerObservationSpanUpdateResponse = (tracerObservationSpanUpdateResponseSuccess | tracerObservationSpanUpdateResponseError)
-
-export const getTracerObservationSpanUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/observation-span/${id}/`
-}
-
-export const tracerObservationSpanUpdate = async (id: string,
-    observationSpanApi: NonReadonly<ObservationSpanApi>, options?: RequestInit): Promise<tracerObservationSpanUpdateResponse> => {
-
-  return apiMutator<tracerObservationSpanUpdateResponse>(getTracerObservationSpanUpdateUrl(id),
-  {
-    ...options,
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      observationSpanApi,)
-  }
-);}
-
-
-
-export type tracerObservationSpanPartialUpdateResponse200 = {
-  data: ObservationSpanApi
-  status: 200
-}
-
-export type tracerObservationSpanPartialUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerObservationSpanPartialUpdateResponseSuccess = (tracerObservationSpanPartialUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerObservationSpanPartialUpdateResponseError = (tracerObservationSpanPartialUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerObservationSpanPartialUpdateResponse = (tracerObservationSpanPartialUpdateResponseSuccess | tracerObservationSpanPartialUpdateResponseError)
-
-export const getTracerObservationSpanPartialUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/observation-span/${id}/`
-}
-
-export const tracerObservationSpanPartialUpdate = async (id: string,
-    observationSpanApi: NonReadonly<ObservationSpanApi>, options?: RequestInit): Promise<tracerObservationSpanPartialUpdateResponse> => {
-
-  return apiMutator<tracerObservationSpanPartialUpdateResponse>(getTracerObservationSpanPartialUpdateUrl(id),
-  {
-    ...options,
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      observationSpanApi,)
-  }
-);}
-
-
-
-export type tracerObservationSpanDeleteResponse204 = {
-  data: void
-  status: 204
-}
-
-export type tracerObservationSpanDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 204>
-}
-
-export type tracerObservationSpanDeleteResponseSuccess = (tracerObservationSpanDeleteResponse204) & {
-  headers: Headers;
-};
-export type tracerObservationSpanDeleteResponseError = (tracerObservationSpanDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerObservationSpanDeleteResponse = (tracerObservationSpanDeleteResponseSuccess | tracerObservationSpanDeleteResponseError)
-
-export const getTracerObservationSpanDeleteUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/observation-span/${id}/`
-}
-
-export const tracerObservationSpanDelete = async (id: string, options?: RequestInit): Promise<tracerObservationSpanDeleteResponse> => {
-
-  return apiMutator<tracerObservationSpanDeleteResponse>(getTracerObservationSpanDeleteUrl(id),
-  {
-    ...options,
-    method: 'DELETE'
-
-
   }
 );}
 
@@ -63534,6 +63548,170 @@ export const tracerProjectVersionCreate = async (projectVersionApi: NonReadonly<
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       projectVersionApi,)
+  }
+);}
+
+
+
+export type tracerProjectVersionReadResponse200 = {
+  data: ProjectVersionApi
+  status: 200
+}
+
+export type tracerProjectVersionReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerProjectVersionReadResponseSuccess = (tracerProjectVersionReadResponse200) & {
+  headers: Headers;
+};
+export type tracerProjectVersionReadResponseError = (tracerProjectVersionReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerProjectVersionReadResponse = (tracerProjectVersionReadResponseSuccess | tracerProjectVersionReadResponseError)
+
+export const getTracerProjectVersionReadUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/project-version/${id}/`
+}
+
+export const tracerProjectVersionRead = async (id: string, options?: RequestInit): Promise<tracerProjectVersionReadResponse> => {
+
+  return apiMutator<tracerProjectVersionReadResponse>(getTracerProjectVersionReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerProjectVersionUpdateResponse200 = {
+  data: ProjectVersionApi
+  status: 200
+}
+
+export type tracerProjectVersionUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerProjectVersionUpdateResponseSuccess = (tracerProjectVersionUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerProjectVersionUpdateResponseError = (tracerProjectVersionUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerProjectVersionUpdateResponse = (tracerProjectVersionUpdateResponseSuccess | tracerProjectVersionUpdateResponseError)
+
+export const getTracerProjectVersionUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/project-version/${id}/`
+}
+
+export const tracerProjectVersionUpdate = async (id: string,
+    projectVersionApi: NonReadonly<ProjectVersionApi>, options?: RequestInit): Promise<tracerProjectVersionUpdateResponse> => {
+
+  return apiMutator<tracerProjectVersionUpdateResponse>(getTracerProjectVersionUpdateUrl(id),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      projectVersionApi,)
+  }
+);}
+
+
+
+export type tracerProjectVersionPartialUpdateResponse200 = {
+  data: ProjectVersionApi
+  status: 200
+}
+
+export type tracerProjectVersionPartialUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerProjectVersionPartialUpdateResponseSuccess = (tracerProjectVersionPartialUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerProjectVersionPartialUpdateResponseError = (tracerProjectVersionPartialUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerProjectVersionPartialUpdateResponse = (tracerProjectVersionPartialUpdateResponseSuccess | tracerProjectVersionPartialUpdateResponseError)
+
+export const getTracerProjectVersionPartialUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/project-version/${id}/`
+}
+
+export const tracerProjectVersionPartialUpdate = async (id: string,
+    projectVersionApi: NonReadonly<ProjectVersionApi>, options?: RequestInit): Promise<tracerProjectVersionPartialUpdateResponse> => {
+
+  return apiMutator<tracerProjectVersionPartialUpdateResponse>(getTracerProjectVersionPartialUpdateUrl(id),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      projectVersionApi,)
+  }
+);}
+
+
+
+export type tracerProjectVersionDeleteResponse204 = {
+  data: void
+  status: 204
+}
+
+export type tracerProjectVersionDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 204>
+}
+
+export type tracerProjectVersionDeleteResponseSuccess = (tracerProjectVersionDeleteResponse204) & {
+  headers: Headers;
+};
+export type tracerProjectVersionDeleteResponseError = (tracerProjectVersionDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerProjectVersionDeleteResponse = (tracerProjectVersionDeleteResponseSuccess | tracerProjectVersionDeleteResponseError)
+
+export const getTracerProjectVersionDeleteUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/project-version/${id}/`
+}
+
+export const tracerProjectVersionDelete = async (id: string, options?: RequestInit): Promise<tracerProjectVersionDeleteResponse> => {
+
+  return apiMutator<tracerProjectVersionDeleteResponse>(getTracerProjectVersionDeleteUrl(id),
+  {
+    ...options,
+    method: 'DELETE'
+
+
   }
 );}
 
@@ -63900,170 +64078,6 @@ export const tracerProjectVersionUpdateProjectVersionConfig = async (projectVers
 
 
 
-export type tracerProjectVersionReadResponse200 = {
-  data: ProjectVersionApi
-  status: 200
-}
-
-export type tracerProjectVersionReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerProjectVersionReadResponseSuccess = (tracerProjectVersionReadResponse200) & {
-  headers: Headers;
-};
-export type tracerProjectVersionReadResponseError = (tracerProjectVersionReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerProjectVersionReadResponse = (tracerProjectVersionReadResponseSuccess | tracerProjectVersionReadResponseError)
-
-export const getTracerProjectVersionReadUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/project-version/${id}/`
-}
-
-export const tracerProjectVersionRead = async (id: string, options?: RequestInit): Promise<tracerProjectVersionReadResponse> => {
-
-  return apiMutator<tracerProjectVersionReadResponse>(getTracerProjectVersionReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerProjectVersionUpdateResponse200 = {
-  data: ProjectVersionApi
-  status: 200
-}
-
-export type tracerProjectVersionUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerProjectVersionUpdateResponseSuccess = (tracerProjectVersionUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerProjectVersionUpdateResponseError = (tracerProjectVersionUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerProjectVersionUpdateResponse = (tracerProjectVersionUpdateResponseSuccess | tracerProjectVersionUpdateResponseError)
-
-export const getTracerProjectVersionUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/project-version/${id}/`
-}
-
-export const tracerProjectVersionUpdate = async (id: string,
-    projectVersionApi: NonReadonly<ProjectVersionApi>, options?: RequestInit): Promise<tracerProjectVersionUpdateResponse> => {
-
-  return apiMutator<tracerProjectVersionUpdateResponse>(getTracerProjectVersionUpdateUrl(id),
-  {
-    ...options,
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      projectVersionApi,)
-  }
-);}
-
-
-
-export type tracerProjectVersionPartialUpdateResponse200 = {
-  data: ProjectVersionApi
-  status: 200
-}
-
-export type tracerProjectVersionPartialUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerProjectVersionPartialUpdateResponseSuccess = (tracerProjectVersionPartialUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerProjectVersionPartialUpdateResponseError = (tracerProjectVersionPartialUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerProjectVersionPartialUpdateResponse = (tracerProjectVersionPartialUpdateResponseSuccess | tracerProjectVersionPartialUpdateResponseError)
-
-export const getTracerProjectVersionPartialUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/project-version/${id}/`
-}
-
-export const tracerProjectVersionPartialUpdate = async (id: string,
-    projectVersionApi: NonReadonly<ProjectVersionApi>, options?: RequestInit): Promise<tracerProjectVersionPartialUpdateResponse> => {
-
-  return apiMutator<tracerProjectVersionPartialUpdateResponse>(getTracerProjectVersionPartialUpdateUrl(id),
-  {
-    ...options,
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      projectVersionApi,)
-  }
-);}
-
-
-
-export type tracerProjectVersionDeleteResponse204 = {
-  data: void
-  status: 204
-}
-
-export type tracerProjectVersionDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 204>
-}
-
-export type tracerProjectVersionDeleteResponseSuccess = (tracerProjectVersionDeleteResponse204) & {
-  headers: Headers;
-};
-export type tracerProjectVersionDeleteResponseError = (tracerProjectVersionDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerProjectVersionDeleteResponse = (tracerProjectVersionDeleteResponseSuccess | tracerProjectVersionDeleteResponseError)
-
-export const getTracerProjectVersionDeleteUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/project-version/${id}/`
-}
-
-export const tracerProjectVersionDelete = async (id: string, options?: RequestInit): Promise<tracerProjectVersionDeleteResponse> => {
-
-  return apiMutator<tracerProjectVersionDeleteResponse>(getTracerProjectVersionDeleteUrl(id),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
 export type tracerProjectListResponse200 = {
   data: TracerProjectList200
   status: 200
@@ -64162,6 +64176,218 @@ export const tracerProjectCreate = async (projectApi: NonReadonly<ProjectApi>, o
 
 
 
+export type tracerProjectReadResponse200 = {
+  data: ProjectDetailResponseApi
+  status: 200
+}
+
+export type tracerProjectReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerProjectReadResponseSuccess = (tracerProjectReadResponse200) & {
+  headers: Headers;
+};
+export type tracerProjectReadResponseError = (tracerProjectReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerProjectReadResponse = (tracerProjectReadResponseSuccess | tracerProjectReadResponseError)
+
+export const getTracerProjectReadUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/project/${id}/`
+}
+
+/**
+ * Get a single project by ID with sampling rate.
+ */
+export const tracerProjectRead = async (id: string, options?: RequestInit): Promise<tracerProjectReadResponse> => {
+
+  return apiMutator<tracerProjectReadResponse>(getTracerProjectReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerProjectUpdateResponse200 = {
+  data: ProjectApi
+  status: 200
+}
+
+export type tracerProjectUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerProjectUpdateResponseSuccess = (tracerProjectUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerProjectUpdateResponseError = (tracerProjectUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerProjectUpdateResponse = (tracerProjectUpdateResponseSuccess | tracerProjectUpdateResponseError)
+
+export const getTracerProjectUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/project/${id}/`
+}
+
+export const tracerProjectUpdate = async (id: string,
+    projectApi: NonReadonly<ProjectApi>, options?: RequestInit): Promise<tracerProjectUpdateResponse> => {
+
+  return apiMutator<tracerProjectUpdateResponse>(getTracerProjectUpdateUrl(id),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      projectApi,)
+  }
+);}
+
+
+
+export type tracerProjectPartialUpdateResponse200 = {
+  data: ProjectApi
+  status: 200
+}
+
+export type tracerProjectPartialUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerProjectPartialUpdateResponseSuccess = (tracerProjectPartialUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerProjectPartialUpdateResponseError = (tracerProjectPartialUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerProjectPartialUpdateResponse = (tracerProjectPartialUpdateResponseSuccess | tracerProjectPartialUpdateResponseError)
+
+export const getTracerProjectPartialUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/project/${id}/`
+}
+
+export const tracerProjectPartialUpdate = async (id: string,
+    projectApi: NonReadonly<ProjectApi>, options?: RequestInit): Promise<tracerProjectPartialUpdateResponse> => {
+
+  return apiMutator<tracerProjectPartialUpdateResponse>(getTracerProjectPartialUpdateUrl(id),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      projectApi,)
+  }
+);}
+
+
+
+export type tracerProjectDeleteResponse204 = {
+  data: void
+  status: 204
+}
+
+export type tracerProjectDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 204>
+}
+
+export type tracerProjectDeleteResponseSuccess = (tracerProjectDeleteResponse204) & {
+  headers: Headers;
+};
+export type tracerProjectDeleteResponseError = (tracerProjectDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerProjectDeleteResponse = (tracerProjectDeleteResponseSuccess | tracerProjectDeleteResponseError)
+
+export const getTracerProjectDeleteUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/project/${id}/`
+}
+
+export const tracerProjectDelete = async (id: string, options?: RequestInit): Promise<tracerProjectDeleteResponse> => {
+
+  return apiMutator<tracerProjectDeleteResponse>(getTracerProjectDeleteUrl(id),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type tracerProjectUpdateTagsResponse200 = {
+  data: ProjectApi
+  status: 200
+}
+
+export type tracerProjectUpdateTagsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerProjectUpdateTagsResponseSuccess = (tracerProjectUpdateTagsResponse200) & {
+  headers: Headers;
+};
+export type tracerProjectUpdateTagsResponseError = (tracerProjectUpdateTagsResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerProjectUpdateTagsResponse = (tracerProjectUpdateTagsResponseSuccess | tracerProjectUpdateTagsResponseError)
+
+export const getTracerProjectUpdateTagsUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/project/${id}/tags/`
+}
+
+/**
+ * Update tags for a project.
+ */
+export const tracerProjectUpdateTags = async (id: string,
+    projectApi: NonReadonly<ProjectApi>, options?: RequestInit): Promise<tracerProjectUpdateTagsResponse> => {
+
+  return apiMutator<tracerProjectUpdateTagsResponse>(getTracerProjectUpdateTagsUrl(id),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      projectApi,)
+  }
+);}
+
+
+
 export type tracerProjectFetchSystemMetricsResponse200 = {
   data: TracerProjectFetchSystemMetrics200
   status: 200
@@ -64214,7 +64440,7 @@ export const tracerProjectFetchSystemMetrics = async (params?: TracerProjectFetc
 
 
 export type tracerProjectGetGraphDataResponse200 = {
-  data: TracerProjectGetGraphData200
+  data: ProjectGraphDataResponseApi
   status: 200
 }
 
@@ -64279,20 +64505,35 @@ export const tracerProjectGetGraphData = async (params: TracerProjectGetGraphDat
 
 
 
-export type tracerProjectGetUserGraphDataResponse201 = {
-  data: ProjectUserGraphDataRequestApi
-  status: 201
+export type tracerProjectGetUserGraphDataResponse200 = {
+  data: ProjectUserGraphDataResponseApi
+  status: 200
+}
+
+export type tracerProjectGetUserGraphDataResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerProjectGetUserGraphDataResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerProjectGetUserGraphDataResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
 }
 
 export type tracerProjectGetUserGraphDataResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
-export type tracerProjectGetUserGraphDataResponseSuccess = (tracerProjectGetUserGraphDataResponse201) & {
+export type tracerProjectGetUserGraphDataResponseSuccess = (tracerProjectGetUserGraphDataResponse200) & {
   headers: Headers;
 };
-export type tracerProjectGetUserGraphDataResponseError = (tracerProjectGetUserGraphDataResponseDefault) & {
+export type tracerProjectGetUserGraphDataResponseError = (tracerProjectGetUserGraphDataResponse400 | tracerProjectGetUserGraphDataResponse500 | tracerProjectGetUserGraphDataResponse503 | tracerProjectGetUserGraphDataResponseDefault) & {
   headers: Headers;
 };
 
@@ -64373,20 +64614,35 @@ export const tracerProjectGetUserMetrics = async (projectUserMetricsRequestApi: 
 
 
 
-export type tracerProjectGetUsersAggregateGraphDataResponse201 = {
-  data: ProjectUsersAggregateGraphDataRequestApi
-  status: 201
+export type tracerProjectGetUsersAggregateGraphDataResponse200 = {
+  data: ObserveGraphDataResponseApi
+  status: 200
+}
+
+export type tracerProjectGetUsersAggregateGraphDataResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerProjectGetUsersAggregateGraphDataResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerProjectGetUsersAggregateGraphDataResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
 }
 
 export type tracerProjectGetUsersAggregateGraphDataResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
-export type tracerProjectGetUsersAggregateGraphDataResponseSuccess = (tracerProjectGetUsersAggregateGraphDataResponse201) & {
+export type tracerProjectGetUsersAggregateGraphDataResponseSuccess = (tracerProjectGetUsersAggregateGraphDataResponse200) & {
   headers: Headers;
 };
-export type tracerProjectGetUsersAggregateGraphDataResponseError = (tracerProjectGetUsersAggregateGraphDataResponseDefault) & {
+export type tracerProjectGetUsersAggregateGraphDataResponseError = (tracerProjectGetUsersAggregateGraphDataResponse400 | tracerProjectGetUsersAggregateGraphDataResponse500 | tracerProjectGetUsersAggregateGraphDataResponse503 | tracerProjectGetUsersAggregateGraphDataResponseDefault) & {
   headers: Headers;
 };
 
@@ -64715,218 +64971,6 @@ export const tracerProjectUpdateProjectSessionConfig = async (projectApi: NonRea
 
 
 
-export type tracerProjectReadResponse200 = {
-  data: ProjectDetailResponseApi
-  status: 200
-}
-
-export type tracerProjectReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerProjectReadResponseSuccess = (tracerProjectReadResponse200) & {
-  headers: Headers;
-};
-export type tracerProjectReadResponseError = (tracerProjectReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerProjectReadResponse = (tracerProjectReadResponseSuccess | tracerProjectReadResponseError)
-
-export const getTracerProjectReadUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/project/${id}/`
-}
-
-/**
- * Get a single project by ID with sampling rate.
- */
-export const tracerProjectRead = async (id: string, options?: RequestInit): Promise<tracerProjectReadResponse> => {
-
-  return apiMutator<tracerProjectReadResponse>(getTracerProjectReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerProjectUpdateResponse200 = {
-  data: ProjectApi
-  status: 200
-}
-
-export type tracerProjectUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerProjectUpdateResponseSuccess = (tracerProjectUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerProjectUpdateResponseError = (tracerProjectUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerProjectUpdateResponse = (tracerProjectUpdateResponseSuccess | tracerProjectUpdateResponseError)
-
-export const getTracerProjectUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/project/${id}/`
-}
-
-export const tracerProjectUpdate = async (id: string,
-    projectApi: NonReadonly<ProjectApi>, options?: RequestInit): Promise<tracerProjectUpdateResponse> => {
-
-  return apiMutator<tracerProjectUpdateResponse>(getTracerProjectUpdateUrl(id),
-  {
-    ...options,
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      projectApi,)
-  }
-);}
-
-
-
-export type tracerProjectPartialUpdateResponse200 = {
-  data: ProjectApi
-  status: 200
-}
-
-export type tracerProjectPartialUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerProjectPartialUpdateResponseSuccess = (tracerProjectPartialUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerProjectPartialUpdateResponseError = (tracerProjectPartialUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerProjectPartialUpdateResponse = (tracerProjectPartialUpdateResponseSuccess | tracerProjectPartialUpdateResponseError)
-
-export const getTracerProjectPartialUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/project/${id}/`
-}
-
-export const tracerProjectPartialUpdate = async (id: string,
-    projectApi: NonReadonly<ProjectApi>, options?: RequestInit): Promise<tracerProjectPartialUpdateResponse> => {
-
-  return apiMutator<tracerProjectPartialUpdateResponse>(getTracerProjectPartialUpdateUrl(id),
-  {
-    ...options,
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      projectApi,)
-  }
-);}
-
-
-
-export type tracerProjectDeleteResponse204 = {
-  data: void
-  status: 204
-}
-
-export type tracerProjectDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 204>
-}
-
-export type tracerProjectDeleteResponseSuccess = (tracerProjectDeleteResponse204) & {
-  headers: Headers;
-};
-export type tracerProjectDeleteResponseError = (tracerProjectDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerProjectDeleteResponse = (tracerProjectDeleteResponseSuccess | tracerProjectDeleteResponseError)
-
-export const getTracerProjectDeleteUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/project/${id}/`
-}
-
-export const tracerProjectDelete = async (id: string, options?: RequestInit): Promise<tracerProjectDeleteResponse> => {
-
-  return apiMutator<tracerProjectDeleteResponse>(getTracerProjectDeleteUrl(id),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
-export type tracerProjectUpdateTagsResponse200 = {
-  data: ProjectApi
-  status: 200
-}
-
-export type tracerProjectUpdateTagsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerProjectUpdateTagsResponseSuccess = (tracerProjectUpdateTagsResponse200) & {
-  headers: Headers;
-};
-export type tracerProjectUpdateTagsResponseError = (tracerProjectUpdateTagsResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerProjectUpdateTagsResponse = (tracerProjectUpdateTagsResponseSuccess | tracerProjectUpdateTagsResponseError)
-
-export const getTracerProjectUpdateTagsUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/project/${id}/tags/`
-}
-
-/**
- * Update tags for a project.
- */
-export const tracerProjectUpdateTags = async (id: string,
-    projectApi: NonReadonly<ProjectApi>, options?: RequestInit): Promise<tracerProjectUpdateTagsResponse> => {
-
-  return apiMutator<tracerProjectUpdateTagsResponse>(getTracerProjectUpdateTagsUrl(id),
-  {
-    ...options,
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      projectApi,)
-  }
-);}
-
-
-
 export type tracerReplaySessionListResponse200 = {
   data: ReplaySessionListApi[]
   status: 200
@@ -65018,51 +65062,6 @@ export const tracerReplaySessionCreate = async (createReplaySessionApi: CreateRe
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       createReplaySessionApi,)
-  }
-);}
-
-
-
-export type tracerReplaySessionGetEvalConfigsResponse200 = {
-  data: ReplaySessionApi[]
-  status: 200
-}
-
-export type tracerReplaySessionGetEvalConfigsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerReplaySessionGetEvalConfigsResponseSuccess = (tracerReplaySessionGetEvalConfigsResponse200) & {
-  headers: Headers;
-};
-export type tracerReplaySessionGetEvalConfigsResponseError = (tracerReplaySessionGetEvalConfigsResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerReplaySessionGetEvalConfigsResponse = (tracerReplaySessionGetEvalConfigsResponseSuccess | tracerReplaySessionGetEvalConfigsResponseError)
-
-export const getTracerReplaySessionGetEvalConfigsUrl = () => {
-
-
-
-
-  return `/tracer/replay-session/eval-configs/`
-}
-
-/**
- * Query params:
-    project_id: uuid (required)
- * @summary Get all custom eval configs for a project with available models per eval template.
- */
-export const tracerReplaySessionGetEvalConfigs = async ( options?: RequestInit): Promise<tracerReplaySessionGetEvalConfigsResponse> => {
-
-  return apiMutator<tracerReplaySessionGetEvalConfigsResponse>(getTracerReplaySessionGetEvalConfigsUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
   }
 );}
 
@@ -65172,6 +65171,51 @@ export const tracerReplaySessionGenerateScenario = async (id: string,
 
 
 
+export type tracerReplaySessionGetEvalConfigsResponse200 = {
+  data: ReplaySessionApi[]
+  status: 200
+}
+
+export type tracerReplaySessionGetEvalConfigsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerReplaySessionGetEvalConfigsResponseSuccess = (tracerReplaySessionGetEvalConfigsResponse200) & {
+  headers: Headers;
+};
+export type tracerReplaySessionGetEvalConfigsResponseError = (tracerReplaySessionGetEvalConfigsResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerReplaySessionGetEvalConfigsResponse = (tracerReplaySessionGetEvalConfigsResponseSuccess | tracerReplaySessionGetEvalConfigsResponseError)
+
+export const getTracerReplaySessionGetEvalConfigsUrl = () => {
+
+
+
+
+  return `/tracer/replay-session/eval-configs/`
+}
+
+/**
+ * Query params:
+    project_id: uuid (required)
+ * @summary Get all custom eval configs for a project with available models per eval template.
+ */
+export const tracerReplaySessionGetEvalConfigs = async ( options?: RequestInit): Promise<tracerReplaySessionGetEvalConfigsResponse> => {
+
+  return apiMutator<tracerReplaySessionGetEvalConfigsResponse>(getTracerReplaySessionGetEvalConfigsUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type tracerSavedViewsListResponse200 = {
   data: SavedViewListResponseApi
   status: 200
@@ -65253,47 +65297,6 @@ export const getTracerSavedViewsCreateUrl = () => {
 export const tracerSavedViewsCreate = async (savedViewListApi: NonReadonly<SavedViewListApi>, options?: RequestInit): Promise<tracerSavedViewsCreateResponse> => {
 
   return apiMutator<tracerSavedViewsCreateResponse>(getTracerSavedViewsCreateUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      savedViewListApi,)
-  }
-);}
-
-
-
-export type tracerSavedViewsReorderResponse200 = {
-  data: SavedViewMessageResponseApi
-  status: 200
-}
-
-export type tracerSavedViewsReorderResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerSavedViewsReorderResponseSuccess = (tracerSavedViewsReorderResponse200) & {
-  headers: Headers;
-};
-export type tracerSavedViewsReorderResponseError = (tracerSavedViewsReorderResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerSavedViewsReorderResponse = (tracerSavedViewsReorderResponseSuccess | tracerSavedViewsReorderResponseError)
-
-export const getTracerSavedViewsReorderUrl = () => {
-
-
-
-
-  return `/tracer/saved-views/reorder/`
-}
-
-export const tracerSavedViewsReorder = async (savedViewListApi: NonReadonly<SavedViewListApi>, options?: RequestInit): Promise<tracerSavedViewsReorderResponse> => {
-
-  return apiMutator<tracerSavedViewsReorderResponse>(getTracerSavedViewsReorderUrl(),
   {
     ...options,
     method: 'POST',
@@ -65500,6 +65503,47 @@ export const tracerSavedViewsDuplicate = async (id: string,
     savedViewListApi: NonReadonly<SavedViewListApi>, options?: RequestInit): Promise<tracerSavedViewsDuplicateResponse> => {
 
   return apiMutator<tracerSavedViewsDuplicateResponse>(getTracerSavedViewsDuplicateUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      savedViewListApi,)
+  }
+);}
+
+
+
+export type tracerSavedViewsReorderResponse200 = {
+  data: SavedViewMessageResponseApi
+  status: 200
+}
+
+export type tracerSavedViewsReorderResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerSavedViewsReorderResponseSuccess = (tracerSavedViewsReorderResponse200) & {
+  headers: Headers;
+};
+export type tracerSavedViewsReorderResponseError = (tracerSavedViewsReorderResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerSavedViewsReorderResponse = (tracerSavedViewsReorderResponseSuccess | tracerSavedViewsReorderResponseError)
+
+export const getTracerSavedViewsReorderUrl = () => {
+
+
+
+
+  return `/tracer/saved-views/reorder/`
+}
+
+export const tracerSavedViewsReorder = async (savedViewListApi: NonReadonly<SavedViewListApi>, options?: RequestInit): Promise<tracerSavedViewsReorderResponse> => {
+
+  return apiMutator<tracerSavedViewsReorderResponse>(getTracerSavedViewsReorderUrl(),
   {
     ...options,
     method: 'POST',
@@ -66292,290 +66336,6 @@ export const tracerTraceSessionCreate = async (traceSessionApi: NonReadonly<Trac
 
 
 
-export type tracerTraceSessionGetSessionFilterValuesResponse200 = {
-  data: TraceSessionApi[]
-  status: 200
-}
-
-export type tracerTraceSessionGetSessionFilterValuesResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerTraceSessionGetSessionFilterValuesResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerTraceSessionGetSessionFilterValuesResponse503 = {
-  data: ApiErrorResponseApi
-  status: 503
-}
-
-export type tracerTraceSessionGetSessionFilterValuesResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
-}
-
-export type tracerTraceSessionGetSessionFilterValuesResponseSuccess = (tracerTraceSessionGetSessionFilterValuesResponse200) & {
-  headers: Headers;
-};
-export type tracerTraceSessionGetSessionFilterValuesResponseError = (tracerTraceSessionGetSessionFilterValuesResponse400 | tracerTraceSessionGetSessionFilterValuesResponse500 | tracerTraceSessionGetSessionFilterValuesResponse503 | tracerTraceSessionGetSessionFilterValuesResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerTraceSessionGetSessionFilterValuesResponse = (tracerTraceSessionGetSessionFilterValuesResponseSuccess | tracerTraceSessionGetSessionFilterValuesResponseError)
-
-export const getTracerTraceSessionGetSessionFilterValuesUrl = (params: TracerTraceSessionGetSessionFilterValuesParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/trace-session/get_session_filter_values/?${stringifiedParams}` : `/tracer/trace-session/get_session_filter_values/`
-}
-
-/**
- * Return distinct values for a session-level column.
-Used by the filter panel's value picker for session-specific fields
-(session_id, user_id, first_message, etc.).
-
-Query params:
-    project_id: required
-    column: canonical session column name, e.g. "session_id"
-    search: optional search substring
-    page: page number (0-based), default 0
-    page_size: default 50
- */
-export const tracerTraceSessionGetSessionFilterValues = async (params: TracerTraceSessionGetSessionFilterValuesParams, options?: RequestInit): Promise<tracerTraceSessionGetSessionFilterValuesResponse> => {
-
-  return apiMutator<tracerTraceSessionGetSessionFilterValuesResponse>(getTracerTraceSessionGetSessionFilterValuesUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerTraceSessionGetSessionGraphDataResponse200 = {
-  data: ObserveGraphDataResponseApi
-  status: 200
-}
-
-export type tracerTraceSessionGetSessionGraphDataResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerTraceSessionGetSessionGraphDataResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerTraceSessionGetSessionGraphDataResponse503 = {
-  data: ObserveGraphDataErrorResponseApi
-  status: 503
-}
-
-export type tracerTraceSessionGetSessionGraphDataResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
-}
-
-export type tracerTraceSessionGetSessionGraphDataResponseSuccess = (tracerTraceSessionGetSessionGraphDataResponse200) & {
-  headers: Headers;
-};
-export type tracerTraceSessionGetSessionGraphDataResponseError = (tracerTraceSessionGetSessionGraphDataResponse400 | tracerTraceSessionGetSessionGraphDataResponse500 | tracerTraceSessionGetSessionGraphDataResponse503 | tracerTraceSessionGetSessionGraphDataResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerTraceSessionGetSessionGraphDataResponse = (tracerTraceSessionGetSessionGraphDataResponseSuccess | tracerTraceSessionGetSessionGraphDataResponseError)
-
-export const getTracerTraceSessionGetSessionGraphDataUrl = (params?: TracerTraceSessionGetSessionGraphDataParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/trace-session/get_session_graph_data/?${stringifiedParams}` : `/tracer/trace-session/get_session_graph_data/`
-}
-
-/**
- * Supports the same metric types as the trace graph endpoint:
-- SYSTEM_METRIC: latency, tokens, cost, error_rate, session_count,
-  avg_duration, avg_traces_per_session — all aggregated at session level
-- EVAL: eval scores averaged across sessions
-- ANNOTATION: annotation scores averaged across sessions
-
-Response shape matches trace graph: {metric_name, data: [{timestamp, value, primary_traffic}]}
- * @summary Fetch time-series session metrics for the observe graph.
- */
-export const tracerTraceSessionGetSessionGraphData = async (traceSessionGraphDataRequestApi: TraceSessionGraphDataRequestApi,
-    params?: TracerTraceSessionGetSessionGraphDataParams, options?: RequestInit): Promise<tracerTraceSessionGetSessionGraphDataResponse> => {
-
-  return apiMutator<tracerTraceSessionGetSessionGraphDataResponse>(getTracerTraceSessionGetSessionGraphDataUrl(params),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      traceSessionGraphDataRequestApi,)
-  }
-);}
-
-
-
-export type tracerTraceSessionGetTraceSessionExportDataResponse200 = {
-  data: TracerTraceSessionGetTraceSessionExportData200
-  status: 200
-}
-
-export type tracerTraceSessionGetTraceSessionExportDataResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerTraceSessionGetTraceSessionExportDataResponseSuccess = (tracerTraceSessionGetTraceSessionExportDataResponse200) & {
-  headers: Headers;
-};
-export type tracerTraceSessionGetTraceSessionExportDataResponseError = (tracerTraceSessionGetTraceSessionExportDataResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerTraceSessionGetTraceSessionExportDataResponse = (tracerTraceSessionGetTraceSessionExportDataResponseSuccess | tracerTraceSessionGetTraceSessionExportDataResponseError)
-
-export const getTracerTraceSessionGetTraceSessionExportDataUrl = (params?: TracerTraceSessionGetTraceSessionExportDataParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/trace-session/get_trace_session_export_data/?${stringifiedParams}` : `/tracer/trace-session/get_trace_session_export_data/`
-}
-
-/**
- * Export traces filtered by project ID and project version ID with optimized queries.
- */
-export const tracerTraceSessionGetTraceSessionExportData = async (params?: TracerTraceSessionGetTraceSessionExportDataParams, options?: RequestInit): Promise<tracerTraceSessionGetTraceSessionExportDataResponse> => {
-
-  return apiMutator<tracerTraceSessionGetTraceSessionExportDataResponse>(getTracerTraceSessionGetTraceSessionExportDataUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerTraceSessionListSessionsResponse200 = {
-  data: TraceObserveListResponseApi
-  status: 200
-}
-
-export type tracerTraceSessionListSessionsResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerTraceSessionListSessionsResponse422 = {
-  data: PageDepthExceededErrorApi
-  status: 422
-}
-
-export type tracerTraceSessionListSessionsResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerTraceSessionListSessionsResponse503 = {
-  data: ApiErrorResponseApi
-  status: 503
-}
-
-export type tracerTraceSessionListSessionsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
-}
-
-export type tracerTraceSessionListSessionsResponseSuccess = (tracerTraceSessionListSessionsResponse200) & {
-  headers: Headers;
-};
-export type tracerTraceSessionListSessionsResponseError = (tracerTraceSessionListSessionsResponse400 | tracerTraceSessionListSessionsResponse422 | tracerTraceSessionListSessionsResponse500 | tracerTraceSessionListSessionsResponse503 | tracerTraceSessionListSessionsResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerTraceSessionListSessionsResponse = (tracerTraceSessionListSessionsResponseSuccess | tracerTraceSessionListSessionsResponseError)
-
-export const getTracerTraceSessionListSessionsUrl = (params?: TracerTraceSessionListSessionsParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/trace-session/list_sessions/?${stringifiedParams}` : `/tracer/trace-session/list_sessions/`
-}
-
-/**
- * List traces filtered by project ID and project version ID with optimized queries.
- */
-export const tracerTraceSessionListSessions = async (params?: TracerTraceSessionListSessionsParams, options?: RequestInit): Promise<tracerTraceSessionListSessionsResponse> => {
-
-  return apiMutator<tracerTraceSessionListSessionsResponse>(getTracerTraceSessionListSessionsUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type tracerTraceSessionReadResponse200 = {
   data: TraceSessionApi
   status: 200
@@ -66790,6 +66550,305 @@ export const tracerTraceSessionEvalLogs = async (id: string, options?: RequestIn
 
 
 
+export type tracerTraceSessionGetSessionFilterValuesResponse200 = {
+  data: TraceSessionApi[]
+  status: 200
+}
+
+export type tracerTraceSessionGetSessionFilterValuesResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceSessionGetSessionFilterValuesResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceSessionGetSessionFilterValuesResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
+export type tracerTraceSessionGetSessionFilterValuesResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
+}
+
+export type tracerTraceSessionGetSessionFilterValuesResponseSuccess = (tracerTraceSessionGetSessionFilterValuesResponse200) & {
+  headers: Headers;
+};
+export type tracerTraceSessionGetSessionFilterValuesResponseError = (tracerTraceSessionGetSessionFilterValuesResponse400 | tracerTraceSessionGetSessionFilterValuesResponse500 | tracerTraceSessionGetSessionFilterValuesResponse503 | tracerTraceSessionGetSessionFilterValuesResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerTraceSessionGetSessionFilterValuesResponse = (tracerTraceSessionGetSessionFilterValuesResponseSuccess | tracerTraceSessionGetSessionFilterValuesResponseError)
+
+export const getTracerTraceSessionGetSessionFilterValuesUrl = (params: TracerTraceSessionGetSessionFilterValuesParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/trace-session/get_session_filter_values/?${stringifiedParams}` : `/tracer/trace-session/get_session_filter_values/`
+}
+
+/**
+ * Return distinct values for a session-level column.
+Used by the filter panel's value picker for session-specific fields
+(session_id, user_id, first_message, etc.).
+
+Query params:
+    project_id: required
+    column: canonical session column name, e.g. "session_id"
+    search: optional search substring
+    page: page number (0-based), default 0
+    page_size: default 50
+ */
+export const tracerTraceSessionGetSessionFilterValues = async (params: TracerTraceSessionGetSessionFilterValuesParams, options?: RequestInit): Promise<tracerTraceSessionGetSessionFilterValuesResponse> => {
+
+  return apiMutator<tracerTraceSessionGetSessionFilterValuesResponse>(getTracerTraceSessionGetSessionFilterValuesUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerTraceSessionGetSessionGraphDataResponse200 = {
+  data: ObserveGraphDataResponseApi
+  status: 200
+}
+
+export type tracerTraceSessionGetSessionGraphDataResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceSessionGetSessionGraphDataResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceSessionGetSessionGraphDataResponse503 = {
+  data: ObserveGraphDataErrorResponseApi
+  status: 503
+}
+
+export type tracerTraceSessionGetSessionGraphDataResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
+}
+
+export type tracerTraceSessionGetSessionGraphDataResponseSuccess = (tracerTraceSessionGetSessionGraphDataResponse200) & {
+  headers: Headers;
+};
+export type tracerTraceSessionGetSessionGraphDataResponseError = (tracerTraceSessionGetSessionGraphDataResponse400 | tracerTraceSessionGetSessionGraphDataResponse500 | tracerTraceSessionGetSessionGraphDataResponse503 | tracerTraceSessionGetSessionGraphDataResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerTraceSessionGetSessionGraphDataResponse = (tracerTraceSessionGetSessionGraphDataResponseSuccess | tracerTraceSessionGetSessionGraphDataResponseError)
+
+export const getTracerTraceSessionGetSessionGraphDataUrl = (params?: TracerTraceSessionGetSessionGraphDataParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/trace-session/get_session_graph_data/?${stringifiedParams}` : `/tracer/trace-session/get_session_graph_data/`
+}
+
+/**
+ * Supports the same metric types as the trace graph endpoint:
+- SYSTEM_METRIC: latency, tokens, cost, error_rate, session_count,
+  avg_duration, avg_traces_per_session — all aggregated at session level
+- EVAL: eval scores averaged across sessions
+- ANNOTATION: annotation scores averaged across sessions
+
+Response shape matches trace graph: {metric_name, data: [{timestamp, value, primary_traffic}]}
+ * @summary Fetch time-series session metrics for the observe graph.
+ */
+export const tracerTraceSessionGetSessionGraphData = async (traceSessionGraphDataRequestApi: TraceSessionGraphDataRequestApi,
+    params?: TracerTraceSessionGetSessionGraphDataParams, options?: RequestInit): Promise<tracerTraceSessionGetSessionGraphDataResponse> => {
+
+  return apiMutator<tracerTraceSessionGetSessionGraphDataResponse>(getTracerTraceSessionGetSessionGraphDataUrl(params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      traceSessionGraphDataRequestApi,)
+  }
+);}
+
+
+
+export type tracerTraceSessionGetTraceSessionExportDataResponse200 = {
+  data: string
+  status: 200
+}
+
+export type tracerTraceSessionGetTraceSessionExportDataResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceSessionGetTraceSessionExportDataResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceSessionGetTraceSessionExportDataResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
+export type tracerTraceSessionGetTraceSessionExportDataResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
+}
+
+export type tracerTraceSessionGetTraceSessionExportDataResponseSuccess = (tracerTraceSessionGetTraceSessionExportDataResponse200) & {
+  headers: Headers;
+};
+export type tracerTraceSessionGetTraceSessionExportDataResponseError = (tracerTraceSessionGetTraceSessionExportDataResponse400 | tracerTraceSessionGetTraceSessionExportDataResponse500 | tracerTraceSessionGetTraceSessionExportDataResponse503 | tracerTraceSessionGetTraceSessionExportDataResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerTraceSessionGetTraceSessionExportDataResponse = (tracerTraceSessionGetTraceSessionExportDataResponseSuccess | tracerTraceSessionGetTraceSessionExportDataResponseError)
+
+export const getTracerTraceSessionGetTraceSessionExportDataUrl = (params: TracerTraceSessionGetTraceSessionExportDataParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/trace-session/get_trace_session_export_data/?${stringifiedParams}` : `/tracer/trace-session/get_trace_session_export_data/`
+}
+
+/**
+ * Export traces filtered by project ID and project version ID with optimized queries.
+ */
+export const tracerTraceSessionGetTraceSessionExportData = async (params: TracerTraceSessionGetTraceSessionExportDataParams, options?: RequestInit): Promise<tracerTraceSessionGetTraceSessionExportDataResponse> => {
+
+  return apiMutator<tracerTraceSessionGetTraceSessionExportDataResponse>(getTracerTraceSessionGetTraceSessionExportDataUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerTraceSessionListSessionsResponse200 = {
+  data: TraceSessionListResponseApi
+  status: 200
+}
+
+export type tracerTraceSessionListSessionsResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceSessionListSessionsResponse422 = {
+  data: PageDepthExceededErrorApi
+  status: 422
+}
+
+export type tracerTraceSessionListSessionsResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceSessionListSessionsResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
+export type tracerTraceSessionListSessionsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
+}
+
+export type tracerTraceSessionListSessionsResponseSuccess = (tracerTraceSessionListSessionsResponse200) & {
+  headers: Headers;
+};
+export type tracerTraceSessionListSessionsResponseError = (tracerTraceSessionListSessionsResponse400 | tracerTraceSessionListSessionsResponse422 | tracerTraceSessionListSessionsResponse500 | tracerTraceSessionListSessionsResponse503 | tracerTraceSessionListSessionsResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerTraceSessionListSessionsResponse = (tracerTraceSessionListSessionsResponseSuccess | tracerTraceSessionListSessionsResponseError)
+
+export const getTracerTraceSessionListSessionsUrl = (params?: TracerTraceSessionListSessionsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/trace-session/list_sessions/?${stringifiedParams}` : `/tracer/trace-session/list_sessions/`
+}
+
+/**
+ * List traces filtered by project ID and project version ID with optimized queries.
+ */
+export const tracerTraceSessionListSessions = async (params?: TracerTraceSessionListSessionsParams, options?: RequestInit): Promise<tracerTraceSessionListSessionsResponse> => {
+
+  return apiMutator<tracerTraceSessionListSessionsResponse>(getTracerTraceSessionListSessionsUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type tracerTraceListResponse200 = {
   data: TracerTraceList200
   status: 200
@@ -66877,6 +66936,233 @@ export const tracerTraceCreate = async (traceApi: NonReadonly<TraceApi>, options
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       traceApi,)
+  }
+);}
+
+
+
+export type tracerTraceReadResponse200 = {
+  data: TraceDetailResponseApi
+  status: 200
+}
+
+export type tracerTraceReadResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceReadResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceReadResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
+export type tracerTraceReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
+}
+
+export type tracerTraceReadResponseSuccess = (tracerTraceReadResponse200) & {
+  headers: Headers;
+};
+export type tracerTraceReadResponseError = (tracerTraceReadResponse400 | tracerTraceReadResponse500 | tracerTraceReadResponse503 | tracerTraceReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerTraceReadResponse = (tracerTraceReadResponseSuccess | tracerTraceReadResponseError)
+
+export const getTracerTraceReadUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/trace/${id}/`
+}
+
+/**
+ * Retrieve a trace by its ID.
+ */
+export const tracerTraceRead = async (id: string, options?: RequestInit): Promise<tracerTraceReadResponse> => {
+
+  return apiMutator<tracerTraceReadResponse>(getTracerTraceReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerTraceUpdateResponse200 = {
+  data: TraceApi
+  status: 200
+}
+
+export type tracerTraceUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerTraceUpdateResponseSuccess = (tracerTraceUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerTraceUpdateResponseError = (tracerTraceUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerTraceUpdateResponse = (tracerTraceUpdateResponseSuccess | tracerTraceUpdateResponseError)
+
+export const getTracerTraceUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/trace/${id}/`
+}
+
+export const tracerTraceUpdate = async (id: string,
+    traceApi: NonReadonly<TraceApi>, options?: RequestInit): Promise<tracerTraceUpdateResponse> => {
+
+  return apiMutator<tracerTraceUpdateResponse>(getTracerTraceUpdateUrl(id),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      traceApi,)
+  }
+);}
+
+
+
+export type tracerTracePartialUpdateResponse200 = {
+  data: TraceApi
+  status: 200
+}
+
+export type tracerTracePartialUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerTracePartialUpdateResponseSuccess = (tracerTracePartialUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerTracePartialUpdateResponseError = (tracerTracePartialUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerTracePartialUpdateResponse = (tracerTracePartialUpdateResponseSuccess | tracerTracePartialUpdateResponseError)
+
+export const getTracerTracePartialUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/trace/${id}/`
+}
+
+export const tracerTracePartialUpdate = async (id: string,
+    traceApi: NonReadonly<TraceApi>, options?: RequestInit): Promise<tracerTracePartialUpdateResponse> => {
+
+  return apiMutator<tracerTracePartialUpdateResponse>(getTracerTracePartialUpdateUrl(id),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      traceApi,)
+  }
+);}
+
+
+
+export type tracerTraceDeleteResponse204 = {
+  data: void
+  status: 204
+}
+
+export type tracerTraceDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 204>
+}
+
+export type tracerTraceDeleteResponseSuccess = (tracerTraceDeleteResponse204) & {
+  headers: Headers;
+};
+export type tracerTraceDeleteResponseError = (tracerTraceDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerTraceDeleteResponse = (tracerTraceDeleteResponseSuccess | tracerTraceDeleteResponseError)
+
+export const getTracerTraceDeleteUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/trace/${id}/`
+}
+
+export const tracerTraceDelete = async (id: string, options?: RequestInit): Promise<tracerTraceDeleteResponse> => {
+
+  return apiMutator<tracerTraceDeleteResponse>(getTracerTraceDeleteUrl(id),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type tracerTraceUpdateTagsResponse200 = {
+  data: TraceTagsUpdateApi
+  status: 200
+}
+
+export type tracerTraceUpdateTagsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerTraceUpdateTagsResponseSuccess = (tracerTraceUpdateTagsResponse200) & {
+  headers: Headers;
+};
+export type tracerTraceUpdateTagsResponseError = (tracerTraceUpdateTagsResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerTraceUpdateTagsResponse = (tracerTraceUpdateTagsResponseSuccess | tracerTraceUpdateTagsResponseError)
+
+export const getTracerTraceUpdateTagsUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/trace/${id}/tags/`
+}
+
+/**
+ * Update tags for a trace.
+ */
+export const tracerTraceUpdateTags = async (id: string,
+    traceTagsUpdateApi: TraceTagsUpdateApi, options?: RequestInit): Promise<tracerTraceUpdateTagsResponse> => {
+
+  return apiMutator<tracerTraceUpdateTagsResponse>(getTracerTraceUpdateTagsUrl(id),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      traceTagsUpdateApi,)
   }
 );}
 
@@ -67233,25 +67519,40 @@ export const tracerTraceGetProperties = async (params?: TracerTraceGetProperties
 
 
 export type tracerTraceGetTraceExportDataResponse200 = {
-  data: TracerTraceGetTraceExportData200
+  data: string
   status: 200
+}
+
+export type tracerTraceGetTraceExportDataResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceGetTraceExportDataResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceGetTraceExportDataResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
 }
 
 export type tracerTraceGetTraceExportDataResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerTraceGetTraceExportDataResponseSuccess = (tracerTraceGetTraceExportDataResponse200) & {
   headers: Headers;
 };
-export type tracerTraceGetTraceExportDataResponseError = (tracerTraceGetTraceExportDataResponseDefault) & {
+export type tracerTraceGetTraceExportDataResponseError = (tracerTraceGetTraceExportDataResponse400 | tracerTraceGetTraceExportDataResponse500 | tracerTraceGetTraceExportDataResponse503 | tracerTraceGetTraceExportDataResponseDefault) & {
   headers: Headers;
 };
 
 export type tracerTraceGetTraceExportDataResponse = (tracerTraceGetTraceExportDataResponseSuccess | tracerTraceGetTraceExportDataResponseError)
 
-export const getTracerTraceGetTraceExportDataUrl = (params?: TracerTraceGetTraceExportDataParams,) => {
+export const getTracerTraceGetTraceExportDataUrl = (params: TracerTraceGetTraceExportDataParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -67271,65 +67572,11 @@ export const getTracerTraceGetTraceExportDataUrl = (params?: TracerTraceGetTrace
 }
 
 /**
- * Fail closed until a complete ClickHouse trace exporter is available.
+ * Export one bounded list page, disclosing any remaining rows in-band.
  */
-export const tracerTraceGetTraceExportData = async (params?: TracerTraceGetTraceExportDataParams, options?: RequestInit): Promise<tracerTraceGetTraceExportDataResponse> => {
+export const tracerTraceGetTraceExportData = async (params: TracerTraceGetTraceExportDataParams, options?: RequestInit): Promise<tracerTraceGetTraceExportDataResponse> => {
 
   return apiMutator<tracerTraceGetTraceExportDataResponse>(getTracerTraceGetTraceExportDataUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerTraceGetTraceIdByIndexResponse200 = {
-  data: TracerTraceGetTraceIdByIndex200
-  status: 200
-}
-
-export type tracerTraceGetTraceIdByIndexResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerTraceGetTraceIdByIndexResponseSuccess = (tracerTraceGetTraceIdByIndexResponse200) & {
-  headers: Headers;
-};
-export type tracerTraceGetTraceIdByIndexResponseError = (tracerTraceGetTraceIdByIndexResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerTraceGetTraceIdByIndexResponse = (tracerTraceGetTraceIdByIndexResponseSuccess | tracerTraceGetTraceIdByIndexResponseError)
-
-export const getTracerTraceGetTraceIdByIndexUrl = (params: TracerTraceGetTraceIdByIndexParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/trace/get_trace_id_by_index/?${stringifiedParams}` : `/tracer/trace/get_trace_id_by_index/`
-}
-
-/**
- * Get the previous and next trace id by index using efficient database queries.
- */
-export const tracerTraceGetTraceIdByIndex = async (params: TracerTraceGetTraceIdByIndexParams, options?: RequestInit): Promise<tracerTraceGetTraceIdByIndexResponse> => {
-
-  return apiMutator<tracerTraceGetTraceIdByIndexResponse>(getTracerTraceGetTraceIdByIndexUrl(params),
   {
     ...options,
     method: 'GET'
@@ -67394,46 +67641,26 @@ export const tracerTraceGetTraceIdByIndexObserve = async (params: TracerTraceGet
 
 
 
-export type tracerTraceListTracesResponse200 = {
-  data: TracePrototypeListResponseApi
+export type tracerTraceGetTraceIdByIndexResponse200 = {
+  data: TracerTraceGetTraceIdByIndex200
   status: 200
 }
 
-export type tracerTraceListTracesResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerTraceListTracesResponse422 = {
-  data: PageDepthExceededErrorApi
-  status: 422
-}
-
-export type tracerTraceListTracesResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerTraceListTracesResponse503 = {
-  data: ApiErrorResponseApi
-  status: 503
-}
-
-export type tracerTraceListTracesResponseDefault = {
+export type tracerTraceGetTraceIdByIndexResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
+  status: Exclude<HTTPStatusCodes, 200>
 }
 
-export type tracerTraceListTracesResponseSuccess = (tracerTraceListTracesResponse200) & {
+export type tracerTraceGetTraceIdByIndexResponseSuccess = (tracerTraceGetTraceIdByIndexResponse200) & {
   headers: Headers;
 };
-export type tracerTraceListTracesResponseError = (tracerTraceListTracesResponse400 | tracerTraceListTracesResponse422 | tracerTraceListTracesResponse500 | tracerTraceListTracesResponse503 | tracerTraceListTracesResponseDefault) & {
+export type tracerTraceGetTraceIdByIndexResponseError = (tracerTraceGetTraceIdByIndexResponseDefault) & {
   headers: Headers;
 };
 
-export type tracerTraceListTracesResponse = (tracerTraceListTracesResponseSuccess | tracerTraceListTracesResponseError)
+export type tracerTraceGetTraceIdByIndexResponse = (tracerTraceGetTraceIdByIndexResponseSuccess | tracerTraceGetTraceIdByIndexResponseError)
 
-export const getTracerTraceListTracesUrl = (params: TracerTraceListTracesParams,) => {
+export const getTracerTraceGetTraceIdByIndexUrl = (params: TracerTraceGetTraceIdByIndexParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -67449,15 +67676,15 @@ export const getTracerTraceListTracesUrl = (params: TracerTraceListTracesParams,
 
   const stringifiedParams = normalizedParams.toString();
 
-  return stringifiedParams.length > 0 ? `/tracer/trace/list_traces/?${stringifiedParams}` : `/tracer/trace/list_traces/`
+  return stringifiedParams.length > 0 ? `/tracer/trace/get_trace_id_by_index/?${stringifiedParams}` : `/tracer/trace/get_trace_id_by_index/`
 }
 
 /**
- * List traces filtered by project ID and project version ID with optimized queries.
+ * Get the previous and next trace id by index using efficient database queries.
  */
-export const tracerTraceListTraces = async (params: TracerTraceListTracesParams, options?: RequestInit): Promise<tracerTraceListTracesResponse> => {
+export const tracerTraceGetTraceIdByIndex = async (params: TracerTraceGetTraceIdByIndexParams, options?: RequestInit): Promise<tracerTraceGetTraceIdByIndexResponse> => {
 
-  return apiMutator<tracerTraceListTracesResponse>(getTracerTraceListTracesUrl(params),
+  return apiMutator<tracerTraceGetTraceIdByIndexResponse>(getTracerTraceGetTraceIdByIndexUrl(params),
   {
     ...options,
     method: 'GET'
@@ -67532,6 +67759,80 @@ export const getTracerTraceListTracesOfSessionUrl = (params?: TracerTraceListTra
 export const tracerTraceListTracesOfSession = async (params?: TracerTraceListTracesOfSessionParams, options?: RequestInit): Promise<tracerTraceListTracesOfSessionResponse> => {
 
   return apiMutator<tracerTraceListTracesOfSessionResponse>(getTracerTraceListTracesOfSessionUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerTraceListTracesResponse200 = {
+  data: TracePrototypeListResponseApi
+  status: 200
+}
+
+export type tracerTraceListTracesResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceListTracesResponse422 = {
+  data: PageDepthExceededErrorApi
+  status: 422
+}
+
+export type tracerTraceListTracesResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceListTracesResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
+export type tracerTraceListTracesResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
+}
+
+export type tracerTraceListTracesResponseSuccess = (tracerTraceListTracesResponse200) & {
+  headers: Headers;
+};
+export type tracerTraceListTracesResponseError = (tracerTraceListTracesResponse400 | tracerTraceListTracesResponse422 | tracerTraceListTracesResponse500 | tracerTraceListTracesResponse503 | tracerTraceListTracesResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerTraceListTracesResponse = (tracerTraceListTracesResponseSuccess | tracerTraceListTracesResponseError)
+
+export const getTracerTraceListTracesUrl = (params: TracerTraceListTracesParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/trace/list_traces/?${stringifiedParams}` : `/tracer/trace/list_traces/`
+}
+
+/**
+ * List traces filtered by project ID and project version ID with optimized queries.
+ */
+export const tracerTraceListTraces = async (params: TracerTraceListTracesParams, options?: RequestInit): Promise<tracerTraceListTracesResponse> => {
+
+  return apiMutator<tracerTraceListTracesResponse>(getTracerTraceListTracesUrl(params),
   {
     ...options,
     method: 'GET'
@@ -67703,233 +68004,6 @@ export const tracerTraceVoiceCallDetail = async (params?: TracerTraceVoiceCallDe
 
 
 
-export type tracerTraceReadResponse200 = {
-  data: TraceDetailResponseApi
-  status: 200
-}
-
-export type tracerTraceReadResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerTraceReadResponse500 = {
-  data: ApiErrorResponseApi
-  status: 500
-}
-
-export type tracerTraceReadResponse503 = {
-  data: ApiErrorResponseApi
-  status: 503
-}
-
-export type tracerTraceReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
-}
-
-export type tracerTraceReadResponseSuccess = (tracerTraceReadResponse200) & {
-  headers: Headers;
-};
-export type tracerTraceReadResponseError = (tracerTraceReadResponse400 | tracerTraceReadResponse500 | tracerTraceReadResponse503 | tracerTraceReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerTraceReadResponse = (tracerTraceReadResponseSuccess | tracerTraceReadResponseError)
-
-export const getTracerTraceReadUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/trace/${id}/`
-}
-
-/**
- * Retrieve a trace by its ID.
- */
-export const tracerTraceRead = async (id: string, options?: RequestInit): Promise<tracerTraceReadResponse> => {
-
-  return apiMutator<tracerTraceReadResponse>(getTracerTraceReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerTraceUpdateResponse200 = {
-  data: TraceApi
-  status: 200
-}
-
-export type tracerTraceUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerTraceUpdateResponseSuccess = (tracerTraceUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerTraceUpdateResponseError = (tracerTraceUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerTraceUpdateResponse = (tracerTraceUpdateResponseSuccess | tracerTraceUpdateResponseError)
-
-export const getTracerTraceUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/trace/${id}/`
-}
-
-export const tracerTraceUpdate = async (id: string,
-    traceApi: NonReadonly<TraceApi>, options?: RequestInit): Promise<tracerTraceUpdateResponse> => {
-
-  return apiMutator<tracerTraceUpdateResponse>(getTracerTraceUpdateUrl(id),
-  {
-    ...options,
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      traceApi,)
-  }
-);}
-
-
-
-export type tracerTracePartialUpdateResponse200 = {
-  data: TraceApi
-  status: 200
-}
-
-export type tracerTracePartialUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerTracePartialUpdateResponseSuccess = (tracerTracePartialUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerTracePartialUpdateResponseError = (tracerTracePartialUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerTracePartialUpdateResponse = (tracerTracePartialUpdateResponseSuccess | tracerTracePartialUpdateResponseError)
-
-export const getTracerTracePartialUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/trace/${id}/`
-}
-
-export const tracerTracePartialUpdate = async (id: string,
-    traceApi: NonReadonly<TraceApi>, options?: RequestInit): Promise<tracerTracePartialUpdateResponse> => {
-
-  return apiMutator<tracerTracePartialUpdateResponse>(getTracerTracePartialUpdateUrl(id),
-  {
-    ...options,
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      traceApi,)
-  }
-);}
-
-
-
-export type tracerTraceDeleteResponse204 = {
-  data: void
-  status: 204
-}
-
-export type tracerTraceDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 204>
-}
-
-export type tracerTraceDeleteResponseSuccess = (tracerTraceDeleteResponse204) & {
-  headers: Headers;
-};
-export type tracerTraceDeleteResponseError = (tracerTraceDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerTraceDeleteResponse = (tracerTraceDeleteResponseSuccess | tracerTraceDeleteResponseError)
-
-export const getTracerTraceDeleteUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/trace/${id}/`
-}
-
-export const tracerTraceDelete = async (id: string, options?: RequestInit): Promise<tracerTraceDeleteResponse> => {
-
-  return apiMutator<tracerTraceDeleteResponse>(getTracerTraceDeleteUrl(id),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
-export type tracerTraceUpdateTagsResponse200 = {
-  data: TraceTagsUpdateApi
-  status: 200
-}
-
-export type tracerTraceUpdateTagsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerTraceUpdateTagsResponseSuccess = (tracerTraceUpdateTagsResponse200) & {
-  headers: Headers;
-};
-export type tracerTraceUpdateTagsResponseError = (tracerTraceUpdateTagsResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerTraceUpdateTagsResponse = (tracerTraceUpdateTagsResponseSuccess | tracerTraceUpdateTagsResponseError)
-
-export const getTracerTraceUpdateTagsUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/trace/${id}/tags/`
-}
-
-/**
- * Update tags for a trace.
- */
-export const tracerTraceUpdateTags = async (id: string,
-    traceTagsUpdateApi: TraceTagsUpdateApi, options?: RequestInit): Promise<tracerTraceUpdateTagsResponse> => {
-
-  return apiMutator<tracerTraceUpdateTagsResponse>(getTracerTraceUpdateTagsUrl(id),
-  {
-    ...options,
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      traceTagsUpdateApi,)
-  }
-);}
-
-
-
 export type tracerUserAlertLogsListResponse200 = {
   data: TracerUserAlertLogsList200
   status: 200
@@ -68027,103 +68101,6 @@ export const tracerUserAlertLogsCreate = async (userAlertMonitorLogWriteRequestA
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       userAlertMonitorLogWriteRequestApi,)
-  }
-);}
-
-
-
-export type tracerUserAlertLogsListAllResponse200 = {
-  data: TracerUserAlertLogsListAll200
-  status: 200
-}
-
-export type tracerUserAlertLogsListAllResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerUserAlertLogsListAllResponseSuccess = (tracerUserAlertLogsListAllResponse200) & {
-  headers: Headers;
-};
-export type tracerUserAlertLogsListAllResponseError = (tracerUserAlertLogsListAllResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerUserAlertLogsListAllResponse = (tracerUserAlertLogsListAllResponseSuccess | tracerUserAlertLogsListAllResponseError)
-
-export const getTracerUserAlertLogsListAllUrl = (params?: TracerUserAlertLogsListAllParams,) => {
-  const normalizedParams = new URLSearchParams();
-
-  Object.entries(params || {}).forEach(([key, value]) => {
-
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
-
-  const stringifiedParams = normalizedParams.toString();
-
-  return stringifiedParams.length > 0 ? `/tracer/user-alert-logs/all/?${stringifiedParams}` : `/tracer/user-alert-logs/all/`
-}
-
-export const tracerUserAlertLogsListAll = async (params?: TracerUserAlertLogsListAllParams, options?: RequestInit): Promise<tracerUserAlertLogsListAllResponse> => {
-
-  return apiMutator<tracerUserAlertLogsListAllResponse>(getTracerUserAlertLogsListAllUrl(params),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerUserAlertLogsMarkAsResolvedResponse200 = {
-  data: UserAlertMonitorLogResolveResponseApi
-  status: 200
-}
-
-export type tracerUserAlertLogsMarkAsResolvedResponse400 = {
-  data: ApiErrorResponseApi
-  status: 400
-}
-
-export type tracerUserAlertLogsMarkAsResolvedResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
-}
-
-export type tracerUserAlertLogsMarkAsResolvedResponseSuccess = (tracerUserAlertLogsMarkAsResolvedResponse200) & {
-  headers: Headers;
-};
-export type tracerUserAlertLogsMarkAsResolvedResponseError = (tracerUserAlertLogsMarkAsResolvedResponse400 | tracerUserAlertLogsMarkAsResolvedResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerUserAlertLogsMarkAsResolvedResponse = (tracerUserAlertLogsMarkAsResolvedResponseSuccess | tracerUserAlertLogsMarkAsResolvedResponseError)
-
-export const getTracerUserAlertLogsMarkAsResolvedUrl = () => {
-
-
-
-
-  return `/tracer/user-alert-logs/resolve/`
-}
-
-export const tracerUserAlertLogsMarkAsResolved = async (userAlertMonitorLogResolveRequestApi: UserAlertMonitorLogResolveRequestApi, options?: RequestInit): Promise<tracerUserAlertLogsMarkAsResolvedResponse> => {
-
-  return apiMutator<tracerUserAlertLogsMarkAsResolvedResponse>(getTracerUserAlertLogsMarkAsResolvedUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      userAlertMonitorLogResolveRequestApi,)
   }
 );}
 
@@ -68353,6 +68330,103 @@ export const tracerUserAlertLogsListForAlert = async (id: string, options?: Requ
 
 
 
+export type tracerUserAlertLogsListAllResponse200 = {
+  data: TracerUserAlertLogsListAll200
+  status: 200
+}
+
+export type tracerUserAlertLogsListAllResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerUserAlertLogsListAllResponseSuccess = (tracerUserAlertLogsListAllResponse200) & {
+  headers: Headers;
+};
+export type tracerUserAlertLogsListAllResponseError = (tracerUserAlertLogsListAllResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerUserAlertLogsListAllResponse = (tracerUserAlertLogsListAllResponseSuccess | tracerUserAlertLogsListAllResponseError)
+
+export const getTracerUserAlertLogsListAllUrl = (params?: TracerUserAlertLogsListAllParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/tracer/user-alert-logs/all/?${stringifiedParams}` : `/tracer/user-alert-logs/all/`
+}
+
+export const tracerUserAlertLogsListAll = async (params?: TracerUserAlertLogsListAllParams, options?: RequestInit): Promise<tracerUserAlertLogsListAllResponse> => {
+
+  return apiMutator<tracerUserAlertLogsListAllResponse>(getTracerUserAlertLogsListAllUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerUserAlertLogsMarkAsResolvedResponse200 = {
+  data: UserAlertMonitorLogResolveResponseApi
+  status: 200
+}
+
+export type tracerUserAlertLogsMarkAsResolvedResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerUserAlertLogsMarkAsResolvedResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400>
+}
+
+export type tracerUserAlertLogsMarkAsResolvedResponseSuccess = (tracerUserAlertLogsMarkAsResolvedResponse200) & {
+  headers: Headers;
+};
+export type tracerUserAlertLogsMarkAsResolvedResponseError = (tracerUserAlertLogsMarkAsResolvedResponse400 | tracerUserAlertLogsMarkAsResolvedResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerUserAlertLogsMarkAsResolvedResponse = (tracerUserAlertLogsMarkAsResolvedResponseSuccess | tracerUserAlertLogsMarkAsResolvedResponseError)
+
+export const getTracerUserAlertLogsMarkAsResolvedUrl = () => {
+
+
+
+
+  return `/tracer/user-alert-logs/resolve/`
+}
+
+export const tracerUserAlertLogsMarkAsResolved = async (userAlertMonitorLogResolveRequestApi: UserAlertMonitorLogResolveRequestApi, options?: RequestInit): Promise<tracerUserAlertLogsMarkAsResolvedResponse> => {
+
+  return apiMutator<tracerUserAlertLogsMarkAsResolvedResponse>(getTracerUserAlertLogsMarkAsResolvedUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      userAlertMonitorLogResolveRequestApi,)
+  }
+);}
+
+
+
 export type tracerUserAlertsListResponse200 = {
   data: TracerUserAlertsList200
   status: 200
@@ -68447,6 +68521,255 @@ export const tracerUserAlertsCreate = async (userAlertMonitorApi: NonReadonly<Us
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       userAlertMonitorApi,)
+  }
+);}
+
+
+
+export type tracerUserAlertsReadResponse200 = {
+  data: UserAlertMonitorApi
+  status: 200
+}
+
+export type tracerUserAlertsReadResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerUserAlertsReadResponseSuccess = (tracerUserAlertsReadResponse200) & {
+  headers: Headers;
+};
+export type tracerUserAlertsReadResponseError = (tracerUserAlertsReadResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerUserAlertsReadResponse = (tracerUserAlertsReadResponseSuccess | tracerUserAlertsReadResponseError)
+
+export const getTracerUserAlertsReadUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/user-alerts/${id}/`
+}
+
+export const tracerUserAlertsRead = async (id: string, options?: RequestInit): Promise<tracerUserAlertsReadResponse> => {
+
+  return apiMutator<tracerUserAlertsReadResponse>(getTracerUserAlertsReadUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerUserAlertsUpdateResponse200 = {
+  data: UserAlertMonitorApi
+  status: 200
+}
+
+export type tracerUserAlertsUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerUserAlertsUpdateResponseSuccess = (tracerUserAlertsUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerUserAlertsUpdateResponseError = (tracerUserAlertsUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerUserAlertsUpdateResponse = (tracerUserAlertsUpdateResponseSuccess | tracerUserAlertsUpdateResponseError)
+
+export const getTracerUserAlertsUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/user-alerts/${id}/`
+}
+
+export const tracerUserAlertsUpdate = async (id: string,
+    userAlertMonitorApi: NonReadonly<UserAlertMonitorApi>, options?: RequestInit): Promise<tracerUserAlertsUpdateResponse> => {
+
+  return apiMutator<tracerUserAlertsUpdateResponse>(getTracerUserAlertsUpdateUrl(id),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      userAlertMonitorApi,)
+  }
+);}
+
+
+
+export type tracerUserAlertsPartialUpdateResponse200 = {
+  data: UserAlertMonitorApi
+  status: 200
+}
+
+export type tracerUserAlertsPartialUpdateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerUserAlertsPartialUpdateResponseSuccess = (tracerUserAlertsPartialUpdateResponse200) & {
+  headers: Headers;
+};
+export type tracerUserAlertsPartialUpdateResponseError = (tracerUserAlertsPartialUpdateResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerUserAlertsPartialUpdateResponse = (tracerUserAlertsPartialUpdateResponseSuccess | tracerUserAlertsPartialUpdateResponseError)
+
+export const getTracerUserAlertsPartialUpdateUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/user-alerts/${id}/`
+}
+
+export const tracerUserAlertsPartialUpdate = async (id: string,
+    userAlertMonitorApi: NonReadonly<UserAlertMonitorApi>, options?: RequestInit): Promise<tracerUserAlertsPartialUpdateResponse> => {
+
+  return apiMutator<tracerUserAlertsPartialUpdateResponse>(getTracerUserAlertsPartialUpdateUrl(id),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      userAlertMonitorApi,)
+  }
+);}
+
+
+
+export type tracerUserAlertsDeleteResponse204 = {
+  data: void
+  status: 204
+}
+
+export type tracerUserAlertsDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 204>
+}
+
+export type tracerUserAlertsDeleteResponseSuccess = (tracerUserAlertsDeleteResponse204) & {
+  headers: Headers;
+};
+export type tracerUserAlertsDeleteResponseError = (tracerUserAlertsDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerUserAlertsDeleteResponse = (tracerUserAlertsDeleteResponseSuccess | tracerUserAlertsDeleteResponseError)
+
+export const getTracerUserAlertsDeleteUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/user-alerts/${id}/`
+}
+
+export const tracerUserAlertsDelete = async (id: string, options?: RequestInit): Promise<tracerUserAlertsDeleteResponse> => {
+
+  return apiMutator<tracerUserAlertsDeleteResponse>(getTracerUserAlertsDeleteUrl(id),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type tracerUserAlertsMonitorDetailsResponse200 = {
+  data: UserAlertMonitorApi
+  status: 200
+}
+
+export type tracerUserAlertsMonitorDetailsResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerUserAlertsMonitorDetailsResponseSuccess = (tracerUserAlertsMonitorDetailsResponse200) & {
+  headers: Headers;
+};
+export type tracerUserAlertsMonitorDetailsResponseError = (tracerUserAlertsMonitorDetailsResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerUserAlertsMonitorDetailsResponse = (tracerUserAlertsMonitorDetailsResponseSuccess | tracerUserAlertsMonitorDetailsResponseError)
+
+export const getTracerUserAlertsMonitorDetailsUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/user-alerts/${id}/details/`
+}
+
+export const tracerUserAlertsMonitorDetails = async (id: string, options?: RequestInit): Promise<tracerUserAlertsMonitorDetailsResponse> => {
+
+  return apiMutator<tracerUserAlertsMonitorDetailsResponse>(getTracerUserAlertsMonitorDetailsUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+export type tracerUserAlertsGraphDataResponse200 = {
+  data: UserAlertMonitorApi
+  status: 200
+}
+
+export type tracerUserAlertsGraphDataResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200>
+}
+
+export type tracerUserAlertsGraphDataResponseSuccess = (tracerUserAlertsGraphDataResponse200) & {
+  headers: Headers;
+};
+export type tracerUserAlertsGraphDataResponseError = (tracerUserAlertsGraphDataResponseDefault) & {
+  headers: Headers;
+};
+
+export type tracerUserAlertsGraphDataResponse = (tracerUserAlertsGraphDataResponseSuccess | tracerUserAlertsGraphDataResponseError)
+
+export const getTracerUserAlertsGraphDataUrl = (id: string,) => {
+
+
+
+
+  return `/tracer/user-alerts/${id}/graph/`
+}
+
+/**
+ * Accepts `start_date` and `end_date` query parameters (ISO 8601 format).
+If not provided, it defaults to the last 7 days.
+ * @summary Returns time-series data for a monitor's metric, suitable for graphing.
+ */
+export const tracerUserAlertsGraphData = async (id: string, options?: RequestInit): Promise<tracerUserAlertsGraphDataResponse> => {
+
+  return apiMutator<tracerUserAlertsGraphDataResponse>(getTracerUserAlertsGraphDataUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
   }
 );}
 
@@ -68711,255 +69034,6 @@ export const tracerUserAlertsPreviewGraph = async (userAlertMonitorPreviewGraphA
 
 
 
-export type tracerUserAlertsReadResponse200 = {
-  data: UserAlertMonitorApi
-  status: 200
-}
-
-export type tracerUserAlertsReadResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerUserAlertsReadResponseSuccess = (tracerUserAlertsReadResponse200) & {
-  headers: Headers;
-};
-export type tracerUserAlertsReadResponseError = (tracerUserAlertsReadResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerUserAlertsReadResponse = (tracerUserAlertsReadResponseSuccess | tracerUserAlertsReadResponseError)
-
-export const getTracerUserAlertsReadUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/user-alerts/${id}/`
-}
-
-export const tracerUserAlertsRead = async (id: string, options?: RequestInit): Promise<tracerUserAlertsReadResponse> => {
-
-  return apiMutator<tracerUserAlertsReadResponse>(getTracerUserAlertsReadUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerUserAlertsUpdateResponse200 = {
-  data: UserAlertMonitorApi
-  status: 200
-}
-
-export type tracerUserAlertsUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerUserAlertsUpdateResponseSuccess = (tracerUserAlertsUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerUserAlertsUpdateResponseError = (tracerUserAlertsUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerUserAlertsUpdateResponse = (tracerUserAlertsUpdateResponseSuccess | tracerUserAlertsUpdateResponseError)
-
-export const getTracerUserAlertsUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/user-alerts/${id}/`
-}
-
-export const tracerUserAlertsUpdate = async (id: string,
-    userAlertMonitorApi: NonReadonly<UserAlertMonitorApi>, options?: RequestInit): Promise<tracerUserAlertsUpdateResponse> => {
-
-  return apiMutator<tracerUserAlertsUpdateResponse>(getTracerUserAlertsUpdateUrl(id),
-  {
-    ...options,
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      userAlertMonitorApi,)
-  }
-);}
-
-
-
-export type tracerUserAlertsPartialUpdateResponse200 = {
-  data: UserAlertMonitorApi
-  status: 200
-}
-
-export type tracerUserAlertsPartialUpdateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerUserAlertsPartialUpdateResponseSuccess = (tracerUserAlertsPartialUpdateResponse200) & {
-  headers: Headers;
-};
-export type tracerUserAlertsPartialUpdateResponseError = (tracerUserAlertsPartialUpdateResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerUserAlertsPartialUpdateResponse = (tracerUserAlertsPartialUpdateResponseSuccess | tracerUserAlertsPartialUpdateResponseError)
-
-export const getTracerUserAlertsPartialUpdateUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/user-alerts/${id}/`
-}
-
-export const tracerUserAlertsPartialUpdate = async (id: string,
-    userAlertMonitorApi: NonReadonly<UserAlertMonitorApi>, options?: RequestInit): Promise<tracerUserAlertsPartialUpdateResponse> => {
-
-  return apiMutator<tracerUserAlertsPartialUpdateResponse>(getTracerUserAlertsPartialUpdateUrl(id),
-  {
-    ...options,
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      userAlertMonitorApi,)
-  }
-);}
-
-
-
-export type tracerUserAlertsDeleteResponse204 = {
-  data: void
-  status: 204
-}
-
-export type tracerUserAlertsDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 204>
-}
-
-export type tracerUserAlertsDeleteResponseSuccess = (tracerUserAlertsDeleteResponse204) & {
-  headers: Headers;
-};
-export type tracerUserAlertsDeleteResponseError = (tracerUserAlertsDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerUserAlertsDeleteResponse = (tracerUserAlertsDeleteResponseSuccess | tracerUserAlertsDeleteResponseError)
-
-export const getTracerUserAlertsDeleteUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/user-alerts/${id}/`
-}
-
-export const tracerUserAlertsDelete = async (id: string, options?: RequestInit): Promise<tracerUserAlertsDeleteResponse> => {
-
-  return apiMutator<tracerUserAlertsDeleteResponse>(getTracerUserAlertsDeleteUrl(id),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
-export type tracerUserAlertsMonitorDetailsResponse200 = {
-  data: UserAlertMonitorApi
-  status: 200
-}
-
-export type tracerUserAlertsMonitorDetailsResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerUserAlertsMonitorDetailsResponseSuccess = (tracerUserAlertsMonitorDetailsResponse200) & {
-  headers: Headers;
-};
-export type tracerUserAlertsMonitorDetailsResponseError = (tracerUserAlertsMonitorDetailsResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerUserAlertsMonitorDetailsResponse = (tracerUserAlertsMonitorDetailsResponseSuccess | tracerUserAlertsMonitorDetailsResponseError)
-
-export const getTracerUserAlertsMonitorDetailsUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/user-alerts/${id}/details/`
-}
-
-export const tracerUserAlertsMonitorDetails = async (id: string, options?: RequestInit): Promise<tracerUserAlertsMonitorDetailsResponse> => {
-
-  return apiMutator<tracerUserAlertsMonitorDetailsResponse>(getTracerUserAlertsMonitorDetailsUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type tracerUserAlertsGraphDataResponse200 = {
-  data: UserAlertMonitorApi
-  status: 200
-}
-
-export type tracerUserAlertsGraphDataResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
-}
-
-export type tracerUserAlertsGraphDataResponseSuccess = (tracerUserAlertsGraphDataResponse200) & {
-  headers: Headers;
-};
-export type tracerUserAlertsGraphDataResponseError = (tracerUserAlertsGraphDataResponseDefault) & {
-  headers: Headers;
-};
-
-export type tracerUserAlertsGraphDataResponse = (tracerUserAlertsGraphDataResponseSuccess | tracerUserAlertsGraphDataResponseError)
-
-export const getTracerUserAlertsGraphDataUrl = (id: string,) => {
-
-
-
-
-  return `/tracer/user-alerts/${id}/graph/`
-}
-
-/**
- * Accepts `start_date` and `end_date` query parameters (ISO 8601 format).
-If not provided, it defaults to the last 7 days.
- * @summary Returns time-series data for a monitor's metric, suitable for graphing.
- */
-export const tracerUserAlertsGraphData = async (id: string, options?: RequestInit): Promise<tracerUserAlertsGraphDataResponse> => {
-
-  return apiMutator<tracerUserAlertsGraphDataResponse>(getTracerUserAlertsGraphDataUrl(id),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
 export type tracerUsersListResponse200 = {
   data: UsersResponseApi
   status: 200
@@ -68970,20 +69044,30 @@ export type tracerUsersListResponse400 = {
   status: 400
 }
 
+export type tracerUsersListResponse422 = {
+  data: ApiErrorResponseApi
+  status: 422
+}
+
 export type tracerUsersListResponse500 = {
   data: ApiErrorResponseApi
   status: 500
 }
 
+export type tracerUsersListResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerUsersListResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
 }
 
 export type tracerUsersListResponseSuccess = (tracerUsersListResponse200) & {
   headers: Headers;
 };
-export type tracerUsersListResponseError = (tracerUsersListResponse400 | tracerUsersListResponse500 | tracerUsersListResponseDefault) & {
+export type tracerUsersListResponseError = (tracerUsersListResponse400 | tracerUsersListResponse422 | tracerUsersListResponse500 | tracerUsersListResponse503 | tracerUsersListResponseDefault) & {
   headers: Headers;
 };
 
@@ -70626,6 +70710,76 @@ export const usageDownloadInvoiceCreate = async (downloadInvoiceRequestApi: Down
 
 
 
+export type usageGetLatestPricesListResponse200 = {
+  data: PricingCalculationResponseApi
+  status: 200
+}
+
+export type usageGetLatestPricesListResponse400 = {
+  data: UsageErrorResponseApi
+  status: 400
+}
+
+export type usageGetLatestPricesListResponse401 = {
+  data: UsageErrorResponseApi
+  status: 401
+}
+
+export type usageGetLatestPricesListResponse402 = {
+  data: UsageErrorResponseApi
+  status: 402
+}
+
+export type usageGetLatestPricesListResponse403 = {
+  data: UsageErrorResponseApi
+  status: 403
+}
+
+export type usageGetLatestPricesListResponse404 = {
+  data: UsageErrorResponseApi
+  status: 404
+}
+
+export type usageGetLatestPricesListResponse500 = {
+  data: UsageErrorResponseApi
+  status: 500
+}
+
+export type usageGetLatestPricesListResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 402 | 403 | 404 | 500>
+}
+
+export type usageGetLatestPricesListResponseSuccess = (usageGetLatestPricesListResponse200) & {
+  headers: Headers;
+};
+export type usageGetLatestPricesListResponseError = (usageGetLatestPricesListResponse400 | usageGetLatestPricesListResponse401 | usageGetLatestPricesListResponse402 | usageGetLatestPricesListResponse403 | usageGetLatestPricesListResponse404 | usageGetLatestPricesListResponse500 | usageGetLatestPricesListResponseDefault) & {
+  headers: Headers;
+};
+
+export type usageGetLatestPricesListResponse = (usageGetLatestPricesListResponseSuccess | usageGetLatestPricesListResponseError)
+
+export const getUsageGetLatestPricesListUrl = () => {
+
+
+
+
+  return `/usage/get_latest_prices/`
+}
+
+export const usageGetLatestPricesList = async ( options?: RequestInit): Promise<usageGetLatestPricesListResponse> => {
+
+  return apiMutator<usageGetLatestPricesListResponse>(getUsageGetLatestPricesListUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
 export type usageGetAutoReloadSettingsListResponse200 = {
   data: AutoReloadSettingsResponseApi
   status: 200
@@ -70966,76 +71120,6 @@ export const getUsageGetWalletBalanceListUrl = () => {
 export const usageGetWalletBalanceList = async ( options?: RequestInit): Promise<usageGetWalletBalanceListResponse> => {
 
   return apiMutator<usageGetWalletBalanceListResponse>(getUsageGetWalletBalanceListUrl(),
-  {
-    ...options,
-    method: 'GET'
-
-
-  }
-);}
-
-
-
-export type usageGetLatestPricesListResponse200 = {
-  data: PricingCalculationResponseApi
-  status: 200
-}
-
-export type usageGetLatestPricesListResponse400 = {
-  data: UsageErrorResponseApi
-  status: 400
-}
-
-export type usageGetLatestPricesListResponse401 = {
-  data: UsageErrorResponseApi
-  status: 401
-}
-
-export type usageGetLatestPricesListResponse402 = {
-  data: UsageErrorResponseApi
-  status: 402
-}
-
-export type usageGetLatestPricesListResponse403 = {
-  data: UsageErrorResponseApi
-  status: 403
-}
-
-export type usageGetLatestPricesListResponse404 = {
-  data: UsageErrorResponseApi
-  status: 404
-}
-
-export type usageGetLatestPricesListResponse500 = {
-  data: UsageErrorResponseApi
-  status: 500
-}
-
-export type usageGetLatestPricesListResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 402 | 403 | 404 | 500>
-}
-
-export type usageGetLatestPricesListResponseSuccess = (usageGetLatestPricesListResponse200) & {
-  headers: Headers;
-};
-export type usageGetLatestPricesListResponseError = (usageGetLatestPricesListResponse400 | usageGetLatestPricesListResponse401 | usageGetLatestPricesListResponse402 | usageGetLatestPricesListResponse403 | usageGetLatestPricesListResponse404 | usageGetLatestPricesListResponse500 | usageGetLatestPricesListResponseDefault) & {
-  headers: Headers;
-};
-
-export type usageGetLatestPricesListResponse = (usageGetLatestPricesListResponseSuccess | usageGetLatestPricesListResponseError)
-
-export const getUsageGetLatestPricesListUrl = () => {
-
-
-
-
-  return `/usage/get_latest_prices/`
-}
-
-export const usageGetLatestPricesList = async ( options?: RequestInit): Promise<usageGetLatestPricesListResponse> => {
-
-  return apiMutator<usageGetLatestPricesListResponse>(getUsageGetLatestPricesListUrl(),
   {
     ...options,
     method: 'GET'
@@ -75007,6 +75091,227 @@ export const usageV2PaymentMethodsUpdate = async (setupIntentConfirmRequestApi: 
 
 
 
+export type usageV2PaymentMethodsDeleteResponse200 = {
+  data: UsageMessageResponseApi
+  status: 200
+}
+
+export type usageV2PaymentMethodsDeleteResponse400 = {
+  data: UsageErrorResponseApi
+  status: 400
+}
+
+export type usageV2PaymentMethodsDeleteResponse401 = {
+  data: UsageErrorResponseApi
+  status: 401
+}
+
+export type usageV2PaymentMethodsDeleteResponse402 = {
+  data: UsageErrorResponseApi
+  status: 402
+}
+
+export type usageV2PaymentMethodsDeleteResponse403 = {
+  data: UsageErrorResponseApi
+  status: 403
+}
+
+export type usageV2PaymentMethodsDeleteResponse404 = {
+  data: UsageErrorResponseApi
+  status: 404
+}
+
+export type usageV2PaymentMethodsDeleteResponse500 = {
+  data: UsageErrorResponseApi
+  status: 500
+}
+
+export type usageV2PaymentMethodsDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 402 | 403 | 404 | 500>
+}
+
+export type usageV2PaymentMethodsDeleteResponseSuccess = (usageV2PaymentMethodsDeleteResponse200) & {
+  headers: Headers;
+};
+export type usageV2PaymentMethodsDeleteResponseError = (usageV2PaymentMethodsDeleteResponse400 | usageV2PaymentMethodsDeleteResponse401 | usageV2PaymentMethodsDeleteResponse402 | usageV2PaymentMethodsDeleteResponse403 | usageV2PaymentMethodsDeleteResponse404 | usageV2PaymentMethodsDeleteResponse500 | usageV2PaymentMethodsDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type usageV2PaymentMethodsDeleteResponse = (usageV2PaymentMethodsDeleteResponseSuccess | usageV2PaymentMethodsDeleteResponseError)
+
+export const getUsageV2PaymentMethodsDeleteUrl = (pmId: string,) => {
+
+
+
+
+  return `/usage/v2/payment-methods/${pmId}/`
+}
+
+/**
+ * Manage a specific payment method.
+ */
+export const usageV2PaymentMethodsDelete = async (pmId: string, options?: RequestInit): Promise<usageV2PaymentMethodsDeleteResponse> => {
+
+  return apiMutator<usageV2PaymentMethodsDeleteResponse>(getUsageV2PaymentMethodsDeleteUrl(pmId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+export type usageV2PaymentMethodsDefaultCreateResponse200 = {
+  data: UsageMessageResponseApi
+  status: 200
+}
+
+export type usageV2PaymentMethodsDefaultCreateResponse400 = {
+  data: UsageErrorResponseApi
+  status: 400
+}
+
+export type usageV2PaymentMethodsDefaultCreateResponse401 = {
+  data: UsageErrorResponseApi
+  status: 401
+}
+
+export type usageV2PaymentMethodsDefaultCreateResponse402 = {
+  data: UsageErrorResponseApi
+  status: 402
+}
+
+export type usageV2PaymentMethodsDefaultCreateResponse403 = {
+  data: UsageErrorResponseApi
+  status: 403
+}
+
+export type usageV2PaymentMethodsDefaultCreateResponse404 = {
+  data: UsageErrorResponseApi
+  status: 404
+}
+
+export type usageV2PaymentMethodsDefaultCreateResponse500 = {
+  data: UsageErrorResponseApi
+  status: 500
+}
+
+export type usageV2PaymentMethodsDefaultCreateResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 402 | 403 | 404 | 500>
+}
+
+export type usageV2PaymentMethodsDefaultCreateResponseSuccess = (usageV2PaymentMethodsDefaultCreateResponse200) & {
+  headers: Headers;
+};
+export type usageV2PaymentMethodsDefaultCreateResponseError = (usageV2PaymentMethodsDefaultCreateResponse400 | usageV2PaymentMethodsDefaultCreateResponse401 | usageV2PaymentMethodsDefaultCreateResponse402 | usageV2PaymentMethodsDefaultCreateResponse403 | usageV2PaymentMethodsDefaultCreateResponse404 | usageV2PaymentMethodsDefaultCreateResponse500 | usageV2PaymentMethodsDefaultCreateResponseDefault) & {
+  headers: Headers;
+};
+
+export type usageV2PaymentMethodsDefaultCreateResponse = (usageV2PaymentMethodsDefaultCreateResponseSuccess | usageV2PaymentMethodsDefaultCreateResponseError)
+
+export const getUsageV2PaymentMethodsDefaultCreateUrl = (pmId: string,) => {
+
+
+
+
+  return `/usage/v2/payment-methods/${pmId}/default/`
+}
+
+/**
+ * Manage a specific payment method.
+ */
+export const usageV2PaymentMethodsDefaultCreate = async (pmId: string,
+    usageEmptyRequestApi: UsageEmptyRequestApi, options?: RequestInit): Promise<usageV2PaymentMethodsDefaultCreateResponse> => {
+
+  return apiMutator<usageV2PaymentMethodsDefaultCreateResponse>(getUsageV2PaymentMethodsDefaultCreateUrl(pmId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      usageEmptyRequestApi,)
+  }
+);}
+
+
+
+export type usageV2PaymentMethodsDefaultDeleteResponse200 = {
+  data: UsageMessageResponseApi
+  status: 200
+}
+
+export type usageV2PaymentMethodsDefaultDeleteResponse400 = {
+  data: UsageErrorResponseApi
+  status: 400
+}
+
+export type usageV2PaymentMethodsDefaultDeleteResponse401 = {
+  data: UsageErrorResponseApi
+  status: 401
+}
+
+export type usageV2PaymentMethodsDefaultDeleteResponse402 = {
+  data: UsageErrorResponseApi
+  status: 402
+}
+
+export type usageV2PaymentMethodsDefaultDeleteResponse403 = {
+  data: UsageErrorResponseApi
+  status: 403
+}
+
+export type usageV2PaymentMethodsDefaultDeleteResponse404 = {
+  data: UsageErrorResponseApi
+  status: 404
+}
+
+export type usageV2PaymentMethodsDefaultDeleteResponse500 = {
+  data: UsageErrorResponseApi
+  status: 500
+}
+
+export type usageV2PaymentMethodsDefaultDeleteResponseDefault = {
+  data: ManagementAPIErrorResponseApi
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 402 | 403 | 404 | 500>
+}
+
+export type usageV2PaymentMethodsDefaultDeleteResponseSuccess = (usageV2PaymentMethodsDefaultDeleteResponse200) & {
+  headers: Headers;
+};
+export type usageV2PaymentMethodsDefaultDeleteResponseError = (usageV2PaymentMethodsDefaultDeleteResponse400 | usageV2PaymentMethodsDefaultDeleteResponse401 | usageV2PaymentMethodsDefaultDeleteResponse402 | usageV2PaymentMethodsDefaultDeleteResponse403 | usageV2PaymentMethodsDefaultDeleteResponse404 | usageV2PaymentMethodsDefaultDeleteResponse500 | usageV2PaymentMethodsDefaultDeleteResponseDefault) & {
+  headers: Headers;
+};
+
+export type usageV2PaymentMethodsDefaultDeleteResponse = (usageV2PaymentMethodsDefaultDeleteResponseSuccess | usageV2PaymentMethodsDefaultDeleteResponseError)
+
+export const getUsageV2PaymentMethodsDefaultDeleteUrl = (pmId: string,) => {
+
+
+
+
+  return `/usage/v2/payment-methods/${pmId}/default/`
+}
+
+/**
+ * Manage a specific payment method.
+ */
+export const usageV2PaymentMethodsDefaultDelete = async (pmId: string, options?: RequestInit): Promise<usageV2PaymentMethodsDefaultDeleteResponse> => {
+
+  return apiMutator<usageV2PaymentMethodsDefaultDeleteResponse>(getUsageV2PaymentMethodsDefaultDeleteUrl(pmId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
 export type usageV2PaymentMethodsSetupIntentListResponse200 = {
   data: PaymentMethodsResponseApi
   status: 200
@@ -75227,227 +75532,6 @@ export const usageV2PaymentMethodsSetupIntentUpdate = async (setupIntentConfirmR
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
       setupIntentConfirmRequestApi,)
-  }
-);}
-
-
-
-export type usageV2PaymentMethodsDeleteResponse200 = {
-  data: UsageMessageResponseApi
-  status: 200
-}
-
-export type usageV2PaymentMethodsDeleteResponse400 = {
-  data: UsageErrorResponseApi
-  status: 400
-}
-
-export type usageV2PaymentMethodsDeleteResponse401 = {
-  data: UsageErrorResponseApi
-  status: 401
-}
-
-export type usageV2PaymentMethodsDeleteResponse402 = {
-  data: UsageErrorResponseApi
-  status: 402
-}
-
-export type usageV2PaymentMethodsDeleteResponse403 = {
-  data: UsageErrorResponseApi
-  status: 403
-}
-
-export type usageV2PaymentMethodsDeleteResponse404 = {
-  data: UsageErrorResponseApi
-  status: 404
-}
-
-export type usageV2PaymentMethodsDeleteResponse500 = {
-  data: UsageErrorResponseApi
-  status: 500
-}
-
-export type usageV2PaymentMethodsDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 402 | 403 | 404 | 500>
-}
-
-export type usageV2PaymentMethodsDeleteResponseSuccess = (usageV2PaymentMethodsDeleteResponse200) & {
-  headers: Headers;
-};
-export type usageV2PaymentMethodsDeleteResponseError = (usageV2PaymentMethodsDeleteResponse400 | usageV2PaymentMethodsDeleteResponse401 | usageV2PaymentMethodsDeleteResponse402 | usageV2PaymentMethodsDeleteResponse403 | usageV2PaymentMethodsDeleteResponse404 | usageV2PaymentMethodsDeleteResponse500 | usageV2PaymentMethodsDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type usageV2PaymentMethodsDeleteResponse = (usageV2PaymentMethodsDeleteResponseSuccess | usageV2PaymentMethodsDeleteResponseError)
-
-export const getUsageV2PaymentMethodsDeleteUrl = (pmId: string,) => {
-
-
-
-
-  return `/usage/v2/payment-methods/${pmId}/`
-}
-
-/**
- * Manage a specific payment method.
- */
-export const usageV2PaymentMethodsDelete = async (pmId: string, options?: RequestInit): Promise<usageV2PaymentMethodsDeleteResponse> => {
-
-  return apiMutator<usageV2PaymentMethodsDeleteResponse>(getUsageV2PaymentMethodsDeleteUrl(pmId),
-  {
-    ...options,
-    method: 'DELETE'
-
-
-  }
-);}
-
-
-
-export type usageV2PaymentMethodsDefaultCreateResponse200 = {
-  data: UsageMessageResponseApi
-  status: 200
-}
-
-export type usageV2PaymentMethodsDefaultCreateResponse400 = {
-  data: UsageErrorResponseApi
-  status: 400
-}
-
-export type usageV2PaymentMethodsDefaultCreateResponse401 = {
-  data: UsageErrorResponseApi
-  status: 401
-}
-
-export type usageV2PaymentMethodsDefaultCreateResponse402 = {
-  data: UsageErrorResponseApi
-  status: 402
-}
-
-export type usageV2PaymentMethodsDefaultCreateResponse403 = {
-  data: UsageErrorResponseApi
-  status: 403
-}
-
-export type usageV2PaymentMethodsDefaultCreateResponse404 = {
-  data: UsageErrorResponseApi
-  status: 404
-}
-
-export type usageV2PaymentMethodsDefaultCreateResponse500 = {
-  data: UsageErrorResponseApi
-  status: 500
-}
-
-export type usageV2PaymentMethodsDefaultCreateResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 402 | 403 | 404 | 500>
-}
-
-export type usageV2PaymentMethodsDefaultCreateResponseSuccess = (usageV2PaymentMethodsDefaultCreateResponse200) & {
-  headers: Headers;
-};
-export type usageV2PaymentMethodsDefaultCreateResponseError = (usageV2PaymentMethodsDefaultCreateResponse400 | usageV2PaymentMethodsDefaultCreateResponse401 | usageV2PaymentMethodsDefaultCreateResponse402 | usageV2PaymentMethodsDefaultCreateResponse403 | usageV2PaymentMethodsDefaultCreateResponse404 | usageV2PaymentMethodsDefaultCreateResponse500 | usageV2PaymentMethodsDefaultCreateResponseDefault) & {
-  headers: Headers;
-};
-
-export type usageV2PaymentMethodsDefaultCreateResponse = (usageV2PaymentMethodsDefaultCreateResponseSuccess | usageV2PaymentMethodsDefaultCreateResponseError)
-
-export const getUsageV2PaymentMethodsDefaultCreateUrl = (pmId: string,) => {
-
-
-
-
-  return `/usage/v2/payment-methods/${pmId}/default/`
-}
-
-/**
- * Manage a specific payment method.
- */
-export const usageV2PaymentMethodsDefaultCreate = async (pmId: string,
-    usageEmptyRequestApi: UsageEmptyRequestApi, options?: RequestInit): Promise<usageV2PaymentMethodsDefaultCreateResponse> => {
-
-  return apiMutator<usageV2PaymentMethodsDefaultCreateResponse>(getUsageV2PaymentMethodsDefaultCreateUrl(pmId),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      usageEmptyRequestApi,)
-  }
-);}
-
-
-
-export type usageV2PaymentMethodsDefaultDeleteResponse200 = {
-  data: UsageMessageResponseApi
-  status: 200
-}
-
-export type usageV2PaymentMethodsDefaultDeleteResponse400 = {
-  data: UsageErrorResponseApi
-  status: 400
-}
-
-export type usageV2PaymentMethodsDefaultDeleteResponse401 = {
-  data: UsageErrorResponseApi
-  status: 401
-}
-
-export type usageV2PaymentMethodsDefaultDeleteResponse402 = {
-  data: UsageErrorResponseApi
-  status: 402
-}
-
-export type usageV2PaymentMethodsDefaultDeleteResponse403 = {
-  data: UsageErrorResponseApi
-  status: 403
-}
-
-export type usageV2PaymentMethodsDefaultDeleteResponse404 = {
-  data: UsageErrorResponseApi
-  status: 404
-}
-
-export type usageV2PaymentMethodsDefaultDeleteResponse500 = {
-  data: UsageErrorResponseApi
-  status: 500
-}
-
-export type usageV2PaymentMethodsDefaultDeleteResponseDefault = {
-  data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 401 | 402 | 403 | 404 | 500>
-}
-
-export type usageV2PaymentMethodsDefaultDeleteResponseSuccess = (usageV2PaymentMethodsDefaultDeleteResponse200) & {
-  headers: Headers;
-};
-export type usageV2PaymentMethodsDefaultDeleteResponseError = (usageV2PaymentMethodsDefaultDeleteResponse400 | usageV2PaymentMethodsDefaultDeleteResponse401 | usageV2PaymentMethodsDefaultDeleteResponse402 | usageV2PaymentMethodsDefaultDeleteResponse403 | usageV2PaymentMethodsDefaultDeleteResponse404 | usageV2PaymentMethodsDefaultDeleteResponse500 | usageV2PaymentMethodsDefaultDeleteResponseDefault) & {
-  headers: Headers;
-};
-
-export type usageV2PaymentMethodsDefaultDeleteResponse = (usageV2PaymentMethodsDefaultDeleteResponseSuccess | usageV2PaymentMethodsDefaultDeleteResponseError)
-
-export const getUsageV2PaymentMethodsDefaultDeleteUrl = (pmId: string,) => {
-
-
-
-
-  return `/usage/v2/payment-methods/${pmId}/default/`
-}
-
-/**
- * Manage a specific payment method.
- */
-export const usageV2PaymentMethodsDefaultDelete = async (pmId: string, options?: RequestInit): Promise<usageV2PaymentMethodsDefaultDeleteResponse> => {
-
-  return apiMutator<usageV2PaymentMethodsDefaultDeleteResponse>(getUsageV2PaymentMethodsDefaultDeleteUrl(pmId),
-  {
-    ...options,
-    method: 'DELETE'
-
-
   }
 );}
 

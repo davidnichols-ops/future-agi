@@ -377,7 +377,7 @@ class TestSpanAttributeKeysPartitionPruning:
         assert params["candidate_limit"] == ATTRIBUTE_READ_CANDIDATE_LIMIT + 1
         assert 0 < timeout_ms <= ATTRIBUTE_READ_QUERY_TIMEOUT_MS
         assert settings["max_threads"] == 1
-        assert settings["max_bytes_to_read"] <= 512 * 1024 * 1024
+        assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         assert "max_rows_to_read" not in settings
         assert settings["optimize_use_projections"] == 0
         assert settings["allow_experimental_projection_optimization"] == 0

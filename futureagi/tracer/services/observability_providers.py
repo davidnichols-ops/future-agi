@@ -1056,6 +1056,9 @@ class ObservabilityService:
             )
 
         if span_attributes:
+            if not processed.get("ended_reason"):
+                processed["ended_reason"] = span_attributes.get("ended_reason")
+
             from tracer.utils.vapi_recording import VapiRecordingService
 
             mono_s3 = span_attributes.get("recording_url") or span_attributes.get(

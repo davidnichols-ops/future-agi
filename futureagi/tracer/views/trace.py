@@ -27,8 +27,10 @@ from django.db.models import (
     When,
 )
 from django.db.models.functions import Coalesce, JSONObject, Round
+from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from drf_yasg import openapi
 from drf_yasg.utils import swagger_auto_schema
 from rest_framework import serializers, status
 from rest_framework.decorators import action
@@ -142,6 +144,7 @@ from tracer.services.users_list_manager import UsersListManager
 from tracer.utils.annotations import (
     build_annotation_subqueries as _build_annotation_subqueries_impl,
 )
+from tracer.utils.bounded_csv import bounded_page_csv_response
 from tracer.utils.filters import FilterEngine
 from tracer.utils.helper import (
     eval_output_type_for_config,
@@ -164,13 +167,13 @@ ERROR_RESPONSES = {
     500: ApiErrorResponseSerializer,
 }
 
-# All trace-list reads share the outer infrastructure's 30-second ceiling.
+# All trace-list reads share a 9.5-second interactive ceiling.
 # Every candidate and enrichment statement receives only the request's
 # remaining time; concurrent finite page hydration therefore cannot extend the
 # endpoint beyond that wall deadline.
-TRACE_LIST_WALL_DEADLINE_MS = 30_000
-TRACE_LIST_CANDIDATE_DEADLINE_MS = 30_000
-TRACE_LIST_ENRICHMENT_TIMEOUT_MS = 30_000
+TRACE_LIST_WALL_DEADLINE_MS = 9_500
+TRACE_LIST_CANDIDATE_DEADLINE_MS = 9_500
+TRACE_LIST_ENRICHMENT_TIMEOUT_MS = 9_500
 # Page-local content/attribute hydration is exact but can still make ClickHouse
 # read a wide part when a caller requests the serializer's 500-row maximum.
 # High-volume qualification showed 100 identities remain below the locked
@@ -193,7 +196,7 @@ TRACE_LIST_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
-    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "max_result_rows": 5_001,
     "read_overflow_mode": "throw",
     "result_overflow_mode": "throw",
@@ -203,9 +206,10 @@ _VOICE_CONTENT_MAX_QUERY_ATTEMPTS = 64
 TRACE_NAVIGATION_CANDIDATE_LIMIT = 4_095
 TRACE_NAVIGATION_SCAN_PAGE_SIZE = 200
 TRACE_NAVIGATION_MAX_QUERIES = 128
-TRACE_NAVIGATION_WALL_DEADLINE_MS = 30_000
+TRACE_NAVIGATION_WALL_DEADLINE_MS = 9_500
 _CLICKHOUSE_ERROR_CODE_RE = re.compile(r"\bcode:\s*(\d+)\b", re.IGNORECASE)
 _OPTIONAL_USER_ENRICHMENT_ERROR_CODES = frozenset({497})
+EXPORT_PAGE_SIZE = 500
 
 
 class AnnotationScoreReadBoundExceeded(ReadDeadlineExceeded):
@@ -3333,6 +3337,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
 
             validated_data = dict(request.validated_query_data)
+            if kwargs.get("bounded_export"):
+                validated_data.update(
+                    page_number=0,
+                    page_size=EXPORT_PAGE_SIZE,
+                    cursor_mode=False,
+                )
             validated_data["filters"] = bind_request_my_annotations_principal(
                 request,
                 validated_data.get("filters", []),
@@ -4050,14 +4060,23 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
             return self._gm.bad_request("Trace navigation could not be loaded")
 
+    @validated_request(
+        query_serializer=TraceExportQuerySerializer,
+        responses={
+            200: openapi.Response(
+                "Bounded CSV export; a terminal comment row discloses truncation.",
+                schema=openapi.Schema(type=openapi.TYPE_STRING),
+            ),
+            **ERROR_RESPONSES,
+            503: ApiErrorResponseSerializer,
+        },
+        produces=["text/csv"],
+    )
     @action(detail=False, methods=["get"])
     def get_trace_export_data(self, request, *args, **kwargs):
-        """Fail closed until a complete ClickHouse trace exporter is available."""
+        """Export one bounded list page, disclosing any remaining rows in-band."""
         try:
-            serializer = TraceExportQuerySerializer(data=request.query_params)
-            if not serializer.is_valid():
-                return self._gm.bad_request(serializer.errors)
-            validated_data = serializer.validated_data
+            validated_data = request.validated_query_data
             project_id = str(validated_data["project_id"])
 
             project = (
@@ -4066,14 +4085,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if not project:
                 return self._gm.bad_request("Project not found")
 
-            # Trace lists are intentionally bounded and paginated. Reusing a
-            # page as a CSV would silently publish partial customer data. Voice
-            # and non-voice exports therefore share one explicit fail-closed
-            # contract until the background CH25 exporter can prove completion.
-            return self._gm.custom_error_response(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "A complete trace export is temporarily unavailable. Please retry later.",
-                code="service_unavailable",
+            page_response = self.list_traces_of_session(request, bounded_export=True)
+            if page_response.status_code != status.HTTP_200_OK:
+                return page_response
+            result = page_response.data.get("result", {})
+            return bounded_page_csv_response(
+                rows=result.get("table"),
+                metadata=result.get("metadata"),
+                filename=f"{project.name or 'project'}_traces.csv",
             )
 
         except Exception as exc:
@@ -5708,7 +5727,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         settings={
                             "max_threads": 1,
                             "max_memory_usage": 36 * 1024 * 1024 * 1024,
-                            "max_bytes_to_read": 512 * 1024 * 1024,
+                            "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
                             "read_overflow_mode": "throw",
                             "max_result_rows": 5001,
                             "result_overflow_mode": "throw",
@@ -6139,7 +6158,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # Eval configuration metadata is a finite project-scoped PG read. Do
         # not put a separate window-wide ClickHouse discovery query in front of
         # the authoritative trace page: that optional column-pruning step used
-        # to carry its own 30-second timeout and could consume the request before
+        # to carry its own wall timeout and could consume the request before
         # the list query started. Page-scoped eval hydration below remains
         # bounded by the selected trace IDs and this finite config set; configs
         # without page data simply render empty cells.
@@ -6276,7 +6295,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # Every page-scoped ClickHouse enrichment shares the same request wall
         # deadline and finite read settings. Content, eval, and user reads are
         # independent after page selection, so run them concurrently instead of
-        # stacking the former 10s + 30s + 10s per-query timeouts.
+        # stacking the former independent per-query timeouts.
         trace_ids = [str(row.get("trace_id", "")) for row in result.data]
         trace_user_identities = tuple(
             dict.fromkeys(
@@ -6655,7 +6674,12 @@ class UsersView(APIView):
 
     @validated_request(
         query_serializer=UsersQuerySerializer,
-        responses={200: UsersResponseSerializer, **ERROR_RESPONSES},
+        responses={
+            200: UsersResponseSerializer,
+            **ERROR_RESPONSES,
+            422: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        },
         # `export=true` returns text/csv; list returns JSON.
         produces=["application/json", "text/csv"],
     )
@@ -6672,25 +6696,6 @@ class UsersView(APIView):
             # Serializer is BooleanField(default=False), so this is already a bool.
             export = query_data.get("export", False)
             search = query_data.get("search", "")
-
-            # The historical Users CSV and sorted-numbered-page paths must
-            # aggregate every matching user before producing the first row.
-            # They are not safe at large-tenant scale and cannot satisfy the
-            # bounded exact-read contract. Fail closed with a stable public
-            # error until a preflighted asynchronous export / bounded global
-            # sort is available; never start a partial 200 CSV stream.
-            if export:
-                return self._gm.custom_error_response(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    "User export is temporarily unavailable.",
-                    code="user_export_unavailable",
-                )
-            if query_data.get("sort_params"):
-                return self._gm.custom_error_response(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    "User sorting is temporarily unavailable.",
-                    code="user_sort_unavailable",
-                )
 
             try:
                 page_size = int(query_data.get("page_size", 30))
@@ -6723,6 +6728,14 @@ class UsersView(APIView):
                 ),
                 attribute_keys=query_data.get("attribute_keys", []),
             )
+
+            if export:
+                response = StreamingHttpResponse(
+                    manager.iter_export_csv(),
+                    content_type="text/csv",
+                )
+                response["Content-Disposition"] = "attachment"
+                return response
 
             cursor_token = query_data.get("cursor")
             cursor_requested = bool(cursor_token or query_data.get("cursor_mode"))

@@ -1,4 +1,4 @@
-"""Public aggregate graphs never publish sampled values."""
+"""Public graphs publish only exact data or proven opt-in bounded samples."""
 
 from inspect import unwrap
 from types import SimpleNamespace
@@ -58,6 +58,18 @@ def test_sampled_graph_is_rejected_even_with_legacy_opt_in():
 
     assert not graph_payload_is_publishable(sample, allow_sampled=False)
     assert not graph_payload_is_publishable(sample, allow_sampled=True)
+
+
+@pytest.mark.unit
+def test_bounded_candidate_sample_is_publishable_only_with_explicit_opt_in():
+    sample = _sampled_series(
+        query_sampled=True,
+        query_exact=False,
+        query_provenance="bounded_candidates",
+    )
+
+    assert not graph_payload_is_publishable(sample, allow_sampled=False)
+    assert graph_payload_is_publishable(sample, allow_sampled=True)
 
 
 @pytest.mark.unit

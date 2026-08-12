@@ -2,13 +2,13 @@ import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, userEvent, waitFor } from "src/utils/test-utils";
 
-const { agGridState, prefetchCallLogsMock, useCallLogsMock } = vi.hoisted(
-  () => ({
+const { agGridState, prefetchCallLogsMock, queryClientMock, useCallLogsMock } =
+  vi.hoisted(() => ({
     agGridState: { props: null },
     prefetchCallLogsMock: vi.fn(),
+    queryClientMock: { prefetchQuery: vi.fn() },
     useCallLogsMock: vi.fn(),
-  }),
-);
+  }));
 
 vi.mock("ag-grid-react", async () => {
   const ReactModule = await import("react");
@@ -28,7 +28,7 @@ vi.mock("ag-grid-react", async () => {
 vi.mock("src/styles/clean-data-table.css", () => ({}));
 vi.mock("@tanstack/react-query", async (importOriginal) => ({
   ...(await importOriginal()),
-  useQueryClient: () => ({ prefetchQuery: vi.fn() }),
+  useQueryClient: () => queryClientMock,
 }));
 vi.mock("src/hooks/use-ag-theme", () => ({
   useAgTheme: () => ({ withParams: () => ({}) }),

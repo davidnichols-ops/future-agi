@@ -205,7 +205,7 @@ describe("AttributesView errors", () => {
     expect(mocks.get).toHaveBeenCalledWith(
       "/span-attribute-keys/",
       expect.objectContaining({
-        timeout: 35_000,
+        timeout: 9_800,
         params: {
           project_id: "project-large",
           page_size: 25,
@@ -227,7 +227,7 @@ describe("AttributesView errors", () => {
     expect(mocks.get).toHaveBeenCalledWith(
       "/span-attribute-keys/",
       expect.objectContaining({
-        timeout: 35_000,
+        timeout: 9_800,
         params: {
           project_id: "project-large",
           page_size: 25,

@@ -383,7 +383,7 @@ class TestResolveUserIds:
         analytics.execute_ch_query.return_value = Mock(data=[])
         builder.resolve_user_ids(trace_ids, analytics)
         _, kwargs = analytics.execute_ch_query.call_args
-        assert kwargs["timeout_ms"] == 10000
+        assert kwargs["timeout_ms"] == 9_500
 
 
 # ---------------------------------------------------------------------------

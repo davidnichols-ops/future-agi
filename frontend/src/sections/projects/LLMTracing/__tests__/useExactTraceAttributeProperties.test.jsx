@@ -88,7 +88,7 @@ describe("useExactTraceAttributeProperties", () => {
       1,
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
-        timeout: 35_000,
+        timeout: 9_800,
         params: {
           project_id: "project-synthetic",
           page_size: 10,
@@ -101,7 +101,7 @@ describe("useExactTraceAttributeProperties", () => {
       2,
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
-        timeout: 35_000,
+        timeout: 9_800,
         params: {
           project_id: "project-synthetic",
           page_size: 10,

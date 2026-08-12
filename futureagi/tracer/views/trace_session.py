@@ -1,4 +1,3 @@
-import io
 import json
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +11,6 @@ try:
 except ImportError:
     _json_loads = json.loads
 
-import pandas as pd
 import structlog
 from django.db import OperationalError, models, transaction
 from django.db.models import (
@@ -33,8 +31,9 @@ from django.db.models.functions import (
     Coalesce,
     Round,
 )
-from django.http import FileResponse, Http404
+from django.http import Http404
 from django.utils import timezone
+from drf_yasg import openapi
 from rest_framework import status as drf_status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -72,7 +71,7 @@ from tracer.serializers.filters import (
     ObserveGraphDataResponseSerializer,
     PageDepthExceededErrorSerializer,
 )
-from tracer.serializers.trace import TraceObserveListResponseSerializer
+from tracer.serializers.trace import TraceSessionListResponseSerializer
 from tracer.serializers.trace_session import (
     TraceSessionExportQuerySerializer,
     TraceSessionFilterValuesQuerySerializer,
@@ -125,6 +124,7 @@ from tracer.services.filter_principal_context import (
     FilterPrincipalContextError,
     bind_request_my_annotations_principal,
 )
+from tracer.utils.bounded_csv import bounded_page_csv_response
 from tracer.utils.filters import FilterEngine, apply_created_at_filters
 from tracer.utils.helper import (
     FieldConfig,
@@ -142,12 +142,12 @@ from tracer.utils.session import get_session_navigation
 logger = structlog.get_logger(__name__)
 session_logger = structlog.get_logger(__name__)
 
-# All session reads share one infrastructure-aligned 30-second wall deadline.
+# All interactive session-list reads share one 9.5-second wall deadline.
 # Individual phases receive only the request's remaining time, so concurrent
 # finite enrichments cannot extend the endpoint beyond that ceiling.
-SESSION_LIST_WALL_DEADLINE_MS = 30_000
-SESSION_LIST_QUERY_TIMEOUT_MS = 30_000
-SESSION_LIST_ENRICHMENT_TIMEOUT_MS = 30_000
+SESSION_LIST_WALL_DEADLINE_MS = 9_500
+SESSION_LIST_QUERY_TIMEOUT_MS = 9_500
+SESSION_LIST_ENRICHMENT_TIMEOUT_MS = 9_500
 SESSION_LIST_FILTER_MAX_CANDIDATES = 200
 SESSION_LIST_FILTER_MAX_SEED_ATTEMPTS = 24
 SESSION_LIST_FILTER_MAX_QUERIES = 48
@@ -155,7 +155,7 @@ SESSION_LIST_READ_SETTINGS = {
     "max_threads": 2,
     "max_block_size": 8192,
     "read_overflow_mode": "throw",
-    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "timeout_overflow_mode": "throw",
 }
@@ -166,6 +166,7 @@ SESSION_GRAPH_RETRYABLE_ERROR_CODES = {
     "read_budget_exceeded",
     "sample_limit",
 }
+SESSION_EXPORT_PAGE_SIZE = 500
 
 
 def _session_read_settings(*, max_result_rows: int) -> dict[str, int | str]:
@@ -186,7 +187,10 @@ def _session_list_cursor_order_for_partial_page(*, rows, bounded_page, cursor_st
 
     if rows:
         last = rows[-1]
-        return last.get("start_time"), str(last.get("session_id") or "")
+        return (
+            last.get("_seed_order_start") or last.get("start_time"),
+            str(last.get("_seed_order_id") or last.get("session_id") or ""),
+        )
     if cursor_state is not None:
         return tuple(cursor_state.order)
     if bounded_page.continuation_before_start_time is not None:
@@ -280,7 +284,12 @@ def _resolve_session_ids_to_canonical(
     return {i: id_to_survivor.get(i, i) for i in ids}
 
 
-def _expand_session_group(analytics, canonical_session_id: str) -> tuple[str, ...]:
+def _expand_session_group(
+    analytics,
+    canonical_session_id: str,
+    *,
+    deadline: ReadDeadline | None = None,
+) -> tuple[str, ...]:
     """Return all trace_session_ids (old + new) that share the same canonical.
 
     For a single session detail lookup this replaces the heavy
@@ -300,7 +309,9 @@ def _expand_session_group(analytics, canonical_session_id: str) -> tuple[str, ..
         "WHERE old_id = %(canonical_id)s"
     )
     res = analytics.execute_ch_query(
-        q, {"canonical_id": canonical_session_id}, timeout_ms=3000
+        q,
+        {"canonical_id": canonical_session_id},
+        timeout_ms=(deadline.remaining_ms(3_000) if deadline else 3_000),
     )
     ids = {canonical_session_id}
     for row in res.data or []:
@@ -773,15 +784,22 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         page_number = query_data["page_number"]
         page_size = query_data["page_size"]
         page_start = page_number * page_size
+        read_deadline = ReadDeadline.start(SESSION_LIST_WALL_DEADLINE_MS)
 
         # P3b step1.5: resolve the session's canonical ID and expand it to
         # all group member IDs (old + new). Use IN (...) instead of the heavy
         # LEFT JOIN (survivor_map_subquery) to avoid OOM on large remap tables.
         requested_session_id = str(trace_session_id)
         canonical_session_id = _resolve_session_ids_to_canonical(
-            analytics, [requested_session_id]
+            analytics,
+            [requested_session_id],
+            deadline=read_deadline,
         ).get(requested_session_id, requested_session_id)
-        session_group_ids = _expand_session_group(analytics, canonical_session_id)
+        session_group_ids = _expand_session_group(
+            analytics,
+            canonical_session_id,
+            deadline=read_deadline,
+        )
 
         # Get session-level aggregates from CH
         agg_query = """
@@ -800,7 +818,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         agg_result = analytics.execute_ch_query(
             agg_query,
             {"project_id": str(project_id), "session_group_ids": session_group_ids},
-            timeout_ms=5000,
+            timeout_ms=read_deadline.remaining_ms(5_000),
         )
 
         agg = agg_result.data[0] if agg_result.data else {}
@@ -819,11 +837,15 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         if end_user_id and end_user_id != null_uuid:
             try:
                 from tracer.services.clickhouse.v2.end_user_dict_reader import (
-                    resolve_user_ids,
+                    resolve_end_user_fields,
                 )
 
-                user_map = resolve_user_ids([end_user_id])
-                user_id_label = user_map.get(end_user_id)
+                user_map = resolve_end_user_fields(
+                    [end_user_id],
+                    timeout_ms=read_deadline.remaining_ms(1_500),
+                    settings=_session_read_settings(max_result_rows=1),
+                )
+                user_id_label = (user_map.get(end_user_id) or {}).get("user_id")
             except Exception:
                 logger.debug(
                     "session_retrieve_user_id_resolve_failed",
@@ -870,7 +892,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 "limit": page_size + 1,
                 "offset": page_start,
             },
-            timeout_ms=10000,
+            timeout_ms=read_deadline.remaining_ms(SESSION_LIST_QUERY_TIMEOUT_MS),
         )
 
         has_next = len(trace_result.data) > page_size
@@ -878,7 +900,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
         if not traces_data:
             next_session_id, previous_session_id = get_session_navigation(
-                request, project_id, trace_session_id, query_data
+                request,
+                project_id,
+                trace_session_id,
+                query_data,
+                deadline=read_deadline,
             )
             session_metadata["next_session_id"] = next_session_id
             session_metadata["previous_session_id"] = previous_session_id
@@ -910,6 +936,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             pre_config_ids = analytics.get_eval_config_ids_for_traces_ch(
                 trace_ids,
                 candidate_config_ids,
+                timeout_ms=read_deadline.remaining_ms(3_000),
             )
             if pre_config_ids:
                 eval_configs = list(
@@ -923,7 +950,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         eval_map = {}
         if eval_configs and trace_ids:
             config_ids = [str(c.id) for c in eval_configs]
-            eval_rows = analytics.get_trace_eval_scores_ch(trace_ids, config_ids)
+            eval_rows = analytics.get_trace_eval_scores_ch(
+                trace_ids,
+                config_ids,
+                timeout_ms=read_deadline.remaining_ms(5_000),
+            )
             for row in eval_rows:
                 key = (row["trace_id"], row["config_id"])
                 if row.get("float_count", 0) > 0:
@@ -995,7 +1026,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             response.append(result)
 
         next_session_id, previous_session_id = get_session_navigation(
-            request, project_id, trace_session_id, query_data
+            request,
+            project_id,
+            trace_session_id,
+            query_data,
+            deadline=read_deadline,
         )
         session_metadata["next_session_id"] = next_session_id
         session_metadata["previous_session_id"] = previous_session_id
@@ -1120,7 +1155,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     timeout_ms=SESSION_LIST_QUERY_TIMEOUT_MS,
                     settings={
                         **_session_read_settings(max_result_rows=page_size),
-                        "max_bytes_to_read": 256 * 1024 * 1024,
+                        "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
                         "max_memory_usage": 36 * 1024 * 1024 * 1024,
                     },
                 )
@@ -1221,7 +1256,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 timeout_ms=SESSION_LIST_QUERY_TIMEOUT_MS,
                 settings={
                     **_session_read_settings(max_result_rows=page_size),
-                    "max_bytes_to_read": 256 * 1024 * 1024,
+                    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
                     "max_memory_usage": 36 * 1024 * 1024 * 1024,
                 },
             )
@@ -1409,7 +1444,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
     @validated_request(
         query_serializer=TraceSessionListQuerySerializer,
         responses={
-            200: TraceObserveListResponseSerializer,
+            200: TraceSessionListResponseSerializer,
             400: ApiErrorResponseSerializer,
             422: PageDepthExceededErrorSerializer,
             500: ApiErrorResponseSerializer,
@@ -1423,6 +1458,12 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         """
         try:
             validated_data = dict(request.validated_query_data)
+            if kwargs.get("bounded_export"):
+                validated_data.update(
+                    page_number=0,
+                    page_size=SESSION_EXPORT_PAGE_SIZE,
+                    cursor_mode=False,
+                )
             validated_data["filters"] = bind_request_my_annotations_principal(
                 request,
                 validated_data.get("filters", []),
@@ -2838,7 +2879,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         # Once the finite page identities are known, every remaining CH read is
         # independent and candidate-scoped. Run those reads concurrently under
         # the one request wall deadline: endpoint time is selector + slowest
-        # enrichment, never selector + independent 5/10/30 second allowances.
+        # enrichment, never selector plus independent per-query allowances.
         metrics_query = ""
         metrics_params: dict = {}
         content_query = ""
@@ -3253,6 +3294,26 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     ),
                 }
             )
+            candidate_seed_is_sampled = getattr(
+                builder, "filter_candidate_seed_is_sampled", None
+            )
+            if callable(candidate_seed_is_sampled) and candidate_seed_is_sampled():
+                # Candidate order came from the insert-only session rollup;
+                # every returned row was still replayed through finite latest
+                # state, but the full ordering source cannot retract historical
+                # versions. Expose that distinction instead of labelling the
+                # fast page exact.
+                metadata.update(
+                    {
+                        "query_complete": public_chunk_complete,
+                        "query_status": (
+                            "complete" if public_chunk_complete else bounded_page.status
+                        ),
+                        "query_exact": False,
+                        "query_provenance": "spans_per_session_candidate",
+                        "ordering_exact": False,
+                    }
+                )
         if not candidate_cursor:
             metadata.update(
                 cursor_page_metadata(
@@ -3472,18 +3533,27 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             )
         return configs
 
+    @validated_request(
+        query_serializer=TraceSessionExportQuerySerializer,
+        responses={
+            200: openapi.Response(
+                "Bounded CSV export; a terminal comment row discloses truncation.",
+                schema=openapi.Schema(type=openapi.TYPE_STRING),
+            ),
+            400: ApiErrorResponseSerializer,
+            500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        },
+        produces=["text/csv"],
+    )
     @action(detail=False, methods=["get"])
     def get_trace_session_export_data(self, request, *args, **kwargs):
         """
         Export traces filtered by project ID and project version ID with optimized queries.
         """
         try:
-            serializer = TraceSessionExportQuerySerializer(data=request.query_params)
-            if not serializer.is_valid():
-                return self._gm.bad_request(serializer.errors)
-            validated_data = serializer.validated_data
-
-            response = self.list_sessions(request, export=True)
+            validated_data = request.validated_query_data
+            response = self.list_sessions(request, bounded_export=True)
 
             if response.status_code != 200:
                 return response
@@ -3491,21 +3561,12 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             project_id = str(validated_data["project_id"])
             project = _project_queryset_for_request(request).get(id=project_id)
 
-            result = response.data.get("result").get("table")
-            df = pd.DataFrame(result) if result else pd.DataFrame(columns=result)
-
-            # Convert to CSV buffer
-            buffer = io.BytesIO()
-            df.to_csv(buffer, index=False, encoding="utf-8")
-            buffer.seek(0)
-
-            # Create the response with the file
-            filename = f"{project.name or 'project'}_sessions.csv"
-            response = FileResponse(
-                buffer, as_attachment=True, filename=filename, content_type="text/csv"
+            result = response.data.get("result", {})
+            return bounded_page_csv_response(
+                rows=result.get("table"),
+                metadata=result.get("metadata"),
+                filename=f"{project.name or 'project'}_sessions.csv",
             )
-
-            return response
 
         except Exception as exc:
             logger.exception(
@@ -3578,7 +3639,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             )
             read_settings = {
                 **SESSION_LIST_READ_SETTINGS,
-                "max_bytes_to_read": 256 * 1024 * 1024,
+                "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
                 "max_memory_usage": 36 * 1024 * 1024 * 1024,
                 "max_result_bytes": 8 * 1024 * 1024,
                 "result_overflow_mode": "throw",

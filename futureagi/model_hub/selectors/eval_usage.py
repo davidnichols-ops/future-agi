@@ -19,8 +19,8 @@ from tracer.services.clickhouse.trace_project_scope import (
     latest_live_trace_projects_sql,
 )
 
-READ_TIMEOUT_MS = 30_000
-QUERY_TIMEOUT_MS = 30_000
+READ_TIMEOUT_MS = 9_500
+QUERY_TIMEOUT_MS = 9_500
 MAX_PAGE_SIZE = 100
 _USAGE_TABLE = "usage_apicalllog"
 _MAX_PAGE_SELECTION_ROWS = 10_000
@@ -29,7 +29,7 @@ _MIN_PAGE_WINDOW = timedelta(microseconds=1)
 _READ_SETTINGS = {
     "max_threads": 2,
     "read_overflow_mode": "throw",
-    "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "timeout_overflow_mode": "throw",
 }

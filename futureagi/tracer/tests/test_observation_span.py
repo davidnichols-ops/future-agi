@@ -358,7 +358,7 @@ class TestObservationSpanWorkspaceScopeAPI:
         )
 
         assert list_response.status_code == status.HTTP_400_BAD_REQUEST
-        assert export_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert export_response.status_code == status.HTTP_400_BAD_REQUEST
         assert graph_response.status_code == status.HTTP_400_BAD_REQUEST
         assert index_response.status_code == status.HTTP_400_BAD_REQUEST
 
@@ -1294,7 +1294,7 @@ class TestObservationSpanExportAPI:
     def test_export_spans_success(
         self, auth_client, project, project_version, trace, observation_span
     ):
-        """A bounded span page must never be published as a complete export."""
+        """Span export remains available through the bounded CSV contract."""
         # Associate span with project version
         observation_span.project_version = project_version
         observation_span.save()
@@ -1303,8 +1303,9 @@ class TestObservationSpanExportAPI:
             "/tracer/observation-span/get_spans_export_data/",
             {"project_id": str(project.id)},
         )
-        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-        assert response.json()["code"] == "service_unavailable"
+        assert response.status_code == status.HTTP_200_OK
+        assert response["Content-Type"].startswith("text/csv")
+        assert "attachment" in response["Content-Disposition"]
 
 
 @pytest.mark.integration

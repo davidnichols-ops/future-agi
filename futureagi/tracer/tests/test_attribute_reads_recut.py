@@ -33,6 +33,7 @@ from tracer.services.clickhouse.attribute_cursor_state import (
 from tracer.services.clickhouse.attribute_reads import (
     _LATEST_CARDINALITY_SQL,
     _STRATIFIED_CANDIDATE_SQL,
+    ATTRIBUTE_KEY_CURSOR_EXACT_MAX_CANDIDATE_PAGES,
     ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT,
     ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT,
     ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT,
@@ -53,6 +54,7 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
     ATTRIBUTE_READ_WALL_TIMEOUT_MS,
     ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+    ATTRIBUTE_VALUE_CURSOR_DENSE_CANDIDATE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_GUARD_MARGIN_MS,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT,
@@ -64,6 +66,8 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
     ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT,
     ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE,
+    ATTRIBUTE_VALUE_CURSOR_MAX_SEARCH_PROOFS,
+    ATTRIBUTE_VALUE_CURSOR_MAX_UNSEARCHED_CONTINUATION_PROOFS,
     ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
     ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS,
     ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS,
@@ -96,8 +100,8 @@ PROJECT_A = "c4de3065-12b5-488c-a814-aa1c8e3f856f"
 PROJECT_B = "790063cd-bc6a-4ad0-866b-35f11b5bc29b"
 
 
-def test_production_attribute_reads_use_one_30s_authoritative_deadline():
-    assert ATTRIBUTE_READ_WALL_TIMEOUT_MS == 30_000
+def test_production_attribute_reads_reserve_transport_inside_ten_second_sla():
+    assert ATTRIBUTE_READ_WALL_TIMEOUT_MS == 8_000
     assert ATTRIBUTE_READ_QUERY_TIMEOUT_MS == ATTRIBUTE_READ_WALL_TIMEOUT_MS
     assert ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS == ATTRIBUTE_READ_WALL_TIMEOUT_MS
     assert ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS == ATTRIBUTE_READ_WALL_TIMEOUT_MS
@@ -595,7 +599,7 @@ def test_empty_key_inventory_walks_five_bounded_ch25_segments():
         assert call.settings["optimize_read_in_order"] == 1
         assert call.settings["max_block_size"] == 8_192
         assert call.settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
-        assert call.settings["max_bytes_to_read"] <= 512 * 1024 * 1024
+        assert call.settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         assert "max_rows_to_read" not in call.settings
         assert call.settings["max_result_rows"] == ATTRIBUTE_READ_CANDIDATE_LIMIT + 1
         assert call.settings["timeout_overflow_mode"] == "throw"
@@ -1626,7 +1630,7 @@ def test_latest_replay_uses_index_pruning_and_exact_physical_identities():
     assert PROJECT_A not in replay.sql
     assert PROJECT_B not in replay.sql
     assert replay.settings["max_threads"] == 1
-    assert replay.settings["max_bytes_to_read"] == 512 * 1024 * 1024
+    assert replay.settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
     assert replay.settings["max_result_rows"] == 6
     candidate_calls = [
         call for call in executor.calls if "segment_start" in call.params
@@ -1797,7 +1801,7 @@ def test_detail_read_uses_latest_versions_and_does_not_resurrect_tombstones():
     assert "_version" in replay.sql
     assert " FINAL " not in f" {replay.sql.upper()} "
     assert "max_rows_to_read" not in replay.settings
-    assert replay.settings["max_bytes_to_read"] == 512 * 1024 * 1024
+    assert replay.settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
 
 
 def test_typed_map_key_browse_and_legacy_json_scalar_precedence():
@@ -1883,7 +1887,7 @@ def test_exact_structured_json_key_is_not_reported_as_complete_empty():
     assert json_seed.params["candidate_limit"] == (
         ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1
     )
-    assert json_seed.settings["max_bytes_to_read"] == 64 * 1024 * 1024
+    assert json_seed.settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
     assert "max_rows_to_read" not in json_seed.settings
 
 
@@ -1949,7 +1953,7 @@ def test_explicit_fourteen_day_exact_json_key_uses_one_bounded_identity_sample()
     assert json_calls[0].params["candidate_limit"] == (
         ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1
     )
-    assert json_calls[0].settings["max_bytes_to_read"] == 64 * 1024 * 1024
+    assert json_calls[0].settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
     assert "max_rows_to_read" not in json_calls[0].settings
     assert len(hydration_calls[0].params["candidate_ids_0"]) <= (
         ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT
@@ -1978,7 +1982,7 @@ def test_exact_json_key_read_budget_becomes_an_explicit_sample():
     assert "attributes_extra" not in json_call.sql
     assert "JSONHas(" not in json_call.sql
     assert 0 < json_call.timeout_ms <= ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS
-    assert json_call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
+    assert json_call.settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
 
 
 def test_exact_typed_key_read_budget_is_not_published_as_a_sample():
@@ -2030,7 +2034,7 @@ def test_exact_typed_key_timeout_keeps_query_safety_caps() -> None:
         for call in executor.calls
     )
     assert all(
-        call.settings["max_bytes_to_read"] <= 512 * 1024 * 1024
+        call.settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         for call in executor.calls
     )
     assert all("max_rows_to_read" not in call.settings for call in executor.calls)
@@ -3138,13 +3142,9 @@ def test_filter_value_cursor_empty_retained_window_terminates_without_loop():
     )
 
 
-@pytest.mark.parametrize(
-    ("horizon_days", "expected_query_count"),
-    ((7, 17), (30, 19), (365, 26)),
-)
-def test_filter_value_cursor_searched_absence_exhausts_horizon_logarithmically(
+@pytest.mark.parametrize("horizon_days", (7, 30, 365))
+def test_filter_value_cursor_searched_absence_returns_advancing_continuation(
     horizon_days,
-    expected_query_count,
 ):
     horizon = timedelta(days=horizon_days)
     executor = RecordingExecutor(distinct_responder=lambda *_args: [])
@@ -3168,17 +3168,19 @@ def test_filter_value_cursor_searched_absence_exhausts_horizon_logarithmically(
         )
         for call in proof_calls
     )
-    assert widths == _geometric_slice_widths(
+    expected_widths = _geometric_slice_widths(
         horizon,
         initial=ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
         maximum=ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT,
-    )
+    )[:6]
+    expected_segment_end = NOW - sum(expected_widths, timedelta())
+    assert widths == expected_widths
     assert read.rows == ()
-    assert read.browse_status == "exhausted"
-    assert read.has_more is False
-    assert read.next_segment_end == NOW - horizon
-    assert read.next_segment_start is None
-    assert read.metadata.query_count == len(proof_calls) == expected_query_count
+    assert read.browse_status == "continuation"
+    assert read.has_more is True
+    assert read.next_segment_end == expected_segment_end
+    assert read.next_segment_start == expected_segment_end - expected_widths[-1]
+    assert read.metadata.query_count == len(proof_calls) == 6
     assert read.metadata.query_count < ATTRIBUTE_READ_MAX_QUERY_COUNT
     assert all(
         call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
@@ -3187,7 +3189,7 @@ def test_filter_value_cursor_searched_absence_exhausts_horizon_logarithmically(
     assert not any("segment_start" in call.params for call in executor.calls)
 
 
-def test_filter_value_cursor_distinct_growth_stops_before_observed_density_cliff():
+def test_filter_value_cursor_search_proof_cap_stops_before_density_cliff():
     class ManualClock:
         value = 100.0
 
@@ -3244,17 +3246,16 @@ def test_filter_value_cursor_distinct_growth_stops_before_observed_density_cliff
         for call in proof_calls
     ]
     assert ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS == 500
-    assert widths == [
+    expected_widths = [
         timedelta(seconds=5),
         timedelta(seconds=10),
         timedelta(seconds=20),
         timedelta(seconds=40),
         timedelta(seconds=80),
         timedelta(seconds=160),
-        timedelta(seconds=320),
-        timedelta(seconds=320),
-        timedelta(seconds=320),
     ]
+    assert widths == expected_widths
+    assert len(widths) == ATTRIBUTE_VALUE_CURSOR_MAX_SEARCH_PROOFS
     assert all(
         newer.params["segment_start_us"] == older.params["segment_end_us"]
         for newer, older in zip(proof_calls, proof_calls[1:], strict=False)
@@ -3265,9 +3266,9 @@ def test_filter_value_cursor_distinct_growth_stops_before_observed_density_cliff
     )
     assert read.rows == ()
     assert read.has_more is True
-    assert read.next_segment_end == NOW - timedelta(seconds=1_275)
-    assert read.next_segment_start == read.next_segment_end - timedelta(seconds=320)
-    assert read.metadata.query_count == len(proof_calls) == 9
+    assert read.next_segment_end == NOW - sum(expected_widths, timedelta())
+    assert read.next_segment_start == read.next_segment_end - expected_widths[-1]
+    assert read.metadata.query_count == len(proof_calls) == 6
     assert not any("segment_start" in call.params for call in executor.calls)
 
 
@@ -3332,7 +3333,7 @@ def test_filter_value_cursor_resource_telemetry_sizes_below_adjacent_byte_cliff(
         proof_calls[0].params["segment_start_us"]
         == proof_calls[1].params["segment_end_us"]
     )
-    assert proof_calls[0].settings["max_bytes_to_read"] == 1_024 * 1024 * 1024
+    assert proof_calls[0].settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
     assert "max_rows_to_read" not in proof_calls[0].settings
     assert read.rows == ()
     assert read.browse_status == "exhausted"
@@ -3344,7 +3345,7 @@ def test_filter_value_cursor_resource_telemetry_sizes_below_adjacent_byte_cliff(
     assert not any("segment_start" in call.params for call in executor.calls)
 
 
-def test_filter_value_cursor_searched_old_number_preserves_type_and_exhausts_year():
+def test_filter_value_cursor_searched_old_number_survives_bounded_continuations():
     old_time = NOW - timedelta(days=300)
     candidate = _candidate(
         PROJECT_A,
@@ -3411,27 +3412,37 @@ def test_filter_value_cursor_searched_old_number_preserves_type_and_exhausts_yea
     assert all("distinct_limit" in call.params for call in executor.calls)
     assert all("attrs_string" not in call.sql for call in executor.calls)
 
-    second_executor = RecordingExecutor(respond, distinct_responder=distinct_respond)
-    terminal = AttributeReadSelector(second_executor, now=NOW).read_value_cursor_page(
-        [PROJECT_A],
-        "numeric.attribute",
-        page_size=10,
-        search="42",
-        attribute_type="number",
-        window_start=NOW - timedelta(days=365),
-        window_end=NOW,
-        segment_end=read.next_segment_end,
-        segment_start=read.next_segment_start,
-        seen_value_digests=read.seen_value_digests,
-    )
-    candidate_calls = [
-        call for call in second_executor.calls if "segment_start" in call.params
-    ]
-    assert terminal.rows == (AttributeValueRow(42.0, "number", 1),)
-    assert terminal.browse_status == "exhausted"
-    assert terminal.has_more is False
-    assert terminal.next_segment_end == NOW - timedelta(days=365)
-    assert terminal.metadata.query_count < ATTRIBUTE_READ_MAX_QUERY_COUNT
+    candidate_calls = []
+    for _ in range(20):
+        continuation_executor = RecordingExecutor(
+            respond,
+            distinct_responder=distinct_respond,
+        )
+        read = AttributeReadSelector(
+            continuation_executor,
+            now=NOW,
+        ).read_value_cursor_page(
+            [PROJECT_A],
+            "numeric.attribute",
+            page_size=10,
+            search="42",
+            attribute_type="number",
+            window_start=NOW - timedelta(days=365),
+            window_end=NOW,
+            segment_end=read.next_segment_end,
+            segment_start=read.next_segment_start,
+            seen_value_digests=read.seen_value_digests,
+        )
+        candidate_calls.extend(
+            call
+            for call in continuation_executor.calls
+            if "segment_start" in call.params
+        )
+        if read.rows:
+            break
+
+    assert read.rows == (AttributeValueRow(42.0, "number", 1),)
+    assert read.metadata.query_count < ATTRIBUTE_READ_MAX_QUERY_COUNT
     assert all("attrs_string" not in call.sql for call in candidate_calls)
     assert any(call.params["segment_start"] <= old_time for call in candidate_calls)
 
@@ -4072,6 +4083,78 @@ def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation()
     )
 
 
+def test_filter_value_cursor_oversamples_typed_dense_values_on_first_batch():
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"dense-{index:04d}",
+            start_time=NOW - timedelta(microseconds=index + 1),
+        )
+        for index in range(600)
+    ]
+    # Model the production voice-call distribution: many adjacent spans share
+    # one call id, so the old 64-identity prefix yielded only a handful of
+    # values even though acquiring it scanned the whole six-hour segment.
+    values = {
+        str(row["id"]): f"call-{index // 40:02d}"
+        for index, row in enumerate(candidates)
+    }
+    executor = _value_cursor_executor(candidates, values)
+
+    read = AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "call_id",
+        page_size=10,
+        attribute_type="string",
+        window_start=NOW - timedelta(hours=6),
+        window_end=NOW,
+    )
+
+    candidate_call = next(
+        call for call in executor.calls if "segment_start" in call.params
+    )
+    assert (
+        candidate_call.params["candidate_limit"] - 1
+        == ATTRIBUTE_VALUE_CURSOR_DENSE_CANDIDATE_LIMIT
+    )
+    assert candidate_call.timeout_ms > ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+    assert len(read.rows) == 10
+    assert len({row.value for row in read.rows}) == 10
+    assert read.has_more is True
+
+
+def test_filter_value_cursor_sparse_typed_key_starts_with_conservative_batch():
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"sparse-{index:04d}",
+            start_time=NOW - timedelta(microseconds=index + 1),
+        )
+        for index in range(100)
+    ]
+    executor = _value_cursor_executor(
+        candidates,
+        {str(row["id"]): "collector-ended-call" for row in candidates},
+    )
+
+    AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "ended_reason",
+        page_size=10,
+        attribute_type="string",
+        window_start=NOW - timedelta(hours=6),
+        window_end=NOW,
+    )
+
+    candidate_call = next(
+        call for call in executor.calls if "segment_start" in call.params
+    )
+    assert (
+        candidate_call.params["candidate_limit"] - 1
+        == ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+    )
+
+
 def test_filter_value_cursor_duplicate_only_page_reaches_older_unique_value():
     duplicate_value = "completed"
     unique_value = "older-unique"
@@ -4425,13 +4508,9 @@ def test_filter_value_cursor_dynamic_proof_rejects_one_unseen_value():
     assert read.rows == (AttributeValueRow(unseen_value, "string", 1),)
 
 
-@pytest.mark.parametrize(
-    ("horizon_days", "expected_query_count"),
-    ((7, 17), (30, 19), (365, 26)),
-)
-def test_filter_value_cursor_duplicate_only_search_exhausts_horizon_logarithmically(
+@pytest.mark.parametrize("horizon_days", (7, 30, 365))
+def test_filter_value_cursor_duplicate_only_search_returns_bounded_continuation(
     horizon_days,
-    expected_query_count,
 ):
     horizon = timedelta(days=horizon_days)
     seen_value = "completed"
@@ -4463,16 +4542,17 @@ def test_filter_value_cursor_duplicate_only_search_exhausts_horizon_logarithmica
         )
         for call in executor.calls
     )
-    assert widths == _geometric_slice_widths(
+    expected_widths = _geometric_slice_widths(
         horizon,
         initial=ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT,
         maximum=ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT,
-    )
+    )[:ATTRIBUTE_VALUE_CURSOR_MAX_SEARCH_PROOFS]
+    assert widths == expected_widths
     assert read.rows == ()
-    assert read.browse_status == "exhausted"
-    assert read.has_more is False
-    assert read.next_segment_end == NOW - horizon
-    assert read.metadata.query_count == len(executor.calls) == expected_query_count
+    assert read.browse_status == "continuation"
+    assert read.has_more is True
+    assert read.next_segment_end == NOW - sum(expected_widths, timedelta())
+    assert read.metadata.query_count == len(executor.calls) == len(expected_widths)
     assert all(
         call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
         for call in executor.calls
@@ -4564,7 +4644,7 @@ def test_filter_value_cursor_unpinned_search_distinct_exhausts_seen_typed_match(
     assert "'json'" in sql
 
 
-def test_filter_value_cursor_searched_empty_proof_exhausts_seven_days():
+def test_filter_value_cursor_searched_empty_proof_returns_bounded_continuation():
     executor = RecordingExecutor(
         distinct_responder=lambda *_args: [],
     )
@@ -4595,10 +4675,17 @@ def test_filter_value_cursor_searched_empty_proof_exhausts_seven_days():
         for call in distinct_calls
     )
     assert read.rows == ()
-    assert read.browse_status == "exhausted"
-    assert read.has_more is False
-    assert read.next_segment_end == NOW - timedelta(days=7)
-    assert read.metadata.query_count == len(distinct_calls) == 17
+    assert read.browse_status == "continuation"
+    assert read.has_more is True
+    assert len(distinct_calls) == ATTRIBUTE_VALUE_CURSOR_MAX_SEARCH_PROOFS
+    assert read.next_segment_end == NOW - sum(
+        (
+            ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT * (2**index)
+            for index in range(ATTRIBUTE_VALUE_CURSOR_MAX_SEARCH_PROOFS)
+        ),
+        timedelta(),
+    )
+    assert read.metadata.query_count == len(distinct_calls)
     assert read.metadata.query_count < ATTRIBUTE_READ_MAX_QUERY_COUNT
 
 
@@ -5022,7 +5109,6 @@ def test_filter_value_cursor_temporal_distinct_failure_returns_proven_safe_slice
     assert widths == [
         ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
         ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT * 2,
-        ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
     ]
     assert all(width <= ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT for width in widths)
     assert not any("segment_start" in call.params for call in executor.calls)
@@ -5065,6 +5151,56 @@ def test_filter_value_cursor_temporal_distinct_minimum_failure_keeps_original_fr
     assert read.rows == (AttributeValueRow("queued", "string", 1),)
 
 
+def test_filter_value_cursor_failed_proof_cap_reanchors_checkpoint_to_exact_floor():
+    checkpoint_time = NOW - timedelta(minutes=30)
+    before_identity = (
+        PROJECT_A,
+        "trace-proof-cap",
+        "span-z-proof-cap",
+        checkpoint_time,
+    )
+    candidate = _candidate(
+        PROJECT_A,
+        "span-a-proof-cap",
+        trace_id=before_identity[1],
+        start_time=checkpoint_time,
+    )
+    executor = _value_cursor_executor(
+        [candidate],
+        {str(candidate["id"]): "queued"},
+    )
+    executor.distinct_responder = lambda *_args: ReadDeadlineExceeded(
+        "bounded proof exceeded read budget"
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "fi.span.kind",
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_start=NOW - timedelta(hours=6),
+        before_identity=before_identity,
+        seen_value_digests=(attribute_value_cursor_digest("string", "completed"),),
+    )
+
+    distinct_calls = [
+        call for call in executor.calls if "distinct_limit" in call.params
+    ]
+    candidate_call = next(
+        call for call in executor.calls if "segment_start" in call.params
+    )
+    assert len(distinct_calls) == 2
+    assert candidate_call.params["segment_start"] == checkpoint_time
+    assert candidate_call.params["segment_end"] == (
+        checkpoint_time + ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+    )
+    assert candidate_call.params["candidate_before_id"] == before_identity[2]
+    assert read.rows == (AttributeValueRow("queued", "string", 1),)
+
+
 def test_filter_value_cursor_typed_distinct_sentinel_is_an_exact_fallback():
     candidate = _candidate(
         PROJECT_A,
@@ -5104,7 +5240,7 @@ def test_filter_value_cursor_typed_distinct_sentinel_is_an_exact_fallback():
     assert distinct_call.settings["max_threads"] == 1
     assert distinct_call.settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
     assert "max_rows_to_read" not in distinct_call.settings
-    assert distinct_call.settings["max_bytes_to_read"] == 1024 * 1024 * 1024
+    assert distinct_call.settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
     assert distinct_call.settings["max_result_rows"] == 2
     assert distinct_call.settings["max_result_bytes"] == 16 * 1024 * 1024
     assert distinct_call.settings["read_overflow_mode"] == "throw"
@@ -5165,7 +5301,7 @@ def test_filter_value_cursor_code_191_fallback_reanchors_page_n_checkpoint():
         call for call in executor.calls if "segment_start" in call.params
     )
     assert distinct_widths[0] == timedelta(hours=6)
-    assert distinct_widths[-1] == ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
+    assert distinct_widths == [timedelta(hours=6), timedelta(hours=3)]
     assert all(call.params["distinct_limit"] == 3 for call in distinct_calls)
     assert candidate_call.params["segment_start"] == checkpoint_time
     assert candidate_call.params["segment_end"] == (
@@ -5276,12 +5412,12 @@ def test_filter_value_cursor_temporal_distinct_preserves_physical_fallback_budge
         seen_value_digests=(seen_digest,),
     )
 
-    assert proof_calls == 6
+    assert proof_calls == ATTRIBUTE_VALUE_CURSOR_MAX_UNSEARCHED_CONTINUATION_PROOFS
     assert first.rows == ()
     assert first.has_more is True
     assert first.next_segment_end < NOW
     assert all("distinct_limit" in call.params for call in first_executor.calls)
-    assert 2.81 <= clock.value - 100.0 < 2.83
+    assert 0.93 <= clock.value - 100.0 < 0.95
     assert ATTRIBUTE_VALUE_CURSOR_DISTINCT_GUARD_MARGIN_MS == 100
 
     candidate = _candidate(
@@ -5571,12 +5707,12 @@ def test_filter_value_cursor_pinned_type_reserves_three_query_page_ceiling():
     # One complete temporal proof consumes the first query.  The selector may
     # then start only whole three-statement typed candidate batches.
     candidate_page_count = (ATTRIBUTE_READ_MAX_QUERY_COUNT - 1) // 3
-    processed_candidates = (
-        ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
-        + (2 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT)
-        + (4 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT)
-        + (candidate_page_count - 3) * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT
-    )
+    expected_candidate_limits = [
+        ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+        2 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+        4 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+    ] + [ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT] * (candidate_page_count - 3)
+    processed_candidates = sum(expected_candidate_limits)
     candidates = [
         _candidate(
             PROJECT_A,
@@ -5626,6 +5762,9 @@ def test_filter_value_cursor_pinned_type_reserves_three_query_page_ceiling():
         == len(hydration_calls)
         == candidate_page_count
     )
+    assert [
+        call.params["candidate_limit"] - 1 for call in candidate_calls
+    ] == expected_candidate_limits
     assert read.next_before_identity == (
         str(last_verified["project_id"]),
         str(last_verified["trace_id"]),
@@ -6749,7 +6888,7 @@ def test_explicit_window_json_value_runs_after_all_typed_bands_are_empty():
     assert all("JSONHas(attributes_extra" not in call.sql for call in candidate_calls)
     assert all("attribute_search" not in call.params for call in candidate_calls)
     first_json_call = candidate_calls[-1]
-    assert first_json_call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
+    assert first_json_call.settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
     assert "max_rows_to_read" not in first_json_call.settings
     assert first_json_call.settings["max_block_size"] == 2_048
     json_hydration = next(
@@ -7210,7 +7349,7 @@ def test_absent_heavy_json_key_uses_only_bounded_identity_seeds():
         for call in json_calls
     )
     assert all(
-        call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
+        call.settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         and "max_rows_to_read" not in call.settings
         and call.settings["max_block_size"] == 2_048
         for call in json_calls
@@ -8305,7 +8444,7 @@ def test_span_attribute_key_cursor_exact_json_continuation_is_bounded_and_unique
     monkeypatch.setattr(selector, "_verify_latest", verify)
     monkeypatch.setattr(
         "tracer.services.clickhouse.attribute_reads."
-        "ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES",
+        "ATTRIBUTE_KEY_CURSOR_EXACT_MAX_CANDIDATE_PAGES",
         2,
     )
 
@@ -8440,13 +8579,9 @@ def test_span_attribute_key_cursor_exact_json_binds_key_in_ordered_sql():
     assert ordered_fallback.settings["use_skip_indexes"] == 0
 
 
-@pytest.mark.parametrize(
-    ("horizon_days", "expected_query_count"),
-    ((7, 12), (30, 15), (365, 21)),
-)
-def test_span_attribute_key_cursor_exact_absence_exhausts_horizon_logarithmically(
+@pytest.mark.parametrize("horizon_days", (7, 30, 365))
+def test_span_attribute_key_cursor_exact_absence_returns_bounded_continuation(
     horizon_days,
-    expected_query_count,
 ):
     horizon = timedelta(days=horizon_days)
     executor = RecordingExecutor()
@@ -8472,17 +8607,25 @@ def test_span_attribute_key_cursor_exact_absence_exhausts_horizon_logarithmicall
         call.params["segment_end"] - call.params["segment_start"]
         for call in ordered_calls
     )
-    assert widths == _geometric_slice_widths(
+    expected_widths = _geometric_slice_widths(
         horizon,
         initial=ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
         maximum=ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT,
-    )
+    )[: ATTRIBUTE_KEY_CURSOR_EXACT_MAX_CANDIDATE_PAGES - 1]
+    assert widths == expected_widths
     assert page.rows == ()
-    assert page.browse_status == "exhausted"
-    assert page.has_more is False
-    assert page.next_segment_end == NOW - horizon
-    assert page.next_segment_start is None
-    assert page.metadata.query_count == len(executor.calls) == expected_query_count
+    assert page.browse_status == "continuation"
+    assert page.has_more is True
+    assert page.next_segment_end == NOW - sum(expected_widths, timedelta())
+    assert page.next_segment_start == page.next_segment_end - min(
+        expected_widths[-1] * 2,
+        ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT,
+    )
+    assert (
+        page.metadata.query_count
+        == len(executor.calls)
+        == ATTRIBUTE_KEY_CURSOR_EXACT_MAX_CANDIDATE_PAGES
+    )
     assert page.metadata.query_count < ATTRIBUTE_READ_MAX_QUERY_COUNT
     assert all(
         call.timeout_ms == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
@@ -8546,7 +8689,7 @@ def test_span_attribute_key_cursor_exact_page_n_reuses_adaptive_width(monkeypatc
     assert second.next_segment_end < first.next_segment_end
 
 
-def test_span_attribute_key_cursor_exact_sparse_year_grows_empty_windows():
+def test_span_attribute_key_cursor_exact_sparse_year_returns_bounded_continuation():
     ordered_segments = []
     boundary_identity = (
         PROJECT_A,
@@ -8617,20 +8760,19 @@ def test_span_attribute_key_cursor_exact_sparse_year_grows_empty_windows():
     assert typed_probe_count == 1
     assert returned_boundaries == [boundary_identity]
     assert page.rows == ()
-    assert page.has_more is False
-    assert page.browse_status == "exhausted"
-    assert page.next_segment_end == window_start
+    assert page.has_more is True
+    assert page.browse_status == "continuation"
+    assert page.next_segment_end == ordered_segments[-1][0]
+    assert page.next_segment_start == page.next_segment_end - widths[-1] * 2
     assert page.metadata.query_count == len(executor.calls)
-    assert page.metadata.query_count == 22
+    assert page.metadata.query_count == 9
     assert page.metadata.query_count < ATTRIBUTE_READ_MAX_QUERY_COUNT
     assert widths[0] == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
     # A completely replayed stale/unsupported candidate proves the first
     # half-open slice empty just like an empty candidate page, so the adjacent
     # older slice widens and the boundary identity is never revisited.
     assert widths[1] == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT * 2
-    assert max(widths) == ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT
-    assert len(widths) < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
-    assert sum(widths, timedelta()) == timedelta(days=365)
+    assert len(widths) == ATTRIBUTE_KEY_CURSOR_EXACT_MAX_CANDIDATE_PAGES - 1
     assert all(
         later_end == earlier_start
         for (earlier_start, _earlier_end), (_later_start, later_end) in zip(
@@ -8647,6 +8789,32 @@ def test_span_attribute_key_cursor_exact_sparse_year_grows_empty_windows():
         )
         or later == widths[-1]
         for earlier, later in zip(widths, widths[1:], strict=False)
+    )
+
+
+def test_span_attribute_key_cursor_exact_missing_key_returns_advancing_page():
+    window_start = NOW - timedelta(days=365)
+    executor = RecordingExecutor()
+
+    page = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    ).read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=window_start,
+        window_end=NOW,
+        exact_key="ended_reason",
+    )
+
+    assert page.rows == ()
+    assert page.has_more is True
+    assert page.next_segment_end < NOW
+    assert page.next_segment_start is not None
+    assert page.metadata.query_count <= 1 + (
+        2 * ATTRIBUTE_KEY_CURSOR_EXACT_MAX_CANDIDATE_PAGES
     )
 
 
@@ -8759,6 +8927,8 @@ def test_span_attribute_key_cursor_exact_floor_failure_never_loops_with_200():
 
 
 def test_span_attribute_key_cursor_exact_replay_budget_halves_without_progress():
+    """A singleton replay failure shrinks time, not an irrelevant batch cap."""
+
     identity = (
         PROJECT_A,
         "trace-replay-dense",
@@ -9109,7 +9279,7 @@ def test_attribute_retained_bound_budget_falls_back_without_starving_cursor(
     assert capacity.timeouts[0] == ATTRIBUTE_READ_METADATA_TIMEOUT_MS / 1000
     assert capacity.timeouts[1] > capacity.timeouts[0]
     assert any("segment_start" in call.params for call in executor.calls)
-    assert all(0 < call.timeout_ms <= 30_000 for call in executor.calls)
+    assert all(0 < call.timeout_ms <= 8_000 for call in executor.calls)
     assert clock.value < 101.0
     assert page.metadata.query_count == len(executor.calls)
 
@@ -11393,6 +11563,80 @@ def test_span_attribute_views_reject_incomplete_selector_metadata(
     assert "read_budget_exceeded" not in payload
     assert "final_status" not in payload
     assert "Rechazado" not in payload
+
+
+def test_legacy_span_attribute_values_publish_honest_empty_bounded_sample(
+    monkeypatch,
+):
+    from tracer.views.span_attributes import SpanAttributeValuesView
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "read_values",
+        lambda *_args, **_kwargs: AttributeValueRead(
+            (),
+            _metadata(complete=False, error_code="sample_limit"),
+        ),
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._project_is_in_request_scope",
+        lambda _request, _project_id: True,
+    )
+    request = _authenticated_get(
+        "/api/traces/span-attribute-values/",
+        {"project_id": PROJECT_A, "key": "ended_reason"},
+    )
+
+    response = SpanAttributeValuesView.as_view()(request)
+
+    assert response.status_code == 200
+    assert response.data["result"] == []
+    assert response.data["query_complete"] is False
+    assert response.data["query_status"] == "sampled"
+    assert response.data["query_error_code"] == "sample_limit"
+
+
+def test_legacy_span_attribute_values_use_one_bounded_compatibility_slice(
+    monkeypatch,
+):
+    from tracer.views.span_attributes import SpanAttributeValuesView
+
+    captured: dict[str, Any] = {}
+
+    def read_values(self, project_ids, key, **kwargs):
+        captured.update(project_ids=project_ids, key=key, **kwargs)
+        return AttributeValueRead(
+            (AttributeValueRow("assistant-ended-call", "string", 1),),
+            AttributeReadMetadata(
+                query_complete=True,
+                query_status="complete",
+                query_error_code=None,
+                query_window_start=kwargs["window_start"],
+                query_window_end=kwargs["window_end"],
+                query_count=2,
+            ),
+        )
+
+    monkeypatch.setattr(AttributeReadSelector, "read_values", read_values)
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._project_is_in_request_scope",
+        lambda _request, _project_id: True,
+    )
+    request = _authenticated_get(
+        "/api/traces/span-attribute-values/",
+        {"project_id": PROJECT_A, "key": "ended_reason", "limit": 50},
+    )
+
+    response = SpanAttributeValuesView.as_view()(request)
+
+    assert response.status_code == 200
+    assert response.data["result"][0]["value"] == "assistant-ended-call"
+    assert response.data["query_complete"] is False
+    assert response.data["query_status"] == "sampled"
+    assert response.data["query_error_code"] == "sample_limit"
+    assert captured["project_ids"] == [PROJECT_A]
+    assert captured["key"] == "ended_reason"
+    assert captured["window_end"] - captured["window_start"] == timedelta(hours=6)
 
 
 @pytest.mark.parametrize(

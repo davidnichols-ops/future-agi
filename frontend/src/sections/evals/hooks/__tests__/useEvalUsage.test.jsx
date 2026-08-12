@@ -120,6 +120,11 @@ describe("useEvalUsage date params", () => {
     expect(result.current.data.queryCompletedAt).toBe(
       "2026-08-03T02:00:00.000Z",
     );
+    expect(result.current.data).toMatchObject({
+      query_complete: true,
+      query_status: "complete",
+      query_sampled: false,
+    });
   });
 
   it("fails metadata-less aggregation responses closed", async () => {
@@ -167,6 +172,12 @@ describe("useEvalUsage date params", () => {
     await act(async () => vi.advanceTimersByTimeAsync(0));
     expect(result.current.data?.queryPending).toBe(true);
     expect(result.current.data?.queryRefreshing).toBe(true);
+    expect(result.current.data).toMatchObject({
+      query_complete: false,
+      query_status: "pending",
+      query_sampled: false,
+      query_refreshing: true,
+    });
     expect(mocks.get).toHaveBeenCalledOnce();
 
     await act(async () => vi.advanceTimersByTimeAsync(1000));
@@ -332,6 +343,11 @@ describe("useEvalUsageLogs response mapping", () => {
     await waitFor(() => expect(result.current.data).toBeTruthy());
     expect(result.current.data.table).toHaveLength(1);
     expect(result.current.data.pagination).toEqual({ total: 5, page: 0 });
+    expect(result.current.data).toMatchObject({
+      query_complete: true,
+      query_status: "complete",
+      query_sampled: false,
+    });
   });
 
   it("keeps the previous exact page visible while the next page loads", async () => {

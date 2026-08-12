@@ -1531,6 +1531,7 @@ def compile_span_filter_plans(
 
 _CANDIDATE_RESIDUAL_KEYS = {
     "annotator",
+    "end_user_id",
     "has_annotation",
     "has_eval",
     "my_annotations",
@@ -1542,10 +1543,10 @@ _CANDIDATE_RESIDUAL_TYPES = {"ANNOTATION", "EVAL_METRIC"}
 def _is_candidate_residual_filter(item: dict[str, Any]) -> bool:
     key, config = _parts(item)
     col_type = str(config.get("col_type") or config.get("colType") or "").upper()
-    if (
-        col_type == "SPAN_ATTRIBUTE"
-        and key in ClickHouseFilterBuilder._ENDUSER_STRING_COLUMNS
-    ):
+    if col_type == "SPAN_ATTRIBUTE" and key in {
+        *ClickHouseFilterBuilder._ENDUSER_STRING_COLUMNS,
+        "end_user_id",
+    }:
         return False
     return key in _CANDIDATE_RESIDUAL_KEYS or col_type in _CANDIDATE_RESIDUAL_TYPES
 

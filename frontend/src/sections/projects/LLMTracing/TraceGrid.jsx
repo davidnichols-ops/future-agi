@@ -67,9 +67,9 @@ const traceRowIdentity = (row) => {
   return id ? `${row?.project_id || ""}:${id}` : null;
 };
 const EMPTY_EXTRA_FILTERS = [];
-const loadTraceObservePage = (params) =>
+const loadTraceObservePage = (params, signal) =>
   axios
-    .get(endpoints.project.getTracesForObserveProject(), { params })
+    .get(endpoints.project.getTracesForObserveProject(), { params, signal })
     .then((response) =>
       parseAxiosResult(response, parseTraceObserveListResponse),
     );
@@ -334,11 +334,12 @@ const TraceGrid = React.forwardRef(
                 pagination: cursorPagination.current,
                 pageNumber,
                 targetRowCount: ROWS_LIMIT,
-                loadResponse: () => {
+                loadResponse: (signal) => {
                   const prefetched = cached;
                   cached = undefined;
                   return (
-                    prefetched || loadTraceObservePage(buildParams(pageNumber))
+                    prefetched ||
+                    loadTraceObservePage(buildParams(pageNumber), signal)
                   );
                 },
                 rowsFromResponse: (response) => response.data.table,
@@ -346,8 +347,8 @@ const TraceGrid = React.forwardRef(
                 rowIdentity: traceRowIdentity,
                 isCurrent: () =>
                   cursorPagination.current.isCurrent(requestGeneration),
-                nextResponse: () =>
-                  loadTraceObservePage(buildParams(pageNumber)),
+                nextResponse: (_cursor, signal) =>
+                  loadTraceObservePage(buildParams(pageNumber), signal),
               });
               if (!cursorPagination.current.isCurrent(requestGeneration)) {
                 // A newer filter/range owns the grid now. Do not let this stale

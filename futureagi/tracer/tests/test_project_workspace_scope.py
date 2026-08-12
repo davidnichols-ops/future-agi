@@ -100,7 +100,7 @@ class TestProjectWorkspaceScope:
         assert 0 < call.kwargs["timeout_ms"] <= 30_000
         settings = call.kwargs["settings"]
         assert "max_rows_to_read" not in settings
-        assert settings["max_bytes_to_read"] == 8 * 1024 * 1024 * 1024
+        assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         assert settings["max_result_rows"] == 10_000
         assert settings["max_result_bytes"] == 32 * 1024 * 1024
@@ -140,7 +140,7 @@ class TestProjectWorkspaceScope:
         assert 0 < call.kwargs["timeout_ms"] <= 30_000
         settings = call.kwargs["settings"]
         assert "max_rows_to_read" not in settings
-        assert settings["max_bytes_to_read"] == 8 * 1024 * 1024 * 1024
+        assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         assert settings["max_result_rows"] == 10_000
         assert settings["max_result_bytes"] == 32 * 1024 * 1024

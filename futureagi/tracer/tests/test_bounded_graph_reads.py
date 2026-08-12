@@ -381,7 +381,8 @@ def test_filtered_graph_candidates_are_finite_latest_state_samples(
     assert "argMax(" in classify_query
     assert "FINAL" not in classify_query
     assert classify_params[candidate_param] in {("trace-1",), ("span-1",)}
-    assert seed_timeout <= 1_500 and classify_timeout <= 1_500
+    assert seed_timeout <= bounded_graph_reads.GRAPH_CANDIDATE_DEADLINE_MS
+    assert classify_timeout <= bounded_graph_reads.GRAPH_CANDIDATE_DEADLINE_MS
     assert seed_settings["max_threads"] == classify_settings["max_threads"] == 1
 
 
@@ -3054,7 +3055,7 @@ def test_partial_or_empty_stratified_deadline_is_not_renderable(
     # distributed_started, first-stratum check, and optional second-stratum
     # check. Crossing the deadline before all planned strata must
     # never turn zero or partial temporal coverage into a sampled graph.
-    clock = iter([0.0, 4.0] if completed_strata == 0 else [0.0, 0.0, 4.0])
+    clock = iter([0.0, 10.0] if completed_strata == 0 else [0.0, 0.0, 10.0])
     monkeypatch.setattr(bounded_graph_reads, "monotonic", lambda: next(clock))
     monkeypatch.setattr(bounded_graph_reads, "read_bounded_filter_page", _page)
 
@@ -3398,7 +3399,6 @@ def test_locked_trace_temporal_candidates_use_resource_safe_union_batches() -> N
 @pytest.mark.parametrize(
     ("fetch_name", "namespace"),
     [
-        ("fetch_system_metric_graph_ch", "observe-system-graph"),
         ("fetch_all_system_metrics_ch", "observe-all-system-graphs"),
         ("fetch_eval_graph_ch", "observe-eval-graph"),
         ("fetch_eval_chart_series_ch", "observe-eval-chart-series"),

@@ -70,6 +70,7 @@ describe("annotation selector exact cursor datasource", () => {
         cursor_mode: true,
         page_number: 0,
       }),
+      expect.any(AbortSignal),
     );
     expect(request).toHaveBeenNthCalledWith(
       2,
@@ -77,6 +78,7 @@ describe("annotation selector exact cursor datasource", () => {
         cursor_mode: true,
         cursor: "signed-1",
       }),
+      expect.any(AbortSignal),
     );
     expect(params.fail).not.toHaveBeenCalled();
     expect(params.success).toHaveBeenCalledWith({
@@ -129,6 +131,7 @@ describe("annotation selector exact cursor datasource", () => {
         cursor_mode: true,
         cursor: "signed-2",
       }),
+      expect.any(AbortSignal),
     );
     expect(resumedAttempt.success).toHaveBeenCalledWith({
       rowData: [{ id: "trace-buffered" }, { id: "trace-rare" }],
@@ -192,6 +195,7 @@ describe("annotation selector exact cursor datasource", () => {
     expect(request).toHaveBeenNthCalledWith(
       3,
       expect.objectContaining({ cursor: "signed-retry" }),
+      expect.any(AbortSignal),
     );
     expect(resumedAttempt.success).toHaveBeenCalledWith({
       rowData: [{ id: "trace-buffered" }, { id: "trace-terminal" }],
@@ -228,6 +232,7 @@ describe("annotation selector exact cursor datasource", () => {
     expect(request).toHaveBeenNthCalledWith(
       3,
       expect.objectContaining({ cursor: "signed-b" }),
+      expect.any(AbortSignal),
     );
     expect(resumedAttempt.success).not.toHaveBeenCalled();
     expect(resumedAttempt.fail).toHaveBeenCalledOnce();

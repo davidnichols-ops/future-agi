@@ -903,8 +903,9 @@ class ObserveGraphDataQuerySerializer(StrictInputSerializer):
         required=False,
         default=False,
         help_text=(
-            "Deprecated compatibility parameter; accepted but ignored. "
-            "Aggregate graph results are always exact."
+            "Allow a bounded graph sample when every declared temporal "
+            "sampling stratum completed. Sampled responses remain explicitly "
+            "non-exact and include their sampling provenance."
         ),
     )
     refresh = serializers.BooleanField(
@@ -915,7 +916,7 @@ class ObserveGraphDataQuerySerializer(StrictInputSerializer):
 
 
 class ObserveGraphDataPointSerializer(serializers.Serializer):
-    """One exact graph point."""
+    """One exact, rollup-derived, or explicitly sampled graph point."""
 
     timestamp = serializers.CharField()
     value = serializers.FloatField(allow_null=True)
@@ -928,11 +929,16 @@ class ObserveGraphDataResultSerializer(serializers.Serializer):
     data = ObserveGraphDataPointSerializer(
         many=True,
         help_text=(
-            "Exact graph points. Pending or failed refreshes never publish "
-            "partial aggregate values."
+            "Graph points. A sampled series is published only with complete "
+            "declared stratum coverage; degraded reads never publish points."
         ),
     )
     query_complete = serializers.BooleanField(required=False)
+    query_exact = serializers.BooleanField(required=False)
+    query_provenance = serializers.ChoiceField(
+        choices=("materialized_rollup", "bounded_candidates", "exact_snapshot"),
+        required=False,
+    )
     query_status = serializers.ChoiceField(
         choices=("complete", "sampled", "degraded", "pending"), required=False
     )
@@ -957,7 +963,11 @@ class ObserveGraphDataResultSerializer(serializers.Serializer):
         required=False, min_value=1
     )
     query_sampling_strategy = serializers.ChoiceField(
-        choices=("time_stratified_latest_state", "bounded_latest_state_prefix"),
+        choices=(
+            "time_stratified_latest_state",
+            "bounded_latest_state_prefix",
+            "newest_trace_candidates",
+        ),
         required=False,
     )
     query_sampling_strata = serializers.IntegerField(required=False, min_value=0)

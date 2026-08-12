@@ -18,6 +18,7 @@ from time import monotonic
 from typing import Any
 
 import structlog
+
 from tracer.selectors.trace_filter_reads import read_bounded_filter_page
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
@@ -50,8 +51,8 @@ GRAPH_CANDIDATE_LIMIT = 4_096
 # 4,096 graph ceiling.
 GRAPH_TRACE_CLASSIFY_BATCH_BUDGET = 32
 GRAPH_TRACE_ROOT_CANDIDATE_LIMIT = (50 * GRAPH_TRACE_CLASSIFY_BATCH_BUDGET) - 1
-GRAPH_CANDIDATE_DEADLINE_MS = 30_000
-GRAPH_DECORATION_CANDIDATE_DEADLINE_MS = 30_000
+GRAPH_CANDIDATE_DEADLINE_MS = 9_500
+GRAPH_DECORATION_CANDIDATE_DEADLINE_MS = 9_500
 GRAPH_MAX_POINTS = 10_000
 GRAPH_ANY_SPAN_STRATA = 8
 # Indexed trace candidates still require one or more ClickHouse decoration
@@ -101,9 +102,10 @@ GRAPH_UNINDEXED_SAMPLE_SLICE = timedelta(minutes=5)
 GRAPH_UNINDEXED_SAMPLE_RETRY_SLICE = timedelta(minutes=1)
 
 # Keep every graph-union classifier inside the same finite resource envelope as
-# the shared bounded selector. Production readback showed four 20-trace chunks
-# at 206-294 MiB, followed by one data-skewed chunk that crossed the 512 MiB
-# server ceiling. Five-ID chunks leave headroom for that skew. Together with
+# the shared bounded selector. Production readback under the retired 512 MiB
+# profile showed four 20-trace chunks at 206-294 MiB followed by one skewed
+# chunk that crossed that old ceiling. The approved 36 GiB envelope removes
+# the obsolete cap; five-ID chunks still bound per-query result work. Together with
 # the six-candidate per-stratum sentinel above, one failed wide probe, eight
 # seeds, eight possible narrow retries, ten classifiers, and five decoration
 # reads fit the 32-query endpoint ceiling.
@@ -114,7 +116,7 @@ GRAPH_TRACE_UNION_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
-    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "max_result_rows": GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE,
     "result_overflow_mode": "throw",

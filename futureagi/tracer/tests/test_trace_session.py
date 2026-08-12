@@ -19,6 +19,7 @@ from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession, TraceSessionOverlay
 from tracer.services.clickhouse.bounded_graph_reads import (
     BoundedGraphReadError,
+    GraphCandidateSample,
 )
 from tracer.services.clickhouse.filter_value_reads import FilterValueRead
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
@@ -27,6 +28,21 @@ from tracer.services.clickhouse.v2.query_builders.trace_list import (
     TraceListQueryBuilderV2,
 )
 from tracer.views.trace_session import SESSION_LIST_QUERY_TIMEOUT_MS, TraceSessionView
+
+SESSION_ROLLUP_RESULT_COLUMNS = [
+    "time_bucket",
+    "avg_latency",
+    "total_tokens",
+    "avg_cost",
+    "traffic_count",
+    "prompt_tokens",
+    "completion_tokens",
+    "error_rate",
+    "session_count",
+    "avg_duration",
+    "avg_traces_per_session",
+    "total_cost_sum",
+]
 
 
 def _create_session_with_span(project, name, created_at=None):
@@ -464,7 +480,7 @@ class TestTraceSessionExportAPI:
                 return_value=list_response,
             ),
             mock.patch(
-                "tracer.views.trace_session.pd.DataFrame.to_csv",
+                "tracer.views.trace_session.bounded_page_csv_response",
                 side_effect=RuntimeError("secret CSV implementation detail"),
             ),
         ):
@@ -512,7 +528,7 @@ class TestTraceSessionExportAPI:
 class TestTraceSessionGraphAPI:
     """Tests for POST /tracer/trace-session/get_session_graph_data/ endpoint."""
 
-    def test_session_graph_uses_30_second_wall_without_row_read_cap(self):
+    def test_session_graph_uses_9_5_second_wall_without_row_read_cap(self):
         from tracer.services.clickhouse.read_budget import ReadDeadline
         from tracer.services.clickhouse.session_graph import (
             SESSION_GRAPH_QUERY_TIMEOUT_MS,
@@ -534,13 +550,13 @@ class TestTraceSessionGraphAPI:
         )
 
         call = delegate.execute_ch_query.call_args
-        assert SESSION_GRAPH_WALL_DEADLINE_MS == 30_000
-        assert SESSION_GRAPH_QUERY_TIMEOUT_MS == 30_000
-        assert 0 < call.kwargs["timeout_ms"] <= 30_000
+        assert SESSION_GRAPH_WALL_DEADLINE_MS == 9_500
+        assert SESSION_GRAPH_QUERY_TIMEOUT_MS == 9_500
+        assert 0 < call.kwargs["timeout_ms"] <= 9_500
         settings = call.kwargs["settings"]
         assert "max_rows_to_read" not in settings
-        assert settings["max_threads"] == 1
-        assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+        assert settings["max_threads"] == 4
+        assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         assert settings["max_result_rows"] == 10_001
         assert settings["max_result_bytes"] == 32 * 1024 * 1024
@@ -613,7 +629,17 @@ class TestTraceSessionGraphAPI:
     def test_session_system_graph_dispatches_exact_snapshot(self):
         project_id = str(uuid.uuid4())
         analytics = mock.Mock()
-        filters = [{"column_id": "created_at", "filter_config": {}}]
+        filters = [
+            {
+                "column_id": "model",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "gpt-4.1",
+                },
+            }
+        ]
         exact_graph = {
             "metric_name": "cost",
             "data": [{"timestamp": "2026-01-01T00:00:00Z", "value": 6}],
@@ -665,21 +691,17 @@ class TestTraceSessionGraphAPI:
             "avg_duration",
         ],
     )
-    def test_session_system_graph_dispatches_all_supported_metrics(self, metric_id):
+    def test_session_system_graph_dispatches_date_only_metrics_to_rollup(
+        self, metric_id
+    ):
         project_id = str(uuid.uuid4())
         analytics = mock.Mock()
-        pending = {
-            "metric_name": metric_id,
-            "data": [],
-            "query_complete": False,
-            "query_status": "pending",
-            "query_sampled": False,
-            "query_refreshing": True,
-        }
+        analytics.execute_ch_query.return_value = mock.Mock(
+            data=[], columns=SESSION_ROLLUP_RESULT_COLUMNS
+        )
 
         with mock.patch(
             "tracer.services.clickhouse.session_graph.read_or_schedule_exact_snapshot",
-            return_value=pending,
         ) as exact_read:
             graph = fetch_session_graph_ch(
                 analytics=analytics,
@@ -689,9 +711,128 @@ class TestTraceSessionGraphAPI:
                 req_data_config={"id": metric_id, "type": "SYSTEM_METRIC"},
             )
 
-        assert graph == pending
-        assert exact_read.call_args.args[1]["metric_id"] == metric_id
-        analytics.execute_ch_query.assert_not_called()
+        assert graph["metric_name"] == metric_id
+        assert graph["query_complete"] is True
+        assert graph["query_status"] == "complete"
+        assert graph["query_sampled"] is False
+        assert graph["query_exact"] is False
+        assert graph["query_provenance"] == "materialized_rollup"
+        exact_read.assert_not_called()
+        query_call = analytics.execute_ch_query.call_args
+        assert "FROM spans_per_session AS sps" in query_call.args[0]
+        assert "FROM spans\n" not in query_call.args[0]
+        assert "trace_session_id_remap" not in query_call.args[0]
+        assert 0 < query_call.kwargs["timeout_ms"] <= 9_500
+        assert query_call.kwargs["settings"]["max_threads"] == 4
+        assert "max_rows_to_read" not in query_call.kwargs["settings"]
+
+    def test_session_avg_traces_uses_bounded_candidates_without_pending(self):
+        project_id = str(uuid.uuid4())
+        analytics = mock.Mock()
+        start = datetime(2026, 8, 1)
+        sample = GraphCandidateSample(
+            rows=(
+                {
+                    "trace_id": "trace-1",
+                    "trace_session_id": "session-1",
+                    "start_time": start + timedelta(hours=1),
+                },
+            ),
+            query_complete=True,
+            query_status="complete",
+            query_error_code=None,
+            window_start=start,
+            window_end=start + timedelta(days=1),
+            elapsed_ms=5,
+            query_count=1,
+            rows_returned=1,
+            result_payload_bytes=100,
+            total_rows_lower_bound=1,
+        )
+        analytics.execute_ch_query.return_value = mock.Mock(data=[])
+
+        with (
+            mock.patch(
+                "tracer.services.clickhouse.session_graph.read_or_schedule_exact_snapshot"
+            ) as exact_read,
+            mock.patch(
+                "tracer.services.clickhouse.session_graph.read_graph_candidates",
+                return_value=sample,
+            ) as candidate_read,
+        ):
+            graph = fetch_session_graph_ch(
+                analytics=analytics,
+                project_id=project_id,
+                filters=[],
+                interval="day",
+                req_data_config={
+                    "id": "avg_traces_per_session",
+                    "type": "SYSTEM_METRIC",
+                },
+            )
+
+        assert graph["query_status"] == "complete"
+        assert graph["query_exact"] is False
+        assert graph["query_provenance"] == "bounded_candidates"
+        assert graph["data"][0]["value"] == 1
+        assert "query_refreshing" not in graph
+        exact_read.assert_not_called()
+        assert candidate_read.call_args.kwargs["deadline_ms"] == 9_500
+
+    def test_session_avg_traces_budget_failure_preserves_sample_progress(self):
+        start = datetime(2025, 8, 12)
+        sample = GraphCandidateSample(
+            rows=(
+                {
+                    "trace_id": "trace-1",
+                    "trace_session_id": "session-1",
+                    "start_time": start,
+                },
+            ),
+            query_complete=False,
+            query_status="degraded",
+            query_error_code="read_budget_exceeded",
+            window_start=start,
+            window_end=start + timedelta(days=365),
+            elapsed_ms=9_475,
+            query_count=3,
+            rows_returned=4,
+            result_payload_bytes=400,
+            total_rows_lower_bound=4,
+            sampling_strategy="time_stratified_latest_state",
+            sampling_strata=8,
+            sampling_strata_completed=3,
+        )
+
+        with (
+            mock.patch(
+                "tracer.services.clickhouse.session_graph.read_graph_candidates",
+                return_value=sample,
+            ),
+            mock.patch(
+                "tracer.services.clickhouse.session_graph.read_or_schedule_exact_snapshot"
+            ) as exact_read,
+        ):
+            graph = fetch_session_graph_ch(
+                analytics=mock.Mock(),
+                project_id=str(uuid.uuid4()),
+                filters=[],
+                interval="month",
+                req_data_config={
+                    "id": "avg_traces_per_session",
+                    "type": "SYSTEM_METRIC",
+                },
+            )
+
+        assert graph["data"] == []
+        assert graph["query_status"] == "degraded"
+        assert graph["query_error_code"] == "read_budget_exceeded"
+        assert graph["query_sampling_strata"] == 8
+        assert graph["query_sampling_strata_completed"] == 3
+        assert graph["query_exact"] is False
+        assert graph["query_provenance"] == "bounded_candidates"
+        assert "query_refreshing" not in graph
+        exact_read.assert_not_called()
 
     def test_session_system_candidate_sql_replays_v2_updates_and_tombstones(self):
         builder = TraceListQueryBuilderV2(
@@ -825,22 +966,16 @@ class TestTraceSessionGraphAPI:
             assert response.data["code"] == "server_error"
             assert "could not be loaded" in response.data["message"]
 
-    def test_session_system_graph_does_not_read_bounded_candidates(self):
+    def test_session_date_only_graph_does_not_read_bounded_candidates(self):
         analytics = mock.Mock()
-        pending = {
-            "metric_name": "session_count",
-            "data": [],
-            "query_complete": False,
-            "query_status": "pending",
-            "query_sampled": False,
-            "query_refreshing": True,
-        }
+        analytics.execute_ch_query.return_value = mock.Mock(
+            data=[], columns=SESSION_ROLLUP_RESULT_COLUMNS
+        )
 
         with (
             mock.patch(
-                "tracer.services.clickhouse.session_graph.read_or_schedule_exact_snapshot",
-                return_value=pending,
-            ),
+                "tracer.services.clickhouse.session_graph.read_or_schedule_exact_snapshot"
+            ) as exact_read,
             mock.patch(
                 "tracer.services.clickhouse.session_graph.read_graph_candidates"
             ) as candidate_read,
@@ -853,12 +988,24 @@ class TestTraceSessionGraphAPI:
                 req_data_config={"id": "session_count", "type": "SYSTEM_METRIC"},
             )
 
-        assert graph == pending
+        assert graph["query_provenance"] == "materialized_rollup"
+        exact_read.assert_not_called()
         candidate_read.assert_not_called()
-        analytics.execute_ch_query.assert_not_called()
+        analytics.execute_ch_query.assert_called_once()
 
     def test_session_system_graph_forwards_explicit_refresh(self):
         analytics = mock.Mock()
+        filters = [
+            {
+                "column_id": "model",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "gpt-4.1",
+                },
+            }
+        ]
         pending = {
             "metric_name": "session_count",
             "data": [],
@@ -875,7 +1022,7 @@ class TestTraceSessionGraphAPI:
             graph = fetch_session_graph_ch(
                 analytics=analytics,
                 project_id=str(uuid.uuid4()),
-                filters=[],
+                filters=filters,
                 interval="day",
                 req_data_config={"id": "session_count", "type": "SYSTEM_METRIC"},
                 refresh=True,
@@ -1451,10 +1598,10 @@ class TestTraceSessionWorkspaceScopeAPI:
         assert "positionCaseInsensitiveUTF8(val, %(filter_value_search)s)" in query
         assert params["filter_value_search"] == "Needle"
         assert params["result_limit"] == 51
-        assert call.kwargs["timeout_ms"] == 30_000
+        assert call.kwargs["timeout_ms"] == 9_500
         settings = call.kwargs["settings"]
         assert "max_rows_to_read" not in settings
-        assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+        assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         assert settings["timeout_overflow_mode"] == "throw"
         assert settings["read_overflow_mode"] == "throw"
@@ -1622,10 +1769,10 @@ class TestTraceSessionWorkspaceScopeAPI:
         assert "secret-internal-query" not in payload
         assert "DB::Exception" not in payload
         call = analytics.execute_ch_query.call_args
-        assert call.kwargs["timeout_ms"] == 30_000
+        assert call.kwargs["timeout_ms"] == 9_500
         settings = call.kwargs["settings"]
         assert "max_rows_to_read" not in settings
-        assert settings["max_bytes_to_read"] == 256 * 1024 * 1024
+        assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         assert settings["max_result_rows"] == 50
         assert settings["max_result_bytes"] == 32 * 1024 * 1024
@@ -1710,11 +1857,11 @@ class TestTraceSessionWorkspaceScopeAPI:
             assert "sum(total_tokens) AS total_tokens" in sql
             assert "HAVING total_tokens >" in sql
         for call in analytics.execute_ch_query.call_args_list:
-            assert SESSION_LIST_QUERY_TIMEOUT_MS == 30_000
+            assert SESSION_LIST_QUERY_TIMEOUT_MS == 9_500
             assert 0 < call.kwargs["timeout_ms"] <= SESSION_LIST_QUERY_TIMEOUT_MS
             settings = call.kwargs["settings"]
             assert "max_rows_to_read" not in settings
-            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
             assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
             assert settings["max_result_rows"] > 0
             assert settings["max_result_bytes"] == 32 * 1024 * 1024
@@ -1846,11 +1993,11 @@ class TestTraceSessionWorkspaceScopeAPI:
             {"value": session_id, "label": "session-alpha"}
         ]
         call = analytics.execute_ch_query.call_args
-        assert call.kwargs["timeout_ms"] == 30_000
+        assert call.kwargs["timeout_ms"] == 9_500
         settings = call.kwargs["settings"]
         assert "max_rows_to_read" not in settings
         assert settings["max_result_rows"] == 50
-        assert settings["max_bytes_to_read"] == 256 * 1024 * 1024
+        assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         assert settings["max_threads"] == 2
 

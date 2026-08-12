@@ -64,7 +64,7 @@ _READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
-    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "max_result_rows": _MAX_CANDIDATES,
     "result_overflow_mode": "throw",
@@ -538,7 +538,6 @@ def read_bounded_filter_page(
             raise ValueError("classify read settings must be a dict")
         unsupported_settings = set(classify_read_settings) - {
             "max_block_size",
-            "max_rows_to_read",
             "preferred_max_column_in_block_size_bytes",
         }
         if unsupported_settings:
@@ -932,7 +931,19 @@ def read_bounded_filter_page(
     seed_batch_recommendation = getattr(
         builder, "recommended_filter_seed_batch_size", None
     )
-    if bounded_continuation:
+    cursor_seed_batch_recommendation = getattr(
+        builder, "recommended_filter_cursor_seed_batch_size", None
+    )
+    if (
+        bounded_continuation
+        and candidate_seed_can_run
+        and callable(cursor_seed_batch_recommendation)
+        and cursor_seed_batch_recommendation() is not None
+    ):
+        requested_candidate_floor = max(
+            prefix_needed, int(cursor_seed_batch_recommendation())
+        )
+    elif bounded_continuation:
         # A cursor can commit one exact ordered prefix and resume from its
         # signed keyset. Keep each seed page to the requested page plus the
         # has-more sentinel so a memory-heavy classifier can finish the whole
@@ -1018,6 +1029,14 @@ def read_bounded_filter_page(
         Hashable, tuple[dict[str, Any], datetime, datetime]
     ] = {}
     eager_identity_prefix_flush_used = False
+    repeated_eager_flush_builder = getattr(
+        builder, "allow_repeated_eager_identity_prefix_flushes", None
+    )
+    allow_repeated_eager_identity_prefix_flushes = bool(
+        repeated_eager_flush_builder()
+        if callable(repeated_eager_flush_builder)
+        else False
+    )
     # A builder may expose a finite raw-witness query only when it is a
     # complete superset of exact latest-state membership. Run that cheap,
     # indexable prefilter before the first full-window classifier batch; the
@@ -2426,12 +2445,19 @@ def read_bounded_filter_page(
                 not prefix_is_proven
                 and seed_proves_result_order
                 and pending_identity_candidates
-                and not eager_identity_prefix_flush_used
+                and (
+                    not eager_identity_prefix_flush_used
+                    or allow_repeated_eager_identity_prefix_flushes
+                )
                 and len(matched_by_id) + len(pending_identity_candidates)
                 >= prefix_needed
             ):
-                # Do not defer a partial classifier batch when it is the only
-                # remaining uncertainty in an otherwise provable public page.
+                # Do not defer a partial classifier batch when it can close
+                # the public prefix.  If that batch is rejected by latest
+                # state, let the next adjacent slices accumulate another
+                # sufficient batch and retry; waiting for the entire request
+                # window would make a sparse twelve-month page scan months
+                # after its newest exact rows were already available.
                 eager_identity_prefix_flush_used = True
                 prefix_is_proven = classify_or_buffer_seed_rows(
                     [],

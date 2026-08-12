@@ -4450,7 +4450,7 @@ def test_exact_trace_membership_exhausts_5k_identity_classifier_boundary(monkeyp
     assert exact_module.EXACT_GRAPH_READ_SETTINGS["max_bytes_to_read"] == (
         exact_module.EXACT_GRAPH_MAX_BYTES_TO_READ
     )
-    assert exact_module.EXACT_GRAPH_MAX_BYTES_TO_READ == 96 * 1024 * 1024 * 1024
+    assert exact_module.EXACT_GRAPH_MAX_BYTES_TO_READ == 36 * 1024 * 1024 * 1024
     assert exact_module.EXACT_GRAPH_TRACE_CLASSIFIER_READ_SETTINGS["max_threads"] == 4
     assert trace_ids == ordered_ids
     assert [len(batch) for batch in classifier_batches] == [5_000, 5_000, 1]
@@ -5430,7 +5430,7 @@ def test_exact_span_graph_merges_additive_partitions_only_after_all_succeed():
     assert all(call[3]["max_threads"] == 1 for call in analytics.calls)
     assert all("max_rows_to_read" not in call[3] for call in analytics.calls)
     assert all(
-        call[3]["max_bytes_to_read"] == 4 * 1024 * 1024 * 1024
+        call[3]["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         for call in analytics.calls
     )
     nonzero = [point for point in result["data"] if point["value"]]
@@ -5658,7 +5658,7 @@ def test_exact_graph_budget_failure_does_not_publish_or_split_contribution_batch
 
 
 @pytest.mark.unit
-def test_public_graph_poll_never_runs_long_exact_query_inline():
+def test_public_filtered_graph_budget_failure_never_enqueues_raw_exact_fallback():
     from tracer.services.clickhouse import graph_dispatch
 
     cache.clear()
@@ -5680,14 +5680,17 @@ def test_public_graph_poll_never_runs_long_exact_query_inline():
             interval="day",
             metric_id="traffic",
             observe_type="trace",
-            # The public timeout remains irrelevant: exact CH work belongs to
-            # the background activity and is governed by its own ceiling.
+            # An already exhausted interactive budget must return typed
+            # degradation. It must not enqueue the retired raw exact path.
             timeout_ms=1,
         )
 
-    assert result["query_status"] == "pending"
+    assert result["query_status"] == "degraded"
     assert result["query_complete"] is False
-    assert enqueue.call_count == 1
+    assert result["query_error_code"] == "read_budget_exceeded"
+    assert result["query_exact"] is False
+    assert result["query_provenance"] == "bounded_candidates"
+    enqueue.assert_not_called()
 
 
 @pytest.mark.unit
@@ -5759,7 +5762,7 @@ def test_filtered_exact_span_window_uses_hour_aligned_additive_statements():
     assert "AS cost_sum" in query
     assert settings["max_threads"] == 1
     assert "max_rows_to_read" not in settings
-    assert settings["max_bytes_to_read"] == 4 * 1024 * 1024 * 1024
+    assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
     assert result["query_count"] == 1
     assert "query_snapshot_version_ceiling" not in result
     assert result["query_complete"] is True

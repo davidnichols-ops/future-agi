@@ -14,9 +14,21 @@ import {
 const readAggregationResult = (data) => {
   const queryReadState = getExactAggregationReadState(data);
   const { isRefreshing, refreshFailed } = getAggregationRefreshState(data);
+  const result = data?.result ?? data;
+  const readMetadata = {
+    query_complete: result?.query_complete,
+    query_status: result?.query_status,
+    query_sampled: result?.query_sampled,
+    query_error_code: result?.query_error_code,
+    query_cached: result?.query_cached,
+    query_refreshing: result?.query_refreshing,
+    query_refresh_failed: result?.query_refresh_failed,
+    data_stale: result?.data_stale,
+  };
   if (queryReadState === "pending") {
     return {
       result: null,
+      readMetadata,
       queryPending: true,
       queryRefreshing: isRefreshing,
       queryRefreshFailed: refreshFailed,
@@ -27,7 +39,8 @@ const readAggregationResult = (data) => {
     throw new Error("Exact evaluation usage data is not available");
   }
   return {
-    result: data.result,
+    result,
+    readMetadata,
     queryPending: false,
     queryRefreshing: isRefreshing,
     queryRefreshFailed: refreshFailed,
@@ -219,6 +232,7 @@ export function useEvalUsageChart(
       record(aggregation);
       const result = aggregation.result || {};
       const nextData = {
+        ...aggregation.readMetadata,
         stats: result.stats,
         chart: result.chart,
         queryPending: aggregation.queryPending,
@@ -240,6 +254,8 @@ export function useEvalUsageChart(
             queryPending: true,
             queryRefreshing: aggregation.queryRefreshing,
             queryRefreshFailed: aggregation.queryRefreshFailed,
+            query_refreshing: aggregation.queryRefreshing,
+            query_refresh_failed: aggregation.queryRefreshFailed,
           }
         : nextData;
     },
@@ -268,7 +284,7 @@ export function useEvalUsageChart(
       query.data?.queryRefreshFailed === true);
   const data =
     (terminalError || aggregationPollingPaused) && query.data?.queryRefreshing
-      ? { ...query.data, queryRefreshing: false }
+      ? { ...query.data, queryRefreshing: false, query_refreshing: false }
       : query.data;
 
   return {
@@ -352,6 +368,7 @@ export function useEvalUsageLogs(
       record(aggregation);
       const result = aggregation.result || {};
       const nextData = {
+        ...aggregation.readMetadata,
         table: result.table || [],
         pagination: result.logs || {},
         queryPending: aggregation.queryPending,
@@ -373,6 +390,8 @@ export function useEvalUsageLogs(
             queryPending: true,
             queryRefreshing: aggregation.queryRefreshing,
             queryRefreshFailed: aggregation.queryRefreshFailed,
+            query_refreshing: aggregation.queryRefreshing,
+            query_refresh_failed: aggregation.queryRefreshFailed,
           }
         : nextData;
     },
@@ -404,7 +423,7 @@ export function useEvalUsageLogs(
       query.data?.queryRefreshFailed === true);
   const data =
     (terminalError || aggregationPollingPaused) && query.data?.queryRefreshing
-      ? { ...query.data, queryRefreshing: false }
+      ? { ...query.data, queryRefreshing: false, query_refreshing: false }
       : query.data;
 
   return {

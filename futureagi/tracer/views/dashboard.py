@@ -1,5 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from copy import deepcopy
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from math import isfinite
+from numbers import Real
+from time import monotonic
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -64,8 +69,10 @@ from tracer.services.clickhouse.list_cursor import (
     encode_list_cursor,
 )
 from tracer.services.clickhouse.query_builders.dashboard import (
+    GRANULARITY_TO_CH,
     METRIC_UNITS,
     InvalidMetricCombinationError,
+    _generate_time_buckets,
 )
 from tracer.services.clickhouse.query_builders.dataset_dashboard import (
     DATASET_FILTER_COLUMNS,
@@ -92,9 +99,6 @@ from tracer.services.clickhouse.v2.query_builders.dashboard import (
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 from tracer.services.dashboard_metrics_catalog import get_cached_metrics_catalog
 from tracer.services.exact_aggregation_cache import (
-    mark_refresh_failed,
-    publish_exact_snapshot,
-    read_exact_snapshot,
     read_or_schedule_exact_snapshot,
 )
 from tracer.utils.workspace_scope import project_queryset_for_request
@@ -112,6 +116,14 @@ class DashboardExactReadError(RuntimeError):
 
 class DashboardQueryScopeError(ValueError):
     """A requested dashboard scope is outside the current workspace."""
+
+
+class DashboardBoundedReadError(RuntimeError):
+    """A dashboard fast read cannot safely produce chartable aggregate data."""
+
+    def __init__(self, error_code: str):
+        super().__init__(error_code)
+        self.error_code = error_code
 
 
 def _project_queryset_for_dashboard_scope(workspace):
@@ -209,8 +221,8 @@ def _materialize_dashboard_query_scope(
 # concurrency instead so a read either completes or fails closed without
 # monopolising the shared cluster.
 _DASHBOARD_TRACE_READ_SETTINGS = {
-    "max_threads": 2,
-    "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
+    "max_threads": 4,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "max_result_rows": 250_000,
@@ -219,7 +231,40 @@ _DASHBOARD_TRACE_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
 }
 _DASHBOARD_TRACE_MAX_CONCURRENT_METRICS = 2
-_DASHBOARD_EXACT_QUERY_TIMEOUT_MS = 30_000
+_DASHBOARD_EXACT_QUERY_TIMEOUT_MS = 9_500
+
+# Public dashboard misses must return in the same wall budget as the rest of
+# the interactive analytics surface. The rollup route issues at most two
+# statements (span states plus the independently keyed trace-count states),
+# and both consume one request-owned deadline.
+_DASHBOARD_INTERACTIVE_TIMEOUT_MS = 9_500
+_DASHBOARD_ROLLUP_MAX_QUERIES = 2
+_DASHBOARD_ROLLUP_MAX_POINTS = 10_000
+_DASHBOARD_ROLLUP_READ_SETTINGS = {
+    "max_threads": 4,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
+    "max_memory_usage": 36 * 1024 * 1024 * 1024,
+    "read_overflow_mode": "throw",
+    "max_result_rows": _DASHBOARD_ROLLUP_MAX_POINTS + 1,
+    "max_result_bytes": 32 * 1024 * 1024,
+    "result_overflow_mode": "throw",
+    "timeout_overflow_mode": "throw",
+}
+
+_DASHBOARD_ROLLUP_SUM_COLUMNS = {
+    "tokens": "total_tokens_sum",
+    "total_tokens": "total_tokens_sum",
+    "input_tokens": "prompt_tokens_sum",
+    "output_tokens": "completion_tokens_sum",
+    "cost": "cost_sum",
+}
+_DASHBOARD_ROLLUP_LATENCY_INDEX = {
+    "avg": 1,
+    "median": 1,
+    "p50": 1,
+    "p95": 2,
+    "p99": 3,
+}
 
 
 def _fetch_exact_dashboard_rows(
@@ -262,6 +307,563 @@ def _pending_dashboard_payload(query_config):
         "query_sampled": False,
         "query_refreshing": True,
     }
+
+
+def _dashboard_metric_key(metric):
+    return str(metric.get("id") or metric.get("name") or "").strip().lower()
+
+
+def _dashboard_rollup_expression(metric):
+    """Return (physical source, aggregate expression, estimate strategy).
+
+    Expressions are selected only from this code-owned whitelist. No request
+    value is interpolated as a table, column, function, or alias.
+    """
+
+    if metric.get("type", "system_metric") != "system_metric":
+        return None
+    metric_name = _dashboard_metric_key(metric)
+    aggregation = str(metric.get("aggregation") or "avg").lower()
+
+    if metric_name == "latency":
+        quantile_index = _DASHBOARD_ROLLUP_LATENCY_INDEX.get(aggregation)
+        if quantile_index is None:
+            return None
+        strategy = (
+            "hourly_tdigest_p50_proxy_for_average"
+            if aggregation == "avg"
+            else "hourly_tdigest"
+        )
+        return (
+            "spans_hourly_rollup",
+            f"(quantilesTDigestMerge(0.5, 0.95, 0.99)(latency_q))[{quantile_index}]",
+            strategy,
+        )
+
+    if metric_name in _DASHBOARD_ROLLUP_SUM_COLUMNS:
+        column = _DASHBOARD_ROLLUP_SUM_COLUMNS[metric_name]
+        if aggregation == "sum":
+            expression = f"sumMerge({column})"
+        elif aggregation == "avg":
+            expression = f"sumMerge({column}) / greatest(countMerge(n), 1)"
+        elif aggregation == "count":
+            expression = "countMerge(n)"
+        else:
+            return None
+        return "spans_hourly_rollup", expression, "hourly_aggregate_states"
+
+    if metric_name == "error_rate":
+        if aggregation == "avg":
+            expression = (
+                "countIfMerge(error_count) * 100.0 / greatest(countMerge(n), 1)"
+            )
+        elif aggregation == "sum":
+            expression = "countIfMerge(error_count)"
+        elif aggregation == "count":
+            expression = "countMerge(n)"
+        else:
+            return None
+        return "spans_hourly_rollup", expression, "hourly_aggregate_states"
+
+    if metric_name in {"span_count", "traffic"} and aggregation in {
+        "count",
+        "count_distinct",
+        "sum",
+    }:
+        return "spans_hourly_rollup", "countMerge(n)", "hourly_aggregate_states"
+
+    if metric_name == "project" and aggregation in {"count", "count_distinct"}:
+        return "spans_hourly_rollup", "uniqExact(project_id)", "hourly_rollup_keys"
+
+    if metric_name == "trace_count" and aggregation in {
+        "count",
+        "count_distinct",
+    }:
+        return (
+            "trace_count_rollup",
+            "uniqExactMerge(uniq_traces_state)",
+            "hourly_exact_trace_states",
+        )
+    return None
+
+
+def _dashboard_resolved_config(query_config):
+    """Freeze a rolling preset once and enforce the public point ceiling."""
+
+    window_builder = DatasetQueryBuilder(query_config)
+    window_start, window_end = window_builder.parse_time_range()
+    if window_start >= window_end:
+        raise DashboardBoundedReadError("invalid_window")
+    buckets = _generate_time_buckets(
+        window_start,
+        window_end,
+        query_config.get("granularity", "day"),
+    )
+    if len(buckets) > _DASHBOARD_ROLLUP_MAX_POINTS:
+        raise DashboardBoundedReadError("sample_limit")
+    return (
+        {
+            **query_config,
+            "time_range": {
+                "custom_start": window_start.isoformat(),
+                "custom_end": window_end.isoformat(),
+            },
+        },
+        window_start,
+        window_end,
+    )
+
+
+def _dashboard_degraded_payload(
+    query_config,
+    *,
+    error_code,
+    refresh_state=None,
+):
+    """Return typed unavailability without chartable zero or empty-bucket data."""
+
+    try:
+        window_start, window_end = DatasetQueryBuilder(query_config).parse_time_range()
+    except (TypeError, ValueError):
+        window_start = window_end = datetime.now(UTC)
+    metrics = []
+    for metric in query_config.get("metrics", []):
+        metric_key = _dashboard_metric_key(metric)
+        metrics.append(
+            {
+                "id": str(metric.get("id") or ""),
+                "name": str(
+                    metric.get("display_name")
+                    or metric.get("displayName")
+                    or metric.get("name")
+                    or ""
+                ),
+                "aggregation": metric.get("aggregation", "avg"),
+                "unit": metric.get("unit") or METRIC_UNITS.get(metric_key, ""),
+                "series": [],
+                "query_complete": False,
+                "query_status": "degraded",
+                "query_sampled": False,
+                "query_exact": False,
+                "query_provenance": "bounded_unavailable",
+                "query_error_code": error_code,
+            }
+        )
+    payload = {
+        "metrics": metrics,
+        "time_range": {
+            "start": window_start.isoformat(),
+            "end": window_end.isoformat(),
+        },
+        "granularity": query_config.get("granularity", "day"),
+        "query_complete": False,
+        "query_status": "degraded",
+        "query_sampled": False,
+        "query_exact": False,
+        "query_provenance": "bounded_unavailable",
+        "query_error_code": error_code,
+    }
+    if isinstance(refresh_state, dict):
+        for key in ("query_refreshing", "query_refresh_failed"):
+            if key in refresh_state:
+                payload[key] = refresh_state[key]
+    return payload
+
+
+def _dashboard_refresh_or_degraded(query_config, *, refresh_state, error_code):
+    """Keep polling an exact refresh; expose unavailability only without one."""
+
+    if (
+        isinstance(refresh_state, dict)
+        and refresh_state.get("query_status") == "pending"
+    ):
+        return deepcopy(refresh_state)
+    return _dashboard_degraded_payload(
+        query_config,
+        error_code=error_code,
+        refresh_state=refresh_state,
+    )
+
+
+def _validate_dashboard_rollup_result(result, expected_columns):
+    columns = list(getattr(result, "columns", None) or [])
+    rows = getattr(result, "data", None)
+    if not isinstance(rows, list) or not set(expected_columns).issubset(columns):
+        raise DashboardBoundedReadError("malformed_result")
+    if len(rows) > _DASHBOARD_ROLLUP_MAX_POINTS:
+        raise DashboardBoundedReadError("sample_limit")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise DashboardBoundedReadError("malformed_result")
+        time_bucket = row.get("time_bucket")
+        if not isinstance(time_bucket, (str, date, datetime)):
+            raise DashboardBoundedReadError("malformed_result")
+        for column in expected_columns:
+            if column == "time_bucket":
+                continue
+            if column not in row:
+                raise DashboardBoundedReadError("malformed_result")
+            value = row.get(column)
+            if value is not None and not isinstance(value, (Real, Decimal)):
+                raise DashboardBoundedReadError("malformed_result")
+            if isinstance(value, Decimal) and not value.is_finite():
+                raise DashboardBoundedReadError("malformed_result")
+            if isinstance(value, Real) and not isfinite(float(value)):
+                raise DashboardBoundedReadError("malformed_result")
+    return rows
+
+
+def _decorate_dashboard_exact_payload(payload):
+    """Attest cached/worker payloads produced by the exact snapshot lane."""
+
+    decorated = deepcopy(payload)
+    if not isinstance(decorated, dict):
+        return decorated
+    decorated["query_exact"] = True
+    decorated["query_provenance"] = "exact_snapshot"
+    for metric in decorated.get("metrics", []):
+        if isinstance(metric, dict):
+            metric["query_exact"] = True
+            metric["query_provenance"] = "exact_snapshot"
+    return decorated
+
+
+def _dashboard_snapshot_is_renderable(payload):
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("query_complete") is True
+        and payload.get("query_status") == "complete"
+        and payload.get("query_sampled") is False
+        and isinstance(payload.get("metrics"), list)
+        and all(
+            isinstance(metric, dict)
+            and metric.get("query_complete") is True
+            and metric.get("query_status") == "complete"
+            and metric.get("query_sampled") is False
+            for metric in payload["metrics"]
+        )
+    )
+
+
+def _read_dashboard_rollup_fast_path(
+    query_config,
+    *,
+    refresh_state=None,
+    deadline=None,
+):
+    """Read simple trace metrics from bounded materialized hourly states."""
+
+    if (
+        query_config.get("filters")
+        or query_config.get("breakdowns")
+        or query_config.get("granularity") == "minute"
+    ):
+        return _dashboard_refresh_or_degraded(
+            query_config,
+            refresh_state=refresh_state,
+            error_code="bounded_shape_unavailable",
+        )
+
+    metrics = query_config.get("metrics", [])
+    prepared = []
+    for index, metric in enumerate(metrics):
+        if metric.get("source", "traces") not in {"traces", "both", "all"}:
+            return _dashboard_refresh_or_degraded(
+                query_config,
+                refresh_state=refresh_state,
+                error_code="bounded_shape_unavailable",
+            )
+        if metric.get("filters"):
+            return _dashboard_refresh_or_degraded(
+                query_config,
+                refresh_state=refresh_state,
+                error_code="bounded_shape_unavailable",
+            )
+        expression = _dashboard_rollup_expression(metric)
+        if expression is None:
+            return _dashboard_refresh_or_degraded(
+                query_config,
+                refresh_state=refresh_state,
+                error_code="bounded_shape_unavailable",
+            )
+        source, aggregate_expression, strategy = expression
+        prepared.append(
+            {
+                "index": index,
+                "metric": metric,
+                "source": source,
+                "alias": f"metric_{index}",
+                "expression": aggregate_expression,
+                "strategy": strategy,
+            }
+        )
+
+    try:
+        frozen_config, window_start, window_end = _dashboard_resolved_config(
+            query_config
+        )
+    except DashboardBoundedReadError as exc:
+        return _dashboard_refresh_or_degraded(
+            query_config,
+            error_code=exc.error_code,
+            refresh_state=refresh_state,
+        )
+
+    project_ids = frozen_config.get("project_ids", [])
+    builder = DashboardQueryBuilderV2(frozen_config)
+    if not project_ids:
+        metric_results = []
+        for item in prepared:
+            metric_info = builder.metric_info(item["metric"])
+            metric_info.update(
+                {
+                    "source": "traces",
+                    "query_complete": True,
+                    "query_status": "complete",
+                    "query_sampled": False,
+                }
+            )
+            metric_results.append((metric_info, []))
+        formatted = builder.format_results(metric_results)
+        formatted.update(
+            {
+                "query_complete": True,
+                "query_status": "complete",
+                "query_sampled": False,
+                "query_exact": True,
+                "query_provenance": "authorized_empty_scope",
+                "query_count": 0,
+            }
+        )
+        for metric in formatted["metrics"]:
+            metric.update(
+                {
+                    "query_exact": True,
+                    "query_provenance": "authorized_empty_scope",
+                }
+            )
+        if isinstance(refresh_state, dict):
+            for key in ("query_refreshing", "query_refresh_failed"):
+                if key in refresh_state:
+                    formatted[key] = refresh_state[key]
+        return formatted
+
+    bucket_fn = GRANULARITY_TO_CH.get(frozen_config.get("granularity"))
+    if bucket_fn is None:
+        return _dashboard_refresh_or_degraded(
+            frozen_config,
+            error_code="bounded_shape_unavailable",
+            refresh_state=refresh_state,
+        )
+
+    grouped = {}
+    for item in prepared:
+        grouped.setdefault(item["source"], []).append(item)
+    if len(grouped) > _DASHBOARD_ROLLUP_MAX_QUERIES:
+        return _dashboard_refresh_or_degraded(
+            frozen_config,
+            error_code="bounded_shape_unavailable",
+            refresh_state=refresh_state,
+        )
+
+    if deadline is None:
+        deadline = ReadDeadline.start(_DASHBOARD_INTERACTIVE_TIMEOUT_MS)
+    try:
+        deadline.remaining_ms(_DASHBOARD_INTERACTIVE_TIMEOUT_MS)
+    except ReadDeadlineExceeded:
+        return _dashboard_refresh_or_degraded(
+            frozen_config,
+            error_code="read_budget_exceeded",
+            refresh_state=refresh_state,
+        )
+    rows_by_index = {item["index"]: [] for item in prepared}
+    started = monotonic()
+    query_count = 0
+    rows_returned = 0
+    try:
+        # These materialized views are fed by the direct-write CH25 spans table;
+        # bind the query to the same physical generation explicitly.
+        analytics = V2AnalyticsQueryService()
+        if not bool(getattr(analytics, "supports_per_query_read_settings", True)):
+            return _dashboard_refresh_or_degraded(
+                frozen_config,
+                error_code="read_settings_unavailable",
+                refresh_state=refresh_state,
+            )
+        for source, items in grouped.items():
+            select_values = ",\n       ".join(
+                f"{item['expression']} AS {item['alias']}" for item in items
+            )
+            if source == "spans_hourly_rollup":
+                table = "spans_hourly_rollup"
+            elif source == "trace_count_rollup":
+                table = "trace_count_rollup"
+            else:  # Defensive fence; source values are code-owned above.
+                raise DashboardBoundedReadError("bounded_shape_unavailable")
+            query = (
+                f"SELECT {bucket_fn}(hour) AS time_bucket,\n"
+                f"       {select_values}\n"
+                f"FROM {table}\n"
+                "PREWHERE project_id IN %(project_ids)s\n"
+                "WHERE hour >= %(start_date)s\n"
+                "  AND hour < %(end_date)s\n"
+                "GROUP BY time_bucket\n"
+                "ORDER BY time_bucket\n"
+                "LIMIT %(result_limit)s"
+            )
+            expected_columns = ["time_bucket", *(item["alias"] for item in items)]
+            result = analytics.execute_ch_query(
+                query,
+                {
+                    "project_ids": project_ids,
+                    "start_date": window_start,
+                    "end_date": window_end,
+                    "result_limit": _DASHBOARD_ROLLUP_MAX_POINTS + 1,
+                },
+                timeout_ms=deadline.remaining_ms(_DASHBOARD_INTERACTIVE_TIMEOUT_MS),
+                settings=_DASHBOARD_ROLLUP_READ_SETTINGS,
+            )
+            rows = _validate_dashboard_rollup_result(result, expected_columns)
+            query_count += 1
+            rows_returned += len(rows)
+            for item in items:
+                rows_by_index[item["index"]] = [
+                    {
+                        "time_bucket": row["time_bucket"],
+                        "value": row[item["alias"]],
+                    }
+                    for row in rows
+                ]
+    except DashboardBoundedReadError as exc:
+        return _dashboard_refresh_or_degraded(
+            frozen_config,
+            error_code=exc.error_code,
+            refresh_state=refresh_state,
+        )
+    except Exception as exc:
+        if is_read_budget_error(exc):
+            error_code = "read_budget_exceeded"
+            logger.warning(
+                "dashboard_rollup_read_budget_exceeded",
+                query_count=query_count,
+            )
+        elif is_clickhouse_query_error(exc):
+            error_code = "query_failed"
+            logger.warning(
+                "dashboard_rollup_read_unavailable",
+                error_type=type(exc).__name__,
+            )
+        else:
+            error_code = "query_failed"
+            logger.exception(
+                "dashboard_rollup_read_failed",
+                error_type=type(exc).__name__,
+            )
+        return _dashboard_refresh_or_degraded(
+            frozen_config,
+            error_code=error_code,
+            refresh_state=refresh_state,
+        )
+
+    metric_results = []
+    for item in prepared:
+        metric_info = builder.metric_info(item["metric"])
+        metric_info.update(
+            {
+                "source": "traces",
+                "query_complete": True,
+                "query_status": "complete",
+                "query_sampled": False,
+                "query_sampling_strategy": item["strategy"],
+                "query_sampling_interval_seconds": 3_600,
+            }
+        )
+        metric_results.append((metric_info, rows_by_index[item["index"]]))
+    formatted = builder.format_results(metric_results)
+    formatted.update(
+        {
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
+            "query_exact": False,
+            "query_provenance": "materialized_rollup",
+            "query_count": query_count,
+            "query_rows_returned": rows_returned,
+            "query_elapsed_ms": round((monotonic() - started) * 1000, 2),
+        }
+    )
+    if isinstance(refresh_state, dict):
+        for key in ("query_refreshing", "query_refresh_failed"):
+            if key in refresh_state:
+                formatted[key] = refresh_state[key]
+    for item, formatted_metric in zip(prepared, formatted["metrics"], strict=True):
+        formatted_metric.update(
+            {
+                "query_exact": False,
+                "query_provenance": "materialized_rollup",
+                "query_sampling_strategy": item["strategy"],
+                "query_sampling_interval_seconds": 3_600,
+            }
+        )
+    try:
+        deadline.remaining_ms(floor_ms=1)
+    except ReadDeadlineExceeded:
+        return _dashboard_refresh_or_degraded(
+            frozen_config,
+            error_code="read_budget_exceeded",
+            refresh_state=refresh_state,
+        )
+    return formatted
+
+
+def _read_public_dashboard_query(
+    query_config,
+    *,
+    cache_identity,
+    refresh,
+    deadline=None,
+    try_rollup=True,
+):
+    """Serve cached exact data or one bounded, honest cold response."""
+
+    if deadline is None:
+        deadline = ReadDeadline.start(_DASHBOARD_INTERACTIVE_TIMEOUT_MS)
+    try:
+        # Snapshot scheduling may spend up to two seconds in Redis/Temporal.
+        # Reserve that time inside the same public wall instead of beginning a
+        # fresh dispatch after synchronous ClickHouse work consumed the budget.
+        deadline.remaining_ms(floor_ms=2_100)
+    except ReadDeadlineExceeded:
+        return _dashboard_degraded_payload(
+            query_config,
+            error_code="read_budget_exceeded",
+        )
+    if not try_rollup:
+        # This is the post-synchronous-read fallback. Starting Redis/Temporal
+        # reconciliation here would create a fresh wall after ClickHouse used
+        # most of the request budget. Background refresh remains available on
+        # the normal cold path; this response fails fast and honestly.
+        return _dashboard_degraded_payload(
+            query_config,
+            error_code="read_budget_exceeded",
+        )
+    try:
+        snapshot = read_or_schedule_exact_snapshot(
+            "dashboard-query",
+            cache_identity,
+            refresh=bool(refresh),
+            pending_payload=_pending_dashboard_payload(query_config),
+        )
+    except Exception:
+        logger.exception("dashboard_exact_snapshot_schedule_failed")
+        snapshot = {"query_refreshing": False, "query_refresh_failed": True}
+    if _dashboard_snapshot_is_renderable(snapshot):
+        return _decorate_dashboard_exact_payload(snapshot)
+    return _read_dashboard_rollup_fast_path(
+        query_config,
+        refresh_state=snapshot if isinstance(snapshot, dict) else None,
+        deadline=deadline,
+    )
 
 
 def _complete_empty_metric_results(builder, source):
@@ -530,15 +1132,16 @@ def _dashboard_filter_to_internal(filter_item):
         ),
         "value": config.get("filter_value"),
         "source": filter_item.get("source", "traces"),
+        # The bounded dashboard lane reuses the trace list classifier, whose
+        # public filter contract is this validated canonical object. Keep it
+        # as data; the dashboard SQL compiler continues to use the flattened
+        # fields above.
+        "canonical_filter": filter_item,
     }
     if filter_item.get("output_type"):
         internal["output_type"] = filter_item["output_type"]
     if metric_type == "custom_attribute":
         internal["attribute_type"] = "number" if filter_type == "number" else "string"
-        # Keep the validated canonical shape for typed span-attribute
-        # compilation. The legacy flattened fields above remain for saved
-        # configs and non-attribute dashboard builders.
-        internal["canonical_filter"] = filter_item
     return internal
 
 
@@ -578,16 +1181,8 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         return DashboardSerializer
 
     def _get_trace_query_timeout_ms(self, trace_config):
-        """Use a longer timeout for high-cardinality or wide trace queries."""
-        has_eval_metrics = any(
-            m.get("type") == "eval_metric" for m in trace_config.get("metrics", [])
-        )
-        has_project_breakdown = any(
-            bd.get("name") == "project"
-            for bd in trace_config.get("breakdowns", [])
-            if bd.get("source", "traces") in ("traces", "both", "all", "")
-        )
-        return 30000 if has_eval_metrics or has_project_breakdown else 10000
+        """Return the dashboard-wide interactive/worker query ceiling."""
+        return _DASHBOARD_EXACT_QUERY_TIMEOUT_MS
 
     @staticmethod
     def _run_metric_queries(
@@ -901,11 +1496,10 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
             "query_config": query_config,
         }
         return self._gm.success_response(
-            read_or_schedule_exact_snapshot(
-                "dashboard-query",
-                cache_identity,
+            _read_public_dashboard_query(
+                query_config,
+                cache_identity=cache_identity,
                 refresh=refresh,
-                pending_payload=_pending_dashboard_payload(query_config),
             )
         )
 
@@ -2737,11 +3331,15 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         refresh=False,
         _exact_worker=False,
         cache_identity_override=None,
+        _read_deadline=None,
     ):
         """Execute a query_config against ClickHouse and return formatted results.
 
         Routes each metric to the appropriate builder based on source.
         """
+        read_deadline = _read_deadline or ReadDeadline.start(
+            _DASHBOARD_INTERACTIVE_TIMEOUT_MS
+        )
         read_query_config = _canonicalize_persisted_dashboard_query_filters_for_read(
             query_config
         )
@@ -2793,29 +3391,33 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         except DashboardQueryScopeError as exc:
             return self._gm.bad_request(str(exc))
 
-        cache_identity = cache_identity_override or {
-            "workspace_id": str(workspace.id),
-            "query_config": query_config,
-        }
-        previous = read_exact_snapshot("dashboard-query", cache_identity)
+        cache_identity = (
+            deepcopy(cache_identity_override)
+            if cache_identity_override is not None
+            else {
+                "workspace_id": str(workspace.id),
+                # Exact-worker normalization adds internal canonical filter
+                # objects. Keep them out of the public cache key and never let
+                # recursive execution mutate the key selected by this request.
+                "query_config": deepcopy(query_config),
+            }
+        )
         if not _exact_worker:
             return self._gm.success_response(
-                read_or_schedule_exact_snapshot(
-                    "dashboard-query",
-                    cache_identity,
+                _read_public_dashboard_query(
+                    query_config,
+                    cache_identity=cache_identity,
                     refresh=bool(refresh),
-                    pending_payload=_pending_dashboard_payload(query_config),
+                    deadline=read_deadline,
                 )
             )
 
         # One worker invocation owns one wall budget. Every metric statement,
         # including later executor waves and later data sources, receives only
         # the time still left on this same deadline. This prevents N metrics or
-        # trace/dataset/simulation sequencing from multiplying the 30-second
+        # trace/dataset/simulation sequencing from multiplying the 9.5-second
         # production ceiling while preserving each metric's indivisible
         # full-window SQL.
-        read_deadline = ReadDeadline.start(_DASHBOARD_EXACT_QUERY_TIMEOUT_MS)
-
         # Freeze one concrete wall-clock window before any builder prepares its
         # metric SQL. Preset windows must not drift by microseconds across
         # concurrent source queries or later response formatting.
@@ -2993,8 +3595,6 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             or bool(metric_info.get("error"))
             for metric_info, _rows in metric_results
         ):
-            if previous is not None and not _exact_worker:
-                return self._gm.success_response(mark_refresh_failed(previous))
             raise DashboardExactReadError(
                 "one or more dashboard metrics did not complete exactly"
             )
@@ -3032,8 +3632,17 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "query_complete": True,
                 "query_status": "complete",
                 "query_sampled": False,
+                "query_exact": True,
+                "query_provenance": "exact_snapshot",
             }
         )
+        for formatted_metric in formatted.get("metrics", []):
+            formatted_metric.update(
+                {
+                    "query_exact": True,
+                    "query_provenance": "exact_snapshot",
+                }
+            )
         # Formatting and ORM-backed display-name hydration are part of this
         # refresh too. A payload returned after the wall expires would still
         # be published atomically by the exact-aggregation activity, so fence
@@ -3044,14 +3653,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             raise DashboardExactReadError(
                 "dashboard exact read deadline exceeded"
             ) from exc
-        if _exact_worker:
-            return self._gm.success_response(formatted)
-        published = publish_exact_snapshot(
-            "dashboard-query",
-            cache_identity,
-            formatted,
-        )
-        return self._gm.success_response(published)
+        return self._gm.success_response(formatted)
 
     @validated_request(
         request_serializer=DashboardSampleOptInSerializer,

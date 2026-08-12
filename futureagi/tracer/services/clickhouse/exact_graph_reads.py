@@ -117,7 +117,7 @@ EXACT_GRAPH_TRACE_ANCHOR_MAX_WORKERS = 2
 EXACT_GRAPH_TRACE_ANCHOR_PAGE_SIZE = 50_000
 EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL = EXACT_GRAPH_TRACE_ANCHOR_PAGE_SIZE + 1
 EXACT_GRAPH_TRACE_ANCHOR_QUERY_TIMEOUT_MS = 30_000
-EXACT_GRAPH_TRACE_ANCHOR_MAX_BYTES_TO_READ = 20 * 1024 * 1024 * 1024
+EXACT_GRAPH_TRACE_ANCHOR_MAX_BYTES_TO_READ = 36 * 1024 * 1024 * 1024
 # Scanning complete retained history is worthwhile only when the requested
 # root window is both substantial in absolute terms and covers a meaningful
 # fraction of project retention.  Shorter/narrower windows stay on the ordered
@@ -146,7 +146,7 @@ EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE = 5_000
 # bisect a hotter tenant-specific batch instead of allowing one statement to
 # inherit the whole background-refresh deadline.
 EXACT_GRAPH_TRACE_CONTRIBUTION_QUERY_TIMEOUT_MS = 30_000
-EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ = 20 * 1024 * 1024 * 1024
+EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ = 36 * 1024 * 1024 * 1024
 # Witness work runs only in the exact-snapshot background activity; public
 # graph polls never wait on an individual statement.  Production qualification
 # includes raw witness slices whose valid bounded reads exceed the former
@@ -190,10 +190,11 @@ EXACT_GRAPH_SPAN_PARTITION_QUERY_TIMEOUT_MS = 30_000
 EXACT_GRAPH_MAX_RESULT_ROWS = 10_000
 EXACT_GRAPH_RESULT_ROW_SENTINEL = EXACT_GRAPH_MAX_RESULT_ROWS + 1
 EXACT_GRAPH_MAX_RESULT_BYTES = 32 * 1024 * 1024
-# The previous 64-GiB ceiling missed one qualified production read by less
-# than 1 MiB. Preserve finite read-volume admission with 50% measured headroom
-# instead of disabling the control entirely. Row volume remains uncapped.
-EXACT_GRAPH_MAX_BYTES_TO_READ = 96 * 1024 * 1024 * 1024
+# Ordinary application reads share the same finite 36-GiB byte and memory
+# envelope. Row volume remains uncapped; an exact background refresh that needs
+# more than this envelope fails closed while the bounded interactive graph path
+# can still publish an explicitly sampled result.
+EXACT_GRAPH_MAX_BYTES_TO_READ = 36 * 1024 * 1024 * 1024
 EXACT_GRAPH_READ_SETTINGS = {
     "max_threads": 1,
     # Attribute maps are several KiB per row on the heaviest tenants.  Smaller
@@ -223,10 +224,10 @@ EXACT_GRAPH_READ_SETTINGS = {
     "use_skip_indexes_if_final": 0,
     # Source-row volume is data, not an error condition, so there is no
     # max_rows_to_read setting. Production evidence includes 207,479,677
-    # physical rows in one valid twelve-month window. The finite byte ceiling
-    # above admits the measured 68,719,963,633-byte graph with explicit
-    # headroom while time, memory, thread, result, and refresh-admission limits
-    # remain independently enforced.
+    # physical rows in one valid twelve-month window. Byte, time, memory,
+    # thread, result, and refresh-admission limits remain independently
+    # enforced; reads above 36 GiB fail closed rather than publishing a partial
+    # result as exact.
     "max_bytes_to_read": EXACT_GRAPH_MAX_BYTES_TO_READ,
     # The same observed seven-day read peaked at 1,055,221,165 bytes.  Preserve
     # measured headroom while spilling compact aggregation/sort state early;
@@ -252,10 +253,9 @@ EXACT_GRAPH_TRACE_CLASSIFIER_READ_SETTINGS = {
 }
 EXACT_GRAPH_SPAN_PARTITION_READ_SETTINGS = {
     **EXACT_GRAPH_READ_SETTINGS,
-    # The densest observed production five-minute statement reads 2.66 GiB while
-    # touching 720k rows. Preserve finite measured headroom without reverting
-    # to an unbounded tenant-wide filtered scan.
-    "max_bytes_to_read": 4 * 1024 * 1024 * 1024,
+    # Span partitions use the same application envelope; their time partition,
+    # shared deadline and result ceilings remain the tighter controls.
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
 }
 EXACT_GRAPH_TRACE_ANCHOR_READ_SETTINGS = {
     **EXACT_GRAPH_READ_SETTINGS,

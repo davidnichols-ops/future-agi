@@ -175,7 +175,7 @@ def _get_client():
             username=cfg["user"],
             password=cfg["password"] or "",
             database=cfg["database"],
-            send_receive_timeout=15,
+            send_receive_timeout=9.5,
             settings=overrides,
         )
         _settings_tls.client = client
@@ -193,7 +193,7 @@ def _get_client():
                 username=cfg["user"],
                 password=cfg["password"] or "",
                 database=cfg["database"],
-                send_receive_timeout=15,
+                send_receive_timeout=9.5,
             )
     return _client
 

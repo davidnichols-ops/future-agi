@@ -33,8 +33,9 @@ from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 
 logger = structlog.get_logger(__name__)
 
-APPLICATION_READ_TIMEOUT_MS = 30_000
+APPLICATION_READ_TIMEOUT_MS = 9_500
 APPLICATION_READ_MAX_MEMORY_USAGE = 36 * 1024 * 1024 * 1024
+APPLICATION_READ_MAX_BYTES_TO_READ = 36 * 1024 * 1024 * 1024
 
 
 class SpanTraceMapIntegrityError(ReadDeadlineExceeded):
@@ -44,7 +45,7 @@ class SpanTraceMapIntegrityError(ReadDeadlineExceeded):
 _PAGE_EVAL_READ_SETTINGS = {
     "max_threads": 2,
     "read_overflow_mode": "throw",
-    "max_bytes_to_read": 256 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "timeout_overflow_mode": "throw",
 }
@@ -169,17 +170,27 @@ class AnalyticsQueryService:
         # Normalize the ordinary application read lane even for older callers
         # that omit settings. Row-count ceilings reject healthy high-volume
         # reads before their finite byte/time/result budgets are reached.
+        requested_timeout_ms = (
+            APPLICATION_READ_TIMEOUT_MS if timeout_ms is None else int(timeout_ms)
+        )
+        timeout_ms = min(
+            APPLICATION_READ_TIMEOUT_MS,
+            max(1, requested_timeout_ms),
+        )
         if self.supports_per_query_read_settings:
-            requested_timeout_ms = (
-                APPLICATION_READ_TIMEOUT_MS if timeout_ms is None else int(timeout_ms)
-            )
-            timeout_ms = min(
-                APPLICATION_READ_TIMEOUT_MS,
-                max(1, requested_timeout_ms),
-            )
             settings = dict(settings or {})
             settings.pop("max_rows_to_read", None)
-            settings["max_memory_usage"] = APPLICATION_READ_MAX_MEMORY_USAGE
+
+            def finite_ceiling(name: str, ceiling: int) -> int:
+                requested = int(settings.get(name, 0) or 0)
+                return ceiling if requested <= 0 else min(requested, ceiling)
+
+            settings["max_memory_usage"] = finite_ceiling(
+                "max_memory_usage", APPLICATION_READ_MAX_MEMORY_USAGE
+            )
+            settings["max_bytes_to_read"] = finite_ceiling(
+                "max_bytes_to_read", APPLICATION_READ_MAX_BYTES_TO_READ
+            )
         start = time.monotonic()
         try:
             rows, columns, qt = self.ch_client.execute_read(

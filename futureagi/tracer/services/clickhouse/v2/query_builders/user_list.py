@@ -1,11 +1,11 @@
 """
 v2 UserList query builder — targets the CH 25.3 spans schema.
 
-The v1 UserListQueryBuilder already emits CH25-native SQL targeting
-`end_users FINAL` and the v2 `spans` table. User membership/order intentionally
-replays latest physical span versions instead of using the insert-only
-`span_user_rollup`, which cannot retract tombstones or corrections. This wrapper
-adds the v2 SETTINGS clause (`optimize_use_projections = 1`,
+The v1 UserListQueryBuilder already emits CH25-native SQL targeting the retained
+`span_user_rollup` plus compact `end_users` fallback for bounded cursor
+candidates, `end_users FINAL` for curated labels, and the v2 `spans` table for
+finite exact replay. The rollup cannot retract tombstones or corrections, so it
+is never a published correctness source. This wrapper adds the v2 SETTINGS clause (`optimize_use_projections = 1`,
 `use_skip_indexes_if_final = 0`, `optimize_aggregation_in_order = 1`). Keeping
 the generic builder in correctness mode avoids relying on every present and
 future skip-index expression being invariant across physical user versions.

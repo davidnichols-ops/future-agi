@@ -2075,9 +2075,10 @@ function TraceSelector({
     [projectId, versionId],
   );
   const requestTracePage = useCallback(
-    (requestParams) =>
+    (requestParams, signal) =>
       axios.get(endpoints.project.getTracesForObserveProject(), {
         params: requestParams,
+        signal,
       }),
     [],
   );
@@ -2793,9 +2794,10 @@ function SpanSelector({ onSetSelection, onSelectAll }) {
     [projectId, versionId],
   );
   const requestSpanPage = useCallback(
-    (requestParams) =>
+    (requestParams, signal) =>
       axios.get(endpoints.project.getSpansForObserveProject(), {
         params: requestParams,
+        signal,
       }),
     [],
   );
@@ -3405,9 +3407,10 @@ function SessionSelector({ onSetSelection, onSelectAll }) {
     [projectId, versionId],
   );
   const requestSessionPage = useCallback(
-    (requestParams) =>
+    (requestParams, signal) =>
       axios.get(endpoints.project.projectSessionList(), {
         params: requestParams,
+        signal,
       }),
     [],
   );

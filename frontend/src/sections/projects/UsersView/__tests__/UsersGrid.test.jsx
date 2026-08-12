@@ -2,6 +2,14 @@ import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, userEvent, waitFor } from "src/utils/test-utils";
 
+const storedValues = new Map();
+vi.stubGlobal("localStorage", {
+  clear: () => storedValues.clear(),
+  getItem: (key) => storedValues.get(key) ?? null,
+  removeItem: (key) => storedValues.delete(key),
+  setItem: (key, value) => storedValues.set(key, String(value)),
+});
+
 const { getMock, gridState, routeState, storeState, validated } = vi.hoisted(
   () => {
     const validated = [
@@ -176,6 +184,25 @@ describe("UsersGrid deterministic pagination", () => {
     storeState.columns = [];
     storeState.clearSelection.mockReset();
     localStorage.clear();
+  });
+
+  it("uses project and end-user identity for cross-project AG Grid rows", () => {
+    renderGrid();
+
+    const sharedUser = {
+      user_id: "shared@example.com",
+      end_user_id: "shared-end-user-id",
+    };
+    const firstId = gridState.props.getRowId({
+      data: { ...sharedUser, project_id: "project-a" },
+    });
+    const secondId = gridState.props.getRowId({
+      data: { ...sharedUser, project_id: "project-b" },
+    });
+
+    expect(firstId).toBe("project-a:shared-end-user-id");
+    expect(secondId).toBe("project-b:shared-end-user-id");
+    expect(firstId).not.toBe(secondId);
   });
 
   it("opts the first unsorted request into cursor mode with the active filters", async () => {
@@ -515,6 +542,32 @@ describe("UsersGrid deterministic pagination", () => {
       ).not.toBeInTheDocument();
     },
   );
+
+  it("fails a degraded HTTP 200 instead of accepting a false empty Users page", async () => {
+    getMock.mockResolvedValueOnce(
+      usersResponse({
+        queryComplete: false,
+        queryStatus: "degraded",
+      }),
+    );
+    const props = renderGrid();
+    const params = makeGridParams();
+
+    await readPage(params);
+
+    expect(params.fail).toHaveBeenCalledTimes(1);
+    expect(params.success).not.toHaveBeenCalled();
+    // The Users grid owns a custom no-rows overlay which renders readError as
+    // an alert, so showing it here exposes the failure rather than a false
+    // empty state.
+    expect(params.api.showNoRowsOverlay).toHaveBeenCalledOnce();
+    expect(props.setHasData).not.toHaveBeenCalledWith(false);
+    expect(storeState.clearSelection).not.toHaveBeenCalled();
+    expect(props.setSearchState).toHaveBeenCalledWith("error");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "We couldn't load this data. Please retry in a moment.",
+    );
+  });
 
   it("invalidates an in-flight page when a changed query starts a new generation", async () => {
     let resolveStale;

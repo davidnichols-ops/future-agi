@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 import time
 import uuid
@@ -16,7 +15,6 @@ from django.test import override_settings
 from tracer.selectors.trace_filter_reads import read_bounded_filter_page
 from tracer.services.clickhouse.query_builders.user_list import (
     UnsupportedBoundedUserListQuery,
-    UserListQueryBuilder,
 )
 from tracer.services.clickhouse.v2.query_builders.session_list import (
     SessionListQueryBuilderV2,
@@ -94,7 +92,14 @@ def test_user_default_page_replays_latest_state_before_pagination():
     assert "sp.is_deleted = 0" in page_sql
     assert "span_user_rollup" not in page_sql
     assert "span_user_rollup" not in combined_sql
-    assert "FROM span_user_rollup" not in inspect.getsource(UserListQueryBuilder)
+    cursor_seed_sql, cursor_seed_params = builder.build_dimension_candidate_query(
+        limit=26
+    )
+    assert "FROM span_user_rollup AS rollup" in cursor_seed_sql
+    assert (
+        cursor_seed_params["candidate_window_start"]
+        < cursor_seed_params["candidate_window_end"]
+    )
     assert "LIMIT %(limit)s OFFSET %(offset)s" in page_sql
     assert params["limit"] == 25
     assert params["offset"] == 50
@@ -190,6 +195,90 @@ def test_session_candidate_page_is_physical_latest_and_page_metrics_are_scoped()
     assert "sum(cost)" not in count_sql
     assert "candidate_root_raw_session_ids AS" in count_sql
     assert "OVER (PARTITION BY new_id)" not in count_sql
+
+
+@pytest.mark.unit
+def test_default_session_cursor_seeds_from_session_rollup_before_exact_replay():
+    now = datetime(2026, 8, 11, 12, 0)
+    project_id = str(uuid.uuid4())
+    builder = SessionListQueryBuilderV2(
+        project_id=project_id,
+        page_size=25,
+        filters=_window(now),
+        bounded_internal_scan=True,
+    )
+
+    sql, params = builder.build_filter_candidate_seed_page(
+        slice_start=now - timedelta(days=1),
+        slice_end=now + timedelta(days=1),
+        limit=26,
+        before_start_time=now,
+        before_id=str(uuid.uuid4()),
+    )
+
+    assert builder.supports_filter_candidate_seed_page() is True
+    assert builder.filter_candidate_seed_proves_result_order() is True
+    assert builder.filter_candidate_seed_is_sampled() is True
+    assert builder.recommended_filter_cursor_seed_batch_size() == 101
+    assert builder.recommended_filter_initial_slice_width() == timedelta(days=2)
+    assert "FROM spans_per_session" in sql
+    assert "minMerge(first_seen) AS start_time" in sql
+    assert "GROUP BY trace_session_id" in sql
+    assert "ORDER BY start_time DESC, toString(session_id) DESC" in sql
+    assert "FROM spans AS" not in sql
+    assert "trace_session_id_remap" not in sql
+    assert "max_rows_to_read" not in sql
+    assert params["project_id"] == project_id
+    assert params["filter_seed_limit"] == 26
+    assert params["filter_slice_start_us"] < params["filter_slice_end_us"]
+    assert "filter_before_start_time_us" in params
+
+
+@pytest.mark.unit
+def test_default_session_rollup_classifier_preserves_finite_raw_seed_order():
+    now = datetime(2026, 8, 11, 12, 0)
+    raw_session_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        page_size=25,
+        filters=_window(now),
+        bounded_internal_scan=True,
+    )
+    seed_rows = [
+        {
+            "session_id": raw_session_ids[0],
+            "start_time": now - timedelta(hours=1),
+        },
+        {
+            "session_id": raw_session_ids[1],
+            "start_time": now - timedelta(hours=2),
+        },
+    ]
+
+    sql, params = builder.build_filter_match_query_from_seed_rows(seed_rows)
+
+    assert "candidate_seed_order_rows AS" in sql
+    assert "candidate_group_rollup_order_rows AS" in sql
+    assert "FROM spans_per_session" in sql
+    assert "SELECT any_id FROM ts_survivor_map" in sql
+    assert "resolved_candidate_seed_order AS" in sql
+    assert "LEFT JOIN ts_survivor_map AS seed_ts_remap" in sql
+    assert "INNER JOIN candidate_seed_order USING (session_id)" in sql
+    assert "AS _seed_order_start" in sql
+    assert "AS _seed_order_id" in sql
+    assert "ORDER BY _seed_order_start DESC, _seed_order_id DESC" in sql
+    assert "PREWHERE old_id IN (" in sql
+    assert "WHERE new_id IN (" in sql
+    assert "OVER (PARTITION BY new_id)" not in sql
+    assert "max_rows_to_read" not in sql
+    assert params["candidate_seed_order_ids"] == raw_session_ids
+    assert len(params["candidate_seed_order_start_us"]) == 2
+    assert builder.bounded_filter_row_order_token(seed_rows[0]) == raw_session_ids[0]
+    classified_row = {
+        "session_id": str(uuid.uuid4()),
+        "_seed_order_id": raw_session_ids[0],
+    }
+    assert builder.bounded_filter_row_order_token(classified_row) == raw_session_ids[0]
 
 
 @pytest.mark.unit
@@ -1309,7 +1398,7 @@ def test_session_identity_filters_stay_on_bounded_candidate_path():
 
 
 @pytest.mark.unit
-def test_public_trace_and_session_filters_share_the_30_second_statement_ceiling():
+def test_public_trace_and_session_filters_share_the_9_5_second_statement_ceiling():
     project_id = str(uuid.uuid4())
     status_filter = {
         "column_id": "status",
@@ -1330,8 +1419,8 @@ def test_public_trace_and_session_filters_share_the_30_second_statement_ceiling(
         filters=[status_filter],
     )
 
-    assert trace_builder.recommended_filter_query_timeout_ms() == 30_000
-    assert session_builder.recommended_filter_query_timeout_ms() == 30_000
+    assert trace_builder.recommended_filter_query_timeout_ms() == 9_500
+    assert session_builder.recommended_filter_query_timeout_ms() == 9_500
 
 
 @pytest.mark.unit
@@ -1354,7 +1443,7 @@ def test_cross_project_user_detail_session_query_bounds_both_remaps():
     sql, params = builder.build_candidate_page_query()
 
     assert builder.supports_candidate_first_page() is True
-    assert builder.recommended_filter_query_timeout_ms() == 30_000
+    assert builder.recommended_filter_query_timeout_ms() == 9_500
     assert builder.supports_filter_anchor_probe() is False
     assert params["candidate_filter_user_ids"] == (end_user_id,)
     assert params["eu_remap_1"] == (end_user_id,)
@@ -1420,7 +1509,7 @@ def test_cross_project_user_detail_trace_query_bounds_dimension_remap():
         ]
     )
 
-    assert builder.recommended_filter_query_timeout_ms() == 30_000
+    assert builder.recommended_filter_query_timeout_ms() == 9_500
     assert builder.supports_filter_anchor_probe() is False
     for sql in (seed_sql, match_sql):
         assert "matching_end_user_ids AS" in sql
@@ -1479,7 +1568,7 @@ def test_user_detail_selector_uses_deadline_without_row_read_cap():
     _, _, timeout_ms, settings = recorder.calls[0]
     assert 3_000 < timeout_ms <= 30_000
     assert "max_rows_to_read" not in settings
-    assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+    assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
     assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
     assert 0 < settings["max_result_rows"] <= 512
     assert settings["max_threads"] == 1

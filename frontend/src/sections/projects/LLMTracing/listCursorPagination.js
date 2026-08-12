@@ -8,7 +8,53 @@ export const LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE =
 export const LIST_CURSOR_CONTINUATION_NOTICE =
   "Preparing exact results. Refresh or retry to continue.";
 const DEFAULT_MAX_EMPTY_CONTINUATIONS = 12;
-const DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS = 30_000;
+const DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS = 9_500;
+
+const requestWithinDeadline = async ({
+  request,
+  cancellationSignal,
+  remainingMs,
+}) => {
+  const requestController = new AbortController();
+  const cancelRequest = () => requestController.abort();
+  cancellationSignal?.addEventListener("abort", cancelRequest, {
+    once: true,
+  });
+  if (cancellationSignal?.aborted) cancelRequest();
+
+  let timer;
+  try {
+    const result = await Promise.race([
+      Promise.resolve()
+        .then(() => request(requestController.signal))
+        .then((response) => ({ completed: true, response })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ completed: false }), remainingMs);
+      }),
+    ]);
+    if (!result.completed) requestController.abort();
+    return result;
+  } finally {
+    clearTimeout(timer);
+    cancellationSignal?.removeEventListener("abort", cancelRequest);
+  }
+};
+
+const requestContinuationWithinDeadline = ({
+  nextResponse,
+  nextCursor,
+  ...deadlineOptions
+}) =>
+  requestWithinDeadline({
+    request: (signal) => nextResponse(nextCursor, signal),
+    ...deadlineOptions,
+  });
+
+const createListCursorContinuationLimitError = () => {
+  const error = new Error("Exact list continuation safety limit reached");
+  error.code = LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE;
+  return error;
+};
 
 const hasOwn = (value, key) =>
   Object.prototype.hasOwnProperty.call(value || {}, key);
@@ -448,6 +494,7 @@ export const loadExactListPage = async ({
   metadataFromResponse,
   rowIdentity,
   isCurrent = () => true,
+  cancellationSignal,
   maxContinuations = DEFAULT_MAX_EMPTY_CONTINUATIONS,
   maxElapsedMs = DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS,
   now = () => Date.now(),
@@ -515,12 +562,24 @@ export const loadExactListPage = async ({
     // a false repeated-cursor protocol error.
     const resumeBufferedCheckpoint =
       continuationCount === 0 && buffered && metadata?.has_more === true;
+    const remainingMs = Math.floor(maxElapsedMs - (now() - startedAt));
+    if (remainingMs < 1) {
+      throw createListCursorContinuationLimitError();
+    }
     let nextTransportResponse;
     try {
-      nextTransportResponse =
-        continuationCount === 0 && !resumeBufferedCheckpoint
-          ? await loadResponse()
-          : await nextResponse(metadata.next_cursor);
+      const transport = await requestWithinDeadline({
+        request:
+          continuationCount === 0 && !resumeBufferedCheckpoint
+            ? (signal) => loadResponse(signal)
+            : (signal) => nextResponse(metadata.next_cursor, signal),
+        cancellationSignal,
+        remainingMs,
+      });
+      if (!transport.completed) {
+        throw createListCursorContinuationLimitError();
+      }
+      nextTransportResponse = transport.response;
     } catch (error) {
       if (
         legacyFallbackAttempted ||
@@ -569,9 +628,7 @@ export const loadExactListPage = async ({
       continuationCount >= maxContinuations ||
       now() - startedAt >= maxElapsedMs
     ) {
-      const error = new Error("Exact list continuation safety limit reached");
-      error.code = LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE;
-      throw error;
+      throw createListCursorContinuationLimitError();
     }
     continuationCount += 1;
     needsResponse = true;
@@ -626,6 +683,7 @@ export const collectExactListRows = async ({
   rowIdentity,
   onContinuation,
   isCurrent = () => true,
+  cancellationSignal,
   maxContinuations = DEFAULT_MAX_EMPTY_CONTINUATIONS,
   maxElapsedMs = DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS,
   now = () => Date.now(),
@@ -742,7 +800,34 @@ export const collectExactListRows = async ({
     followed.add(nextCursor);
     onContinuation?.(metadata);
     continuationCount += 1;
-    response = await nextResponse(nextCursor);
+    const remainingMs = Math.floor(maxElapsedMs - (now() - startedAt));
+    if (remainingMs < 1) {
+      return {
+        response,
+        rows,
+        metadata,
+        pending: true,
+        stale: false,
+        nextCursor,
+      };
+    }
+    const continuation = await requestContinuationWithinDeadline({
+      nextResponse,
+      nextCursor,
+      cancellationSignal,
+      remainingMs,
+    });
+    if (!continuation.completed) {
+      return {
+        response,
+        rows,
+        metadata,
+        pending: true,
+        stale: false,
+        nextCursor,
+      };
+    }
+    response = continuation.response;
   }
 
   throw createListCursorProtocolError("List continuation returned no response");
@@ -812,9 +897,11 @@ export const followEmptyListContinuations = async ({
   nextResponse,
   onContinuation,
   isCurrent = () => true,
+  cancellationSignal,
   maxContinuations = DEFAULT_MAX_EMPTY_CONTINUATIONS,
   maxElapsedMs = DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS,
   now = () => Date.now(),
+  startedAt = now(),
 }) => {
   if (!Number.isInteger(maxContinuations) || maxContinuations < 1) {
     throw new Error("Invalid list continuation limit");
@@ -824,7 +911,6 @@ export const followEmptyListContinuations = async ({
   }
   let response = initialResponse;
   const followed = new Set();
-  const startedAt = now();
   let rows = rowsFromResponse(response) || [];
 
   while (rows.length === 0) {
@@ -858,8 +944,105 @@ export const followEmptyListContinuations = async ({
     }
     followed.add(nextCursor);
     onContinuation?.(metadata);
-    response = await nextResponse(nextCursor);
+    const remainingMs = Math.floor(maxElapsedMs - (now() - startedAt));
+    if (remainingMs < 1) return response;
+    const next = await requestContinuationWithinDeadline({
+      nextResponse,
+      nextCursor,
+      cancellationSignal,
+      remainingMs,
+    });
+    if (!next.completed) return response;
+    response = next.response;
     rows = rowsFromResponse(response) || [];
   }
   return response;
+};
+
+/**
+ * Fill one visible picker page from bounded physical cursor pages.
+ *
+ * The final response remains the metadata authority, including its signed
+ * next cursor. Only the returned row collection spans physical pages.
+ */
+export const accumulateUniqueListContinuations = async ({
+  initialResponse,
+  rowsFromResponse,
+  metadataFromResponse,
+  identityFromRow,
+  knownIdentities = [],
+  targetRowCount,
+  nextResponse,
+  onContinuation,
+  isCurrent = () => true,
+  cancellationSignal,
+  maxContinuations = DEFAULT_MAX_EMPTY_CONTINUATIONS,
+  maxElapsedMs = DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS,
+  now = () => Date.now(),
+  startedAt = now(),
+}) => {
+  if (!Number.isInteger(targetRowCount) || targetRowCount < 1) {
+    throw new Error("Invalid list continuation target row count");
+  }
+  if (!Number.isInteger(maxContinuations) || maxContinuations < 1) {
+    throw new Error("Invalid list continuation limit");
+  }
+  if (!Number.isFinite(maxElapsedMs) || maxElapsedMs < 1) {
+    throw new Error("Invalid list continuation deadline");
+  }
+
+  let response = initialResponse;
+  const identities = new Set(knownIdentities);
+  const followedCursors = new Set();
+  const rows = [];
+  const appendRows = () => {
+    for (const row of rowsFromResponse(response) || []) {
+      const identity = identityFromRow(row);
+      if (identity == null || identities.has(identity)) continue;
+      identities.add(identity);
+      rows.push(row);
+    }
+  };
+
+  appendRows();
+  while (rows.length < targetRowCount) {
+    const metadata = metadataFromResponse(response) || {};
+    const nextCursor = metadata.next_cursor;
+    if (
+      metadata.has_more !== true ||
+      typeof nextCursor !== "string" ||
+      nextCursor.length === 0
+    ) {
+      break;
+    }
+    if (!isCurrent()) break;
+    if (followedCursors.has(nextCursor)) {
+      throw createListCursorProtocolError(
+        "List API returned a repeated continuation cursor",
+      );
+    }
+    if (
+      followedCursors.size >= maxContinuations ||
+      now() - startedAt >= maxElapsedMs
+    ) {
+      break;
+    }
+
+    const remainingMs = Math.floor(maxElapsedMs - (now() - startedAt));
+    if (remainingMs < 1) break;
+    const next = await requestContinuationWithinDeadline({
+      nextResponse,
+      nextCursor,
+      cancellationSignal,
+      remainingMs,
+    });
+    if (!next.completed) break;
+
+    followedCursors.add(nextCursor);
+    onContinuation?.(metadata);
+    response = next.response;
+    appendRows();
+  }
+
+  return { response, rows, followedCursors: [...followedCursors] };
 };

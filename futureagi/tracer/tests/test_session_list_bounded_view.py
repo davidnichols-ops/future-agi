@@ -100,6 +100,31 @@ def _view_and_request():
 
 
 @pytest.mark.unit
+def test_session_partial_page_cursor_prefers_hidden_rollup_seed_order():
+    from tracer.views.trace_session import _session_list_cursor_order_for_partial_page
+
+    seed_start = datetime(2025, 1, 1, 0, 0)
+    exact_start = datetime(2026, 8, 11, 12, 0)
+    raw_session_id = str(uuid.uuid4())
+    canonical_session_id = str(uuid.uuid4())
+
+    order = _session_list_cursor_order_for_partial_page(
+        rows=[
+            {
+                "session_id": canonical_session_id,
+                "start_time": exact_start,
+                "_seed_order_start": seed_start,
+                "_seed_order_id": raw_session_id,
+            }
+        ],
+        bounded_page=SimpleNamespace(),
+        cursor_state=None,
+    )
+
+    assert order == (seed_start, raw_session_id)
+
+
+@pytest.mark.unit
 def test_org_session_relational_collision_fails_before_id_only_hydration():
     from tracer.views.trace_session import TraceSessionView
 
@@ -425,7 +450,7 @@ def test_session_end_user_dictionary_lookup_remap_is_candidate_bounded():
 
 
 @pytest.mark.unit
-def test_user_detail_reverse_lookup_keeps_transport_and_query_under_30_seconds(
+def test_user_detail_reverse_lookup_keeps_transport_and_query_under_10_seconds(
     monkeypatch,
 ):
     import sys
@@ -475,12 +500,13 @@ def test_user_detail_reverse_lookup_keeps_transport_and_query_under_30_seconds(
     finally:
         reader._reset_client()
 
-    assert client_factory.call_args.kwargs["send_receive_timeout"] == 30
+    assert client_factory.call_args.kwargs["send_receive_timeout"] == 9.5
     assert "settings" not in client_factory.call_args.kwargs
     query_settings = client.query.call_args.kwargs["settings"]
-    assert query_settings["max_execution_time"] == 30
+    assert query_settings["max_execution_time"] == 9.5
     assert "max_rows_to_read" not in query_settings
     assert query_settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
+    assert query_settings["max_bytes_to_read"] == 256 * 1024 * 1024
     assert query_settings["max_threads"] == 2
     assert query_settings["max_result_rows"] == 10_000
 
@@ -699,6 +725,9 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
         "query_complete": True,
         "query_status": "complete",
         "query_error_code": None,
+        "query_exact": False,
+        "query_provenance": "spans_per_session_candidate",
+        "ordering_exact": False,
     }
     assert payload["table"][0]["first_message"] == "first"
     assert payload["table"][0]["last_message"] == "last"
@@ -1322,6 +1351,11 @@ def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
     assert first_payload["metadata"]["query_complete"] is True
     assert first_payload["metadata"]["query_status"] == "complete"
     assert first_payload["metadata"]["query_error_code"] is None
+    assert first_payload["metadata"]["query_exact"] is False
+    assert first_payload["metadata"]["query_provenance"] == (
+        "spans_per_session_candidate"
+    )
+    assert first_payload["metadata"]["ordering_exact"] is False
     assert isinstance(cursor, str)
     assert second_status == "ok"
     assert [row["session_id"] for row in second_payload["table"]] == [session_id]

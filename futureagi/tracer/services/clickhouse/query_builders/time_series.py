@@ -334,7 +334,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             countMerge(n) AS traffic_count,
             sumMerge(prompt_tokens_sum) AS prompt_tokens,
             sumMerge(completion_tokens_sum) AS completion_tokens,
-            countMerge(error_count) * 100.0 / greatest(countMerge(n), 1)
+            countIfMerge(error_count) * 100.0 / greatest(countMerge(n), 1)
                 AS error_rate
         FROM {self.AGG_TABLE}
         WHERE project_id = %(project_id)s

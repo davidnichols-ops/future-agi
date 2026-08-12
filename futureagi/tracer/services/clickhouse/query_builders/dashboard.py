@@ -352,6 +352,7 @@ def _prefix_spans_columns(clause: str) -> str:
         sql = pieces[piece_index]
         for col in (
             "project_id",
+            "trace_id",
             "_peerdb_is_deleted",
             "start_time",
             "created_at",

@@ -327,65 +327,61 @@ def test_observation_span_fields_redact_internal_failure():
 
 
 @pytest.mark.unit
-def test_observation_span_export_fails_closed_before_paginated_list():
+def test_observation_span_export_uses_bounded_list_page():
     from tracer.views.observation_span import ObservationSpanView
 
-    request = SimpleNamespace(query_params={})
+    request = SimpleNamespace(
+        query_params={},
+        validated_query_data={"project_id": "project-1", "filters": []},
+        organization=SimpleNamespace(id="org-1"),
+    )
     view = ObservationSpanView()
     view.request = request
-    serializer = MagicMock()
-    serializer.is_valid.return_value = True
-    serializer.validated_data = {"project_id": "project-1"}
+    project = SimpleNamespace(name="project")
+    project_queryset = MagicMock()
+    project_queryset.first.return_value = project
+    page = MagicMock(status_code=200)
+    page.data = {"result": {"table": [], "metadata": {"has_more": False}}}
 
     with (
         patch(
-            "tracer.views.observation_span.SpanExportQuerySerializer",
-            return_value=serializer,
+            "tracer.views.observation_span.Project.objects.filter",
+            return_value=project_queryset,
         ),
-        patch.object(view, "list_spans_observe") as list_spans,
+        patch.object(view, "list_spans_observe", return_value=page) as list_spans,
     ):
-        response = view.get_spans_export_data(request)
+        response = view.get_spans_export_data.__wrapped__(view, request)
 
-    assert response.status_code == 503
-    assert response.data["code"] == "service_unavailable"
-    assert response.data["result"] == (
-        "A complete span export is temporarily unavailable. Please retry later."
-    )
-    list_spans.assert_not_called()
+    assert response.status_code == 200
+    assert response["Content-Type"].startswith("text/csv")
+    list_spans.assert_called_once_with(request, bounded_export=True)
 
 
 @pytest.mark.unit
-def test_trace_export_fails_closed_before_any_telemetry_read():
+def test_trace_export_uses_bounded_list_page():
     from tracer.views.trace import TraceView
 
-    request = SimpleNamespace(query_params={})
+    request = SimpleNamespace(
+        query_params={},
+        validated_query_data={"project_id": "project-1", "filters": []},
+    )
     view = TraceView()
     view.request = request
-
-    serializer = MagicMock()
-    serializer.is_valid.return_value = True
-    serializer.validated_data = {"project_id": "project-1"}
-
     project = SimpleNamespace(name="project")
     project_queryset = MagicMock()
     project_queryset.filter.return_value.first.return_value = project
+    page = MagicMock(status_code=200)
+    page.data = {"result": {"table": [], "metadata": {"has_more": False}}}
 
     with (
-        patch(
-            "tracer.views.trace.TraceExportQuerySerializer",
-            return_value=serializer,
-        ),
         patch(
             "tracer.views.trace._project_queryset_for_request",
             return_value=project_queryset,
         ),
-        patch.object(view, "list_traces_of_session") as list_traces,
+        patch.object(view, "list_traces_of_session", return_value=page) as list_traces,
     ):
-        response = view.get_trace_export_data(request)
+        response = view.get_trace_export_data.__wrapped__(view, request)
 
-    assert response.status_code == 503
-    assert response.data["code"] == "service_unavailable"
-    assert response.data["result"] == (
-        "A complete trace export is temporarily unavailable. Please retry later."
-    )
-    list_traces.assert_not_called()
+    assert response.status_code == 200
+    assert response["Content-Type"].startswith("text/csv")
+    list_traces.assert_called_once_with(request, bounded_export=True)

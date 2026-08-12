@@ -1838,6 +1838,7 @@ class ClickHouseFilterBuilder:
         to compare the correct column in ``tracer_eval_logger``.
         """
         from django.core.exceptions import ValidationError
+
         from model_hub.models.evals_metric import EvalTemplate
         from tracer.models.custom_eval_config import CustomEvalConfig
 
@@ -2672,7 +2673,14 @@ class ClickHouseFilterBuilder:
 
         if not filter_value:
             return None
-        values = filter_value if isinstance(filter_value, list) else [filter_value]
+        # Saved multi-select filters may deserialize as either a list or a
+        # tuple. Both represent individual UUID values; wrapping a tuple as one
+        # scalar would bind its Python representation as an invalid UUID.
+        values = (
+            list(filter_value)
+            if isinstance(filter_value, (list, tuple))
+            else [filter_value]
+        )
         uuid_list = self._uuid_in_clause(values, "uid")
         if not uuid_list:
             return None

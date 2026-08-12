@@ -95,14 +95,13 @@ class UserListQueryBuilder(BaseQueryBuilder):
         "end_user_id": "end_user_id",
     }
 
-    # Columns that can be selected by the exact latest-span page query.  The
-    # selector deliberately does *not* use ``span_user_rollup``: that table is
-    # populated by an insert-only AggregateMergeTree MV, so a later span
-    # tombstone/version reassignment cannot retract its contribution.  Using it
-    # for membership or ordering can therefore return the wrong page quickly.
-    # Raw-derived metrics that are hydrated only after pagination remain
-    # unsupported as page filters/sorts because applying them after ``LIMIT``
-    # would also change membership/order.
+    # Columns that can be selected by the exact latest-span page query.  Cursor
+    # reads prioritize ``span_user_rollup`` and complete its insert-block blind
+    # spots from the compact curated dimension; every selected id is replayed
+    # from latest physical span versions before a row is published.
+    # Raw-derived metrics that are hydrated only after
+    # pagination remain unsupported as page filters/sorts because applying them
+    # after ``LIMIT`` would also change membership/order.
     _CANDIDATE_FIRST_COLUMNS = frozenset(
         {
             "user_id",
@@ -144,6 +143,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
         candidate_end_user_ids: list[str] | tuple[str, ...] | None = None,
         candidate_scan_end_user_ids: list[str] | tuple[str, ...] | None = None,
         candidate_end_user_id_map: dict[str, str] | None = None,
+        include_num_sessions: bool = False,
         include_null_workspace: bool = False,
         empty_scope: bool = False,
     ) -> None:
@@ -196,6 +196,12 @@ class UserListQueryBuilder(BaseQueryBuilder):
             if missing_aliases or invalid_survivors:
                 raise ValueError("candidate end-user remap is inconsistent")
         self.candidate_end_user_id_map = tuple(supplied_map.items())
+        self.include_num_sessions = bool(
+            include_num_sessions and self.candidate_end_user_ids
+        )
+        self.embedded_page_metric_fields = (
+            frozenset({"num_sessions"}) if self.include_num_sessions else frozenset()
+        )
         self.include_null_workspace = include_null_workspace
         # When the caller resolved an EMPTY workspace-project set, the read must
         # return nothing — NOT fall through to an org-wide scan. (BaseQueryBuilder
@@ -238,33 +244,45 @@ class UserListQueryBuilder(BaseQueryBuilder):
         limit: int,
         before_first_seen: Any | None = None,
         before_end_user_id: str | None = None,
+        window_start: Any | None = None,
+        window_end: Any | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Return one stable, finite page from the curated user dimension.
+        """Return one stable, finite page from the user candidate population.
 
-        This query is only a candidate selector.  The caller replays the
-        latest physical spans for the returned ids before publishing a row, so
-        a stale/tombstoned dimension entry can create extra bounded work but
-        can never become a false list result. Ordering by immutable
-        ``first_seen`` plus the lexicographic String form of ``end_user_id``
-        gives continuation pages a total order without scanning or grouping the
-        tenant's full span window.
+        ``span_user_rollup`` is insert-only, so it is deliberately *not* the
+        correctness source. Its windowed ids stay first as the hot path, while
+        live curated ids occupy one stable sentinel immediately before the
+        window. The latter closes the rollup MV's insert-block blind spot: a
+        block containing old and in-window spans can be stored under only its
+        old ``hour_first_seen``. The caller resolves only a finite page's remaps
+        and replays latest physical span versions before publishing anything.
+
+        ``first_seen`` is transport-only: rollup rows carry their latest
+        activity and fallback rows carry the sentinel. Retaining the existing
+        key name avoids changing the signed opaque cursor shape.
         """
 
         if limit <= 0:
             raise ValueError("dimension candidate limit must be positive")
         if (before_first_seen is None) != (before_end_user_id is None):
             raise ValueError("dimension continuation values must be provided together")
+        if (window_start is None) != (window_end is None):
+            raise ValueError("dimension candidate window must be provided together")
+        if window_start is None:
+            window_start, window_end = self.parse_time_range(self.filters)
+        if window_start is None or window_end is None or window_start >= window_end:
+            raise ValueError("dimension candidate window is invalid")
 
         params: dict[str, Any] = {
             "org_id": self.organization_id,
             "dimension_limit": int(limit),
+            "candidate_window_start": window_start,
+            "candidate_window_end": window_end,
         }
         if self.project_ids is not None:
             params["project_ids"] = tuple(self.project_ids)
         else:
             params["project_id"] = self.project_id
-        if self.search:
-            params["search"] = self.search
         if before_first_seen is not None:
             # ``clickhouse-driver`` formats a bound Python datetime at whole-
             # second precision.  A continuation created inside a DateTime64(6)
@@ -280,11 +298,11 @@ class UserListQueryBuilder(BaseQueryBuilder):
             params["before_end_user_id"] = str(before_end_user_id)
 
         empty_scope_filter = "AND 0 = 1" if self.empty_scope else ""
-        search_filter = (
-            "AND positionCaseInsensitive(user_id, %(search)s) > 0"
-            if self.search
-            else ""
-        )
+        # Search is deliberately absent from this raw-id seed. During a remap
+        # window the rollup can contain only the new id while the curated label
+        # remains old-id keyed. Applying label membership here would therefore
+        # drop a valid canonical group before the finite remap can resolve it.
+        # The exact candidate replay applies search to the canonical label.
         continuation_filter = (
             """
             AND (
@@ -295,7 +313,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
                         = parseDateTime64BestEffort(
                             %(before_first_seen)s, 6, 'UTC'
                         )
-                    AND toString(eu.end_user_id) < %(before_end_user_id)s
+                    AND toString(rc.end_user_id) < %(before_end_user_id)s
                 )
             )
             """
@@ -303,52 +321,177 @@ class UserListQueryBuilder(BaseQueryBuilder):
             else ""
         )
         query = f"""
+        WITH
+        rollup_candidates AS (
+            SELECT
+                end_user_id,
+                greatest(
+                    coalesce(maxMerge(last_seen), minMerge(first_seen)),
+                    toDateTime64(%(candidate_window_start)s, 6, 'UTC')
+                ) AS first_seen
+            FROM span_user_rollup AS rollup
+            PREWHERE {self._project_predicate("rollup")}
+              AND hour_first_seen >=
+                  toStartOfHour(
+                      toDateTime64(%(candidate_window_start)s, 6, 'UTC')
+                  ) - INTERVAL 1 HOUR
+              AND hour_first_seen <
+                  toStartOfHour(
+                      toDateTime64(%(candidate_window_end)s, 6, 'UTC')
+                  ) + INTERVAL 1 HOUR
+            GROUP BY end_user_id
+        ),
+        candidate_population AS (
+            SELECT end_user_id, first_seen
+            FROM rollup_candidates
+
+            UNION ALL
+
+            SELECT
+                eu.end_user_id AS end_user_id,
+                toDateTime64(%(candidate_window_start)s, 6, 'UTC')
+                    - INTERVAL 1 MICROSECOND AS first_seen
+            FROM end_users AS eu FINAL
+            WHERE eu.organization_id = toUUID(%(org_id)s)
+              AND eu.is_deleted = 0
+              AND notEmpty(eu.user_id)
+              AND {self._project_predicate("eu")}
+        ),
+        raw_candidates AS (
+            SELECT
+                end_user_id,
+                max(first_seen) AS first_seen
+            FROM candidate_population
+            GROUP BY end_user_id
+        )
         SELECT
-            toString(eu.end_user_id) AS end_user_id,
-            user_id,
-            user_id_type,
-            user_id_hash,
+            toString(rc.end_user_id) AS end_user_id,
             first_seen
-        FROM end_users AS eu FINAL
-        WHERE eu.organization_id = toUUID(%(org_id)s)
-          AND eu.is_deleted = 0
-          AND notEmpty(eu.user_id)
-          AND {self._project_predicate("eu")}
+        FROM raw_candidates AS rc
+        WHERE 1 = 1
           {empty_scope_filter}
-          {search_filter}
           {continuation_filter}
-        ORDER BY first_seen DESC, toString(eu.end_user_id) DESC
+        ORDER BY first_seen DESC, toString(rc.end_user_id) DESC
         LIMIT %(dimension_limit)s
         """
         return query, params
 
     def build_dimension_survivor_query(
-        self, candidate_end_user_ids: list[str] | tuple[str, ...]
+        self,
+        candidate_end_user_ids: list[str] | tuple[str, ...],
+        *,
+        window_start: Any | None = None,
+        window_end: Any | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Classify a finite dimension page into canonical survivor ids.
+        """Classify a finite raw page and return each touched group's order.
 
-        The curated dimension remains old-id keyed during the remap window.
-        Only the lexicographic survivor old id may be published; alias rows are
-        still consumed by the continuation cursor so they can never loop or be
-        emitted on a later page.  Ids absent from the remap table are survivors
-        by definition and are filled by the caller.
+        The canonical public id can differ from the id present in the rollup.
+        Each touched remap group is therefore ordered by its greatest raw
+        ``(activity timestamp, alias id)`` tuple. Only that raw tuple may emit
+        the canonical survivor; lower aliases are cursor checkpoints only.
+        Ids absent from the remap table are identity groups filled by the
+        caller.
         """
 
         ids = tuple(str(value) for value in candidate_end_user_ids if value)
         if not ids:
             return "", {}
+        if (window_start is None) != (window_end is None):
+            raise ValueError("dimension survivor window must be provided together")
+        if window_start is None:
+            window_start, window_end = self.parse_time_range(self.filters)
+        if window_start is None or window_end is None or window_start >= window_end:
+            raise ValueError("dimension survivor window is invalid")
         remap = bounded_survivor_map_subquery(
             "end_user_id_remap", candidate_param="dimension_candidate_ids"
         )
+        params: dict[str, Any] = {
+            "org_id": self.organization_id,
+            "dimension_candidate_ids": ids,
+            "candidate_window_start": window_start,
+            "candidate_window_end": window_end,
+        }
+        if self.project_ids is not None:
+            params["project_ids"] = tuple(self.project_ids)
+        else:
+            params["project_id"] = self.project_id
+        empty_scope_filter = "AND 0 = 1" if self.empty_scope else ""
         return (
             f"""
-            WITH bounded_map AS ({remap})
+            WITH
+            bounded_map AS ({remap}),
+            candidate_alias_order_inputs AS (
+                SELECT
+                    end_user_id AS any_id,
+                    greatest(
+                        coalesce(maxMerge(last_seen), minMerge(first_seen)),
+                        toDateTime64(%(candidate_window_start)s, 6, 'UTC')
+                    ) AS candidate_order_time
+                FROM span_user_rollup AS rollup
+                PREWHERE {self._project_predicate("rollup")}
+                  AND hour_first_seen >=
+                      toStartOfHour(
+                          toDateTime64(%(candidate_window_start)s, 6, 'UTC')
+                      ) - INTERVAL 1 HOUR
+                  AND hour_first_seen <
+                      toStartOfHour(
+                          toDateTime64(%(candidate_window_end)s, 6, 'UTC')
+                      ) + INTERVAL 1 HOUR
+                  AND end_user_id IN (SELECT any_id FROM bounded_map)
+                GROUP BY end_user_id
+
+                UNION ALL
+
+                SELECT
+                    eu.end_user_id AS any_id,
+                    toDateTime64(%(candidate_window_start)s, 6, 'UTC')
+                        - INTERVAL 1 MICROSECOND AS candidate_order_time
+                FROM end_users AS eu FINAL
+                WHERE eu.organization_id = toUUID(%(org_id)s)
+                  AND eu.is_deleted = 0
+                  AND notEmpty(eu.user_id)
+                  AND {self._project_predicate("eu")}
+                  AND eu.end_user_id IN (SELECT any_id FROM bounded_map)
+                  {empty_scope_filter}
+            ),
+            candidate_alias_orders AS (
+                SELECT
+                    any_id,
+                    max(candidate_order_time) AS candidate_order_time
+                FROM candidate_alias_order_inputs
+                GROUP BY any_id
+            ),
+            candidate_group_orders AS (
+                SELECT
+                    bm.survivor_id AS survivor_id,
+                    argMax(
+                        ao.candidate_order_time,
+                        tuple(
+                            ao.candidate_order_time,
+                            toString(ao.any_id)
+                        )
+                    ) AS group_order_time,
+                    argMax(
+                        toString(ao.any_id),
+                        tuple(
+                            ao.candidate_order_time,
+                            toString(ao.any_id)
+                        )
+                    ) AS group_order_id
+                FROM candidate_alias_orders AS ao
+                INNER JOIN bounded_map AS bm ON ao.any_id = bm.any_id
+                GROUP BY bm.survivor_id
+            )
             SELECT
-                toString(any_id) AS any_id,
-                toString(survivor_id) AS survivor_id
-            FROM bounded_map
+                toString(bm.any_id) AS any_id,
+                toString(bm.survivor_id) AS survivor_id,
+                go.group_order_time AS group_order_time,
+                go.group_order_id AS group_order_id
+            FROM bounded_map AS bm
+            INNER JOIN candidate_group_orders AS go
+                ON bm.survivor_id = go.survivor_id
             """,
-            {"dimension_candidate_ids": ids},
+            params,
         )
 
     def supports_candidate_first_page(self) -> bool:
@@ -418,17 +561,14 @@ class UserListQueryBuilder(BaseQueryBuilder):
     def _candidate_page_ctes(self) -> tuple[str, str, dict[str, Any]]:
         """Build the exact latest-state page selector shared by list reads.
 
-        ``span_user_rollup`` is intentionally absent.  Its insert-only states
-        are useful for approximate analytics, but cannot retract a later span
-        tombstone, user reassignment, or corrected token/cost value.  This
-        selector uses one of two exact latest-state plans.  Cursor reads already
-        own a finite dimension candidate set, so they first identify only span
-        identities that ever referenced those users and replay every version of
-        those identities with ``argMax(_version)``.  This preserves reassignment
-        and tombstone semantics while avoiding an all-user aggregation.  The
-        legacy numbered path has no finite candidate set and therefore uses
-        ``FINAL`` across the requested partitions.  Id remaps are resolved
-        before membership, metrics, order, and the page count in both plans.
+        ``span_user_rollup`` is intentionally absent from this correctness
+        selector.  Cursor reads reach it only before this method, as a bounded
+        candidate seed.  Once they own that finite id set, this selector finds
+        only span identities that ever referenced those users and replays every
+        version with ``argMax(_version)``.  The legacy numbered path has no
+        finite candidate set and therefore uses ``FINAL`` across the requested
+        partitions.  Id remaps are resolved before membership, metrics, order,
+        and the page count in both plans.
         """
 
         start_date, end_date = self.parse_time_range(self.filters)
@@ -458,8 +598,8 @@ class UserListQueryBuilder(BaseQueryBuilder):
         self.params.update(output_params)
 
         empty_scope_filter = "AND 0 = 1" if self.empty_scope else ""
-        search_filter = (
-            "AND positionCaseInsensitive(eu.user_id, %(search)s) > 0"
+        canonical_search_filter = (
+            "WHERE positionCaseInsensitive(user_id, %(search)s) > 0"
             if self.search
             else ""
         )
@@ -468,6 +608,11 @@ class UserListQueryBuilder(BaseQueryBuilder):
         )
         candidate_end_user_filter = (
             "HAVING end_user_id IN %(candidate_end_user_ids)s"
+            if self.candidate_end_user_ids
+            else ""
+        )
+        candidate_curated_filter = (
+            "AND eu.end_user_id IN %(candidate_scan_end_user_ids)s"
             if self.candidate_end_user_ids
             else ""
         )
@@ -499,13 +644,36 @@ class UserListQueryBuilder(BaseQueryBuilder):
             # resurrect an older version.  The first scan is only an identity
             # superset.  The second scan replays *all* versions of each selected
             # immutable identity and applies user/deletion predicates afterward.
+            embedded_session_state = (
+                "argMax(tuple(trace_session_id), _version).1 "
+                "AS latest_trace_session_id,"
+                if self.include_num_sessions
+                else ""
+            )
+            if self.include_num_sessions:
+                # This presentation-only count deliberately skips canonical
+                # session-remap folding. The manager labels it approximate and
+                # never uses it to decide num_sessions filter membership.
+                embedded_session_projection = """
+                uniqExactIf(
+                    latest_trace_session_id,
+                    isNotNull(latest_trace_session_id)
+                    AND latest_trace_session_id != toUUID(
+                        '00000000-0000-0000-0000-000000000000'
+                    )
+                ) AS num_sessions,
+                """
+            else:
+                embedded_session_projection = "toUInt64(0) AS num_sessions,"
             usage_ctes = f"""
         candidate_span_identities AS (
             SELECT DISTINCT
                 project_id,
+                observation_type,
+                service_name,
+                toStartOfHour(start_time) AS identity_hour,
                 trace_id,
-                id,
-                start_time
+                id
             FROM spans
             PREWHERE {self._project_predicate("spans")}
               AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
@@ -516,30 +684,53 @@ class UserListQueryBuilder(BaseQueryBuilder):
         latest_candidate_spans AS (
             SELECT
                 project_id,
+                observation_type,
+                service_name,
+                toStartOfHour(start_time) AS identity_hour,
                 trace_id,
                 id,
-                start_time,
                 argMax(tuple(end_user_id), _version).1 AS latest_end_user_id,
                 argMax(tuple(end_time), _version).1 AS latest_end_time,
                 argMax(cost, _version) AS latest_cost,
                 argMax(total_tokens, _version) AS latest_total_tokens,
                 argMax(prompt_tokens, _version) AS latest_prompt_tokens,
                 argMax(completion_tokens, _version) AS latest_completion_tokens,
+                {embedded_session_state}
                 argMax(is_deleted, _version) AS latest_is_deleted
             FROM spans
             PREWHERE {self._project_predicate("spans")}
               AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
               AND start_time >= %(start_date)s
               AND start_time < %(end_date)s
-              AND (project_id, trace_id, id, start_time) IN (
-                  SELECT project_id, trace_id, id, start_time
+              AND (
+                  project_id,
+                  observation_type,
+                  service_name,
+                  toStartOfHour(start_time),
+                  trace_id,
+                  id
+              ) IN (
+                  SELECT
+                      project_id,
+                      observation_type,
+                      service_name,
+                      identity_hour,
+                      trace_id,
+                      id
                   FROM candidate_span_identities
               )
-            GROUP BY project_id, trace_id, id, start_time
+            GROUP BY
+                project_id,
+                observation_type,
+                service_name,
+                identity_hour,
+                trace_id,
+                id
         ),
         exact_usage AS (
             SELECT
                 {resolved_latest_eu} AS end_user_id,
+                {embedded_session_projection}
                 sum(latest_cost) AS total_cost,
                 sum(toInt64(latest_total_tokens)) AS total_tokens,
                 sum(toInt64(latest_prompt_tokens)) AS input_tokens,
@@ -557,10 +748,13 @@ class UserListQueryBuilder(BaseQueryBuilder):
         )
             """
         else:
+            # The unbounded compatibility path never embeds optional metrics;
+            # keep the common row shape without adding session work.
             usage_ctes = f"""
         exact_usage AS (
             SELECT
                 {resolved_id_expr("sp.end_user_id", "span_eu_remap")} AS end_user_id,
+                toUInt64(0) AS num_sessions,
                 sum(sp.cost) AS total_cost,
                 sum(toInt64(sp.total_tokens)) AS total_tokens,
                 sum(toInt64(sp.prompt_tokens)) AS input_tokens,
@@ -599,7 +793,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
               AND notEmpty(eu.user_id)
               AND {self._project_predicate("eu")}
               {empty_scope_filter}
-              {search_filter}
+              {candidate_curated_filter}
               {end_user_filter}
         ),
         filtered_end_users AS (
@@ -616,6 +810,11 @@ class UserListQueryBuilder(BaseQueryBuilder):
             GROUP BY end_user_id
             {candidate_end_user_filter}
         ),
+        searched_end_users AS (
+            SELECT *
+            FROM filtered_end_users
+            {canonical_search_filter}
+        ),
         {usage_ctes},
         base_rows AS (
             SELECT
@@ -625,13 +824,14 @@ class UserListQueryBuilder(BaseQueryBuilder):
                 coalesce(xu.input_tokens, 0) AS input_tokens,
                 coalesce(xu.output_tokens, 0) AS output_tokens,
                 coalesce(xu.num_traces, 0) AS num_traces,
+                coalesce(xu.num_sessions, 0) AS num_sessions,
                 eu.first_seen AS activated_at,
                 xu.last_active AS last_active,
                 eu.project_id AS project_id,
                 eu.user_id_type AS user_id_type,
                 eu.user_id_hash AS user_id_hash,
                 eu.end_user_id AS end_user_id
-            FROM filtered_end_users AS eu
+            FROM searched_end_users AS eu
             INNER JOIN exact_usage AS xu ON xu.end_user_id = eu.end_user_id
         ),
         candidate_users AS (
@@ -664,6 +864,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
             input_tokens,
             output_tokens,
             num_traces,
+            num_sessions,
             activated_at,
             last_active,
             project_id,
@@ -877,16 +1078,26 @@ class UserListQueryBuilder(BaseQueryBuilder):
         base_params.update(finite_map_params)
         resolved_eu = resolved_id_expr("latest_end_user_id", "span_eu_remap")
 
-        def common_prefix(state_selects: list[str], *, include_sessions: bool) -> str:
+        def common_prefix(
+            state_selects: list[str],
+            *,
+            include_sessions: bool,
+            include_start_time: bool,
+        ) -> str:
             remap_ctes = f"eu_survivor_map AS ({eu_map})"
+            if include_start_time:
+                state_selects = [
+                    "argMax(start_time, _version) AS latest_start_time",
+                    *state_selects,
+                ]
             state_projection = "".join(
                 f",\n                {state_select}" for state_select in state_selects
             )
             session_remap_ctes = ""
             if include_sessions:
-                # Session ids are not known until the page's latest span
-                # versions have been replayed. Build the survivor map only for
-                # those touched groups; unmatched ids fall back to themselves.
+                # Seed the finite session remap from the page-scoped latest
+                # replay. This prevents stale session ids from old physical
+                # versions from expanding unrelated remap groups.
                 session_remap_ctes = """,
         candidate_session_ids AS (
             SELECT DISTINCT latest_trace_session_id AS trace_session_id
@@ -926,7 +1137,13 @@ class UserListQueryBuilder(BaseQueryBuilder):
             WHERE end_user_id IN %(candidate_end_user_ids)s
         ),
         candidate_span_identities AS (
-            SELECT DISTINCT project_id, trace_id, id, start_time
+            SELECT DISTINCT
+                project_id,
+                observation_type,
+                service_name,
+                toStartOfHour(start_time) AS identity_hour,
+                trace_id,
+                id
             FROM spans
             PREWHERE {self._project_predicate("spans")}
               AND toDate(start_time) BETWEEN
@@ -940,9 +1157,11 @@ class UserListQueryBuilder(BaseQueryBuilder):
         latest_candidate_spans AS (
             SELECT
                 project_id,
+                observation_type,
+                service_name,
+                toStartOfHour(start_time) AS identity_hour,
                 trace_id,
                 id,
-                start_time,
                 argMax(tuple(end_user_id), _version).1 AS latest_end_user_id
                 {state_projection},
                 argMax(is_deleted, _version) AS latest_is_deleted
@@ -952,11 +1171,30 @@ class UserListQueryBuilder(BaseQueryBuilder):
                   toDate(%(start_date)s) AND toDate(%(end_date)s)
               AND start_time >= %(start_date)s
               AND start_time < %(end_date)s
-              AND (project_id, trace_id, id, start_time) IN (
-                  SELECT project_id, trace_id, id, start_time
+              AND (
+                  project_id,
+                  observation_type,
+                  service_name,
+                  toStartOfHour(start_time),
+                  trace_id,
+                  id
+              ) IN (
+                  SELECT
+                      project_id,
+                      observation_type,
+                      service_name,
+                      identity_hour,
+                      trace_id,
+                      id
                   FROM candidate_span_identities
             )
-            GROUP BY project_id, trace_id, id, start_time
+            GROUP BY
+                project_id,
+                observation_type,
+                service_name,
+                identity_hour,
+                trace_id,
+                id
         )
         {session_remap_ctes}
             """
@@ -968,16 +1206,21 @@ class UserListQueryBuilder(BaseQueryBuilder):
             if field in requested
         )
         if session_fields:
+            needs_duration = "avg_session_duration" in session_fields
             resolved_session = resolved_id_expr(
                 "latest_trace_session_id", "span_ts_remap"
             )
+            session_state_selects = [
+                "argMax(tuple(trace_session_id), _version).1 AS latest_trace_session_id"
+            ]
+            if needs_duration:
+                session_state_selects.append(
+                    "argMax(tuple(end_time), _version).1 AS latest_end_time"
+                )
             prefix = common_prefix(
-                [
-                    "argMax(tuple(trace_session_id), _version).1 "
-                    "AS latest_trace_session_id",
-                    "argMax(tuple(end_time), _version).1 AS latest_end_time",
-                ],
+                session_state_selects,
                 include_sessions=True,
+                include_start_time=needs_duration,
             )
             projections = []
             if "num_sessions" in session_fields:
@@ -986,14 +1229,41 @@ class UserListQueryBuilder(BaseQueryBuilder):
                 projections.append(
                     "round(avg(duration_seconds), 2) AS avg_session_duration"
                 )
+            resolved_time_columns = (
+                ",\n                    latest_start_time AS start_time,"
+                "\n                    latest_end_time AS end_time"
+                if needs_duration
+                else ""
+            )
+            session_rows = (
+                """
+            session_rows AS (
+                SELECT
+                    end_user_id,
+                    trace_session_id,
+                    dateDiff(
+                        'millisecond', min(start_time), max(end_time)
+                    ) / 1000.0 AS duration_seconds
+                FROM resolved_candidate_spans
+                GROUP BY end_user_id, trace_session_id
+            )
+                """
+                if needs_duration
+                else """
+            session_rows AS (
+                SELECT end_user_id, trace_session_id
+                FROM resolved_candidate_spans
+                GROUP BY end_user_id, trace_session_id
+            )
+                """
+            )
             query = f"""
             {prefix},
             resolved_candidate_spans AS (
                 SELECT
                     {resolved_eu} AS end_user_id,
-                    {resolved_session} AS trace_session_id,
-                    start_time,
-                    latest_end_time AS end_time
+                    {resolved_session} AS trace_session_id
+                    {resolved_time_columns}
                 FROM latest_candidate_spans
                 LEFT JOIN eu_survivor_map AS span_eu_remap
                     ON latest_end_user_id = span_eu_remap.any_id
@@ -1006,20 +1276,11 @@ class UserListQueryBuilder(BaseQueryBuilder):
                       '00000000-0000-0000-0000-000000000000'
                   )
             ),
-            session_durations AS (
-                SELECT
-                    end_user_id,
-                    trace_session_id,
-                    dateDiff(
-                        'millisecond', min(start_time), max(end_time)
-                    ) / 1000.0 AS duration_seconds
-                FROM resolved_candidate_spans
-                GROUP BY end_user_id, trace_session_id
-            )
+            {session_rows}
             SELECT
                 toString(end_user_id) AS end_user_id,
                 {", ".join(projections)}
-            FROM session_durations
+            FROM session_rows
             GROUP BY end_user_id
             """
             queries.append((query, dict(base_params), session_fields))
@@ -1060,14 +1321,20 @@ class UserListQueryBuilder(BaseQueryBuilder):
                     "AS num_guardrails_triggered"
                 )
             if "num_active_days" in span_fields:
-                projections.append("uniqExact(toDate(start_time)) AS num_active_days")
+                projections.append(
+                    "uniqExact(toDate(latest_start_time)) AS num_active_days"
+                )
             if "num_traces_with_errors" in span_fields:
                 state_selects.append("argMax(status, _version) AS latest_status")
                 projections.append(
                     "uniqExactIf(trace_id, latest_status = 'ERROR') "
                     "AS num_traces_with_errors"
                 )
-            prefix = common_prefix(state_selects, include_sessions=False)
+            prefix = common_prefix(
+                state_selects,
+                include_sessions=False,
+                include_start_time="num_active_days" in span_fields,
+            )
             query = f"""
             {prefix}
             SELECT

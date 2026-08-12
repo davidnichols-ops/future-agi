@@ -8,6 +8,7 @@ import pytest
 from tracer.services.clickhouse.filter_value_reads import (
     FILTER_VALUE_CURSOR_INITIAL_SEGMENT,
     FILTER_VALUE_CURSOR_MIN_SEGMENT,
+    FILTER_VALUE_READ_TIMEOUT_MS,
     FilterValueRead,
     _value_digest,
     read_end_user_filter_value_cursor_page,
@@ -18,6 +19,10 @@ from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 
 NOW = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
 PROJECT_ID = "00000000-0000-4000-8000-000000000001"
+
+
+def test_system_filter_values_reserve_transport_inside_ten_second_sla():
+    assert FILTER_VALUE_READ_TIMEOUT_MS == 8_000
 
 
 def _read(
@@ -276,3 +281,45 @@ def test_system_value_budget_backoff_changes_cursor_then_fails_at_floor():
             segment_start=first.next_segment_start,
             seen_value_digests=first.seen_value_digests,
         )
+
+
+def test_system_value_cursor_shares_one_deadline_across_adjacent_slices(monkeypatch):
+    class Deadline:
+        calls = 0
+
+        @classmethod
+        def start(cls, _total_ms):
+            return cls()
+
+        def remaining_ms(self, _cap_ms=None):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                return 9_000
+            raise ReadDeadlineExceeded("shared filter-value deadline")
+
+    class Analytics:
+        calls = []
+
+        def execute_ch_query(self, _query, _params, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(data=[])
+
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.filter_value_reads.ReadDeadline",
+        Deadline,
+    )
+    analytics = Analytics()
+    read = read_span_system_filter_value_cursor_page(
+        analytics,
+        project_ids=[PROJECT_ID],
+        metric_name="status",
+        page_size=10,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+    )
+
+    assert len(analytics.calls) == 1
+    assert analytics.calls[0]["timeout_ms"] == 9_000
+    assert read.values == ()
+    assert read.has_more is True
+    assert read.next_segment_end == NOW - FILTER_VALUE_CURSOR_INITIAL_SEGMENT

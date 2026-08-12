@@ -82,6 +82,8 @@ const sessionResponse = ({
   nextCursor,
   totalRows = rows.length,
   lowerBound = false,
+  queryComplete,
+  queryStatus,
 } = {}) => {
   const metadata = {
     total_rows: totalRows,
@@ -89,6 +91,8 @@ const sessionResponse = ({
   };
   if (hasMore !== undefined) metadata.has_more = hasMore;
   if (nextCursor !== undefined) metadata.next_cursor = nextCursor;
+  if (queryComplete !== undefined) metadata.query_complete = queryComplete;
+  if (queryStatus !== undefined) metadata.query_status = queryStatus;
   return {
     data: {
       result: {
@@ -276,6 +280,31 @@ describe("SessionGrid cursor continuation", () => {
     });
   });
 
+  it("treats cursor exhaustion as exact even when an older response leaves a lower-bound flag", async () => {
+    getMock.mockResolvedValueOnce(
+      sessionResponse({
+        rows: [row(8)],
+        hasMore: false,
+        nextCursor: null,
+        totalRows: 99,
+        lowerBound: true,
+      }),
+    );
+    renderGrid();
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const params = makeParams();
+    await getRows(params);
+
+    expect(params.success).toHaveBeenCalledWith({
+      rowData: [row(8)],
+      rowCount: 1,
+    });
+    expect(params.api.totalRowCount).toBe(1);
+    expect(params.api.totalRowCountLowerBound).toBeNull();
+    expect(params.api.totalRowCountIsLowerBound).toBe(false);
+  });
+
   it("fills a short nonterminal page and carries overflow into page N", async () => {
     getMock
       .mockResolvedValueOnce(
@@ -429,6 +458,30 @@ describe("SessionGrid cursor continuation", () => {
     expect(enqueueSnackbarMock).not.toHaveBeenCalledWith(
       expect.stringMatching(/DB::Exception/i),
       expect.anything(),
+    );
+  });
+
+  it("fails a degraded HTTP 200 instead of displaying a false empty session grid", async () => {
+    getMock.mockResolvedValueOnce(
+      sessionResponse({
+        hasMore: false,
+        nextCursor: null,
+        queryComplete: false,
+        queryStatus: "degraded",
+      }),
+    );
+    renderGrid();
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const params = makeParams();
+    await getRows(params);
+
+    expect(params.fail).toHaveBeenCalledTimes(1);
+    expect(params.success).not.toHaveBeenCalled();
+    expect(params.api.showNoRowsOverlay).not.toHaveBeenCalled();
+    expect(enqueueSnackbarMock).toHaveBeenCalledWith(
+      "Session data could not be loaded. Please retry.",
+      { variant: "error" },
     );
   });
 

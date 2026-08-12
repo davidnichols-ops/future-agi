@@ -6,15 +6,18 @@ reader's client. These tests drive the real (undecorated) activity body and
 snapshot ``current_settings()`` at the moment the wrapped CH work begins — if the
 ``with`` is dropped, or a refactor slips a context-dropping hop in front of the
 read, the snapshot is empty and the test fails. DB-free: every collaborator is
-mocked. ``cluster_scan_issues_task`` is intentionally uncovered — it reads only
-through ``ClickHouseVectorDB`` (a separate client that never sees the contextvar).
+mocked. ``cluster_scan_issues_task`` uses the separate guarded vector-read
+transport.
 """
 
 import contextlib
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
-from tracer.services.clickhouse.v2.query_settings import current_settings
+from tracer.services.clickhouse.v2.query_settings import (
+    application_read_settings,
+    current_settings,
+)
 from tracer.tasks import trace_scanner as scanner
 
 _NOW = datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC)
@@ -53,7 +56,7 @@ def test_scan_traces_task_runs_scan_and_write_inside_guardrails():
         stack.enter_context(patch.object(scanner, "embed_trace_inputs_task"))
         scanner.scan_traces_task._original_func(["t1"], "p1", False)
 
-    assert captured["settings"] == scanner.SCAN_CH_GUARDRAILS
+    assert captured["settings"] == application_read_settings(scanner.SCAN_CH_GUARDRAILS)
 
 
 def test_embed_trace_inputs_task_runs_embed_inside_guardrails():
@@ -67,7 +70,7 @@ def test_embed_trace_inputs_task_runs_embed_inside_guardrails():
         # trigger_clustering=False → no cluster chain to mock.
         scanner.embed_trace_inputs_task._original_func(["t1"], "p1", False)
 
-    assert captured["settings"] == scanner.SCAN_CH_GUARDRAILS
+    assert captured["settings"] == application_read_settings(scanner.SCAN_CH_GUARDRAILS)
 
 
 def test_sweep_builds_reader_inside_guardrails():
@@ -98,4 +101,4 @@ def test_sweep_builds_reader_inside_guardrails():
         stack.enter_context(patch.object(scanner, "scan_traces_task"))
         scanner.sweep_scannable_traces._original_func()
 
-    assert captured["settings"] == scanner.SCAN_CH_GUARDRAILS
+    assert captured["settings"] == application_read_settings(scanner.SCAN_CH_GUARDRAILS)

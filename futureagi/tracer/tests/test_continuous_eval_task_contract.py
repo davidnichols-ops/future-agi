@@ -683,7 +683,7 @@ def test_continuous_10k_custom_attribute_classifier_has_finite_exact_budget(
         assert settings["timeout_overflow_mode"] == "throw"
         assert settings["max_threads"] == 1
         assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
-        assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+        assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         assert settings["read_overflow_mode"] == "throw"
         assert settings["max_result_rows"] == 10
         assert settings["result_overflow_mode"] == "throw"

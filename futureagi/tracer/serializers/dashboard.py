@@ -308,7 +308,7 @@ class DashboardQuerySerializer(StrictInputSerializer):
         default=False,
         help_text=(
             "Deprecated compatibility parameter; accepted but ignored. "
-            "Dashboard aggregates are always exact."
+            "The response explicitly labels exact, rollup, or unavailable provenance."
         ),
     )
 
@@ -333,7 +333,7 @@ class DashboardPreviewQuerySerializer(StrictInputSerializer):
         default=False,
         help_text=(
             "Deprecated compatibility parameter; accepted but ignored. "
-            "Dashboard aggregates are always exact."
+            "The response explicitly labels exact, rollup, or unavailable provenance."
         ),
     )
 
@@ -347,7 +347,7 @@ class DashboardSampleOptInSerializer(StrictInputSerializer):
         default=False,
         help_text=(
             "Deprecated compatibility parameter; accepted but ignored. "
-            "Dashboard aggregates are always exact."
+            "The response explicitly labels exact, rollup, or unavailable provenance."
         ),
     )
 
@@ -383,10 +383,27 @@ class DashboardQueryMetricResultSerializer(serializers.Serializer):
     query_complete = serializers.BooleanField(required=False)
     query_sampled = serializers.BooleanField(required=False)
     query_status = serializers.ChoiceField(
-        choices=["complete", "sampled", "degraded"], required=False
+        choices=["complete", "degraded"], required=False
     )
     query_error_code = serializers.ChoiceField(
-        choices=["sample_limit", "read_budget_exceeded", "query_failed"],
+        choices=[
+            "sample_limit",
+            "read_budget_exceeded",
+            "query_failed",
+            "bounded_shape_unavailable",
+            "invalid_window",
+            "malformed_result",
+        ],
+        required=False,
+    )
+    query_exact = serializers.BooleanField(required=False)
+    query_provenance = serializers.ChoiceField(
+        choices=[
+            "exact_snapshot",
+            "materialized_rollup",
+            "authorized_empty_scope",
+            "bounded_unavailable",
+        ],
         required=False,
     )
     query_sampling_strategy = serializers.CharField(required=False)
@@ -411,6 +428,31 @@ class DashboardQueryResultSerializer(serializers.Serializer):
         choices=["complete", "degraded", "pending"], required=False
     )
     query_sampled = serializers.BooleanField(required=False)
+    query_exact = serializers.BooleanField(required=False)
+    query_provenance = serializers.ChoiceField(
+        choices=[
+            "exact_snapshot",
+            "materialized_rollup",
+            "authorized_empty_scope",
+            "bounded_unavailable",
+        ],
+        required=False,
+    )
+    query_error_code = serializers.ChoiceField(
+        choices=[
+            "sample_limit",
+            "read_budget_exceeded",
+            "query_failed",
+            "bounded_shape_unavailable",
+            "invalid_window",
+            "malformed_result",
+        ],
+        required=False,
+    )
+    query_sampling_strategy = serializers.CharField(required=False)
+    query_count = serializers.IntegerField(min_value=0, max_value=256, required=False)
+    query_rows_returned = serializers.IntegerField(min_value=0, required=False)
+    query_elapsed_ms = serializers.FloatField(min_value=0, required=False)
     query_completed_at = serializers.DateTimeField(required=False)
     query_cached = serializers.BooleanField(required=False)
     query_refresh_failed = serializers.BooleanField(required=False)

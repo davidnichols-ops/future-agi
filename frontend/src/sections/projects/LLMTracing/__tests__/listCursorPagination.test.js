@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  accumulateUniqueListContinuations,
   collectExactListRows,
   createListCursorPagination,
   followEmptyListContinuations,
@@ -470,7 +471,10 @@ describe("list cursor pagination", () => {
       isLastPage: true,
     });
     expect(loadResponse).toHaveBeenCalledOnce();
-    expect(resumedContinuation).toHaveBeenCalledWith("resume-after-outage");
+    expect(resumedContinuation).toHaveBeenCalledWith(
+      "resume-after-outage",
+      expect.any(AbortSignal),
+    );
   });
 
   it("preserves a valid sparse continuation at its hop bound", async () => {
@@ -536,6 +540,55 @@ describe("list cursor pagination", () => {
       rows: [],
       metadata: { has_more: true, next_cursor: "checkpoint-1" },
     });
+  });
+
+  it("aborts an in-flight continuation when the shared action deadline expires", async () => {
+    let continuationSignal;
+    const initialResponse = {
+      rows: [],
+      metadata: { has_more: true, next_cursor: "checkpoint-1" },
+    };
+
+    const response = await followEmptyListContinuations({
+      initialResponse,
+      rowsFromResponse: (value) => value.rows,
+      metadataFromResponse: (value) => value.metadata,
+      maxElapsedMs: 5,
+      nextResponse: (_cursor, signal) => {
+        continuationSignal = signal;
+        return new Promise(() => {});
+      },
+    });
+
+    expect(response).toBe(initialResponse);
+    expect(continuationSignal.aborted).toBe(true);
+  });
+
+  it("keeps accumulated rows and the retryable cursor when a fill continuation times out", async () => {
+    let continuationSignal;
+    const initialResponse = {
+      rows: [{ key: "one" }],
+      metadata: { has_more: true, next_cursor: "checkpoint-1" },
+    };
+
+    const result = await accumulateUniqueListContinuations({
+      initialResponse,
+      rowsFromResponse: (value) => value.rows,
+      metadataFromResponse: (value) => value.metadata,
+      identityFromRow: ({ key }) => key,
+      targetRowCount: 10,
+      maxElapsedMs: 5,
+      nextResponse: (_cursor, signal) => {
+        continuationSignal = signal;
+        return new Promise(() => {});
+      },
+    });
+
+    expect(result.response).toBe(initialResponse);
+    expect(result.rows).toEqual([{ key: "one" }]);
+    expect(result.followedCursors).toEqual([]);
+    expect(result.response.metadata.next_cursor).toBe("checkpoint-1");
+    expect(continuationSignal.aborted).toBe(true);
   });
 
   it("schedules an AG Grid retry without advancing the visible page", () => {
@@ -890,6 +943,31 @@ describe("list cursor pagination", () => {
     );
   });
 
+  it("aborts a hung initial exact-page request at the shared deadline", async () => {
+    const pagination = createListCursorPagination();
+    let requestSignal;
+
+    await expect(
+      loadExactListPage({
+        pagination,
+        pageNumber: 0,
+        targetRowCount: 1,
+        maxElapsedMs: 5,
+        loadResponse: (signal) => {
+          requestSignal = signal;
+          return new Promise(() => {});
+        },
+        nextResponse: vi.fn(),
+        rowsFromResponse: (response) => response.rows,
+        metadataFromResponse: (response) => response.metadata,
+        rowIdentity: (row) => row.id,
+      }),
+    ).rejects.toMatchObject({
+      code: LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE,
+    });
+    expect(requestSignal.aborted).toBe(true);
+  });
+
   it("fails closed when a non-empty continuation repeats its cursor", async () => {
     const pagination = createListCursorPagination();
     await expect(
@@ -936,6 +1014,33 @@ describe("list cursor pagination", () => {
     expect(page.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
     expect(page.pending).toBe(true);
     expect(page.nextCursor).toBe("after-3");
+  });
+
+  it("aborts a hung preview continuation and preserves its checkpoint", async () => {
+    const initialResponse = exactResponse([{ id: 1 }], true, "after-1");
+    let requestSignal;
+
+    const page = await collectExactListRows({
+      initialResponse,
+      targetRowCount: 2,
+      maxElapsedMs: 5,
+      rowsFromResponse: (response) => response.rows,
+      metadataFromResponse: (response) => response.metadata,
+      nextResponse: (_cursor, signal) => {
+        requestSignal = signal;
+        return new Promise(() => {});
+      },
+      rowIdentity: (row) => row.id,
+    });
+
+    expect(page).toMatchObject({
+      response: initialResponse,
+      rows: [{ id: 1 }],
+      pending: true,
+      stale: false,
+      nextCursor: "after-1",
+    });
+    expect(requestSignal.aborted).toBe(true);
   });
 
   it.each([

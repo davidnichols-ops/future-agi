@@ -57,8 +57,8 @@ import {
   createAggregationPollController,
   getAggregationRefreshState,
   getExactAggregationReadState,
-  getExactGraphData,
   getQueryCompletedAt,
+  getRenderableGraphData,
   awaitAggregationRequestWithDeadline,
 } from "src/utils/queryReadState";
 import { parseTraceGraphResponse } from "src/api/project/observe-contracts";
@@ -106,6 +106,8 @@ const EXCLUDED = new Set([
 ]);
 
 const CHART_HEIGHT = 140;
+const GRAPH_SAMPLED_MESSAGE =
+  "Showing sampled estimates across the selected time range.";
 
 const COMPARE_DATE_OPTIONS = [
   { key: "Today", label: "Today" },
@@ -450,7 +452,7 @@ const PrimaryGraph = ({
               },
               {
                 params: {
-                  allow_sampled: false,
+                  allow_sampled: true,
                   ...(refresh ? { refresh: true } : {}),
                 },
                 signal: requestSignal,
@@ -654,34 +656,51 @@ const PrimaryGraph = ({
           updatedAt: getQueryCompletedAt(graphData),
         }
       : null;
-  const exactSnapshot =
+  const retainedExactSnapshot =
     currentExactSnapshot ||
     (lastExactSnapshot?.key === snapshotKey ? lastExactSnapshot : null);
-  const displayGraphData = exactSnapshot?.data;
+  const currentSampleSnapshot =
+    graphData && graphReadState === "sampled"
+      ? {
+          key: snapshotKey,
+          data: graphData,
+          updatedAt: getQueryCompletedAt(graphData),
+        }
+      : null;
+  // A retained exact snapshot remains preferable during a manual refresh;
+  // otherwise a fully covered bounded sample is immediately usable and is
+  // labelled below rather than being converted into the generic error state.
+  const displaySnapshot = retainedExactSnapshot || currentSampleSnapshot;
+  const displayGraphData = displaySnapshot?.data;
   const graphRefreshState = getAggregationRefreshState(graphData);
   const graphReadFailed =
     graphError ||
     graphRefreshState.refreshFailed ||
     (Boolean(graphData) &&
       graphReadState !== "complete" &&
+      graphReadState !== "sampled" &&
       graphReadState !== "pending");
   const graphStatusMessage = graphReadFailed
     ? QUERY_FAILED_RETRY_MESSAGE
     : aggregationPollingPaused
       ? AGGREGATION_POLLING_PAUSED_MESSAGE
-      : !exactSnapshot &&
+      : !displaySnapshot &&
           (isLoading ||
             refreshUnavailable ||
             graphReadState === "pending" ||
             !graphData)
         ? GRAPH_LOADING_MESSAGE
         : null;
+  const graphSampleMessage =
+    graphReadState === "sampled" && displayGraphData === graphData
+      ? GRAPH_SAMPLED_MESSAGE
+      : null;
 
   // Parse API data → [{timestamp, value, primary_traffic}, ...]
   const { metricData, trafficData } = useMemo(() => {
     if (!displayGraphData) return { metricData: [], trafficData: [] };
 
-    const items = getExactGraphData(displayGraphData);
+    const items = getRenderableGraphData(displayGraphData);
     const mData = [];
     const tData = [];
 
@@ -879,7 +898,7 @@ const PrimaryGraph = ({
     ],
   );
 
-  if (isLoading && !exactSnapshot) {
+  if (isLoading && !displaySnapshot) {
     return (
       <Box sx={{ px: 2, py: 1, height: CHART_HEIGHT + 40 }}>
         <GraphSkeleton />
@@ -1173,12 +1192,12 @@ const PrimaryGraph = ({
       </Box>
 
       {/* Chart */}
-      {graphStatusMessage && exactSnapshot ? (
+      {(graphStatusMessage || graphSampleMessage) && displaySnapshot ? (
         <Typography
           role="status"
           sx={{ px: 1, fontSize: 11, color: "text.secondary" }}
         >
-          {graphStatusMessage}
+          {graphStatusMessage || graphSampleMessage}
         </Typography>
       ) : null}
       {hasData ? (
@@ -1200,7 +1219,9 @@ const PrimaryGraph = ({
           }}
         >
           <Typography sx={{ fontSize: 12, color: "text.disabled" }}>
-            {graphStatusMessage || "No data available for this time range"}
+            {graphStatusMessage ||
+              graphSampleMessage ||
+              "No data available for this time range"}
           </Typography>
         </Box>
       )}

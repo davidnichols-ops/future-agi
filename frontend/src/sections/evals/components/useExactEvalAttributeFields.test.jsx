@@ -107,7 +107,7 @@ describe("useExactEvalAttributeFields", () => {
         "/api/traces/span-attribute-keys/",
         expect.objectContaining({
           signal: expect.any(AbortSignal),
-          timeout: 35_000,
+          timeout: 9_800,
           params: {
             project_id: "00000000-0000-4000-8000-000000000901",
             page_size: 10,
@@ -118,7 +118,7 @@ describe("useExactEvalAttributeFields", () => {
         "/api/traces/span-attribute-keys/",
         expect.objectContaining({
           signal: expect.any(AbortSignal),
-          timeout: 35_000,
+          timeout: 9_800,
           params: {
             project_id: "00000000-0000-4000-8000-000000000901",
             page_size: 10,

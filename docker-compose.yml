@@ -447,6 +447,7 @@ services:
       # same `postgres` service Django uses (PG_USER/PG_PASSWORD/PG_DB).
       FI_PG_WRITE: postgres://${PG_USER:-futureagi}:${PG_PASSWORD:-futureagi}@postgres:5432/${PG_DB:-futureagi}?sslmode=disable
       FI_PG_READ: postgres://${PG_USER:-futureagi}:${PG_PASSWORD:-futureagi}@postgres:5432/${PG_DB:-futureagi}?sslmode=disable
+      FI_AUTH_REDIS_ADDR: redis:6379
       FI_GRPC_ADDR: ":4317"
       # OTLP/HTTP receiver — needed by browser SDKs + lightweight clients.
       # `FI_HTTP_ADDR=disable` turns the listener off if you front the
@@ -458,6 +459,8 @@ services:
       - fi-collector-data:/var/lib/fi-collector
     depends_on:
       clickhouse:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
 

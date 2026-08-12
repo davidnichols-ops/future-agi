@@ -422,12 +422,12 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
       const requestList = async (
         url,
         params,
-        { voice = false, parser } = {},
+        { voice = false, parser, signal: requestSignal = signal } = {},
       ) => {
         try {
           const response = await requestListWithLegacyCursorFallback({
             request: (nextParams) =>
-              axios.get(url, { params: nextParams, signal }),
+              axios.get(url, { params: nextParams, signal: requestSignal }),
             params,
             pageParam: voice ? "page" : "page_number",
             firstPage: voice ? 1 : 0,
@@ -483,11 +483,16 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             requestParams.page_size,
           rowsFromResponse: (response) => response.data.results,
           metadataFromResponse: (response) => response.data,
-          nextResponse: (cursor) =>
+          cancellationSignal: signal,
+          nextResponse: (cursor, requestSignal) =>
             requestList(
               endpoints.project.getCallLogs,
               listContinuationParams(requestParams, cursor),
-              { voice: true, parser: parseVoiceCallListResponse },
+              {
+                voice: true,
+                parser: parseVoiceCallListResponse,
+                signal: requestSignal,
+              },
             ),
           onContinuation: recordContinuation,
           isCurrent: () => !signal.aborted,
@@ -559,9 +564,11 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           requestParams.page_size,
         rowsFromResponse: (response) => response.data.table,
         metadataFromResponse: (response) => response.data.metadata,
-        nextResponse: (cursor) =>
+        cancellationSignal: signal,
+        nextResponse: (cursor, requestSignal) =>
           requestList(url, listContinuationParams(requestParams, cursor), {
             parser: responseParser,
+            signal: requestSignal,
           }),
         onContinuation: recordContinuation,
         isCurrent: () => !signal.aborted,

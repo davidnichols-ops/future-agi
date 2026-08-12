@@ -28,6 +28,7 @@ from tracer.services.clickhouse.v2.query_builders.user_list import (
     UserListQueryBuilderV2,
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
+from tracer.services.user_attribute_contract import unsupported_user_attribute_keys
 
 logger = structlog.get_logger(__name__)
 
@@ -57,30 +58,30 @@ USERS_EXPORT_COLUMNS = [
 # in Excel/Sheets, so customer-controlled strings get a leading quote prefixed.
 _CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
-_SKIP_ATTR_PREFIXES = (
-    "raw.",
-    "llm.input_messages",
-    "llm.output_messages",
-    "input.value",
-    "output.value",
-)
-
-# Production telemetry reads share the infrastructure's hard 30-second ceiling.
+# Interactive telemetry reads reserve HTTP serialization/transport time inside
+# the ten-second product SLA. Every phase shares one eight-second request wall.
 # Each phase receives only the request's remaining time, so sequential work
 # cannot extend the endpoint beyond that wall.
-USER_LIST_WALL_DEADLINE_MS = 30_000
-USER_LIST_PRESENCE_TIMEOUT_MS = 30_000
-USER_LIST_QUERY_TIMEOUT_MS = 30_000
-USER_LIST_ENRICHMENT_TIMEOUT_MS = 30_000
-USER_EXPORT_WALL_DEADLINE_MS = 30_000
+USER_LIST_WALL_DEADLINE_MS = 8_000
+USER_LIST_PRESENCE_TIMEOUT_MS = 8_000
+USER_LIST_QUERY_TIMEOUT_MS = 8_000
+USER_LIST_ENRICHMENT_TIMEOUT_MS = 8_000
+USER_EXPORT_WALL_DEADLINE_MS = 8_000
+# Keep the unfiltered first replay aligned with the default grid page. Optional
+# session metrics run as their own finite statement, so this exact usage replay
+# no longer carries session remap/aggregation state over the full span scan.
 USER_LIST_CANDIDATE_BATCH_SIZE = 25
+USER_LIST_ATTRIBUTE_FILTER_CANDIDATE_BATCH_SIZE = 8
+USER_LIST_REFILL_MIN_CANDIDATES = 4
+USER_LIST_REFILL_MAX_CANDIDATES = 8
+USER_LIST_REFILL_MIN_BUDGET_MS = 3_000
 USER_LIST_MAX_CANDIDATE_BATCHES = 8
 
 _USER_LIST_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
     "read_overflow_mode": "throw",
-    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "timeout_overflow_mode": "throw",
 }
@@ -150,6 +151,15 @@ def _page_read_settings(*, max_result_rows: int) -> dict[str, Any]:
     return _read_settings(max_result_rows=max_result_rows)
 
 
+def _page_replay_read_settings(*, max_result_rows: int) -> dict[str, Any]:
+    """Parallelize only finite page-scoped latest-state replays."""
+
+    return {
+        **_page_read_settings(max_result_rows=max_result_rows),
+        "max_threads": 8,
+    }
+
+
 def _log_user_read_failure(event: str, exc: Exception, **context: object) -> None:
     """Log operational reads compactly and programming defects with a stack."""
 
@@ -167,6 +177,7 @@ def _users_attr_enrichment_query(
     start_date: datetime | None = None,
     end_date: datetime | None = None,
     candidate_end_user_id_map: dict[str, str] | None = None,
+    candidate_text_values_by_key: dict[str, tuple[str, ...]] | None = None,
 ):
     """Project only requested keys for a finite Observe-Users page.
 
@@ -223,23 +234,56 @@ def _users_attr_enrichment_query(
           AND start_time >= %(attr_start_date)s
           AND start_time < %(attr_end_date)s
         """
+    candidate_value_params: dict[str, tuple[str, ...] | str] = {}
+    candidate_value_clauses: list[str] = []
+    for index, (attribute_key, raw_values) in enumerate(
+        sorted((candidate_text_values_by_key or {}).items())
+    ):
+        values = tuple(dict.fromkeys(str(value).lower() for value in raw_values))
+        if not attribute_key or not values:
+            continue
+        key_param = f"candidate_attribute_key_{index}"
+        values_param = f"candidate_attribute_values_{index}"
+        candidate_value_params[key_param] = str(attribute_key)
+        candidate_value_params[values_param] = values
+        candidate_value_clauses.append(
+            f"""
+            mapContains(attrs_string, %({key_param})s)
+            AND lowerUTF8(attrs_string[%({key_param})s]) IN %({values_param})s
+            """
+        )
+    params.update(candidate_value_params)
+    candidate_value_filter = (
+        "AND (" + ") OR (".join(candidate_value_clauses) + ")"
+        if candidate_value_clauses
+        else ""
+    )
     sql = f"""
     WITH
     eu_survivor_map AS ({eu_map}),
     candidate_span_identities AS (
-        SELECT DISTINCT project_id, trace_id, id, start_time
+        SELECT DISTINCT
+            project_id,
+            observation_type,
+            service_name,
+            toStartOfHour(start_time) AS identity_hour,
+            trace_id,
+            id
         FROM spans
         PREWHERE 1 = 1
           {project_clause}
           {time_filter}
           AND end_user_id IN %(eu_scan_ids)s
+          {candidate_value_filter}
     ),
     latest_candidate_attribute_values AS (
         SELECT
             project_id,
+            observation_type,
+            service_name,
+            toStartOfHour(start_time) AS identity_hour,
             trace_id,
             id,
-            start_time,
             attribute_key,
             argMax(tuple(end_user_id), _version).1 AS latest_end_user_id,
             argMax(
@@ -262,23 +306,59 @@ def _users_attr_enrichment_query(
                 ),
                 _version
             ).1 AS latest_attribute_value_json,
+            argMax(
+                tuple(
+                    multiIf(
+                        notEmpty(JSONExtractRaw(attributes_extra, attribute_key)),
+                            'json',
+                        mapContains(attrs_bool, attribute_key), 'boolean',
+                        mapContains(attrs_number, attribute_key), 'number',
+                        mapContains(attrs_string, attribute_key), 'string',
+                        ''
+                    )
+                ),
+                _version
+            ).1 AS latest_attribute_value_type,
             argMax(is_deleted, _version) AS latest_is_deleted
         FROM spans
         ARRAY JOIN %(requested_attribute_keys)s AS attribute_key
         PREWHERE 1 = 1
           {project_clause}
           {time_filter}
-          AND (project_id, trace_id, id, start_time) IN (
-              SELECT project_id, trace_id, id, start_time
+          AND (
+              project_id,
+              observation_type,
+              service_name,
+              toStartOfHour(start_time),
+              trace_id,
+              id
+          ) IN (
+              SELECT
+                  project_id,
+                  observation_type,
+                  service_name,
+                  identity_hour,
+                  trace_id,
+                  id
               FROM candidate_span_identities
           )
-        GROUP BY project_id, trace_id, id, start_time, attribute_key
+        GROUP BY
+            project_id,
+            observation_type,
+            service_name,
+            identity_hour,
+            trace_id,
+            id,
+            attribute_key
     )
     SELECT
         toString({resolved}) AS end_user_id,
         attribute_key,
-        arraySort(groupUniqArray(latest_attribute_value_json))
-            AS attribute_values_json
+        arraySort(
+            groupUniqArray(
+                tuple(latest_attribute_value_type, latest_attribute_value_json)
+            )
+        ) AS attribute_typed_values
     FROM latest_candidate_attribute_values
     LEFT JOIN eu_survivor_map AS eu_remap
         ON latest_end_user_id = eu_remap.any_id
@@ -328,13 +408,65 @@ class UsersListManager:
             if column
         )
         requested_attribute_keys = [str(key) for key in (attribute_keys or ()) if key]
+        attribute_filter_items: dict[str, list[dict[str, Any]]] = {}
         for item in self.filters:
             if UserListQueryBuilderV2._is_date_filter(item):
                 continue
             column_id = item.get("column_id") or item.get("columnId")
             if column_id and column_id not in UserListQueryBuilderV2.OUTPUT_FILTER_MAP:
-                requested_attribute_keys.append(str(column_id))
+                attribute_key = str(column_id)
+                requested_attribute_keys.append(attribute_key)
+                attribute_filter_items.setdefault(attribute_key, []).append(item)
         self.attribute_keys = tuple(dict.fromkeys(requested_attribute_keys))
+        unsupported_attribute_keys = unsupported_user_attribute_keys(
+            self.attribute_keys
+        )
+        if unsupported_attribute_keys:
+            raise ValueError(
+                "Observe Users does not support payload attribute keys: "
+                + ", ".join(unsupported_attribute_keys)
+            )
+        self._attribute_value_types_by_user: dict[
+            str, dict[str, dict[str, frozenset[str]]]
+        ] = {}
+        exact_text_filters: dict[str, tuple[str, ...]] = {}
+        for attribute_key, items in attribute_filter_items.items():
+            values: list[str] = []
+            acceleratable = True
+            for item in items:
+                config = item.get("filter_config") or {}
+                operation = config.get("filter_op") or config.get("filterOp")
+                filter_type = config.get("filter_type") or config.get("filterType")
+                raw_value = config.get("filter_value", config.get("filterValue"))
+                raw_values = raw_value if isinstance(raw_value, list) else [raw_value]
+                value_types = config.get("attribute_value_types")
+                if (
+                    operation not in {"equals", "in"}
+                    or filter_type not in {"text", "string"}
+                    or not raw_values
+                    or any(not isinstance(value, str) for value in raw_values)
+                    or (
+                        value_types is not None
+                        and (
+                            not isinstance(value_types, list)
+                            or len(value_types) != len(raw_values)
+                            or any(
+                                value_type not in {None, "string"}
+                                for value_type in value_types
+                            )
+                        )
+                    )
+                ):
+                    acceleratable = False
+                    break
+                values.extend(raw_values)
+            if acceleratable and values:
+                exact_text_filters[attribute_key] = tuple(
+                    dict.fromkeys(value.lower() for value in values)
+                )
+        # This is only a candidate accelerator. A latest-state replay still
+        # decides every value before Python applies the complete filter list.
+        self.attribute_exact_text_filters = exact_text_filters
         filter_columns = {
             UserListQueryBuilderV2.OUTPUT_FILTER_MAP.get(
                 str(item.get("column_id") or item.get("columnId")),
@@ -351,8 +483,20 @@ class UsersListManager:
         self.metric_keys = frozenset(
             (self.requested_columns | filter_columns) & _USER_LIST_EXTRA_METRIC_FIELDS
         )
+        # The fast presentation count uses latest physical session ids without
+        # canonical session-remap folding. A num_sessions predicate must keep
+        # the separate remap-aware metric replay so membership stays exact.
+        self.approximate_num_sessions = bool(
+            "num_sessions" in self.requested_columns
+            and not {"num_sessions", "avg_session_duration"} & filter_columns
+        )
         self.needs_evals = bool(
             (self.requested_columns | filter_columns) & _USER_LIST_EVAL_FIELDS
+        )
+        self.filters_need_enrichment = bool(
+            attribute_filter_items
+            or filter_columns
+            & (_USER_LIST_EXTRA_METRIC_FIELDS | _USER_LIST_EVAL_FIELDS)
         )
         self.scoped_project_ids, self.empty_scope = self._resolve_scope(
             self.project_id, allowed_project_ids
@@ -430,9 +574,15 @@ class UsersListManager:
         end_user_ids = [r.get("end_user_id") for r in rows if r.get("end_user_id")]
         if not end_user_ids or not self.metric_keys:
             return {}
+        embedded_fields = getattr(builder, "embedded_page_metric_fields", frozenset())
+        if not isinstance(embedded_fields, (set, frozenset)):
+            embedded_fields = frozenset()
         queries = builder.build_requested_page_metric_queries(
-            [str(value) for value in end_user_ids], self.metric_keys
+            [str(value) for value in end_user_ids],
+            self.metric_keys - embedded_fields,
         )
+        if not queries:
+            return {}
         analytics = V2AnalyticsQueryService()
         merged: dict[str, dict] = {}
         for query, params, _fields in queries:
@@ -440,7 +590,9 @@ class UsersListManager:
                 query,
                 params,
                 timeout_ms=deadline.remaining_ms(timeout_cap_ms),
-                settings=_page_read_settings(max_result_rows=max(1, len(end_user_ids))),
+                settings=_page_replay_read_settings(
+                    max_result_rows=max(1, len(end_user_ids))
+                ),
             )
             for row in result.data:
                 key = str(row.get("end_user_id", ""))
@@ -486,23 +638,36 @@ class UsersListManager:
         # query itself returns one row per user/key with a distinct value array;
         # Python merges exact arrays across key batches and adaptive time
         # buckets without changing positive/negative/null predicate semantics.
-        collected: dict[str, dict[str, dict[str, object]]] = {}
+        collected: dict[
+            str,
+            dict[str, dict[tuple[str, str], tuple[object, str]]],
+        ] = {}
 
         def _collect(rows_to_collect: list[dict]) -> None:
             for attr_row in rows_to_collect:
                 uid = str(attr_row.get("end_user_id", ""))
                 key = str(attr_row.get("attribute_key", ""))
-                if not uid or not key or key.startswith(_SKIP_ATTR_PREFIXES):
+                if not uid or not key:
                     continue
-                raw_values = attr_row.get("attribute_values_json")
+                typed_values = attr_row.get("attribute_typed_values")
+                if typed_values is not None:
+                    raw_values = [
+                        (str(value_type or ""), raw_value)
+                        for value_type, raw_value in typed_values
+                    ]
+                else:
+                    legacy_values = attr_row.get("attribute_values_json")
+                    raw_values = None
+                    if legacy_values is not None:
+                        if not isinstance(legacy_values, (list, tuple)):
+                            legacy_values = [legacy_values]
+                        raw_values = [("", raw_value) for raw_value in legacy_values]
                 if raw_values is None:
                     # Compatibility with a rolling deploy/test double using
                     # the earlier one-value projected response.
-                    raw_values = [attr_row.get("attribute_value_json", "")]
-                elif not isinstance(raw_values, (list, tuple)):
-                    raw_values = [raw_values]
+                    raw_values = [("", attr_row.get("attribute_value_json", ""))]
                 values = collected.setdefault(uid, {}).setdefault(key, {})
-                for raw in raw_values:
+                for storage_type, raw in raw_values:
                     try:
                         value = json.loads(raw) if isinstance(raw, str) else raw
                     except (json.JSONDecodeError, TypeError):
@@ -518,12 +683,17 @@ class UsersListManager:
                         )
                     elif isinstance(value, bool):
                         value = str(value).lower()
-                    values[self._canonical_filter_value(value)] = value
+                    if not storage_type:
+                        storage_type = self._inferred_attribute_storage_type(value)
+                    canonical = self._canonical_filter_value(value)
+                    values[(storage_type, canonical)] = (value, storage_type)
 
         def _read_key_bucket(
             keys: tuple[str, ...],
             bucket_start: datetime | None,
             bucket_end: datetime | None,
+            *,
+            candidate_text_values_by_key: dict[str, tuple[str, ...]] | None = None,
         ) -> None:
             attr_query, attr_params = _users_attr_enrichment_query(
                 project_id=self.project_id,
@@ -532,6 +702,7 @@ class UsersListManager:
                 start_date=bucket_start,
                 end_date=bucket_end,
                 candidate_end_user_id_map=candidate_end_user_id_map,
+                candidate_text_values_by_key=candidate_text_values_by_key,
             )
             attr_params["eu_ids"] = tuple(str(e) for e in end_user_ids)
             attr_params["eu_scan_ids"] = tuple(
@@ -542,7 +713,7 @@ class UsersListManager:
                     attr_query,
                     attr_params,
                     timeout_ms=deadline.remaining_ms(USER_LIST_ENRICHMENT_TIMEOUT_MS),
-                    settings=_page_read_settings(
+                    settings=_page_replay_read_settings(
                         max_result_rows=max(1, len(end_user_ids) * len(keys))
                     ),
                 )
@@ -556,32 +727,73 @@ class UsersListManager:
                 if not can_split:
                     raise
                 midpoint = bucket_start + (bucket_end - bucket_start) / 2
-                _read_key_bucket(keys, bucket_start, midpoint)
-                _read_key_bucket(keys, midpoint, bucket_end)
+                _read_key_bucket(
+                    keys,
+                    bucket_start,
+                    midpoint,
+                    candidate_text_values_by_key=candidate_text_values_by_key,
+                )
+                _read_key_bucket(
+                    keys,
+                    midpoint,
+                    bucket_end,
+                    candidate_text_values_by_key=candidate_text_values_by_key,
+                )
                 return
             _collect(list(attr_result.data or ()))
 
-        for key_start in range(
-            0, len(self.attribute_keys), _USER_LIST_ATTRIBUTE_KEY_BATCH_SIZE
-        ):
-            _read_key_bucket(
-                self.attribute_keys[
+        accelerated_keys = tuple(
+            key
+            for key in self.attribute_keys
+            if key in self.attribute_exact_text_filters
+        )
+        ordinary_keys = tuple(
+            key
+            for key in self.attribute_keys
+            if key not in self.attribute_exact_text_filters
+        )
+        key_batches = [
+            ((key,), {key: self.attribute_exact_text_filters[key]})
+            for key in accelerated_keys
+        ]
+        key_batches.extend(
+            (
+                ordinary_keys[
                     key_start : key_start + _USER_LIST_ATTRIBUTE_KEY_BATCH_SIZE
                 ],
+                None,
+            )
+            for key_start in range(
+                0, len(ordinary_keys), _USER_LIST_ATTRIBUTE_KEY_BATCH_SIZE
+            )
+        )
+        for keys, candidate_values in key_batches:
+            _read_key_bucket(
+                keys,
                 start_date,
                 end_date,
+                candidate_text_values_by_key=candidate_values,
             )
 
         user_attrs: dict[str, dict[str, object]] = {}
         for uid, attributes in collected.items():
-            for key, canonical_values in attributes.items():
-                ordered_values = [
-                    canonical_values[value_key]
-                    for value_key in sorted(canonical_values)
+            for key, typed_values in attributes.items():
+                ordered_records = [
+                    typed_values[value_key] for value_key in sorted(typed_values)
                 ]
+                ordered_values = [value for value, _storage_type in ordered_records]
                 user_attrs.setdefault(uid, {})[key] = (
                     ordered_values[0] if len(ordered_values) == 1 else ordered_values
                 )
+                types_by_value: dict[str, set[str]] = {}
+                for value, storage_type in ordered_records:
+                    types_by_value.setdefault(
+                        self._canonical_filter_value(value), set()
+                    ).add(storage_type)
+                self._attribute_value_types_by_user.setdefault(uid, {})[key] = {
+                    value: frozenset(storage_types)
+                    for value, storage_types in types_by_value.items()
+                }
         return user_attrs
 
     @staticmethod
@@ -633,7 +845,9 @@ class UsersListManager:
             eval_query,
             eval_params,
             timeout_ms=deadline.remaining_ms(USER_LIST_ENRICHMENT_TIMEOUT_MS),
-            settings=_page_read_settings(max_result_rows=max(1, len(end_user_ids))),
+            settings=_page_replay_read_settings(
+                max_result_rows=max(1, len(end_user_ids))
+            ),
         )
         return {str(row.get("end_user_id", "")): row for row in eval_result.data}
 
@@ -660,7 +874,7 @@ class UsersListManager:
 
         # ClickHouse read caps apply per statement, while concurrent statements
         # add their resident memory.  Run optional page enrichments serially so
-        # one request cannot multiply the 256 MiB ceiling by three.
+        # one request cannot multiply the 36 GiB ceiling by three.
         if self.metric_keys:
             metrics = self._read_page_metrics(rows, builder, deadline)
             self._apply_page_metrics(rows, metrics)
@@ -708,6 +922,8 @@ class UsersListManager:
         limit: int,
         before_first_seen: datetime | None,
         before_end_user_id: str | None,
+        window_start: datetime,
+        window_end: datetime,
     ) -> list[dict]:
         builder = UserListQueryBuilderV2(
             organization_id=self.organization_id,
@@ -719,6 +935,8 @@ class UsersListManager:
             limit=limit,
             before_first_seen=before_first_seen,
             before_end_user_id=before_end_user_id,
+            window_start=window_start,
+            window_end=window_end,
         )
         result = V2AnalyticsQueryService().execute_ch_query(
             query,
@@ -735,10 +953,13 @@ class UsersListManager:
 
         # The dimension is deliberately scanned in raw key order so the hot
         # query never materializes the global many-to-one remap. Classify only
-        # this finite page: alias rows advance the cursor but are never
-        # published, while ids absent from the remap are canonical by default.
+        # touched groups and retain their greatest raw (time, id) tuple. That
+        # tuple emits the canonical survivor; every lower alias is consumed as
+        # a cursor checkpoint without becoming a duplicate public row.
         remap_query, remap_params = builder.build_dimension_survivor_query(
-            candidate_ids
+            candidate_ids,
+            window_start=window_start,
+            window_end=window_end,
         )
         remap_result = V2AnalyticsQueryService().execute_ch_query(
             remap_query,
@@ -746,22 +967,75 @@ class UsersListManager:
             timeout_ms=deadline.remaining_ms(USER_LIST_QUERY_TIMEOUT_MS),
             settings=_page_read_settings(max_result_rows=_USER_LIST_ATTR_RESULT_ROWS),
         )
-        survivor_by_id = {
-            str(row.get("any_id")): str(row.get("survivor_id"))
-            for row in (remap_result.data or [])
-            if row.get("any_id") and row.get("survivor_id")
-        }
+        survivor_by_id: dict[str, str] = {}
+        aliases_by_survivor: dict[str, set[str]] = {}
+        group_order_by_survivor: dict[str, tuple[Any, str]] = {}
+        for row in remap_result.data or []:
+            any_id = str(row.get("any_id") or "")
+            survivor_id = str(row.get("survivor_id") or "")
+            if not any_id or not survivor_id:
+                continue
+            survivor_by_id[any_id] = survivor_id
+            aliases_by_survivor.setdefault(survivor_id, set()).add(any_id)
+            group_order_time = row.get("group_order_time")
+            group_order_id = str(row.get("group_order_id") or "")
+            if group_order_time is not None and group_order_id:
+                group_order_by_survivor[survivor_id] = (
+                    group_order_time,
+                    group_order_id,
+                )
         for candidate in candidates:
             candidate_id = str(candidate.get("end_user_id", ""))
+            candidate_order_time = candidate.get("first_seen")
             survivor_id = survivor_by_id.get(candidate_id, candidate_id)
-            candidate["_is_survivor_candidate"] = survivor_id == candidate_id
-            if survivor_id == candidate_id:
-                candidate["_candidate_scan_end_user_ids"] = tuple(
-                    any_id
-                    for any_id, mapped_survivor in survivor_by_id.items()
-                    if mapped_survivor == survivor_id
-                ) or (candidate_id,)
+            candidate["_candidate_order_time"] = candidate_order_time
+            candidate["_candidate_order_id"] = candidate_id
+            group_order = group_order_by_survivor.get(
+                survivor_id,
+                (candidate_order_time, candidate_id),
+            )
+            is_group_max = (
+                candidate_order_time == group_order[0]
+                and candidate_id == group_order[1]
+            )
+            candidate["_is_survivor_candidate"] = is_group_max
+            if is_group_max:
+                scan_ids = aliases_by_survivor.get(survivor_id, set()) | {
+                    candidate_id,
+                    survivor_id,
+                }
+                candidate["_candidate_scan_end_user_ids"] = tuple(sorted(scan_ids))
+                # Exact replay and the public response are survivor keyed. The
+                # hidden raw fields above remain the only cursor order source.
+                candidate["end_user_id"] = survivor_id
         return candidates
+
+    def _exact_candidate_builder(
+        self,
+        *,
+        candidate_ids: list[str],
+        candidate_scan_ids: list[str] | None,
+        candidate_end_user_id_map: dict[str, str] | None,
+        frozen_filters: list[dict],
+    ) -> UserListQueryBuilderV2:
+        date_filters = [
+            item
+            for item in frozen_filters
+            if UserListQueryBuilderV2._is_date_filter(item)
+        ]
+        return UserListQueryBuilderV2(
+            organization_id=self.organization_id,
+            project_ids=self.scoped_project_ids,
+            search=self.search,
+            filters=date_filters,
+            limit=len(candidate_ids),
+            offset=0,
+            candidate_end_user_ids=candidate_ids,
+            candidate_scan_end_user_ids=candidate_scan_ids or candidate_ids,
+            candidate_end_user_id_map=candidate_end_user_id_map,
+            include_num_sessions=self.approximate_num_sessions,
+            empty_scope=self.empty_scope,
+        )
 
     def _read_exact_candidate_rows(
         self,
@@ -773,48 +1047,51 @@ class UsersListManager:
         window_start: datetime,
         window_end: datetime,
         deadline: ReadDeadline,
+        enrich_rows: bool = True,
     ) -> list[dict]:
         if not candidate_ids:
             return []
-        date_filters = [
-            item
-            for item in frozen_filters
-            if UserListQueryBuilderV2._is_date_filter(item)
-        ]
-        builder = UserListQueryBuilderV2(
-            organization_id=self.organization_id,
-            project_ids=self.scoped_project_ids,
-            filters=date_filters,
-            limit=len(candidate_ids),
-            offset=0,
-            candidate_end_user_ids=candidate_ids,
-            candidate_scan_end_user_ids=candidate_scan_ids or candidate_ids,
+        builder = self._exact_candidate_builder(
+            candidate_ids=candidate_ids,
+            candidate_scan_ids=candidate_scan_ids,
             candidate_end_user_id_map=candidate_end_user_id_map,
-            empty_scope=self.empty_scope,
+            frozen_filters=frozen_filters,
         )
         query, params = builder.build_candidate_page_query()
         result = V2AnalyticsQueryService().execute_ch_query(
             query,
             params,
             timeout_ms=deadline.remaining_ms(USER_LIST_QUERY_TIMEOUT_MS),
-            settings=_page_read_settings(max_result_rows=max(1, len(candidate_ids))),
+            settings=_page_replay_read_settings(
+                max_result_rows=max(1, len(candidate_ids))
+            ),
         )
         rows = builder.format_rows(result.data)["table"]
         if not rows:
             return []
-        self._enrich_rows(
-            rows,
-            builder,
-            deadline,
-            start_date=window_start,
-            end_date=window_end,
-            candidate_scan_ids=candidate_scan_ids,
-            candidate_end_user_id_map=candidate_end_user_id_map,
-        )
+        if self.approximate_num_sessions:
+            for row in rows:
+                row["num_sessions_is_approximate"] = True
+        if enrich_rows:
+            self._enrich_rows(
+                rows,
+                builder,
+                deadline,
+                start_date=window_start,
+                end_date=window_end,
+                candidate_scan_ids=candidate_scan_ids,
+                candidate_end_user_id_map=candidate_end_user_id_map,
+            )
         return rows
 
     @staticmethod
-    def _candidate_value_matches(candidate: Any, op: str | None, expected: Any) -> bool:
+    def _candidate_value_matches(
+        candidate: Any,
+        op: str | None,
+        expected: Any,
+        *,
+        case_insensitive: bool = False,
+    ) -> bool:
         if isinstance(candidate, (list, tuple, set)):
             values = list(candidate)
             if op in {"not_equals", "not_in", "not_contains", "not_between"}:
@@ -826,12 +1103,20 @@ class UsersListManager:
                 }[str(op)]
                 return all(
                     not UsersListManager._candidate_value_matches(
-                        value, positive_op, expected
+                        value,
+                        positive_op,
+                        expected,
+                        case_insensitive=case_insensitive,
                     )
                     for value in values
                 )
             return any(
-                UsersListManager._candidate_value_matches(value, op, expected)
+                UsersListManager._candidate_value_matches(
+                    value,
+                    op,
+                    expected,
+                    case_insensitive=case_insensitive,
+                )
                 for value in values
             )
         if op == "is_null":
@@ -841,14 +1126,23 @@ class UsersListManager:
         if op in {"in", "not_in"}:
             expected_values = expected if isinstance(expected, list) else [expected]
             left = UsersListManager._canonical_filter_value(candidate)
+            if case_insensitive:
+                left = left.lower()
             matched = any(
-                left == UsersListManager._canonical_filter_value(value)
+                left
+                == (
+                    UsersListManager._canonical_filter_value(value).lower()
+                    if case_insensitive
+                    else UsersListManager._canonical_filter_value(value)
+                )
                 for value in expected_values
             )
             return not matched if op == "not_in" else matched
         if op in {"equals", "not_equals"}:
             left = UsersListManager._canonical_filter_value(candidate)
             right = UsersListManager._canonical_filter_value(expected)
+            if case_insensitive:
+                left, right = left.lower(), right.lower()
             matched = left == right
             return not matched if op == "not_equals" else matched
         if op in {"contains", "not_contains", "starts_with", "ends_with"}:
@@ -892,6 +1186,87 @@ class UsersListManager:
         # never turn an unsupported predicate into an unfiltered successful
         # page.
         return False
+
+    @staticmethod
+    def _inferred_attribute_storage_type(value: Any) -> str:
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, (int, float, Decimal)):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        return "json"
+
+    def _attribute_value_matches(
+        self,
+        *,
+        row: dict[str, Any],
+        key: str,
+        config: dict[str, Any],
+    ) -> bool:
+        candidate = row.get(key)
+        operation = config.get("filter_op") or config.get("filterOp")
+        expected = config.get("filter_value", config.get("filterValue"))
+        filter_type = str(config.get("filter_type") or config.get("filterType") or "")
+        default_storage_type = {
+            "text": "string",
+            "string": "string",
+            "number": "number",
+            "boolean": "boolean",
+            "array": "json",
+            "map": "json",
+        }.get(filter_type)
+        candidate_values = (
+            list(candidate)
+            if isinstance(candidate, (list, tuple, set))
+            else [candidate]
+        )
+        type_map = self._attribute_value_types_by_user.get(
+            str(row.get("end_user_id", "")), {}
+        ).get(key, {})
+
+        def storage_types(value: Any) -> frozenset[str]:
+            recorded = type_map.get(self._canonical_filter_value(value))
+            if recorded:
+                return recorded
+            return frozenset({self._inferred_attribute_storage_type(value)})
+
+        selected_types = config.get("attribute_value_types")
+        if selected_types is not None and operation in {"in", "not_in"}:
+            expected_values = expected if isinstance(expected, list) else [expected]
+            matches = any(
+                selected_type in storage_types(value)
+                and self._candidate_value_matches(
+                    value,
+                    "equals",
+                    expected_value,
+                    case_insensitive=selected_type == "string",
+                )
+                for value in candidate_values
+                for expected_value, selected_type in zip(
+                    expected_values,
+                    selected_types,
+                    strict=True,
+                )
+            )
+            return not matches if operation == "not_in" else matches
+
+        typed_values = [
+            value
+            for value in candidate_values
+            if default_storage_type is None
+            or default_storage_type in storage_types(value)
+        ]
+        if operation == "is_null":
+            return not typed_values or all(value is None for value in typed_values)
+        if operation == "is_not_null":
+            return any(value is not None for value in typed_values)
+        return self._candidate_value_matches(
+            typed_values,
+            operation,
+            expected,
+            case_insensitive=default_storage_type == "string",
+        )
 
     @staticmethod
     def _canonical_filter_value(value: Any) -> str:
@@ -942,11 +1317,19 @@ class UsersListManager:
                 key = "bool_eval_pass_rate"
             else:
                 key = UserListQueryBuilderV2.OUTPUT_FILTER_MAP.get(column_id, column_id)
-            if not self._candidate_value_matches(
-                row.get(key),
-                config.get("filter_op") or config.get("filterOp"),
-                config.get("filter_value", config.get("filterValue")),
-            ):
+            if column_id not in UserListQueryBuilderV2.OUTPUT_FILTER_MAP:
+                matched = self._attribute_value_matches(row=row, key=key, config=config)
+            else:
+                matched = self._candidate_value_matches(
+                    row.get(key),
+                    config.get("filter_op") or config.get("filterOp"),
+                    config.get("filter_value", config.get("filterValue")),
+                    case_insensitive=(
+                        config.get("filter_type") or config.get("filterType")
+                    )
+                    in {"text", "string"},
+                )
+            if not matched:
                 return False
         return True
 
@@ -997,26 +1380,53 @@ class UsersListManager:
         checkpoint: tuple[Any, ...] | None = None
         has_more = False
         unseen_row_proven = False
-
+        presentation_candidate_map: dict[str, str] = {}
         for _ in range(USER_LIST_MAX_CANDIDATE_BATCHES):
+            if self.attribute_exact_text_filters:
+                candidate_batch_size = USER_LIST_ATTRIBUTE_FILTER_CANDIDATE_BATCH_SIZE
+            elif published:
+                try:
+                    # Reserve enough wall for an up-to-eight-user refill plus
+                    # its finite seed/remap. The advancing checkpoint makes the
+                    # already exact rows resumable when that budget is absent.
+                    deadline.remaining_ms(floor_ms=USER_LIST_REFILL_MIN_BUDGET_MS)
+                except ReadDeadlineExceeded:
+                    has_more = True
+                    break
+                remaining_slots = page_size - len(published)
+                # The first production batch retained 22/25 candidates. Use a
+                # conservative 80% survival floor for refills, while keeping
+                # every incremental replay between four and eight users.
+                candidate_batch_size = min(
+                    USER_LIST_REFILL_MAX_CANDIDATES,
+                    max(
+                        USER_LIST_REFILL_MIN_CANDIDATES,
+                        (remaining_slots * 5 + 3) // 4,
+                    ),
+                )
+            else:
+                candidate_batch_size = USER_LIST_CANDIDATE_BATCH_SIZE
             try:
                 candidate_rows = self._read_dimension_candidates(
                     deadline=deadline,
-                    limit=USER_LIST_CANDIDATE_BATCH_SIZE + 1,
+                    limit=candidate_batch_size + 1,
                     before_first_seen=before_first_seen,
                     before_end_user_id=before_end_user_id,
+                    window_start=window_start,
+                    window_end=window_end,
                 )
                 if not candidate_rows:
                     has_more = False
                     break
 
-                batch = candidate_rows[:USER_LIST_CANDIDATE_BATCH_SIZE]
+                batch = candidate_rows[:candidate_batch_size]
                 dimension_has_more = len(candidate_rows) > len(batch)
                 candidate_ids = [
                     str(row["end_user_id"])
                     for row in batch
                     if row.get("_is_survivor_candidate", True)
                 ]
+                candidate_ids = list(dict.fromkeys(candidate_ids))
                 candidate_scan_ids = list(
                     dict.fromkeys(
                         scan_id
@@ -1037,6 +1447,7 @@ class UsersListManager:
                         (str(row["end_user_id"]),),
                     )
                 }
+                presentation_candidate_map.update(candidate_end_user_id_map)
                 exact_rows = self._read_exact_candidate_rows(
                     candidate_ids=candidate_ids,
                     candidate_scan_ids=candidate_scan_ids,
@@ -1045,6 +1456,7 @@ class UsersListManager:
                     window_start=window_start,
                     window_end=window_end,
                     deadline=deadline,
+                    enrich_rows=self.filters_need_enrichment,
                 )
                 exact_by_id = {
                     str(row.get("end_user_id")): row
@@ -1054,6 +1466,8 @@ class UsersListManager:
                 consumed = 0
                 for candidate in batch:
                     consumed += 1
+                    if not candidate.get("_is_survivor_candidate", True):
+                        continue
                     row = exact_by_id.get(str(candidate.get("end_user_id")))
                     if row is None or not self._row_matches_filters(row):
                         continue
@@ -1061,7 +1475,8 @@ class UsersListManager:
                     if len(published) == page_size:
                         unseen_row_proven = any(
                             (
-                                exact_by_id.get(str(later.get("end_user_id")))
+                                later.get("_is_survivor_candidate", True)
+                                and exact_by_id.get(str(later.get("end_user_id")))
                                 is not None
                                 and self._row_matches_filters(
                                     exact_by_id[str(later.get("end_user_id"))]
@@ -1073,8 +1488,16 @@ class UsersListManager:
 
                 consumed_row = batch[consumed - 1]
                 checkpoint = (
-                    consumed_row["first_seen"],
-                    str(consumed_row["end_user_id"]),
+                    consumed_row.get(
+                        "_candidate_order_time",
+                        consumed_row["first_seen"],
+                    ),
+                    str(
+                        consumed_row.get(
+                            "_candidate_order_id",
+                            consumed_row["end_user_id"],
+                        )
+                    ),
                 )
                 before_first_seen = checkpoint[0]
                 before_end_user_id = checkpoint[1]
@@ -1082,14 +1505,11 @@ class UsersListManager:
                 has_more = bool(
                     unconsumed_candidates
                     or dimension_has_more
-                    or len(batch) == USER_LIST_CANDIDATE_BATCH_SIZE
+                    or len(batch) == candidate_batch_size
                 )
                 if len(published) == page_size:
                     break
-                if (
-                    not dimension_has_more
-                    and len(batch) < USER_LIST_CANDIDATE_BATCH_SIZE
-                ):
+                if not dimension_has_more and len(batch) < candidate_batch_size:
                     has_more = False
                     break
             except (FuturesTimeoutError, ReadDeadlineExceeded):
@@ -1104,6 +1524,41 @@ class UsersListManager:
                 break
         else:
             has_more = checkpoint is not None
+
+        if (
+            published
+            and not self.filters_need_enrichment
+            and (self.metric_keys or self.attribute_keys or self.needs_evals)
+        ):
+            published_ids = list(
+                dict.fromkeys(
+                    str(row["end_user_id"])
+                    for row in published
+                    if row.get("end_user_id")
+                )
+            )
+            published_id_set = set(published_ids)
+            published_candidate_map = {
+                scan_id: survivor_id
+                for scan_id, survivor_id in presentation_candidate_map.items()
+                if survivor_id in published_id_set
+            }
+            published_scan_ids = list(published_candidate_map) or list(published_ids)
+            builder = self._exact_candidate_builder(
+                candidate_ids=published_ids,
+                candidate_scan_ids=published_scan_ids,
+                candidate_end_user_id_map=published_candidate_map,
+                frozen_filters=frozen_filters,
+            )
+            self._enrich_rows(
+                published,
+                builder,
+                deadline,
+                start_date=window_start,
+                end_date=window_end,
+                candidate_scan_ids=published_scan_ids,
+                candidate_end_user_id_map=published_candidate_map,
+            )
 
         seen_rows = seen_before + len(published)
         lower_bound = seen_rows + (1 if has_more and unseen_row_proven else 0)
@@ -1120,6 +1575,12 @@ class UsersListManager:
             # incomplete/sampled result in shared UI state handling.
             "query_complete": True,
             "query_status": "complete",
+            "query_exact": False,
+            "query_provenance": "span_user_rollup_end_users_candidate",
+            "ordering_exact": False,
+            "approximate_fields": (
+                ["num_sessions"] if self.approximate_num_sessions else []
+            ),
         }
         return UserCursorRead(
             payload=payload,

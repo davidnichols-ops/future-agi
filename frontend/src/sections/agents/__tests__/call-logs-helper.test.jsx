@@ -188,6 +188,7 @@ describe("useCallLogs", () => {
           page: 1,
           page_size: 25,
         },
+        signal: expect.any(AbortSignal),
       },
     );
     expect(axiosMocks.get).toHaveBeenNthCalledWith(
@@ -200,6 +201,7 @@ describe("useCallLogs", () => {
           cursor_mode: true,
           cursor: "after-call-1",
         },
+        signal: expect.any(AbortSignal),
       },
     );
     expect(result.current.data.__exactPage).toEqual(

@@ -1,4 +1,4 @@
-import { followEmptyListContinuations } from "./listCursorPagination";
+import { accumulateUniqueListContinuations } from "./listCursorPagination";
 
 // `limit_reached` describes one bounded backend walk, not necessarily the end
 // of the retained catalog. When the response also carries an advancing signed
@@ -11,8 +11,8 @@ const CURSOR_STOPPED_KEY = "__attributeKeyCursorStopped";
 // The shared Axios client intentionally has no global timeout. Attribute-key
 // browsing is interactive, so one stalled proxy/backend response must not
 // leave a picker in an endless loading state. Keep this just above the
-// server-side 30-second ceiling so structured server timeouts still win.
-export const ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS = 35_000;
+// server-side 9.5-second ceiling so structured server timeouts still win.
+export const ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS = 9_800;
 
 const attributeKey = (item) =>
   typeof item?.key === "string" && item.key.length > 0 ? item.key : null;
@@ -54,36 +54,26 @@ export const getAttributeKeyNextCursor = (page) => {
  */
 export const readAttributeKeyPage = async ({
   pageParam,
+  pageSize = 10,
+  publishedData,
   requestPage,
   signal,
 }) => {
-  // De-duplicate only inside this bounded transport chunk. React Query
-  // refetches rebuild their output while the old cache is still readable, so
-  // consulting cached keys here would erase unchanged results. Hook consumers
-  // de-duplicate the published pages, while getNextAttributeKeyPageParam
-  // validates cursors across chunks.
-  const knownKeys = new Set();
-  const knownCursors = new Set(
-    typeof pageParam === "string" && pageParam.length > 0 ? [pageParam] : [],
+  const actionStartedAt = Date.now();
+  const isFreshChainRead = pageParam == null;
+  const publishedPages = isFreshChainRead ? [] : publishedData?.pages || [];
+  const knownKeys = publishedPages.flatMap((page) =>
+    (Array.isArray(page?.result) ? page.result : [])
+      .map(attributeKey)
+      .filter(Boolean),
   );
-  const followedCursors = new Set();
-  const uniqueRowsByPage = new WeakMap();
-
-  const uniqueRows = (page) => {
-    if (page && typeof page === "object" && uniqueRowsByPage.has(page)) {
-      return uniqueRowsByPage.get(page);
-    }
-    const rows = (Array.isArray(page?.result) ? page.result : []).filter(
-      (item) => {
-        const key = attributeKey(item);
-        if (!key || knownKeys.has(key)) return false;
-        knownKeys.add(key);
-        return true;
-      },
-    );
-    if (page && typeof page === "object") uniqueRowsByPage.set(page, rows);
-    return rows;
-  };
+  const knownCursors = new Set(
+    [
+      ...(isFreshChainRead ? [] : publishedData?.pageParams || []),
+      ...publishedPages.flatMap((page) => page?.[FOLLOWED_CURSORS_KEY] || []),
+      pageParam,
+    ].filter((cursor) => typeof cursor === "string" && cursor.length > 0),
+  );
 
   const checkedMetadata = (page) => {
     const normalized = normalizeAttributeKeyPage(page);
@@ -92,7 +82,7 @@ export const readAttributeKeyPage = async ({
     if (typeof nextCursor !== "string" || nextCursor.length === 0) {
       return stopAttributeKeyCursor(normalized, "malformed_cursor");
     }
-    if (knownCursors.has(nextCursor) || followedCursors.has(nextCursor)) {
+    if (knownCursors.has(nextCursor)) {
       return stopAttributeKeyCursor(normalized, "repeated_cursor");
     }
     return normalized;
@@ -109,22 +99,28 @@ export const readAttributeKeyPage = async ({
   };
 
   const initialPage = await requestPage(pageParam);
-  const page = await followEmptyListContinuations({
+  const {
+    response: page,
+    rows: visibleRows,
+    followedCursors,
+  } = await accumulateUniqueListContinuations({
     initialResponse: initialPage,
-    rowsFromResponse: uniqueRows,
+    rowsFromResponse: (response) =>
+      Array.isArray(response?.result) ? response.result : [],
     metadataFromResponse: continuationMetadata,
+    identityFromRow: attributeKey,
+    knownIdentities: knownKeys,
+    targetRowCount: isFreshChainRead ? 1 : pageSize,
     nextResponse: requestPage,
     onContinuation: (metadata) => {
       const nextCursor = getAttributeKeyNextCursor(metadata);
-      if (nextCursor) {
-        followedCursors.add(nextCursor);
-        knownCursors.add(nextCursor);
-      }
+      if (nextCursor) knownCursors.add(nextCursor);
     },
     isCurrent: () => !signal?.aborted,
+    cancellationSignal: signal,
+    startedAt: actionStartedAt,
   });
   const normalized = checkedMetadata(page);
-  const visibleRows = uniqueRows(page);
 
   return {
     ...normalized,
@@ -134,7 +130,7 @@ export const readAttributeKeyPage = async ({
     result: visibleRows,
     // Store only cursors consumed by this chunk. Copying the cumulative cursor
     // history onto every page makes long sparse catalogs grow quadratically.
-    [FOLLOWED_CURSORS_KEY]: [...followedCursors],
+    [FOLLOWED_CURSORS_KEY]: followedCursors,
   };
 };
 

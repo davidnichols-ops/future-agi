@@ -33003,8 +33003,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
     "/tracer/observation-span/get_spans_export_data/": {
       "get": {
         "operationId": "tracer_observation-span_get_spans_export_data",
-        "runtimeRequestValidation": false,
-        "runtimeResponseValidation": false,
+        "runtimeRequestValidation": true,
+        "runtimeResponseValidation": true,
         "requestBody": null,
         "queryParameters": {
           "page": {
@@ -33018,36 +33018,35 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "schema": {
               "type": "integer"
             }
+          },
+          "project_id": {
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "filters": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "default": "[]"
+            }
           }
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/ObservationSpan"
-                }
-              }
-            }
+            "type": "string"
+          },
+          "400": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "500": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "503": {
+            "$ref": "#/definitions/ApiErrorResponse"
           },
           "default": {
             "$ref": "#/definitions/ManagementAPIErrorResponse"
@@ -34211,32 +34210,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/Project"
-                }
-              }
-            }
+            "$ref": "#/definitions/ProjectGraphDataResponse"
           },
           "400": {
             "$ref": "#/definitions/ApiErrorResponse"
@@ -34257,7 +34231,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
       "post": {
         "operationId": "tracer_project_get_user_graph_data",
         "runtimeRequestValidation": true,
-        "runtimeResponseValidation": false,
+        "runtimeResponseValidation": true,
         "requestBody": {
           "$ref": "#/definitions/ProjectUserGraphDataRequest"
         },
@@ -34278,8 +34252,17 @@ export const OPENAPI_CONTRACT = Object.freeze({
           }
         },
         "responses": {
-          "201": {
-            "$ref": "#/definitions/ProjectUserGraphDataRequest"
+          "200": {
+            "$ref": "#/definitions/ProjectUserGraphDataResponse"
+          },
+          "400": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "500": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "503": {
+            "$ref": "#/definitions/ApiErrorResponse"
           },
           "default": {
             "$ref": "#/definitions/ManagementAPIErrorResponse"
@@ -34310,7 +34293,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
       "post": {
         "operationId": "tracer_project_get_users_aggregate_graph_data",
         "runtimeRequestValidation": true,
-        "runtimeResponseValidation": false,
+        "runtimeResponseValidation": true,
         "requestBody": {
           "$ref": "#/definitions/ProjectUsersAggregateGraphDataRequest"
         },
@@ -34331,8 +34314,17 @@ export const OPENAPI_CONTRACT = Object.freeze({
           }
         },
         "responses": {
-          "201": {
-            "$ref": "#/definitions/ProjectUsersAggregateGraphDataRequest"
+          "200": {
+            "$ref": "#/definitions/ObserveGraphDataResponse"
+          },
+          "400": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "500": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "503": {
+            "$ref": "#/definitions/ApiErrorResponse"
           },
           "default": {
             "$ref": "#/definitions/ManagementAPIErrorResponse"
@@ -35404,8 +35396,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
     "/tracer/trace-session/get_trace_session_export_data/": {
       "get": {
         "operationId": "tracer_trace-session_get_trace_session_export_data",
-        "runtimeRequestValidation": false,
-        "runtimeResponseValidation": false,
+        "runtimeRequestValidation": true,
+        "runtimeResponseValidation": true,
         "requestBody": null,
         "queryParameters": {
           "page": {
@@ -35419,36 +35411,99 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "schema": {
               "type": "integer"
             }
+          },
+          "project_id": {
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "user_id": {
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "bookmarked": {
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "filters": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "default": "[]"
+            }
+          },
+          "sort_params": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "default": "[]"
+            }
+          },
+          "page_number": {
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          "page_size": {
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 30
+            }
+          },
+          "cursor": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          },
+          "cursor_mode": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "interval": {
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/TraceSession"
-                }
-              }
-            }
+            "type": "string"
+          },
+          "400": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "500": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "503": {
+            "$ref": "#/definitions/ApiErrorResponse"
           },
           "default": {
             "$ref": "#/definitions/ManagementAPIErrorResponse"
@@ -35557,7 +35612,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "responses": {
           "200": {
-            "$ref": "#/definitions/TraceObserveListResponse"
+            "$ref": "#/definitions/TraceSessionListResponse"
           },
           "400": {
             "$ref": "#/definitions/ApiErrorResponse"
@@ -35993,8 +36048,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
     "/tracer/trace/get_trace_export_data/": {
       "get": {
         "operationId": "tracer_trace_get_trace_export_data",
-        "runtimeRequestValidation": false,
-        "runtimeResponseValidation": false,
+        "runtimeRequestValidation": true,
+        "runtimeResponseValidation": true,
         "requestBody": null,
         "queryParameters": {
           "page": {
@@ -36008,36 +36063,35 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "schema": {
               "type": "integer"
             }
+          },
+          "project_id": {
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "filters": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "default": "[]"
+            }
           }
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/Trace"
-                }
-              }
-            }
+            "type": "string"
+          },
+          "400": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "500": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "503": {
+            "$ref": "#/definitions/ApiErrorResponse"
           },
           "default": {
             "$ref": "#/definitions/ManagementAPIErrorResponse"
@@ -37314,7 +37368,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "400": {
             "$ref": "#/definitions/ApiErrorResponse"
           },
+          "422": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
           "500": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "503": {
             "$ref": "#/definitions/ApiErrorResponse"
           },
           "default": {
@@ -51677,7 +51737,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "allow_sampled": {
           "title": "Allow sampled",
-          "description": "Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact.",
+          "description": "Deprecated compatibility parameter; accepted but ignored. The response explicitly labels exact, rollup, or unavailable provenance.",
           "type": "boolean",
           "default": false
         }
@@ -51807,7 +51867,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "allow_sampled": {
           "title": "Allow sampled",
-          "description": "Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact.",
+          "description": "Deprecated compatibility parameter; accepted but ignored. The response explicitly labels exact, rollup, or unavailable provenance.",
           "type": "boolean",
           "default": false
         }
@@ -51835,7 +51895,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
       "properties": {
         "allow_sampled": {
           "title": "Allow sampled",
-          "description": "Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact.",
+          "description": "Deprecated compatibility parameter; accepted but ignored. The response explicitly labels exact, rollup, or unavailable provenance.",
           "type": "boolean",
           "default": false
         }
@@ -65699,6 +65759,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "ProjectGraphDataResponse": {
+      "required": [
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean",
+          "default": true
+        },
+        "result": {
+          "$ref": "#/definitions/ProjectGraphDataResult"
+        }
+      }
+    },
     "ProjectIdListResponse": {
       "required": [
         "result"
@@ -65791,6 +65867,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "additionalProperties": false
           },
           "default": []
+        }
+      }
+    },
+    "ProjectUserGraphDataResponse": {
+      "required": [
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean",
+          "default": true
+        },
+        "result": {
+          "$ref": "#/definitions/ProjectUserGraphDataResult"
         }
       }
     },
@@ -73278,6 +73370,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "type"
           ],
           "additionalProperties": false
+        }
+      }
+    },
+    "TraceSessionListResponse": {
+      "required": [
+        "status",
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean"
+        },
+        "result": {
+          "$ref": "#/definitions/TraceSessionListResult"
         }
       }
     },
@@ -81052,6 +81160,53 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Query sampled",
           "type": "boolean"
         },
+        "query_exact": {
+          "title": "Query exact",
+          "type": "boolean"
+        },
+        "query_provenance": {
+          "title": "Query provenance",
+          "type": "string",
+          "enum": [
+            "exact_snapshot",
+            "materialized_rollup",
+            "authorized_empty_scope",
+            "bounded_unavailable"
+          ]
+        },
+        "query_error_code": {
+          "title": "Query error code",
+          "type": "string",
+          "enum": [
+            "sample_limit",
+            "read_budget_exceeded",
+            "query_failed",
+            "bounded_shape_unavailable",
+            "invalid_window",
+            "malformed_result"
+          ]
+        },
+        "query_sampling_strategy": {
+          "title": "Query sampling strategy",
+          "type": "string",
+          "minLength": 1
+        },
+        "query_count": {
+          "title": "Query count",
+          "type": "integer",
+          "maximum": 256,
+          "minimum": 0
+        },
+        "query_rows_returned": {
+          "title": "Query rows returned",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_elapsed_ms": {
+          "title": "Query elapsed ms",
+          "type": "number",
+          "minimum": 0
+        },
         "query_completed_at": {
           "title": "Query completed at",
           "type": "string",
@@ -87067,7 +87222,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string"
         },
         "data": {
-          "description": "Exact graph points. Pending or failed refreshes never publish partial aggregate values.",
+          "description": "Graph points. A sampled series is published only with complete declared stratum coverage; degraded reads never publish points.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/ObserveGraphDataPoint"
@@ -87076,6 +87231,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "query_complete": {
           "title": "Query complete",
           "type": "boolean"
+        },
+        "query_exact": {
+          "title": "Query exact",
+          "type": "boolean"
+        },
+        "query_provenance": {
+          "title": "Query provenance",
+          "type": "string",
+          "enum": [
+            "materialized_rollup",
+            "bounded_candidates",
+            "exact_snapshot"
+          ]
         },
         "query_status": {
           "title": "Query status",
@@ -87167,7 +87335,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "time_stratified_latest_state",
-            "bounded_latest_state_prefix"
+            "bounded_latest_state_prefix",
+            "newest_trace_candidates"
           ]
         },
         "query_sampling_strata": {
@@ -87203,7 +87372,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string"
         },
         "data": {
-          "description": "Exact graph points. Pending or failed refreshes never publish partial aggregate values.",
+          "description": "Graph points. A sampled series is published only with complete declared stratum coverage; degraded reads never publish points.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/ObserveGraphDataPoint"
@@ -87212,6 +87381,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "query_complete": {
           "title": "Query complete",
           "type": "boolean"
+        },
+        "query_exact": {
+          "title": "Query exact",
+          "type": "boolean"
+        },
+        "query_provenance": {
+          "title": "Query provenance",
+          "type": "string",
+          "enum": [
+            "materialized_rollup",
+            "bounded_candidates",
+            "exact_snapshot"
+          ]
         },
         "query_status": {
           "title": "Query status",
@@ -87303,7 +87485,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "time_stratified_latest_state",
-            "bounded_latest_state_prefix"
+            "bounded_latest_state_prefix",
+            "newest_trace_candidates"
           ]
         },
         "query_sampling_strata": {
@@ -88726,6 +88909,27 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "ProjectGraphDataResult": {
+      "required": [
+        "system_metrics",
+        "evaluations"
+      ],
+      "type": "object",
+      "properties": {
+        "system_metrics": {
+          "title": "System metrics",
+          "type": "object",
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "evaluations": {
+          "title": "Evaluations",
+          "type": "object",
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        }
+      }
+    },
     "ProjectIdListResult": {
       "required": [
         "projects"
@@ -88736,6 +88940,78 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "array",
           "items": {
             "$ref": "#/definitions/ProjectIdListItem"
+          }
+        }
+      }
+    },
+    "ProjectUserGraphDataResult": {
+      "required": [
+        "session",
+        "trace",
+        "cost",
+        "input_tokens",
+        "output_tokens"
+      ],
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          }
+        },
+        "trace": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          }
+        },
+        "cost": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          }
+        },
+        "input_tokens": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          }
+        },
+        "output_tokens": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
           }
         }
       }
@@ -93087,6 +93363,37 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "TraceSessionListResult": {
+      "required": [
+        "metadata",
+        "table",
+        "config"
+      ],
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "$ref": "#/definitions/TraceSessionListMetadata"
+        },
+        "table": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          }
+        },
+        "config": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TraceObserveColumnConfig"
+          }
+        }
+      }
+    },
     "TraceToGraphResult": {
       "required": [
         "graph_id",
@@ -94390,7 +94697,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "table": {
           "type": "array",
           "items": {
-            "type": "object"
+            "$ref": "#/definitions/UsersTableRow"
           }
         },
         "total_count": {
@@ -94426,6 +94733,30 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "complete",
             "degraded"
           ]
+        },
+        "query_exact": {
+          "title": "Query exact",
+          "type": "boolean"
+        },
+        "query_provenance": {
+          "title": "Query provenance",
+          "type": "string",
+          "enum": [
+            "span_user_rollup_end_users_candidate"
+          ]
+        },
+        "ordering_exact": {
+          "title": "Ordering exact",
+          "type": "boolean"
+        },
+        "approximate_fields": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "num_sessions"
+            ]
+          }
         }
       }
     },
@@ -95982,7 +96313,6 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "complete",
-            "sampled",
             "degraded"
           ]
         },
@@ -95992,7 +96322,24 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "enum": [
             "sample_limit",
             "read_budget_exceeded",
-            "query_failed"
+            "query_failed",
+            "bounded_shape_unavailable",
+            "invalid_window",
+            "malformed_result"
+          ]
+        },
+        "query_exact": {
+          "title": "Query exact",
+          "type": "boolean"
+        },
+        "query_provenance": {
+          "title": "Query provenance",
+          "type": "string",
+          "enum": [
+            "exact_snapshot",
+            "materialized_rollup",
+            "authorized_empty_scope",
+            "bounded_unavailable"
           ]
         },
         "query_sampling_strategy": {
@@ -100108,7 +100455,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
       }
     },
     "ObserveGraphDataPoint": {
-      "description": "Exact graph points. Pending or failed refreshes never publish partial aggregate values.",
+      "description": "Graph points. A sampled series is published only with complete declared stratum coverage; degraded reads never publish points.",
       "required": [
         "timestamp",
         "value"
@@ -102110,6 +102457,89 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "TraceSessionListMetadata": {
+      "required": [
+        "total_rows"
+      ],
+      "type": "object",
+      "properties": {
+        "total_rows": {
+          "title": "Total rows",
+          "type": "integer"
+        },
+        "total_rows_exact": {
+          "title": "Total rows exact",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "total_rows_is_lower_bound": {
+          "title": "Total rows is lower bound",
+          "type": "boolean"
+        },
+        "has_more": {
+          "title": "Has more",
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "title": "Next cursor",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "query_complete": {
+          "title": "Query complete",
+          "type": "boolean"
+        },
+        "query_status": {
+          "title": "Query status",
+          "type": "string",
+          "enum": [
+            "complete",
+            "degraded"
+          ]
+        },
+        "query_error_code": {
+          "title": "Query error code",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "query_elapsed_ms": {
+          "title": "Query elapsed ms",
+          "type": "number"
+        },
+        "query_count": {
+          "title": "Query count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_rows_returned": {
+          "title": "Query rows returned",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_result_payload_bytes": {
+          "title": "Query result payload bytes",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_exact": {
+          "title": "Query exact",
+          "type": "boolean"
+        },
+        "query_provenance": {
+          "title": "Query provenance",
+          "type": "string",
+          "enum": [
+            "spans_per_session_candidate"
+          ]
+        },
+        "ordering_exact": {
+          "title": "Ordering exact",
+          "type": "boolean"
+        }
+      }
+    },
     "TracesAggregates": {
       "required": [
         "total_traces",
@@ -102835,6 +103265,129 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "type": "string",
             "minLength": 1
           }
+        }
+      }
+    },
+    "UsersTableRow": {
+      "required": [
+        "total_cost"
+      ],
+      "type": "object",
+      "properties": {
+        "user_id": {
+          "title": "User id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "total_cost": {
+          "title": "Total cost",
+          "type": "number"
+        },
+        "total_tokens": {
+          "title": "Total tokens",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "input_tokens": {
+          "title": "Input tokens",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "output_tokens": {
+          "title": "Output tokens",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "num_traces": {
+          "title": "Num traces",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "num_sessions": {
+          "title": "Num sessions",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "num_sessions_is_approximate": {
+          "title": "Num sessions is approximate",
+          "type": "boolean"
+        },
+        "avg_session_duration": {
+          "title": "Avg session duration",
+          "type": "number",
+          "x-nullable": true
+        },
+        "avg_trace_latency": {
+          "title": "Avg trace latency",
+          "type": "number",
+          "x-nullable": true
+        },
+        "num_llm_calls": {
+          "title": "Num llm calls",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "num_guardrails_triggered": {
+          "title": "Num guardrails triggered",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "activated_at": {
+          "title": "Activated at",
+          "type": "string",
+          "format": "date-time",
+          "x-nullable": true
+        },
+        "last_active": {
+          "title": "Last active",
+          "type": "string",
+          "format": "date-time",
+          "x-nullable": true
+        },
+        "num_active_days": {
+          "title": "Num active days",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "num_traces_with_errors": {
+          "title": "Num traces with errors",
+          "type": "integer",
+          "x-nullable": true
+        },
+        "bool_eval_pass_rate": {
+          "title": "Bool eval pass rate",
+          "type": "number",
+          "x-nullable": true
+        },
+        "avg_output_float": {
+          "title": "Avg output float",
+          "type": "number",
+          "x-nullable": true
+        },
+        "project_id": {
+          "title": "Project id",
+          "type": "string",
+          "format": "uuid",
+          "x-nullable": true
+        },
+        "user_id_type": {
+          "title": "User id type",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "user_id_hash": {
+          "title": "User id hash",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "end_user_id": {
+          "title": "End user id",
+          "type": "string",
+          "format": "uuid",
+          "x-nullable": true
         }
       }
     },

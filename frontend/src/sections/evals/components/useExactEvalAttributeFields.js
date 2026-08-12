@@ -1,4 +1,4 @@
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
@@ -52,6 +52,7 @@ export function useExactEvalAttributeFields({
   search,
   enabled = true,
 }) {
+  const queryClient = useQueryClient();
   const normalizedRowType = normalizeExactAttributeRowType(rowType);
   const debouncedSearch = useDebounce(String(search || "").trim(), 350);
   const exactSearch =
@@ -88,11 +89,13 @@ export function useExactEvalAttributeFields({
     queryFn: ({ signal, pageParam }) =>
       readAttributeKeyPage({
         pageParam,
+        pageSize: 10,
+        publishedData: queryClient.getQueryData(retainedQueryKey),
         signal,
-        requestPage: (cursor) =>
+        requestPage: (cursor, requestSignal = signal) =>
           axios
             .get(endpoints.project.spanAttributeKeys(), {
-              signal,
+              signal: requestSignal,
               timeout: ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
               params: {
                 project_id: projectId,
@@ -120,11 +123,13 @@ export function useExactEvalAttributeFields({
     queryFn: ({ signal, pageParam }) =>
       readAttributeKeyPage({
         pageParam,
+        pageSize: 10,
+        publishedData: queryClient.getQueryData(exactQueryKey),
         signal,
-        requestPage: (cursor) =>
+        requestPage: (cursor, requestSignal = signal) =>
           axios
             .get(endpoints.project.spanAttributeKeys(), {
-              signal,
+              signal: requestSignal,
               timeout: ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
               params: {
                 project_id: projectId,

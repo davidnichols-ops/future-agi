@@ -16,10 +16,15 @@ from tracer.services.clickhouse.bounded_graph_reads import (
     read_graph_candidates,
 )
 from tracer.services.clickhouse.graph_dispatch import (
+    degraded_graph_response,
     fetch_annotation_graph_ch,
     fetch_eval_graph_ch,
+    format_system_metric_graph,
 )
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
+from tracer.services.clickhouse.query_builders.session_time_series import (
+    SessionRollupTimeSeriesQueryBuilder,
+)
 from tracer.services.clickhouse.query_service import QueryExecutor, QueryResult
 from tracer.services.clickhouse.read_budget import (
     ReadDeadline,
@@ -33,8 +38,9 @@ from tracer.services.exact_aggregation_cache import (
     read_or_schedule_exact_snapshot,
 )
 
-SESSION_GRAPH_WALL_DEADLINE_MS = 30_000
-SESSION_GRAPH_QUERY_TIMEOUT_MS = 30_000
+SESSION_GRAPH_WALL_DEADLINE_MS = 9_500
+SESSION_GRAPH_QUERY_TIMEOUT_MS = 9_500
+SESSION_GRAPH_INTERACTIVE_QUERY_TIMEOUT_MS = 9_500
 SESSION_GRAPH_RESULT_BYTES = 32 * 1024 * 1024
 SESSION_GRAPH_HYDRATION_BATCH_SIZE = 512
 SESSION_GRAPH_MAX_HYDRATION_QUERIES = (
@@ -61,11 +67,28 @@ SESSION_SYSTEM_METRICS = frozenset(
 _SESSION_IDENTITY_ONLY_METRICS = frozenset(
     {"traffic", "session_count", "avg_traces_per_session"}
 )
+_SESSION_ROLLUP_METRICS = SESSION_SYSTEM_METRICS - {"avg_traces_per_session"}
+_SESSION_ROLLUP_RESULT_COLUMNS = frozenset(
+    {
+        "time_bucket",
+        "avg_latency",
+        "total_tokens",
+        "avg_cost",
+        "traffic_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "error_rate",
+        "session_count",
+        "avg_duration",
+        "avg_traces_per_session",
+        "total_cost_sum",
+    }
+)
 
 _SESSION_GRAPH_READ_CAPS = {
-    "max_threads": 1,
+    "max_threads": 4,
     "max_block_size": 8192,
-    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
     "max_result_rows": 10_001,
     "max_result_bytes": SESSION_GRAPH_RESULT_BYTES,
@@ -96,12 +119,99 @@ def _bounded_read_settings(settings: dict[str, Any] | None) -> dict[str, Any]:
     return bounded
 
 
+def _has_only_positive_window_filters(filters: list[dict[str, Any]]) -> bool:
+    """Return whether the session rollup can answer the whole filter shape."""
+
+    return all(
+        (item.get("column_id") or item.get("columnId")) in {"created_at", "start_time"}
+        and not BaseQueryBuilder.is_datetime_complement_filter(item)
+        for item in filters
+    )
+
+
+def _require_rollup_result_shape(rows: list[Any], columns: list[str]) -> None:
+    """Reject schema drift instead of publishing a successful zero graph."""
+
+    missing = _SESSION_ROLLUP_RESULT_COLUMNS.difference(columns)
+    if missing:
+        raise BoundedGraphReadError("query_failed")
+    bucket_index = columns.index("time_bucket")
+    for row in rows:
+        bucket = (
+            row.get("time_bucket")
+            if isinstance(row, dict)
+            else row[bucket_index]
+            if bucket_index < len(row)
+            else None
+        )
+        if bucket is None:
+            raise BoundedGraphReadError("query_failed")
+
+
+def _fetch_rollup_system_metric_graph(
+    *,
+    analytics: QueryExecutor,
+    project_id: str,
+    filters: list[dict[str, Any]],
+    interval: str,
+    metric_id: str,
+    started: float,
+) -> dict[str, Any]:
+    """Execute one retained-rollup statement inside the interactive deadline."""
+
+    builder = SessionRollupTimeSeriesQueryBuilder(
+        project_id=project_id,
+        filters=filters,
+        interval=interval,
+    )
+    query, params = builder.build()
+    if (
+        builder.start_date is not None
+        and builder.end_date is not None
+        and builder.start_date >= builder.end_date
+    ):
+        rows: list[Any] = []
+        columns: list[str] = []
+        query_count = 0
+    else:
+        result = analytics.execute_ch_query(
+            query,
+            params,
+            timeout_ms=SESSION_GRAPH_INTERACTIVE_QUERY_TIMEOUT_MS,
+            settings={"max_threads": 4},
+        )
+        rows = list(result.data or [])
+        columns = list(result.columns or [])
+        _require_rollup_result_shape(rows, columns)
+        query_count = 1
+    response = format_system_metric_graph(
+        builder.format_result(rows, columns),
+        metric_id,
+    )
+    response.update(
+        {
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
+            "query_count": query_count,
+            "query_elapsed_ms": round((monotonic() - started) * 1000, 3),
+            "query_rows_returned": len(rows),
+            "query_provenance": "materialized_rollup",
+            "query_exact": False,
+        }
+    )
+    return response
+
+
 class _DeadlineBoundAnalytics:
     """Clamp every nested graph query to one monotonic request deadline."""
 
     def __init__(self, delegate: QueryExecutor, deadline: ReadDeadline) -> None:
         self._delegate = delegate
         self._deadline = deadline
+        self.supports_per_query_read_settings = bool(
+            getattr(delegate, "supports_per_query_read_settings", True)
+        )
 
     def execute_ch_query(
         self,
@@ -446,6 +556,7 @@ def _fetch_system_metric_graph(
     interval: str,
     metric_id: str,
     started: float,
+    deadline_ms: int = SESSION_GRAPH_WALL_DEADLINE_MS,
 ) -> dict[str, Any]:
     """Aggregate latest trace rows from an exact or fully executed sample."""
 
@@ -465,70 +576,91 @@ def _fetch_system_metric_graph(
         # a bounded session-level selector for those shapes.
         raise BoundedGraphReadError("unsupported_filter_shape")
     session_filters = _session_scoped_filters(filters)
-    sample = read_graph_candidates(
-        analytics=analytics,
-        project_id=project_id,
-        filters=session_filters,
-        observe_type="trace",
-        deadline_ms=GRAPH_DECORATION_CANDIDATE_DEADLINE_MS,
-    )
-    # A session graph folds every selected trace into per-session aggregates.
-    # A distributed sample changes membership and values, so it is renderable
-    # only when all declared strata executed and the response retains the
-    # selector's explicit sampled metadata. Failed/partial reads still fail
-    # closed and never reach the reducer.
-    if not sample.query_complete and not (
-        sample.query_status == "sampled"
-        and sample.query_error_code == "sample_limit"
-        and sample.sampling_strategy
-        and sample.sampling_strata > 0
-        and sample.sampling_strata_completed == sample.sampling_strata
-    ):
-        raise BoundedGraphReadError(sample.query_error_code or "sample_limit")
-    rows = tuple(sample.rows)
-    hydration_query_count = 0
-    hydration_rows_returned = 0
-    hydration_result_payload_bytes = 0
-    if metric_id not in _SESSION_IDENTITY_ONLY_METRICS:
-        (
-            rows,
-            hydration_query_count,
-            hydration_rows_returned,
-            hydration_result_payload_bytes,
-        ) = _hydrate_session_trace_candidates(
+    sample: GraphCandidateSample | None = None
+    try:
+        sample = read_graph_candidates(
             analytics=analytics,
             project_id=project_id,
             filters=session_filters,
+            observe_type="trace",
+            deadline_ms=min(
+                int(deadline_ms),
+                GRAPH_DECORATION_CANDIDATE_DEADLINE_MS,
+            ),
+        )
+        # A session graph folds every selected trace into per-session aggregates.
+        # A distributed sample changes membership and values, so it is renderable
+        # only when all declared strata executed and the response retains the
+        # selector's explicit sampled metadata. Failed/partial reads still fail
+        # closed and never reach the reducer.
+        if not sample.query_complete and not (
+            sample.query_status == "sampled"
+            and sample.query_error_code == "sample_limit"
+            and sample.sampling_strategy
+            and sample.sampling_strata > 0
+            and sample.sampling_strata_completed == sample.sampling_strata
+        ):
+            raise BoundedGraphReadError(sample.query_error_code or "sample_limit")
+        rows = tuple(sample.rows)
+        hydration_query_count = 0
+        hydration_rows_returned = 0
+        hydration_result_payload_bytes = 0
+        if metric_id not in _SESSION_IDENTITY_ONLY_METRICS:
+            (
+                rows,
+                hydration_query_count,
+                hydration_rows_returned,
+                hydration_result_payload_bytes,
+            ) = _hydrate_session_trace_candidates(
+                analytics=analytics,
+                project_id=project_id,
+                filters=session_filters,
+                rows=rows,
+            )
+        raw_session_ids = tuple(
+            dict.fromkeys(
+                str(row.get("trace_session_id"))
+                for row in rows
+                if row.get("trace_session_id")
+            )
+        )
+        if rows and len(raw_session_ids) == 0:
+            raise BoundedGraphReadError("query_failed")
+        session_id_map, remap_rows_returned, remap_result_payload_bytes = (
+            _canonical_session_ids(
+                analytics=analytics,
+                session_ids=raw_session_ids,
+            )
+        )
+        return _aggregate_session_candidates(
+            sample=sample,
             rows=rows,
+            session_id_map=session_id_map,
+            interval=interval,
+            metric_id=metric_id,
+            started=started,
+            extra_query_count=(hydration_query_count + (1 if raw_session_ids else 0)),
+            extra_rows_returned=hydration_rows_returned + remap_rows_returned,
+            extra_result_payload_bytes=(
+                hydration_result_payload_bytes + remap_result_payload_bytes
+            ),
         )
-    raw_session_ids = tuple(
-        dict.fromkeys(
-            str(row.get("trace_session_id"))
-            for row in rows
-            if row.get("trace_session_id")
+    except BoundedGraphReadError as exc:
+        return degraded_graph_response(
+            metric_id,
+            exc,
+            sample=sample,
+            provenance="bounded_candidates",
         )
-    )
-    if rows and len(raw_session_ids) == 0:
-        raise BoundedGraphReadError("query_failed")
-    session_id_map, remap_rows_returned, remap_result_payload_bytes = (
-        _canonical_session_ids(
-            analytics=analytics,
-            session_ids=raw_session_ids,
+    except Exception as exc:
+        if not is_read_budget_error(exc):
+            raise
+        return degraded_graph_response(
+            metric_id,
+            exc,
+            sample=sample,
+            provenance="bounded_candidates",
         )
-    )
-    return _aggregate_session_candidates(
-        sample=sample,
-        rows=rows,
-        session_id_map=session_id_map,
-        interval=interval,
-        metric_id=metric_id,
-        started=started,
-        extra_query_count=(hydration_query_count + (1 if raw_session_ids else 0)),
-        extra_rows_returned=hydration_rows_returned + remap_rows_returned,
-        extra_result_payload_bytes=(
-            hydration_result_payload_bytes + remap_result_payload_bytes
-        ),
-    )
 
 
 def _session_scoped_filters(
@@ -562,14 +694,10 @@ def fetch_session_graph_ch(
     organization_id: str | None = None,
     workspace_id: str | None = None,
 ) -> dict[str, Any]:
-    """Dispatch complete exact session aggregates to direct-write CH25."""
+    """Dispatch rollups, bounded average-trace samples, or exact snapshots."""
 
     if wall_deadline_ms <= 0:
         raise ValueError("session graph wall deadline must be positive")
-    deadline = ReadDeadline.start(
-        min(int(wall_deadline_ms), SESSION_GRAPH_WALL_DEADLINE_MS)
-    )
-    bounded_analytics = _DeadlineBoundAnalytics(analytics, deadline)
     metric_type = str(req_data_config.get("type") or "")
     metric_id = str(req_data_config.get("id") or "session_count")
     filters = list(filters or [])
@@ -577,6 +705,54 @@ def fetch_session_graph_ch(
     if metric_type == "SYSTEM_METRIC":
         if metric_id not in SESSION_SYSTEM_METRICS:
             raise ValueError("Unsupported session system metric")
+        if metric_id in _SESSION_ROLLUP_METRICS and _has_only_positive_window_filters(
+            filters
+        ):
+            if not bool(getattr(analytics, "supports_per_query_read_settings", True)):
+                return degraded_graph_response(
+                    metric_id,
+                    BoundedGraphReadError("query_failed", retryable=True),
+                    provenance="server_read_policy_unavailable",
+                )
+            started = monotonic()
+            deadline = ReadDeadline.start(
+                min(
+                    int(wall_deadline_ms),
+                    SESSION_GRAPH_INTERACTIVE_QUERY_TIMEOUT_MS,
+                )
+            )
+            return _fetch_rollup_system_metric_graph(
+                analytics=_DeadlineBoundAnalytics(analytics, deadline),
+                project_id=str(project_id),
+                filters=filters,
+                interval=interval,
+                metric_id=metric_id,
+                started=started,
+            )
+        if metric_id == "avg_traces_per_session" and _has_only_positive_window_filters(
+            filters
+        ):
+            started = monotonic()
+            deadline_ms = min(int(wall_deadline_ms), SESSION_GRAPH_WALL_DEADLINE_MS)
+            response = _fetch_system_metric_graph(
+                analytics=_DeadlineBoundAnalytics(
+                    analytics,
+                    ReadDeadline.start(deadline_ms),
+                ),
+                project_id=str(project_id),
+                filters=filters,
+                interval=interval,
+                metric_id=metric_id,
+                started=started,
+                deadline_ms=deadline_ms,
+            )
+            response.update(
+                {
+                    "query_exact": False,
+                    "query_provenance": "bounded_candidates",
+                }
+            )
+            return response
         identity = {
             "project_id": str(project_id),
             "filters": filters,
@@ -601,6 +777,13 @@ def fetch_session_graph_ch(
             },
         )
 
+    # Eval and annotation graphs, like filtered system graphs, are exact
+    # aggregation snapshots. Their request path only schedules/polls work and
+    # performs no ClickHouse read.
+    bounded_analytics = _DeadlineBoundAnalytics(
+        analytics,
+        ReadDeadline.start(min(int(wall_deadline_ms), SESSION_GRAPH_WALL_DEADLINE_MS)),
+    )
     session_filters = _session_scoped_filters(filters)
     if metric_type == "EVAL":
         return fetch_eval_graph_ch(
@@ -633,6 +816,7 @@ def fetch_session_graph_ch(
 
 __all__ = [
     "SESSION_GRAPH_QUERY_TIMEOUT_MS",
+    "SESSION_GRAPH_INTERACTIVE_QUERY_TIMEOUT_MS",
     "SESSION_GRAPH_WALL_DEADLINE_MS",
     "SESSION_SYSTEM_METRICS",
     "fetch_session_graph_ch",

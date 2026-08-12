@@ -20,6 +20,7 @@ from tracer.serializers.filters import (
     bounded_filter_list_query_param_field,
     filter_list_query_param_field,
 )
+from tracer.services.user_attribute_contract import unsupported_user_attribute_keys
 
 
 class TraceSerializer(serializers.ModelSerializer):
@@ -282,6 +283,16 @@ class TraceObserveListMetadataSerializer(serializers.Serializer):
     query_result_payload_bytes = serializers.IntegerField(required=False, min_value=0)
 
 
+class TraceSessionListMetadataSerializer(TraceObserveListMetadataSerializer):
+    """Session-list page completeness plus non-exact candidate ordering."""
+
+    query_exact = serializers.BooleanField(required=False)
+    query_provenance = serializers.ChoiceField(
+        choices=("spans_per_session_candidate",), required=False
+    )
+    ordering_exact = serializers.BooleanField(required=False)
+
+
 class TraceObserveColumnConfigSerializer(serializers.Serializer):
     """One column-config row — the asdict() shape of tracer.utils.helper.FieldConfig."""
 
@@ -317,6 +328,15 @@ class TraceObserveListResultSerializer(serializers.Serializer):
 class TraceObserveListResponseSerializer(serializers.Serializer):
     status = serializers.BooleanField()
     result = TraceObserveListResultSerializer()
+
+
+class TraceSessionListResultSerializer(TraceObserveListResultSerializer):
+    metadata = TraceSessionListMetadataSerializer()
+
+
+class TraceSessionListResponseSerializer(serializers.Serializer):
+    status = serializers.BooleanField()
+    result = TraceSessionListResultSerializer()
 
 
 class TracePrototypeListResultSerializer(serializers.Serializer):
@@ -652,6 +672,29 @@ class UsersQuerySerializer(StrictInputSerializer):
                     )
                 }
             )
+        unsupported_projection_keys = unsupported_user_attribute_keys(attribute_keys)
+        if unsupported_projection_keys:
+            raise serializers.ValidationError(
+                {
+                    "attribute_keys": (
+                        "Observe Users does not support payload attribute keys: "
+                        + ", ".join(unsupported_projection_keys)
+                    )
+                }
+            )
+        unsupported_filter_keys = unsupported_user_attribute_keys(
+            item.get("column_id") or item.get("columnId")
+            for item in attrs.get("filters", [])
+        )
+        if unsupported_filter_keys:
+            raise serializers.ValidationError(
+                {
+                    "filters": (
+                        "Observe Users does not support payload attribute keys: "
+                        + ", ".join(unsupported_filter_keys)
+                    )
+                }
+            )
         attrs["requested_columns"] = list(requested_columns)
         attrs["attribute_keys"] = list(attribute_keys)
         return validate_cursor_exclusivity(
@@ -670,6 +713,7 @@ class UsersTableRowSerializer(serializers.Serializer):
     output_tokens = serializers.IntegerField(required=False, allow_null=True)
     num_traces = serializers.IntegerField(required=False, allow_null=True)
     num_sessions = serializers.IntegerField(required=False, allow_null=True)
+    num_sessions_is_approximate = serializers.BooleanField(required=False)
     avg_session_duration = serializers.FloatField(required=False, allow_null=True)
     avg_trace_latency = serializers.FloatField(required=False, allow_null=True)
     num_llm_calls = serializers.IntegerField(required=False, allow_null=True)
@@ -687,7 +731,7 @@ class UsersTableRowSerializer(serializers.Serializer):
 
 
 class UsersResultSerializer(serializers.Serializer):
-    table = serializers.ListField(child=serializers.JSONField())
+    table = UsersTableRowSerializer(many=True)
     total_count = serializers.IntegerField()
     total_pages = serializers.IntegerField()
     count_is_lower_bound = serializers.BooleanField(required=False)
@@ -696,6 +740,15 @@ class UsersResultSerializer(serializers.Serializer):
     query_complete = serializers.BooleanField(required=False)
     query_status = serializers.ChoiceField(
         choices=("complete", "degraded"), required=False
+    )
+    query_exact = serializers.BooleanField(required=False)
+    query_provenance = serializers.ChoiceField(
+        choices=("span_user_rollup_end_users_candidate",), required=False
+    )
+    ordering_exact = serializers.BooleanField(required=False)
+    approximate_fields = serializers.ListField(
+        child=serializers.ChoiceField(choices=("num_sessions",)),
+        required=False,
     )
 
 

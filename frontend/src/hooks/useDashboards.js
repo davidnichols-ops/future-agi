@@ -6,7 +6,7 @@ import {
 } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import { getFilterValueReadState } from "src/utils/queryReadState";
-import { followEmptyListContinuations } from "src/sections/projects/LLMTracing/listCursorPagination";
+import { accumulateUniqueListContinuations } from "src/sections/projects/LLMTracing/listCursorPagination";
 
 const DASHBOARD_KEYS = {
   all: ["dashboards"],
@@ -80,10 +80,10 @@ const validateFilterValueCursor = (page, consumedCursors = new Set()) => {
 };
 
 // The shared Axios instance intentionally has no global timeout. Distinct
-// value browsing is interactive and the API has a 30-second read ceiling, so
+// value browsing is interactive and the API has a 9.5-second read ceiling, so
 // release the picker shortly after that boundary instead of leaving Load more
 // in a permanent spinner when a proxy/request stalls.
-export const FILTER_VALUE_REQUEST_TIMEOUT_MS = 35_000;
+export const FILTER_VALUE_REQUEST_TIMEOUT_MS = 9_800;
 
 const getFilterValueIdentity = (option) => {
   const value =
@@ -410,10 +410,11 @@ export function useDashboardFilterValues({
   const query = useInfiniteQuery({
     queryKey,
     queryFn: async ({ signal, pageParam }) => {
-      const requestPage = (cursor) =>
+      const actionStartedAt = Date.now();
+      const requestPage = (cursor, requestSignal = signal) =>
         axios
           .get(endpoints.dashboard.filterValues, {
-            signal,
+            signal: requestSignal,
             timeout: FILTER_VALUE_REQUEST_TIMEOUT_MS,
             params: {
               metric_name: metricName,
@@ -431,14 +432,12 @@ export function useDashboardFilterValues({
       const cachedData = queryClient.getQueryData(queryKey);
       const cachedPages = cachedData?.pages || [];
       const isFreshChainRead = pageParam == null;
-      const knownValueIdentities = new Set(
-        isFreshChainRead
-          ? []
-          : cachedPages.flatMap((page) =>
-              (page?.values || []).map(getFilterValueIdentity),
-            ),
-      );
-      const followedCursors = new Set(
+      const knownValueIdentities = isFreshChainRead
+        ? []
+        : cachedPages.flatMap((page) =>
+            (page?.values || []).map(getFilterValueIdentity),
+          );
+      const consumedCursors = new Set(
         [
           ...(isFreshChainRead ? [] : cachedData?.pageParams || []),
           ...(isFreshChainRead
@@ -451,16 +450,17 @@ export function useDashboardFilterValues({
       );
       const initialPage = await requestPage(pageParam);
       const checkedMetadata = (response) =>
-        validateFilterValueCursor(response, followedCursors);
-      const page = await followEmptyListContinuations({
+        validateFilterValueCursor(response, consumedCursors);
+      const {
+        response: page,
+        rows: values,
+        followedCursors,
+      } = await accumulateUniqueListContinuations({
         initialResponse: initialPage,
-        rowsFromResponse: (response) =>
-          (response?.values || []).filter((option) => {
-            const identity = getFilterValueIdentity(option);
-            if (knownValueIdentities.has(identity)) return false;
-            knownValueIdentities.add(identity);
-            return true;
-          }),
+        rowsFromResponse: (response) => response?.values || [],
+        identityFromRow: getFilterValueIdentity,
+        knownIdentities: knownValueIdentities,
+        targetRowCount: isFreshChainRead ? 1 : pageSize || 10,
         // A private marker records a protocol stop for the picker. Project it
         // as terminal only for this bounded follower so no malformed/repeated
         // cursor is requested and the published response remains retryable.
@@ -473,14 +473,17 @@ export function useDashboardFilterValues({
         nextResponse: requestPage,
         onContinuation: (metadata) => {
           const nextCursor = getFilterValueNextCursor(metadata);
-          if (nextCursor) followedCursors.add(nextCursor);
+          if (nextCursor) consumedCursors.add(nextCursor);
         },
         isCurrent: () => !signal.aborted,
+        cancellationSignal: signal,
+        startedAt: actionStartedAt,
       });
       const checkedPage = checkedMetadata(page);
       return {
         ...checkedPage,
-        [FILTER_VALUE_FOLLOWED_CURSORS_KEY]: [...followedCursors],
+        values,
+        [FILTER_VALUE_FOLLOWED_CURSORS_KEY]: followedCursors,
       };
     },
     initialPageParam: null,

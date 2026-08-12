@@ -956,7 +956,7 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
             assert settings["preferred_max_column_in_block_size_bytes"] == 1_048_576
             assert "max_rows_to_read" not in settings
             assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
-            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
             assert settings["max_result_rows"] == 1
             return QueryResult(
                 [
@@ -1052,7 +1052,7 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
             assert timeout_ms <= 3_000
             assert settings["max_threads"] == 1
             assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
-            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
 
             candidate_ids = params.get("candidate_trace_ids")
             if candidate_ids is not None:
@@ -1216,7 +1216,7 @@ def test_trace_eval_witness_replay_uses_ten_id_batches_with_hard_caps(
                 "max_block_size": 2_048,
                 "preferred_max_column_in_block_size_bytes": 1_048_576,
                 "max_memory_usage": 36 * 1024 * 1024 * 1024,
-                "max_bytes_to_read": 512 * 1024 * 1024,
+                "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
                 "read_overflow_mode": "throw",
                 "result_overflow_mode": "throw",
                 "max_result_rows": len(trace_ids),
@@ -1287,7 +1287,7 @@ def test_dense_100k_custom_trace_witness_replay_is_a_bounded_fail_safe_only(
             assert settings["max_execution_time"] == 3
             assert settings["max_threads"] == 1
             assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
-            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
             assert settings["max_result_rows"] == len(params["candidate_trace_ids"])
             replayed = []
             for trace_id in params["candidate_trace_ids"]:
@@ -1535,7 +1535,7 @@ def test_workflow_one_phase_late_classifier_failure_never_returns_partial_rows()
             assert timeout_ms <= 3_000
             assert settings["max_threads"] == 1
             assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
-            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
             candidate_ids = params.get("candidate_trace_ids")
             if candidate_ids is not None:
                 self.classify_calls += 1

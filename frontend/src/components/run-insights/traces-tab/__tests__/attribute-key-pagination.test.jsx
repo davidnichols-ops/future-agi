@@ -69,7 +69,7 @@ describe("useRunInsightAttributeKeys", () => {
       1,
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
-        timeout: 35_000,
+        timeout: 9_800,
         params: { project_id: "project-large", page_size: 50 },
       }),
     );
@@ -81,7 +81,7 @@ describe("useRunInsightAttributeKeys", () => {
       2,
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
-        timeout: 35_000,
+        timeout: 9_800,
         params: {
           project_id: "project-large",
           page_size: 50,

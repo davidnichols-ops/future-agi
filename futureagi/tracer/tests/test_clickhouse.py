@@ -2518,7 +2518,7 @@ class TestTimeSeriesQueryBuilder:
             project_id="test-project-id", filters=[], interval="hour"
         )
         query, _ = builder.build()
-        assert "countMerge(error_count) * 100.0 / greatest(countMerge(n), 1)" in query
+        assert "countIfMerge(error_count) * 100.0 / greatest(countMerge(n), 1)" in query
 
     def test_agg_query_does_not_reference_legacy_table(self):
         """No path back to the legacy CDC-fed aggregate or its source."""
@@ -8266,6 +8266,7 @@ class TestAnnotationGraphQueryBuilder:
         project_id = "00000000-0000-4000-8000-000000000901"
         window_start = datetime(2026, 1, 1)
         with (
+            mock.patch.object(exact_graph_reads.connection, "vendor", "sqlite"),
             mock.patch.object(
                 exact_graph_reads,
                 "get_annotation_labels_for_project",
@@ -9029,6 +9030,95 @@ class TestSessionTimeSeriesQueryBuilder:
         assert "HAVING session_duration > %(having_901)s" in query
         assert "span_attr_num" not in query
         assert params["having_901"] == 50
+
+    def test_date_only_rollup_never_reads_raw_spans_or_global_remap(self):
+        from tracer.services.clickhouse.query_builders.session_time_series import (
+            SessionRollupTimeSeriesQueryBuilder,
+        )
+
+        builder = SessionRollupTimeSeriesQueryBuilder(
+            project_id="22222222-2222-4222-8222-222222222222",
+            interval="month",
+            filters=[
+                {
+                    "column_id": "created_at",
+                    "filter_config": {
+                        "filter_type": "datetime",
+                        "filter_op": "between",
+                        "filter_value": [
+                            "2025-08-12T00:00:00Z",
+                            "2026-08-12T00:00:00Z",
+                        ],
+                    },
+                }
+            ],
+        )
+
+        query, params = builder.build()
+
+        assert "FROM spans_per_session AS sps" in query
+        assert "FROM spans\n" not in query
+        assert "trace_session_id_remap" not in query
+        assert "FINAL" not in query
+        assert "hour_first_seen >= %(rollup_scan_start)s" in query
+        assert "hour_first_seen < %(rollup_scan_end)s" in query
+        assert "addHours(toStartOfHour(%(end_date)s), 1)" not in query
+        assert "session_start >= %(start_date)s" in query
+        assert params["start_date"] == datetime(2025, 8, 12)
+        assert params["end_date"] == datetime(2026, 8, 12)
+        assert params["rollup_scan_start"] == datetime(2025, 8, 12)
+        # An hour-aligned exclusive end must not scan the following hour.
+        assert params["rollup_scan_end"] == datetime(2026, 8, 12)
+
+    def test_date_only_rollup_rounds_only_unaligned_end_up_to_next_hour(self):
+        from tracer.services.clickhouse.query_builders.session_time_series import (
+            SessionRollupTimeSeriesQueryBuilder,
+        )
+
+        builder = SessionRollupTimeSeriesQueryBuilder(
+            project_id="22222222-2222-4222-8222-222222222222",
+            interval="day",
+            filters=[
+                {
+                    "column_id": "created_at",
+                    "filter_config": {
+                        "filter_type": "datetime",
+                        "filter_op": "between",
+                        "filter_value": [
+                            "2026-08-11T00:15:00Z",
+                            "2026-08-11T12:34:56Z",
+                        ],
+                    },
+                }
+            ],
+        )
+
+        _query, params = builder.build()
+
+        assert params["rollup_scan_start"] == datetime(2026, 8, 11)
+        assert params["rollup_scan_end"] == datetime(2026, 8, 11, 13)
+
+    def test_rollup_rejects_non_date_filter_shape(self):
+        from tracer.services.clickhouse.query_builders.session_time_series import (
+            SessionRollupTimeSeriesQueryBuilder,
+        )
+
+        builder = SessionRollupTimeSeriesQueryBuilder(
+            project_id="22222222-2222-4222-8222-222222222222",
+            filters=[
+                {
+                    "column_id": "model",
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "gpt-4.1",
+                    },
+                }
+            ],
+        )
+
+        with pytest.raises(ValueError, match="only positive datetime filters"):
+            builder.build()
 
 
 # ============================================================================

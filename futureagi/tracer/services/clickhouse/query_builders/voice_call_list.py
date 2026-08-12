@@ -222,52 +222,11 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
 
         return self._bounded_delegate().recommended_filter_seed_batch_size()
 
-    def supports_filter_candidate_seed_page(self) -> bool:
-        """Use sparse positive annotator membership before ordered voice roots."""
-
-        return bool(
-            not self._bounded_internal_scan
-            and not self._bounded_identity_only
-            and self._bounded_delegate()._positive_exact_annotator_seed_filter()
-            is not None
-        )
-
-    @staticmethod
-    def filter_candidate_seed_proves_result_order() -> bool:
-        """The candidate relation only narrows an unchanged root-order read."""
-
-        return True
-
-    def build_filter_candidate_seed_page(
-        self, **kwargs: Any
-    ) -> tuple[str, dict[str, Any]]:
-        """Build the exact Score-constrained ordered voice-root seed."""
-
-        if not self.supports_filter_candidate_seed_page():
-            raise ValueError("voice annotator candidate seed is unavailable")
-        return self._bounded_delegate().build_filter_ordered_seed_page(
-            **kwargs,
-            _positive_annotator_candidate_first=True,
-        )
-
-    def recommended_filter_initial_slice_width(self) -> timedelta | None:
-        """Read a sparse relational candidate set across the frozen window."""
-
-        if self.supports_filter_candidate_seed_page():
-            start, end = self._bounded_request_window
-            return end - start
-        return None
-
-    def recommended_filter_max_slice_width(self) -> timedelta | None:
-        """Permit the candidate-first seed to retain its exact full window."""
-
-        return self.recommended_filter_initial_slice_width()
-
     def recommended_filter_query_timeout_ms(self) -> int | None:
-        """Share the public endpoint's 30-second wall across required reads."""
+        """Share the public endpoint's 9.5-second wall across required reads."""
 
         if not self._bounded_internal_scan and not self._bounded_identity_only:
-            return 30_000
+            return 9_500
         return None
 
     def recommended_filter_classify_batch_size(self) -> int | None:

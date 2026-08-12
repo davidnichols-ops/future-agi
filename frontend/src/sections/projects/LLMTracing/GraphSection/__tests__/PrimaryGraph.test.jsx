@@ -103,7 +103,7 @@ describe("PrimaryGraph", () => {
       expect.objectContaining({
         project_id: "project-override",
       }),
-      expect.objectContaining({ params: { allow_sampled: false } }),
+      expect.objectContaining({ params: { allow_sampled: true } }),
     );
   });
 
@@ -122,7 +122,7 @@ describe("PrimaryGraph", () => {
       expect.objectContaining({
         project_id: "project-override",
       }),
-      expect.objectContaining({ params: { allow_sampled: false } }),
+      expect.objectContaining({ params: { allow_sampled: true } }),
     );
   });
 
@@ -229,7 +229,7 @@ describe("PrimaryGraph", () => {
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
   });
 
-  it("does not chart an explicitly sampled graph", async () => {
+  it("charts and labels a fully covered bounded graph sample", async () => {
     axios.post.mockResolvedValue({
       data: {
         result: {
@@ -243,6 +243,9 @@ describe("PrimaryGraph", () => {
           ],
           query_complete: false,
           query_status: "sampled",
+          query_sampled: true,
+          query_exact: false,
+          query_provenance: "bounded_candidates",
           query_error_code: "sample_limit",
           query_sampling_strategy: "time_stratified_latest_state",
           query_sampling_strata: 8,
@@ -255,13 +258,13 @@ describe("PrimaryGraph", () => {
       <PrimaryGraph observeIdOverride="project-override" />,
     );
 
+    expect(await screen.findByTestId("apex-chart")).toBeInTheDocument();
+    expect(screen.getByText(/sampled estimates/i)).toBeInTheDocument();
     expect(
-      await screen.findByText(
+      screen.queryByText(
         "We couldn't load this data. Please retry in a moment.",
       ),
-    ).toBeInTheDocument();
-    expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
-    expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument();
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByText("No data available for this time range"),
     ).not.toBeInTheDocument();
@@ -355,7 +358,7 @@ describe("PrimaryGraph", () => {
       "/tracer/trace/get_graph_methods/",
       expect.any(Object),
       expect.objectContaining({
-        params: { allow_sampled: false, refresh: true },
+        params: { allow_sampled: true, refresh: true },
       }),
     );
     expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument();
@@ -416,7 +419,7 @@ describe("PrimaryGraph", () => {
       2,
       "/tracer/trace/get_graph_methods/",
       expect.any(Object),
-      expect.objectContaining({ params: { allow_sampled: false } }),
+      expect.objectContaining({ params: { allow_sampled: true } }),
     );
     expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
     expect(exactCompletion).toHaveBeenCalledOnce();

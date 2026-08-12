@@ -276,6 +276,36 @@ class TestListBuilderOutputContract:
             }:
                 start, end = builder.parse_time_range(builder.filters)
                 result = method(slice_start=start, slice_end=end, limit=2)
+            elif name == "build_filter_candidate_seed_page":
+                if builder.supports_filter_candidate_seed_page():
+                    start, end = builder.parse_time_range(builder.filters)
+                    result = method(slice_start=start, slice_end=end, limit=2)
+                elif type(builder).__name__ == "TraceListQueryBuilderV2":
+                    original_filters = builder.filters
+                    original_internal_scan = builder._bounded_internal_scan
+                    builder.filters = [
+                        *original_filters,
+                        {
+                            "column_id": "end_user_id",
+                            "filter_config": {
+                                "col_type": "SYSTEM_METRIC",
+                                "filter_type": "text",
+                                "filter_op": "in",
+                                "filter_value": [
+                                    "00000000-0000-4000-8000-000000000001"
+                                ],
+                            },
+                        },
+                    ]
+                    builder._bounded_internal_scan = False
+                    try:
+                        start, end = builder.parse_time_range(builder.filters)
+                        result = method(slice_start=start, slice_end=end, limit=2)
+                    finally:
+                        builder.filters = original_filters
+                        builder._bounded_internal_scan = original_internal_scan
+                else:
+                    continue
             elif name == "build_filter_unindexed_micro_seed_page":
                 original_filters = builder.filters
                 builder.filters = [

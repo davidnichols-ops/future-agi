@@ -30,13 +30,13 @@ _CONTENT_BATCH_SIZE = 200
 _MAX_EVAL_ROWS = 5000
 _MAX_ANNOTATION_ROWS = 5000
 MAX_TRACE_DETAIL_EVAL_CONFIGS = 4096
-_DETAIL_DEADLINE_MS = 30_000
-_QUERY_TIMEOUT_MS = 30_000
+_DETAIL_DEADLINE_MS = 9_500
+_QUERY_TIMEOUT_MS = 9_500
 _READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
-    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "result_overflow_mode": "throw",
 }

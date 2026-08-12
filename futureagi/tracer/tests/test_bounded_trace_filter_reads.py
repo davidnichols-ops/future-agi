@@ -31,6 +31,9 @@ from tracer.services.clickhouse.query_builders.voice_call_list import (
 )
 from tracer.services.clickhouse.query_service import QueryResult
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+from tracer.services.clickhouse.v2.query_builders.session_list import (
+    SessionListQueryBuilderV2,
+)
 from tracer.services.clickhouse.v2.query_builders.span_list import (
     SpanListQueryBuilderV2,
 )
@@ -66,6 +69,26 @@ def _time_filter(start: datetime = START, end: datetime = END) -> dict[str, Any]
 
 def _short_time_filter() -> dict[str, Any]:
     return _time_filter(start=END - timedelta(minutes=30), end=END)
+
+
+@pytest.mark.parametrize(
+    ("period", "days"),
+    [("today", 1), ("7d", 7), ("30d", 30), ("3m", 90), ("6m", 180), ("12m", 365)],
+)
+def test_interactive_list_builder_period_matrix_freezes_exact_window(period, days):
+    del period
+    end = datetime(2026, 8, 11, 12)
+    start = end - timedelta(days=days)
+    filters = [_time_filter(start=start, end=end)]
+    builders = (
+        TraceListQueryBuilderV2(project_id=PROJECT_ID, filters=filters),
+        SpanListQueryBuilderV2(project_id=PROJECT_ID, filters=filters),
+        VoiceCallListQueryBuilderV2(project_id=PROJECT_ID, filters=filters),
+        SessionListQueryBuilderV2(project_id=PROJECT_ID, filters=filters),
+    )
+
+    for builder in builders:
+        assert builder.parse_time_range(filters) == (start, end)
 
 
 def _has_eval_filter(value: bool | str) -> dict[str, Any]:
@@ -195,6 +218,8 @@ class _ProjectConfigQuery:
 
     def filter(self, **kwargs):
         projects = kwargs.get("project_id__in")
+        if projects is None and kwargs.get("project_id") is not None:
+            projects = (kwargs["project_id"],)
         if projects is None:
             return self
         return _ProjectConfigQuery(
@@ -203,7 +228,10 @@ class _ProjectConfigQuery:
         )
 
     def exists(self):
-        return any(self._configs_by_project.values())
+        projects = self._selected_projects or tuple(self._configs_by_project)
+        return any(
+            self._configs_by_project.get(project_id, ()) for project_id in projects
+        )
 
     def values_list(self, field, **_kwargs):
         projects = self._selected_projects or tuple(self._configs_by_project)
@@ -819,7 +847,10 @@ def test_external_user_trace_candidate_seed_is_user_first_and_root_ordered(
     assert "user_candidate_end_us" not in params
 
 
-def test_structural_end_user_id_candidate_seed_uses_direct_uuid_predicate() -> None:
+@pytest.mark.parametrize("col_type", ["", "SYSTEM_METRIC"])
+def test_structural_end_user_id_candidate_seed_uses_direct_uuid_predicate(
+    col_type: str,
+) -> None:
     end_user_id = "50f8845d-e410-5ceb-9bb5-a0d5e7ca6773"
     builder = TraceListQueryBuilderV2(
         project_id=PROJECT_ID,
@@ -828,7 +859,7 @@ def test_structural_end_user_id_candidate_seed_uses_direct_uuid_predicate() -> N
             {
                 "column_id": "end_user_id",
                 "filter_config": {
-                    "col_type": "SYSTEM_METRIC",
+                    "col_type": col_type,
                     "filter_type": "text",
                     "filter_op": "equals",
                     "filter_value": end_user_id,
@@ -845,7 +876,7 @@ def test_structural_end_user_id_candidate_seed_uses_direct_uuid_predicate() -> N
     candidate_sql = sql.split("SELECT trace_id, id AS root_span_id", 1)[0]
 
     assert builder.supports_filter_candidate_seed_page() is True
-    assert builder.filter_seed_proves_result_order() is False
+    assert builder.filter_seed_proves_result_order() is True
     assert builder.filter_candidate_seed_proves_result_order() is True
     assert "matching_user_trace_identities AS" in candidate_sql
     assert "toString(end_user_id) = %(col_1)s" in candidate_sql
@@ -853,7 +884,7 @@ def test_structural_end_user_id_candidate_seed_uses_direct_uuid_predicate() -> N
     assert params["col_1"] == end_user_id
 
 
-def test_voice_annotator_and_turn_count_use_one_exact_candidate_seed() -> None:
+def test_voice_annotator_and_turn_count_use_resumable_bounded_seed() -> None:
     annotator_id = "00000000-0000-4000-8000-000000000099"
     filters = [
         _time_filter(),
@@ -882,28 +913,19 @@ def test_voice_annotator_and_turn_count_use_one_exact_candidate_seed() -> None:
         filters=filters,
     )
 
-    sql, params = builder.build_filter_candidate_seed_page(
+    sql, params = builder.build_filter_seed_page(
         slice_start=START,
         slice_end=END,
         limit=26,
     )
     compact_sql = " ".join(sql.split())
 
-    assert builder.supports_filter_candidate_seed_page() is True
-    assert builder.filter_candidate_seed_proves_result_order() is True
-    assert builder.recommended_filter_initial_slice_width() == END - START
-    assert builder.recommended_filter_max_slice_width() == END - START
-    assert builder.recommended_filter_query_timeout_ms() == 30_000
-    assert "FROM model_hub_score AS s FINAL" in compact_sql
-    assert "s.tracer_project_id = toUUID(%(project_id)s)" in compact_sql
-    assert "s.annotator_id IN (toUUID(%(uid_1)s))" in compact_sql
-    assert "s.created_at >=" not in compact_sql
-    assert "trace_id IN (SELECT DISTINCT" in compact_sql
-    assert "call.total_turns" in compact_sql
+    assert not hasattr(builder, "supports_filter_candidate_seed_page")
+    assert builder.recommended_filter_query_timeout_ms() == 9_500
+    assert "model_hub_score" not in compact_sql
     assert "observation_type" in compact_sql
     assert "ORDER BY start_time DESC, trace_id DESC" in compact_sql
     assert "LIMIT 1 BY trace_id LIMIT %(filter_seed_limit)s" in compact_sql
-    assert params["uid_1"] == annotator_id
     assert params["filter_seed_limit"] == 26
 
 
@@ -923,15 +945,7 @@ def test_negative_voice_annotator_stays_on_exact_bounded_classifier() -> None:
         ],
     )
 
-    assert builder.supports_filter_candidate_seed_page() is False
-    assert builder.recommended_filter_initial_slice_width() is None
-    assert builder.recommended_filter_max_slice_width() is None
-    with pytest.raises(ValueError, match="voice annotator candidate seed"):
-        builder.build_filter_candidate_seed_page(
-            slice_start=START,
-            slice_end=END,
-            limit=26,
-        )
+    assert not hasattr(builder, "supports_filter_candidate_seed_page")
 
 
 def test_raw_annotator_span_attribute_never_uses_score_candidate_seed() -> None:
@@ -951,7 +965,7 @@ def test_raw_annotator_span_attribute_never_uses_score_candidate_seed() -> None:
         ],
     )
 
-    assert builder.supports_filter_candidate_seed_page() is False
+    assert not hasattr(builder, "supports_filter_candidate_seed_page")
 
 
 @pytest.mark.parametrize("column_id", ["end_user_id", "user", "user_id"])
@@ -2906,6 +2920,7 @@ def test_trace_has_eval_false_is_latest_state_candidate_scoped(
     sql, params = builder.build_filter_match_query(["trace-a", "trace-b"])
 
     assert builder.supports_bounded_filter_scan() is True
+    assert builder.supports_filter_candidate_seed_page() is False
     assert "tracer_eval_logger" not in seed_sql
     assert seed_params["filter_before_id"] == "trace-z"
     assert "trace_id NOT IN (" in sql
@@ -3982,7 +3997,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget(
     assert (
         bounded_read.call_args.kwargs["deadline_ms"] <= TRACE_LIST_CANDIDATE_DEADLINE_MS
     )
-    assert TRACE_LIST_CANDIDATE_DEADLINE_MS == TRACE_LIST_WALL_DEADLINE_MS == 30_000
+    assert TRACE_LIST_CANDIDATE_DEADLINE_MS == TRACE_LIST_WALL_DEADLINE_MS == 9_500
     assert TRACE_LIST_ENRICHMENT_MAX_WORKERS == 2
     assert len(analytics.calls) == 2 * expected_chunks + 1
     content_chunks = [
@@ -4007,12 +4022,25 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget(
         0 < len(chunk) <= TRACE_LIST_ENRICHMENT_CHUNK_SIZE
         for chunk in (*content_chunks, *attribute_chunks)
     )
-    assert [trace_id for chunk in content_chunks for trace_id in chunk] == [
-        f"trace-{index}" for index in range(row_count)
+    expected_enrichment_chunks = [
+        tuple(
+            f"trace-{index}"
+            for index in range(
+                chunk_start,
+                min(chunk_start + TRACE_LIST_ENRICHMENT_CHUNK_SIZE, row_count),
+            )
+        )
+        for chunk_start in range(0, row_count, TRACE_LIST_ENRICHMENT_CHUNK_SIZE)
     ]
-    assert [trace_id for chunk in attribute_chunks for trace_id in chunk] == [
-        f"trace-{index}" for index in range(row_count)
-    ]
+    # Content and attribute queries share a two-worker pool. Their invocation
+    # order is intentionally nondeterministic, but every ordered page chunk
+    # must be submitted exactly once.
+    assert sorted(tuple(chunk) for chunk in content_chunks) == sorted(
+        expected_enrichment_chunks
+    )
+    assert sorted(tuple(chunk) for chunk in attribute_chunks) == sorted(
+        expected_enrichment_chunks
+    )
     assert all(
         0 < timeout_ms <= TRACE_LIST_ENRICHMENT_TIMEOUT_MS
         for _, timeout_ms, _ in analytics.calls
@@ -4026,10 +4054,10 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget(
     CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"},
 )
 def test_page_500_slow_candidate_admits_every_exact_enrichment_wave():
-    """The 30 s ceiling admits the modeled 14.3 s max-page exact replay.
+    """The 9.5 s ceiling admits the modeled 9.3 s max-page exact replay.
 
     The virtual two-worker scheduler is deterministic: the candidate consumes
-    8 s, each CH statement consumes its full 900 ms cap, and the optional user
+    3 s, each CH statement consumes its full 900 ms cap, and the optional user
     resolver consumes two statements. Five content chunks, five packed
     attribute chunks, packed evals, annotations, and user replay therefore use
     fourteen worker slots / two workers = seven waves. No required future may
@@ -4045,7 +4073,7 @@ def test_page_500_slow_candidate_admits_every_exact_enrichment_wave():
         TraceView,
     )
 
-    candidate_ms = 8_000
+    candidate_ms = 3_000
     query_ms = 900
     started = END - timedelta(minutes=1)
     rows = [
@@ -4244,8 +4272,8 @@ def test_page_500_slow_candidate_admits_every_exact_enrichment_wave():
 
     assert status_name == "ok"
     assert len(payload["table"]) == 500
-    assert TRACE_LIST_WALL_DEADLINE_MS == 30_000
-    assert deadline.now_ms == 14_300
+    assert TRACE_LIST_WALL_DEADLINE_MS == 9_500
+    assert deadline.now_ms == 9_300
     assert VirtualPool.instances[0].submit_count == 13
     assert all(
         0 < timeout <= TRACE_LIST_ENRICHMENT_TIMEOUT_MS
@@ -5694,6 +5722,18 @@ class _IdentityHydrationFakeBuilder(_FakeBuilder):
 
 
 @dataclass
+class _NewestPartitionTraceFakeBuilder(_IdentityHydrationFakeBuilder):
+    """Model the default trace list's tail-first adaptive traversal."""
+
+    def recommended_filter_max_slice_width(self) -> timedelta:
+        return self.end - self.start
+
+    @staticmethod
+    def allow_repeated_eager_identity_prefix_flushes() -> bool:
+        return True
+
+
+@dataclass
 class _CandidateFirstIdentityHydrationFakeBuilder(_IdentityHydrationFakeBuilder):
     @staticmethod
     def supports_filter_candidate_seed_page() -> bool:
@@ -5702,6 +5742,10 @@ class _CandidateFirstIdentityHydrationFakeBuilder(_IdentityHydrationFakeBuilder)
     @staticmethod
     def filter_candidate_seed_proves_result_order() -> bool:
         return True
+
+    @staticmethod
+    def recommended_filter_cursor_seed_batch_size() -> int:
+        return 101
 
     def build_filter_candidate_seed_page(
         self,
@@ -5832,7 +5876,7 @@ def test_candidate_first_seed_keeps_exact_classifier_and_page_hydration() -> Non
     seed_params = executor.calls[0][1]
     assert seed_params["slice_start"] == END - timedelta(days=365)
     assert seed_params["slice_end"] == END
-    assert seed_params["limit"] == 26
+    assert seed_params["limit"] == 101
     assert [attempt.kind for attempt in page.attempts] == [
         "seed",
         "classify",
@@ -5842,7 +5886,7 @@ def test_candidate_first_seed_keeps_exact_classifier_and_page_hydration() -> Non
         "max_rows_to_read" not in settings for _, settings in executor.settings_by_query
     )
     assert all(
-        settings["max_bytes_to_read"] == 512 * 1024 * 1024
+        settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
         and settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
         and settings["max_threads"] == 1
         and 0 < settings["max_result_rows"] <= 10_000
@@ -6594,6 +6638,129 @@ def test_builder_can_widen_only_the_first_exact_seed_slice() -> None:
     assert [query for query, _params in executor.calls] == ["seed", "match"]
     assert executor.calls[0][1]["slice_start"] == END - timedelta(hours=1)
     assert executor.calls[0][1]["slice_end"] == END
+
+
+def test_default_trace_page_is_window_invariant_and_reads_only_newest_slice() -> None:
+    rows = [
+        {
+            "id": f"trace-{index:02d}",
+            "root_span_id": f"root-{index:02d}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(30)
+    ]
+    pages = []
+    executors = []
+
+    for days in (30, 365):
+        builder = _NewestPartitionTraceFakeBuilder(
+            rows=rows,
+            start=END - timedelta(days=days),
+            end=END,
+            recommended_batch_size=80,
+            recommended_seed_batch_size=50,
+        )
+        executor = _IdentityHydrationFakeExecutor(builder)
+        pages.append(
+            read_bounded_filter_page(
+                builder=builder,
+                analytics=executor,
+                filters=[_time_filter(builder.start, builder.end)],
+                key_field="id",
+                page_number=0,
+                page_size=20,
+                deadline_ms=9_500,
+            )
+        )
+        executors.append(executor)
+
+    assert all(page.complete and page.has_more for page in pages)
+    assert [[row["id"] for row in page.rows] for page in pages] == [
+        [f"trace-{index:02d}" for index in range(20)],
+        [f"trace-{index:02d}" for index in range(20)],
+    ]
+    for executor in executors:
+        assert [query for query, _params in executor.calls] == [
+            "seed",
+            "match_identity",
+            "hydrate",
+        ]
+        seed_params = executor.calls[0][1]
+        assert seed_params["slice_start"] == END - timedelta(minutes=5)
+        assert seed_params["slice_end"] == END
+
+
+def test_default_trace_page_expands_only_after_newer_candidates_are_rejected() -> None:
+    rejected_rows = [
+        {
+            "id": f"rejected-{index:02d}",
+            "root_span_id": f"rejected-root-{index:02d}",
+            "start_time": END - timedelta(minutes=1, seconds=index),
+        }
+        for index in range(25)
+    ]
+    matching_rows = [
+        {
+            "id": f"match-{index:02d}",
+            "root_span_id": f"match-root-{index:02d}",
+            "start_time": END - timedelta(minutes=16, seconds=index),
+        }
+        for index in range(22)
+    ]
+    builder = _NewestPartitionTraceFakeBuilder(
+        rows=[*rejected_rows, *matching_rows],
+        match_rows=matching_rows,
+        start=END - timedelta(days=365),
+        end=END,
+        recommended_batch_size=80,
+        recommended_seed_batch_size=50,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(builder.start, builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=20,
+        deadline_ms=9_500,
+    )
+
+    assert page.complete is True
+    assert page.has_more is True
+    assert [row["id"] for row in page.rows] == [
+        f"match-{index:02d}" for index in range(20)
+    ]
+    seed_params = [params for query, params in executor.calls if query == "seed"]
+    assert [params["slice_end"] - params["slice_start"] for params in seed_params] == [
+        timedelta(minutes=5),
+        timedelta(minutes=10),
+        timedelta(minutes=20),
+    ]
+    assert seed_params[-1]["slice_start"] == END - timedelta(minutes=35)
+
+
+def test_default_trace_builder_allows_tail_first_walk_to_cover_full_window() -> None:
+    filters = [_time_filter(END - timedelta(days=365), END)]
+    builder = TraceListQueryBuilderV2(project_id=PROJECT_ID, filters=filters)
+
+    assert builder.recommended_filter_initial_slice_width() is None
+    assert builder.recommended_filter_max_slice_width() == timedelta(days=365)
+
+    custom_sort = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=filters,
+        sort_params=[{"column_id": "latency", "sort": "desc"}],
+    )
+    assert custom_sort.recommended_filter_max_slice_width() is None
+
+    project_version = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        project_version_id="00000000-0000-4000-8000-000000000099",
+        filters=filters,
+    )
+    assert project_version.recommended_filter_max_slice_width() == timedelta(days=365)
 
 
 def test_session_numbered_page_ceiling_is_deterministic() -> None:
@@ -10832,6 +10999,170 @@ def test_cursor_keyset_handles_equal_timestamps_without_duplicates_or_skips() ->
         row["id"] for row in second.rows
     )
     assert second.has_more is False
+
+
+def test_session_rollup_cursor_does_not_skip_resurrected_old_seed_on_page_two() -> None:
+    """An insert-only t1 seed must not be rewritten to its exact live t100.
+
+    The first 101 rollup positions are occupied by B sessions, so A is not
+    classified on page one. A's old root at t1 was later tombstoned and its
+    current live root is at t100. Replacing its seed order with t100 on page
+    two would put it above the signed page-one cursor and reject it forever.
+    """
+
+    window_start = END - timedelta(days=1)
+    session_a_seed_start = window_start + timedelta(seconds=1)
+    session_a_exact_start = END - timedelta(microseconds=1)
+    rollup_rows = [
+        {
+            "id": f"session-b-{index:03d}",
+            "start_time": window_start + timedelta(seconds=index + 1),
+        }
+        for index in range(1, 102)
+    ]
+    rollup_rows.append({"id": "session-a", "start_time": session_a_seed_start})
+
+    @dataclass
+    class SessionRollupCursorBuilder(_FakeBuilder):
+        @staticmethod
+        def supports_filter_candidate_seed_page() -> bool:
+            return True
+
+        @staticmethod
+        def filter_candidate_seed_proves_result_order() -> bool:
+            return True
+
+        @staticmethod
+        def recommended_filter_cursor_seed_batch_size() -> int:
+            return 101
+
+        @staticmethod
+        def recommended_filter_classify_batch_size() -> int:
+            return 50
+
+        @staticmethod
+        def bounded_filter_row_order_token(row: dict[str, Any]) -> str:
+            return str(row.get("_seed_order_id") or row["id"])
+
+        def recommended_filter_initial_slice_width(self) -> timedelta:
+            return self.end - self.start
+
+        def recommended_filter_max_slice_width(self) -> timedelta:
+            return self.end - self.start
+
+        def build_filter_candidate_seed_page(
+            self,
+            *,
+            slice_start: datetime,
+            slice_end: datetime,
+            limit: int,
+            before_start_time: datetime | None = None,
+            before_id: str | None = None,
+        ) -> tuple[str, dict[str, Any]]:
+            return "session_rollup_seed", {
+                "slice_start": slice_start,
+                "slice_end": slice_end,
+                "limit": limit,
+                "before_start_time": before_start_time,
+                "before_id": before_id,
+            }
+
+        @staticmethod
+        def build_filter_match_query_from_seed_rows(rows):
+            return "session_exact_from_seed", {
+                "seed_rows": tuple((row["id"], row["start_time"]) for row in rows)
+            }
+
+    class SessionRollupCursorExecutor:
+        def __init__(self, builder):
+            self.builder = builder
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            del timeout_ms, settings
+            if query == "session_exact_from_seed":
+                return QueryResult(
+                    [
+                        {
+                            "id": session_id,
+                            # Public/signed order remains the raw rollup tuple.
+                            "start_time": seed_start,
+                            "_seed_order_start": seed_start,
+                            "_seed_order_id": session_id,
+                            # Presentation may still expose exact current state.
+                            "exact_start_time": (
+                                session_a_exact_start
+                                if session_id == "session-a"
+                                else seed_start
+                            ),
+                        }
+                        for session_id, seed_start in params["seed_rows"]
+                    ],
+                    len(params["seed_rows"]),
+                    "clickhouse",
+                    1.0,
+                )
+            rows = [
+                row
+                for row in self.builder.rows
+                if params["slice_start"] <= row["start_time"] < params["slice_end"]
+            ]
+            rows.sort(key=lambda row: (row["start_time"], row["id"]), reverse=True)
+            if params["before_start_time"] is not None:
+                boundary = params["before_start_time"], params["before_id"]
+                rows = [
+                    row for row in rows if (row["start_time"], row["id"]) < boundary
+                ]
+            rows = rows[: params["limit"]]
+            return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+    builder = SessionRollupCursorBuilder(
+        rollup_rows,
+        start=window_start,
+        end=END,
+        key_field="id",
+    )
+
+    first = read_bounded_filter_page(
+        builder=builder,
+        analytics=SessionRollupCursorExecutor(builder),
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=100,
+        deadline_ms=5_000,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+    first_cursor = (
+        first.rows[-1]["_seed_order_start"],
+        first.rows[-1]["_seed_order_id"],
+    )
+    second = read_bounded_filter_page(
+        builder=builder,
+        analytics=SessionRollupCursorExecutor(builder),
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=100,
+        deadline_ms=5_000,
+        include_incomplete_rows=True,
+        cursor_start_time=first_cursor[0],
+        cursor_order_token=first_cursor[1],
+        bounded_continuation=True,
+    )
+
+    first_ids = [row["id"] for row in first.rows]
+    second_ids = [row["id"] for row in second.rows]
+    assert first.complete is True
+    assert first.has_more is True
+    assert len(first_ids) == 100
+    assert "session-a" not in first_ids
+    assert second.complete is True
+    assert second_ids == ["session-b-001", "session-a"]
+    assert second.rows[-1]["exact_start_time"] > first_cursor[0]
+    combined_ids = [*first_ids, *second_ids]
+    assert len(combined_ids) == 102
+    assert len(combined_ids) == len(set(combined_ids))
 
 
 def test_org_trace_page_keeps_same_trace_id_from_both_projects() -> None:

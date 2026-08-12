@@ -1,4 +1,4 @@
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 import axios, { endpoints } from "src/utils/axios";
 import {
@@ -8,16 +8,20 @@ import {
 } from "src/sections/projects/LLMTracing/attributeKeyCursorPagination";
 
 export const useRunInsightAttributeKeys = (projectId) => {
+  const queryClient = useQueryClient();
+  const queryKey = ["run-insights-span-attribute-keys", projectId];
   const query = useInfiniteQuery({
-    queryKey: ["run-insights-span-attribute-keys", projectId],
+    queryKey,
     queryFn: ({ signal, pageParam }) =>
       readAttributeKeyPage({
         pageParam,
+        pageSize: 50,
+        publishedData: queryClient.getQueryData(queryKey),
         signal,
-        requestPage: (cursor) =>
+        requestPage: (cursor, requestSignal = signal) =>
           axios
             .get(endpoints.project.spanAttributeKeys(), {
-              signal,
+              signal: requestSignal,
               timeout: ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
               params: {
                 project_id: projectId,

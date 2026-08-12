@@ -127,13 +127,14 @@ QueryReadStatus.propTypes = {
   pollingPaused: PropTypes.bool,
 };
 
-const getExactDashboardSnapshot = (response, signature) => {
+const getDashboardSnapshot = (response, signature) => {
   const result = getExactDashboardResult(response);
   if (!result) return null;
 
   return {
     signature,
     result,
+    exact: result.query_exact !== false,
     updatedAt: getQueryCompletedAt(response),
   };
 };
@@ -203,11 +204,12 @@ export default function WidgetChart({
   );
   // Mutation data can be pre-seeded by a caller/query cache on first mount.
   // Subsequent responses are accepted only through the exactness gate below.
-  const initialSnapshot = getExactDashboardSnapshot(
+  const initialSnapshot = getDashboardSnapshot(
     queryMutation.data,
     querySignature,
   );
-  const [lastExactSnapshot, setLastExactSnapshot] = useState(initialSnapshot);
+  const [lastRenderableSnapshot, setLastRenderableSnapshot] =
+    useState(initialSnapshot);
   const [latestOutcome, setLatestOutcome] = useState(() => ({
     signature: querySignature,
     unavailable: Boolean(queryMutation.data && !initialSnapshot),
@@ -337,15 +339,12 @@ export default function WidgetChart({
         {
           onSuccess: (response) => {
             if (!acceptResponse()) return;
-            const snapshot = getExactDashboardSnapshot(
-              response,
-              querySignature,
-            );
+            const snapshot = getDashboardSnapshot(response, querySignature);
             const { isRefreshing, refreshFailed } =
               getAggregationRefreshState(response);
             const readState = getExactAggregationReadState(response);
             pollingController.recordSuccess();
-            if (snapshot) setLastExactSnapshot(snapshot);
+            if (snapshot) setLastRenderableSnapshot(snapshot);
 
             if (
               isRefreshing &&
@@ -379,7 +378,7 @@ export default function WidgetChart({
                 retryUnavailable: false,
                 pollingPaused: false,
               });
-              settle(snapshot, true);
+              settle(snapshot, snapshot.exact);
               return;
             }
             // Sampled, degraded, unmarked and otherwise malformed terminal
@@ -429,20 +428,22 @@ export default function WidgetChart({
     widget.id,
   ]);
 
-  const exactSnapshot =
-    lastExactSnapshot?.signature === querySignature ? lastExactSnapshot : null;
-  const result = exactSnapshot?.result;
+  const renderableSnapshot =
+    lastRenderableSnapshot?.signature === querySignature
+      ? lastRenderableSnapshot
+      : null;
+  const result = renderableSnapshot?.result;
   const { renderableMetrics, series } = useMemo(
     () => getDashboardMetricSeriesState(result?.metrics),
     [result?.metrics],
   );
   const hasRunnableQuery = Boolean(queryConfig?.metrics?.length);
-  // Until an exact snapshot exists, the query is unresolved—not empty. This
+  // Until a complete renderable snapshot exists, the query is unresolved—not empty. This
   // also covers the first paint before the mutation effect starts and the
   // render between changing a widget query and receiving its new response.
-  const awaitingFirstExactResult = hasRunnableQuery && !exactSnapshot;
+  const awaitingFirstResult = hasRunnableQuery && !renderableSnapshot;
   const readUnavailable =
-    awaitingFirstExactResult ||
+    awaitingFirstResult ||
     (latestOutcome.signature === querySignature && latestOutcome.unavailable) ||
     (queryMutation.isError && !queryMutation.isPending);
   const retryUnavailable =
@@ -595,7 +596,7 @@ export default function WidgetChart({
   // the adapter's stale pending flag mask it forever.
   if (
     queryMutation.isPending &&
-    !exactSnapshot &&
+    !renderableSnapshot &&
     !retryUnavailable &&
     !pollingPaused
   ) {
@@ -632,7 +633,7 @@ export default function WidgetChart({
       >
         <QueryReadStatus
           unavailable={readUnavailable}
-          hasSnapshot={Boolean(exactSnapshot)}
+          hasSnapshot={Boolean(renderableSnapshot)}
           retryUnavailable={retryUnavailable}
           pollingPaused={pollingPaused}
         />
@@ -662,7 +663,7 @@ export default function WidgetChart({
       >
         <QueryReadStatus
           unavailable={readUnavailable}
-          hasSnapshot={Boolean(exactSnapshot)}
+          hasSnapshot={Boolean(renderableSnapshot)}
           retryUnavailable={retryUnavailable}
           pollingPaused={pollingPaused}
         />
@@ -688,7 +689,7 @@ export default function WidgetChart({
       >
         <QueryReadStatus
           unavailable={readUnavailable}
-          hasSnapshot={Boolean(exactSnapshot)}
+          hasSnapshot={Boolean(renderableSnapshot)}
           retryUnavailable={retryUnavailable}
           pollingPaused={pollingPaused}
         />
@@ -745,7 +746,7 @@ export default function WidgetChart({
       >
         <QueryReadStatus
           unavailable={readUnavailable}
-          hasSnapshot={Boolean(exactSnapshot)}
+          hasSnapshot={Boolean(renderableSnapshot)}
           retryUnavailable={retryUnavailable}
           pollingPaused={pollingPaused}
         />
@@ -967,7 +968,7 @@ export default function WidgetChart({
       >
         <QueryReadStatus
           unavailable={readUnavailable}
-          hasSnapshot={Boolean(exactSnapshot)}
+          hasSnapshot={Boolean(renderableSnapshot)}
           retryUnavailable={retryUnavailable}
           pollingPaused={pollingPaused}
         />
@@ -1066,7 +1067,7 @@ export default function WidgetChart({
       >
         <QueryReadStatus
           unavailable={readUnavailable}
-          hasSnapshot={Boolean(exactSnapshot)}
+          hasSnapshot={Boolean(renderableSnapshot)}
           retryUnavailable={retryUnavailable}
           pollingPaused={pollingPaused}
         />
@@ -1245,7 +1246,7 @@ export default function WidgetChart({
       >
         <QueryReadStatus
           unavailable={readUnavailable}
-          hasSnapshot={Boolean(exactSnapshot)}
+          hasSnapshot={Boolean(renderableSnapshot)}
           retryUnavailable={retryUnavailable}
           pollingPaused={pollingPaused}
         />
@@ -1604,7 +1605,7 @@ export default function WidgetChart({
     >
       <QueryReadStatus
         unavailable={readUnavailable}
-        hasSnapshot={Boolean(exactSnapshot)}
+        hasSnapshot={Boolean(renderableSnapshot)}
         retryUnavailable={retryUnavailable}
         pollingPaused={pollingPaused}
       />

@@ -224,6 +224,34 @@ describe("WidgetChart — queued exact refresh", () => {
     expect(screen.getByTestId("apex-line")).toBeInTheDocument();
   });
 
+  it("renders a complete rollup without reporting it as exact", () => {
+    const rollupResponse = queryResult([
+      { timestamp: "2026-07-09T00:00:00Z", value: 12 },
+    ]);
+    Object.assign(rollupResponse.data.result, {
+      query_exact: false,
+      query_provenance: "materialized_rollup",
+    });
+    const onQuerySettled = vi.fn();
+    h.query.mutate.mockImplementation((_request, options) =>
+      options?.onSuccess?.(rollupResponse),
+    );
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({ exact: false, updatedAt: null }),
+    );
+  });
+
   it("keeps cached exact data visible and treats terminal refresh failure as unsettled", async () => {
     vi.useFakeTimers();
     const cachedResponse = queryResult([

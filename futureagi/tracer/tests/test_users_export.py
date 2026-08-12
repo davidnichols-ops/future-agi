@@ -6,9 +6,14 @@ from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
+from django.http import StreamingHttpResponse
 from rest_framework import status
 
 from tracer.serializers.trace import UsersTableRowSerializer
+from tracer.services.clickhouse.query_builders.user_list import (
+    UnsupportedBoundedUserListQuery,
+    UserListQueryBuilder,
+)
 from tracer.services.clickhouse.query_service import AnalyticsQueryService
 from tracer.services.users_list_manager import (
     MAX_EXPORT_ROWS,
@@ -100,10 +105,14 @@ def _parse_csv(response):
 
 
 class TestUsersExport:
-    def test_export_fails_closed_before_any_clickhouse_read(
+    def test_export_preserves_the_bounded_streaming_csv_contract(
         self, auth_client, organization, workspace, observe_project
     ):
-        with patch.object(AnalyticsQueryService, "execute_ch_query") as execute_query:
+        with patch.object(
+            UsersListManager,
+            "iter_export_csv",
+            return_value=iter(["User ID\r\n", "user-1\r\n"]),
+        ) as export_csv:
             response = auth_client.get(
                 "/tracer/users/",
                 {
@@ -111,10 +120,14 @@ class TestUsersExport:
                     "export": "true",
                 },
             )
+            body = b"".join(response.streaming_content).decode("utf-8")
 
-        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
-        assert response.json()["code"] == "user_export_unavailable"
-        execute_query.assert_not_called()
+        assert response.status_code == status.HTTP_200_OK
+        assert isinstance(response, StreamingHttpResponse)
+        assert response["Content-Type"].startswith("text/csv")
+        assert response["Content-Disposition"] == "attachment"
+        assert body == "User ID\r\nuser-1\r\n"
+        export_csv.assert_called_once_with()
 
     def test_export_requires_authentication(self, api_client, observe_project):
         response = api_client.get(
@@ -126,7 +139,56 @@ class TestUsersExport:
             status.HTTP_403_FORBIDDEN,
         )
 
-    def test_sorted_list_fails_closed_before_any_clickhouse_read(
+    def test_supported_sort_uses_the_bounded_numbered_list_path(
+        self, auth_client, organization, workspace, observe_project
+    ):
+        payload = {"table": [], "total_count": 0, "total_pages": 0}
+        sort_params = [{"column_id": "num_traces", "direction": "desc"}]
+        with patch("tracer.views.trace.UsersListManager") as manager_cls:
+            manager_cls.return_value.list_payload.return_value = payload
+            response = auth_client.get(
+                "/tracer/users/",
+                {
+                    "project_id": str(observe_project.id),
+                    "sort_params": json.dumps(sort_params),
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["result"] == payload
+        assert manager_cls.call_args.kwargs["sort_params"] == sort_params
+        manager_cls.return_value.list_payload.assert_called_once_with(
+            page_size=30, current_page=0
+        )
+
+    def test_derived_sort_remains_a_typed_422(
+        self, auth_client, organization, workspace, observe_project
+    ):
+        sort_params = [{"column_id": "num_sessions", "direction": "desc"}]
+        builder = UserListQueryBuilder(
+            organization_id=str(organization.id),
+            project_ids=[str(observe_project.id)],
+            sort_params=sort_params,
+        )
+        assert builder.supports_candidate_first_page() is False
+
+        with patch.object(
+            UsersListManager,
+            "list_payload",
+            side_effect=UnsupportedBoundedUserListQuery("bounded sort unavailable"),
+        ):
+            response = auth_client.get(
+                "/tracer/users/",
+                {
+                    "project_id": str(observe_project.id),
+                    "sort_params": json.dumps(sort_params),
+                },
+            )
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert response.json()["code"] == "user_sort_unsupported"
+
+    def test_cursor_sort_is_rejected_before_any_clickhouse_read(
         self, auth_client, organization, workspace, observe_project
     ):
         with patch.object(AnalyticsQueryService, "execute_ch_query") as execute_query:
@@ -134,6 +196,7 @@ class TestUsersExport:
                 "/tracer/users/",
                 {
                     "project_id": str(observe_project.id),
+                    "cursor_mode": "true",
                     "sort_params": json.dumps(
                         [{"column_id": "num_traces", "direction": "desc"}]
                     ),
@@ -141,8 +204,14 @@ class TestUsersExport:
             )
 
         assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
-        assert response.json()["code"] == "user_sort_unavailable"
+        assert response.json()["code"] == "cursor_sort_unsupported"
         execute_query.assert_not_called()
+
+    def test_users_endpoint_documents_bounded_failures(self):
+        from tracer.views.trace import UsersView
+
+        responses = UsersView.get._swagger_auto_schema["responses"]
+        assert {422, 503} <= responses.keys()
 
 
 class TestUserListQueryBuilderUnpaginated:
@@ -313,7 +382,7 @@ class TestUsersExportStreaming:
             assert call.kwargs["timeout_ms"] <= USER_LIST_WALL_DEADLINE_MS
             settings = call.kwargs["settings"]
             assert "max_rows_to_read" not in settings
-            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
             assert settings["max_memory_usage"] == 36 * 1024 * 1024 * 1024
             assert settings["max_result_rows"] > 0
             assert settings["max_result_bytes"] == 32 * 1024 * 1024

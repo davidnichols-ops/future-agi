@@ -28,8 +28,10 @@ import {
   useSessionsGridStoreShallow,
 } from "./ReplaySessions/store";
 import { APP_CONSTANTS } from "src/utils/constants";
-import { getListTotalState } from "src/sections/projects/LLMTracing/listTotalMetadata";
-import { failServerSideGridRead } from "src/utils/queryReadState";
+import {
+  getListReadMessage,
+  getListTotalState,
+} from "src/sections/projects/LLMTracing/listTotalMetadata";
 import {
   createListCursorPagination,
   isListCursorContinuationLimitError,
@@ -287,13 +289,14 @@ const SessionGrid = React.forwardRef(
                 pagination: cursorPagination.current,
                 pageNumber,
                 targetRowCount: DATASET_ROWS_LIMIT,
-                loadResponse: () => {
+                loadResponse: (signal) => {
                   const prefetched = cached;
                   cached = undefined;
                   return (
                     prefetched ||
                     axios.get(endpoints.project.projectSessionList(), {
                       params: buildParams(pageNumber),
+                      signal,
                     })
                   );
                 },
@@ -304,9 +307,10 @@ const SessionGrid = React.forwardRef(
                 rowIdentity: sessionRowIdentity,
                 isCurrent: () =>
                   cursorPagination.current.isCurrent(requestGeneration),
-                nextResponse: () =>
+                nextResponse: (_cursor, signal) =>
                   axios.get(endpoints.project.projectSessionList(), {
                     params: buildParams(pageNumber),
+                    signal,
                   }),
               });
               if (!cursorPagination.current.isCurrent(requestGeneration)) {
@@ -414,7 +418,24 @@ const SessionGrid = React.forwardRef(
               ) {
                 return;
               }
-              const totalState = getListTotalState(metadata);
+              const listReadMessage = getListReadMessage({
+                result: { table: rows, metadata },
+              });
+              if (listReadMessage) throw new Error(listReadMessage);
+
+              const isLastPage = exactPage.isLastPage;
+              // A terminal cursor is an exact exhaustion proof. Normalize an
+              // older/stale lower-bound marker so the status bar and AG Grid
+              // agree with `has_more: false` instead of showing a phantom ≥N.
+              const totalMetadata =
+                isLastPage && metadata?.has_more === false
+                  ? {
+                      ...metadata,
+                      total_rows: request.startRow + rows.length,
+                      total_rows_is_lower_bound: false,
+                    }
+                  : metadata;
+              const totalState = getListTotalState(totalMetadata);
               params.api.totalRowCount = totalState.totalRowCount;
               params.api.totalRowCountLowerBound =
                 totalState.totalRowCountLowerBound;
@@ -422,7 +443,6 @@ const SessionGrid = React.forwardRef(
                 totalState.totalRowCountIsLowerBound;
               useSessionsGridStore.setState(totalState);
 
-              const isLastPage = exactPage.isLastPage;
               const lastRow = isLastPage ? request.startRow + rows.length : -1;
 
               params.success({
@@ -484,7 +504,11 @@ const SessionGrid = React.forwardRef(
                   variant: "error",
                 },
               );
-              failServerSideGridRead(params);
+              // Preserve any previously rendered rows on a failed read. The
+              // default AG Grid no-rows overlay would incorrectly present a
+              // degraded/error response as an exact empty result; the retry
+              // snackbar above is the explicit failure state instead.
+              params.fail();
             }
           },
           getRowId: ({ data }) => {

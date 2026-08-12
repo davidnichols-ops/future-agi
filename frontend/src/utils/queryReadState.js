@@ -282,11 +282,10 @@ const AGGREGATION_POLL_DELAYS_MS = [1000, 2000, 4000, 8000];
 export const AGGREGATION_POLL_MAX_ATTEMPTS = 12;
 export const AGGREGATION_POLL_TIMEOUT_MS = 60_000;
 export const AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES = 3;
-// Bound each HTTP cache-state read independently. Exact aggregation jobs are
-// server-owned and can legitimately run much longer than a minute; the client
-// must not turn an explicit `query_refreshing` state into a false failure just
-// because the background job outlives one request deadline.
-export const AGGREGATION_REQUEST_TIMEOUT_MS = 60_000;
+// Background aggregation may run for a minute, but each cache-state poll is an
+// interactive HTTP read. Give the API's 9.5-second server wall a small transport
+// grace without letting one stalled poll hold the graph spinner for a minute.
+export const AGGREGATION_REQUEST_TIMEOUT_MS = 9_800;
 
 const aggregationRequestError = (code) => {
   const error = new Error("Exact aggregation request did not complete");

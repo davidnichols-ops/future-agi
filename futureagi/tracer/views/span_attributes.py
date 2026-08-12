@@ -8,7 +8,7 @@ Endpoints:
 """
 
 import re
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -36,7 +36,10 @@ from tracer.services.clickhouse.attribute_cursor_state import (
     load_attribute_cursor_seen_state,
     persist_attribute_cursor_seen_state,
 )
-from tracer.services.clickhouse.attribute_reads import AttributeReadSelector
+from tracer.services.clickhouse.attribute_reads import (
+    ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+    AttributeReadSelector,
+)
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
     cursor_scope_for_request,
@@ -502,7 +505,33 @@ class SpanAttributeValuesView(APIView):
             )
             if not _project_is_in_request_scope(request, project_id):
                 return self._gm.not_found("Project not found")
-            read = selector.read_values([project_id], key, search=q, max_values=limit)
+            # This endpoint predates signed retained-data pagination. Keep it
+            # as a responsive compatibility sample: a narrow exact latest-state
+            # slice is useful to old clients and cannot turn a dense 365-day
+            # scan into a ten-second 503. Exhaustive filter pickers use the
+            # cursor-backed dashboard filter-values endpoint.
+            window_end = selector.query_window_end
+            read = selector.read_values(
+                [project_id],
+                key,
+                search=q,
+                max_values=limit,
+                window_start=window_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+                window_end=window_end,
+            )
+            if (
+                read.metadata.query_complete
+                or read.metadata.query_error_code == "sample_limit"
+            ):
+                read = replace(
+                    read,
+                    metadata=replace(
+                        read.metadata,
+                        query_complete=False,
+                        query_status="sampled",
+                        query_error_code="sample_limit",
+                    ),
+                )
             if _attribute_read_metadata_is_unavailable(read.metadata):
                 logger.warning(
                     "span_attribute_values_incomplete",

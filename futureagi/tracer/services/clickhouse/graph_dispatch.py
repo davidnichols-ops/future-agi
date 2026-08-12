@@ -20,21 +20,29 @@ from tracer.services.clickhouse.bounded_graph_reads import (
     GRAPH_MAX_POINTS,
     BoundedGraphReadError,
     GraphCandidateSample,
+    aggregate_system_candidate_graph,
+    read_graph_candidates,
 )
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders import (
     TimeSeriesQueryBuilder,
 )
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
-from tracer.services.clickhouse.read_budget import is_read_budget_error
+from tracer.services.clickhouse.read_budget import (
+    ReadDeadline,
+    is_clickhouse_query_error,
+    is_read_budget_error,
+)
 from tracer.services.exact_aggregation_cache import (
     read_or_schedule_exact_snapshot,
 )
 
 GRAPH_WALL_DEADLINE_MS = 30_000
 GRAPH_QUERY_TIMEOUT_MS = 30_000
+GRAPH_INTERACTIVE_QUERY_TIMEOUT_MS = 9_500
 GRAPH_DECORATION_TIMEOUT_MS = 30_000
 GRAPH_EVENT_LIMIT = 2_000
+GRAPH_RESULT_BYTES = 32 * 1024 * 1024
 # Part of the cache identity, not a database schema version. Incrementing this
 # prevents a rolling deploy from serving a 30-day cached payload produced by
 # the retired hierarchy-as-path projection.
@@ -51,11 +59,26 @@ GRAPH_TRACE_ENTITY_BATCH_SIZE = GRAPH_TRACE_DECORATION_CANDIDATE_LIMIT
 # removing the extra metric statement observed for the twelve-trace graph
 # sample. Additive sufficient statistics preserve exact cross-batch merges.
 GRAPH_SPAN_METRIC_BATCH_SIZE = 1_024
+_TRACE_ROLLUP_RESULT_COLUMNS = frozenset(
+    {
+        "time_bucket",
+        "avg_latency",
+        "total_tokens",
+        "avg_cost",
+        "traffic_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "error_rate",
+    }
+)
 _GRAPH_BASE_READ_SETTINGS = {
-    "max_threads": 1,
+    # The retained hourly rollup is already row-reduced. Four workers keep the
+    # interactive scan parallel without leaving concurrency unbounded on the
+    # largest Coletia/Whatfix projects.
+    "max_threads": 4,
     "max_block_size": 8192,
     "max_memory_usage": 36 * 1024 * 1024 * 1024,
-    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "result_overflow_mode": "throw",
     "timeout_overflow_mode": "throw",
@@ -63,6 +86,7 @@ _GRAPH_BASE_READ_SETTINGS = {
 GRAPH_READ_SETTINGS = {
     **_GRAPH_BASE_READ_SETTINGS,
     "max_result_rows": GRAPH_MAX_POINTS + 1,
+    "max_result_bytes": GRAPH_RESULT_BYTES,
 }
 GRAPH_EVENT_READ_SETTINGS = {
     **_GRAPH_BASE_READ_SETTINGS,
@@ -96,7 +120,13 @@ def _active_filters(filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def degraded_graph_response(metric_id: str, exc: Exception) -> dict[str, Any]:
+def degraded_graph_response(
+    metric_id: str,
+    exc: Exception,
+    *,
+    sample: GraphCandidateSample | None = None,
+    provenance: str | None = None,
+) -> dict[str, Any]:
     """Return a stable graph payload without leaking database diagnostics."""
 
     explicit_code = getattr(exc, "error_code", None)
@@ -108,18 +138,105 @@ def degraded_graph_response(metric_id: str, exc: Exception) -> dict[str, Any]:
         error_code = "read_budget_exceeded"
     else:
         error_code = "query_failed"
-    return {
+    response: dict[str, Any] = {
         "metric_name": str(metric_id or ""),
         "data": [],
         "query_complete": False,
         "query_status": "degraded",
+        "query_sampled": False,
+        "query_exact": False,
         "query_error_code": error_code,
     }
+    if sample is not None:
+        # Preserve honest progress from the bounded selector.  In particular,
+        # a deadline after N of M temporal strata must not collapse into an
+        # indistinguishable false-empty response.  The points remain empty
+        # until all strata finish, but the caller can show useful progress and
+        # retry/narrow the same window.
+        response.update(sample.metadata())
+        response.update(
+            {
+                "data": [],
+                "query_complete": False,
+                "query_status": "degraded",
+                "query_sampled": False,
+                "query_exact": False,
+                "query_error_code": error_code,
+            }
+        )
+    if provenance:
+        response["query_provenance"] = provenance
+    return response
 
 
-def _remaining_timeout_ms(started: float, cap_ms: int) -> int:
+def _bounded_interactive_read_settings(
+    settings: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Retain finite graph caps while removing source-row ceilings."""
+
+    caps = {
+        "max_threads": 4,
+        "max_block_size": 8192,
+        "max_memory_usage": 36 * 1024 * 1024 * 1024,
+        "max_bytes_to_read": 36 * 1024 * 1024 * 1024,
+        "max_result_rows": GRAPH_MAX_POINTS + 1,
+        "max_result_bytes": GRAPH_RESULT_BYTES,
+    }
+    bounded = dict(caps)
+    for key, value in (settings or {}).items():
+        if key == "max_rows_to_read":
+            continue
+        if key in caps:
+            bounded[key] = min(int(value), int(caps[key]))
+        else:
+            bounded[key] = value
+    bounded.update(
+        {
+            "read_overflow_mode": "throw",
+            "result_overflow_mode": "throw",
+            "timeout_overflow_mode": "throw",
+        }
+    )
+    return bounded
+
+
+class _DeadlineBoundGraphAnalytics:
+    """Clamp discovery and decoration to one request-owned wall deadline."""
+
+    def __init__(self, delegate: Any, deadline: ReadDeadline) -> None:
+        self._delegate = delegate
+        self._deadline = deadline
+        self.supports_per_query_read_settings = bool(
+            getattr(delegate, "supports_per_query_read_settings", True)
+        )
+
+    def execute_ch_query(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+        timeout_ms: int = GRAPH_INTERACTIVE_QUERY_TIMEOUT_MS,
+        settings: dict[str, Any] | None = None,
+    ) -> Any:
+        requested_timeout_ms = min(
+            int(timeout_ms),
+            GRAPH_INTERACTIVE_QUERY_TIMEOUT_MS,
+        )
+        return self._delegate.execute_ch_query(
+            query,
+            params or {},
+            timeout_ms=self._deadline.remaining_ms(requested_timeout_ms),
+            settings=_bounded_interactive_read_settings(settings),
+        )
+
+
+def _remaining_timeout_ms(
+    started: float,
+    cap_ms: int,
+    *,
+    wall_deadline_ms: int = GRAPH_WALL_DEADLINE_MS,
+) -> int:
     elapsed_ms = (monotonic() - started) * 1000
-    remaining_ms = int(GRAPH_WALL_DEADLINE_MS - elapsed_ms)
+    remaining_ms = int(wall_deadline_ms - elapsed_ms)
     if remaining_ms < 25:
         raise BoundedGraphReadError("deadline_exceeded")
     return min(cap_ms, remaining_ms)
@@ -182,10 +299,35 @@ def _complete_metadata(
     return {
         "query_complete": True,
         "query_status": "complete",
+        "query_sampled": False,
         "query_count": query_count,
         "query_elapsed_ms": round((monotonic() - started) * 1000, 3),
         "query_rows_returned": rows_returned,
     }
+
+
+def _require_rollup_result_shape(
+    rows: list[Any],
+    columns: list[str],
+    *,
+    expected_columns: frozenset[str],
+) -> None:
+    """Reject schema drift instead of formatting it into a successful zero graph."""
+
+    missing = expected_columns.difference(columns)
+    if missing:
+        raise BoundedGraphReadError("query_failed")
+    bucket_index = columns.index("time_bucket")
+    for row in rows:
+        bucket = (
+            row.get("time_bucket")
+            if isinstance(row, dict)
+            else row[bucket_index]
+            if bucket_index < len(row)
+            else None
+        )
+        if bucket is None:
+            raise BoundedGraphReadError("query_failed")
 
 
 def _ensure_point_budget(
@@ -327,14 +469,7 @@ def graph_payload_is_publishable(
     *,
     allow_sampled: bool,
 ) -> bool:
-    """Fail closed unless every graph series is complete and exact.
-
-    ``allow_sampled`` remains in older request schemas for compatibility, but
-    aggregation endpoints never use it to publish estimates. Lists may expose
-    progressive pages; aggregate values may not be sampled.
-    """
-
-    del allow_sampled
+    """Accept exact/pending series or an explicitly requested safe sample."""
 
     series = payload if isinstance(payload, list) else [payload]
     for item in series:
@@ -342,6 +477,23 @@ def graph_payload_is_publishable(
             return False
         status = item.get("query_status")
         complete = item.get("query_complete")
+        if status == "sampled":
+            planned = item.get("query_sampling_strata")
+            completed = item.get("query_sampling_strata_completed")
+            if (
+                not allow_sampled
+                or complete is not False
+                or item.get("query_sampled") is False
+                or item.get("query_exact") is not False
+                or item.get("query_provenance") != "bounded_candidates"
+                or not item.get("query_sampling_strategy")
+                or not isinstance(planned, int)
+                or isinstance(planned, bool)
+                or planned < 1
+                or completed != planned
+            ):
+                return False
+            continue
         if status == "pending":
             if (
                 complete is not False
@@ -816,6 +968,86 @@ def _fetch_trace_system_metric_graph(
     return enforce_exact_graph_data_contract(response)
 
 
+def _fetch_rollup_system_metric_graph(
+    *,
+    analytics: Any,
+    project_id: str,
+    filters: list[dict[str, Any]],
+    interval: str,
+    metric_id: str,
+    observe_type: str,
+    timeout_ms: int,
+) -> dict[str, Any]:
+    """Serve the main-compatible date-only system graph in one request.
+
+    The hourly rollup is the established fast path for an empty filter set or
+    a positive date window. Relational, attribute, complement-datetime, eval,
+    and annotation filters are handled by the bounded candidate dispatcher.
+    """
+
+    started = monotonic()
+    # Bind the normalized window explicitly and pass no filters to the query
+    # builder. This is a physical-source invariant: even if the general
+    # builder learns another filter shape later, this interactive route can
+    # only emit the ``spans_hourly_rollup`` query and can never fall back to a
+    # raw ``spans`` scan.
+    start_date, end_date = BaseQueryBuilder.parse_time_range(filters, strict=True)
+    builder = TimeSeriesQueryBuilder(
+        project_id=project_id,
+        filters=[],
+        interval=interval,
+        observe_type=observe_type,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    query, params = builder.build()
+    interactive_deadline_ms = max(
+        1,
+        min(int(timeout_ms), GRAPH_INTERACTIVE_QUERY_TIMEOUT_MS),
+    )
+    if start_date is not None and end_date is not None and start_date >= end_date:
+        rows: list[Any] = []
+        columns: list[str] = []
+        query_count = 0
+    else:
+        result = analytics.execute_ch_query(
+            query,
+            params,
+            timeout_ms=_remaining_timeout_ms(
+                started,
+                interactive_deadline_ms,
+                wall_deadline_ms=interactive_deadline_ms,
+            ),
+            settings=GRAPH_READ_SETTINGS,
+        )
+        rows = list(result.data or [])
+        columns = list(result.columns or [])
+        _require_rollup_result_shape(
+            rows,
+            columns,
+            expected_columns=_TRACE_ROLLUP_RESULT_COLUMNS,
+        )
+        query_count = 1
+    response = format_system_metric_graph(
+        builder.format_result(rows, columns),
+        metric_id,
+    )
+    response.update(
+        _complete_metadata(
+            started=started,
+            query_count=query_count,
+            rows_returned=len(rows),
+        )
+    )
+    response.update(
+        {
+            "query_provenance": "materialized_rollup",
+            "query_exact": False,
+        }
+    )
+    return enforce_exact_graph_data_contract(response)
+
+
 def fetch_system_metric_graph_ch(
     *,
     analytics: Any,
@@ -829,27 +1061,98 @@ def fetch_system_metric_graph_ch(
     organization_id: str | None = None,
     workspace_id: str | None = None,
 ) -> dict[str, Any]:
-    """Read one complete exact graph, reusing its last successful snapshot."""
+    """Read a rollup graph or a bounded synchronous filtered graph."""
 
-    del timeout_ms
     project_id = _validated_project_id(project_id)
     filters = list(filters or [])
     normalized_observe_type = str(observe_type or "trace").strip().lower()
-    identity = {
-        "project_id": project_id,
-        "filters": filters,
-        "interval": interval,
-        "metric_id": str(metric_id or ""),
-        "observe_type": normalized_observe_type,
-    }
-    return _read_or_refresh_exact_graph(
-        namespace="observe-system-graph",
-        identity=identity,
-        refresh=bool(refresh),
-        pending_payload=_pending_graph_payload(str(metric_id or "")),
-        organization_id=organization_id,
-        workspace_id=workspace_id,
+    if not _active_filters(filters):
+        if not bool(getattr(analytics, "supports_per_query_read_settings", True)):
+            return degraded_graph_response(
+                str(metric_id or ""),
+                BoundedGraphReadError("query_failed", retryable=True),
+                provenance="server_read_policy_unavailable",
+            )
+        return _fetch_rollup_system_metric_graph(
+            analytics=analytics,
+            project_id=project_id,
+            filters=filters,
+            interval=interval,
+            metric_id=str(metric_id or ""),
+            observe_type=normalized_observe_type,
+            timeout_ms=timeout_ms,
+        )
+    # System graphs are interactive.  Candidate discovery and every trace
+    # child-span decoration query share this single monotonic deadline; there
+    # is no background/raw exact fallback when the budget is exhausted.
+    del refresh, organization_id, workspace_id
+    interactive_deadline_ms = min(
+        int(timeout_ms),
+        GRAPH_INTERACTIVE_QUERY_TIMEOUT_MS,
     )
+    if interactive_deadline_ms <= 0:
+        raise ValueError("graph timeout must be positive")
+    started = monotonic()
+    bounded_analytics = _DeadlineBoundGraphAnalytics(
+        analytics,
+        ReadDeadline.start(interactive_deadline_ms),
+    )
+    sample: GraphCandidateSample | None = None
+    try:
+        sample = read_graph_candidates(
+            analytics=bounded_analytics,
+            project_id=project_id,
+            filters=filters,
+            observe_type=normalized_observe_type,
+            deadline_ms=interactive_deadline_ms,
+        )
+        _require_renderable_sample(sample)
+        if normalized_observe_type == "trace":
+            response = _fetch_trace_system_metric_graph(
+                analytics=bounded_analytics,
+                sample=sample,
+                project_id=project_id,
+                interval=interval,
+                metric_id=str(metric_id or ""),
+                started=started,
+                timeout_ms=interactive_deadline_ms,
+            )
+        elif normalized_observe_type == "span":
+            response = enforce_exact_graph_data_contract(
+                aggregate_system_candidate_graph(
+                    sample,
+                    metric_id=str(metric_id or ""),
+                    interval=interval,
+                )
+            )
+        else:
+            raise ValueError("observe_type must be trace or span")
+        response.update(
+            {
+                "query_provenance": "bounded_candidates",
+                "query_exact": bool(
+                    response.get("query_complete") is True
+                    and response.get("query_sampled") is not True
+                ),
+            }
+        )
+        return response
+    except BoundedGraphReadError as exc:
+        return degraded_graph_response(
+            str(metric_id or ""),
+            exc,
+            sample=sample,
+            provenance="bounded_candidates",
+        )
+    except Exception as exc:
+        if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
+            raise
+        return degraded_graph_response(
+            str(metric_id or ""),
+            exc,
+            sample=sample,
+            provenance="bounded_candidates",
+        )
 
 
 def fetch_agent_graph_ch(

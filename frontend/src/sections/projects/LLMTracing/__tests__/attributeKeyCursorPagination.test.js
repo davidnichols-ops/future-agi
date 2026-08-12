@@ -173,6 +173,10 @@ describe("attribute key cursor pagination", () => {
     });
     const result = await readAttributeKeyPage({
       pageParam: null,
+      publishedData: {
+        pages: [unchanged],
+        pageParams: [null],
+      },
       requestPage: vi.fn(() => Promise.resolve({ ...unchanged })),
       signal: new AbortController().signal,
     });
@@ -180,6 +184,50 @@ describe("attribute key cursor pagination", () => {
     expect(result.result).toEqual([{ key: "final_status", type: "string" }]);
     expect(result.browse_status).toBe("exhausted");
     expect(isAttributeKeyCursorStopped(result)).toBe(false);
+  });
+
+  it("fills load more across duplicate-heavy pages and excludes published keys", async () => {
+    const published = page(["already.loaded"], {
+      next_cursor: "load-more-start",
+    });
+    const requestPage = vi
+      .fn()
+      .mockResolvedValueOnce(
+        page(["already.loaded", "new.one"], { next_cursor: "physical-2" }),
+      )
+      .mockResolvedValueOnce(
+        page(["already.loaded", "new.two"], { next_cursor: "physical-3" }),
+      )
+      .mockResolvedValueOnce(
+        page(["new.one", "new.three"], { next_cursor: "signed-final" }),
+      );
+
+    const result = await readAttributeKeyPage({
+      pageParam: "load-more-start",
+      pageSize: 3,
+      publishedData: {
+        pages: [published],
+        pageParams: [null],
+      },
+      requestPage,
+      signal: new AbortController().signal,
+    });
+
+    expect(requestPage.mock.calls.map(([cursor]) => cursor)).toEqual([
+      "load-more-start",
+      "physical-2",
+      "physical-3",
+    ]);
+    expect(result.result.map(({ key }) => key)).toEqual([
+      "new.one",
+      "new.two",
+      "new.three",
+    ]);
+    expect(result.next_cursor).toBe("signed-final");
+    expect(result.__attributeKeyFollowedCursors).toEqual([
+      "physical-2",
+      "physical-3",
+    ]);
   });
 
   it("does not re-request a cursor consumed inside the visible page", () => {
