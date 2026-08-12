@@ -242,7 +242,16 @@ class SpanAttributeKeysView(APIView):
                         )
                         or (
                             raw_segment_start is not None
-                            and not (raw_before_identity or raw_resume_identity)
+                            and not (
+                                raw_before_identity
+                                or raw_resume_identity
+                                # Exact-key absence pages advance through a
+                                # proven empty temporal slice without a row
+                                # checkpoint.  The selector explicitly accepts
+                                # this adaptive-width continuation; rejecting it
+                                # here made every page-two exact lookup a 400.
+                                or exact_key is not None
+                            )
                         )
                     ):
                         raise ListCursorError(

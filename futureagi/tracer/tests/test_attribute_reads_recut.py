@@ -2953,6 +2953,68 @@ def test_filter_value_cursor_unpinned_nested_string_avoids_wide_json_replay():
     assert "attributes_extra" not in typed_hydration_call.sql
 
 
+def test_filter_value_cursor_unpinned_recuts_baseline_before_exact_hydration():
+    candidate = _candidate(
+        PROJECT_A,
+        "whatfix-style-value",
+        trace_id="trace-whatfix-style-value",
+        start_time=NOW - timedelta(seconds=1),
+        candidate_version=7,
+    )
+    candidate_calls = []
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            candidate_calls.append(call)
+            width = call.params["segment_end"] - call.params["segment_start"]
+            if width == ATTRIBUTE_READ_EXPLICIT_SEGMENT:
+                assert call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+                return ReadDeadlineExceeded("dense unpinned baseline")
+            assert width == ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+            assert call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
+            return [candidate]
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    candidate["id"],
+                    trace_id=candidate["trace_id"],
+                    start_time=candidate["start_time"],
+                    latest_version=candidate["candidate_version"],
+                )
+            ]
+        assert "attributes_extra" not in call.sql
+        return [
+            _target_row(
+                PROJECT_A,
+                candidate["id"],
+                trace_id=candidate["trace_id"],
+                start_time=candidate["start_time"],
+                string="verified-value",
+            )
+        ]
+
+    read = AttributeReadSelector(
+        RecordingExecutor(respond),
+        now=NOW,
+        json_attribute_mode="arrays",
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "whatfix.ent_id",
+        page_size=1,
+        attribute_type=None,
+        window_start=NOW - ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+        window_end=NOW,
+    )
+
+    assert [call.timeout_ms for call in candidate_calls] == [
+        ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS,
+        ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS,
+    ]
+    assert [call.params["segment_end"] for call in candidate_calls] == [NOW, NOW]
+    assert read.rows == (AttributeValueRow("verified-value", "string", 1),)
+
+
 def test_filter_value_cursor_unpinned_splits_mixed_typed_and_json_latest_state():
     candidates = [
         _candidate(
@@ -8312,10 +8374,111 @@ def test_span_attribute_key_cursor_retries_expanded_batch_without_moving_checkpo
     assert calls[:3] == [
         (64, None, None),
         (128, identities[63], ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS),
-        (64, identities[63], None),
+        (
+            64,
+            identities[63],
+            ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
+        ),
     ]
     if failure_stage == "replay":
         assert replay_calls[1][1] == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    [
+        pytest.param(None, id="timeout"),
+        pytest.param(396, id="max-result-bytes"),
+    ],
+)
+def test_span_attribute_key_cursor_recuts_base_replay_without_skipping_keys(
+    monkeypatch, failure_code
+):
+    identities = tuple(
+        (
+            PROJECT_A,
+            f"trace-wide-{index}",
+            f"span-wide-{index}",
+            NOW - timedelta(seconds=index + 1),
+        )
+        for index in range(70)
+    )
+    identity_indexes = {identity: index for index, identity in enumerate(identities)}
+    rows = {
+        identity: {
+            "project_id": PROJECT_A,
+            "trace_id": identity[1],
+            "id": identity[2],
+            "start_time": identity[3],
+            "is_deleted": 0,
+            "string_keys": [f"wide_key_{index:02d}"],
+            "number_keys": [],
+            "boolean_keys": [],
+            "attributes_extra": "{}",
+        }
+        for index, identity in enumerate(identities)
+    }
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    candidate_calls = []
+
+    def candidates(_projects, segment, **kwargs):
+        before_identity = kwargs.get("before_identity")
+        limit = kwargs["candidate_limit"]
+        candidate_calls.append((limit, before_identity))
+        matches = [
+            identity
+            for identity in identities
+            if segment[0] <= identity[3] < segment[1]
+            and (
+                before_identity is None
+                or identity_indexes[identity] > identity_indexes[before_identity]
+            )
+        ]
+        return tuple(matches[:limit]), len(matches) > limit, {}
+
+    def verify(*_args, **kwargs):
+        candidate_ids = kwargs.get("candidate_ids", ())
+        if len(candidate_ids) > 32:
+            if failure_code is None:
+                raise ReadDeadlineExceeded("wide replay exceeded its deadline")
+            raise ServerException("wide replay exceeded max_result_bytes", failure_code)
+        return [rows[identity] for identity in candidate_ids]
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(selector, "_verify_latest", verify)
+
+    first = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=2,
+        window_start=NOW - timedelta(hours=6),
+        window_end=NOW,
+    )
+    second = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=2,
+        window_start=NOW - timedelta(hours=6),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        segment_start=first.next_segment_start,
+        before_identity=first.next_before_identity,
+        resume_identity=first.next_resume_identity,
+        resume_key_offset=first.next_resume_key_offset,
+        seen_key_digests=first.seen_key_digests,
+    )
+
+    assert candidate_calls[:2] == [(64, None), (32, None)]
+    assert candidate_calls[2:4] == [
+        (64, identities[1]),
+        (32, identities[1]),
+    ]
+    assert [row.key for row in first.rows] == ["wide_key_00", "wide_key_01"]
+    assert [row.key for row in second.rows] == ["wide_key_02", "wide_key_03"]
+    assert set(first.seen_key_digests).isdisjoint(second.appended_key_digests)
 
 
 def test_span_attribute_key_cursor_exact_search_continues_until_verified_match(
@@ -9663,6 +9826,83 @@ def test_span_attribute_key_cursor_recovers_old_wide_checkpoint_after_budget_cas
     assert page.next_segment_start is None
 
 
+def test_span_attribute_key_cursor_recuts_dense_checkpoint_at_same_keyset_frontier(
+    monkeypatch,
+):
+    checkpoint = (
+        PROJECT_A,
+        "trace-dense-checkpoint",
+        "span-z-dense-checkpoint",
+        NOW - timedelta(hours=1),
+    )
+    older = (
+        PROJECT_A,
+        checkpoint[1],
+        "span-a-after-dense-checkpoint",
+        checkpoint[3],
+    )
+    calls = []
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    def candidates(_projects, segment, **kwargs):
+        calls.append(
+            (
+                segment,
+                kwargs.get("before_identity"),
+                kwargs.get("query_timeout_ms"),
+            )
+        )
+        if segment[1] - segment[0] == ATTRIBUTE_READ_EXPLICIT_SEGMENT:
+            raise ReadDeadlineExceeded("dense checkpoint candidate timed out")
+        assert segment[1] - segment[0] == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+        return (older,), False, {}
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **_kwargs: [
+            {
+                "project_id": PROJECT_A,
+                "trace_id": older[1],
+                "id": older[2],
+                "start_time": older[3],
+                "is_deleted": 0,
+                "string_keys": ["reachable_after_candidate_recut"],
+                "number_keys": [],
+                "boolean_keys": [],
+                "attributes_extra": "{}",
+            }
+        ],
+    )
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_end=NOW,
+        segment_start=NOW - ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+        before_identity=checkpoint,
+    )
+
+    assert calls[0] == (
+        (NOW - ATTRIBUTE_READ_EXPLICIT_SEGMENT, NOW),
+        checkpoint,
+        ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
+    )
+    assert calls[1][0][1] == checkpoint[3] + ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+    assert calls[1][0][1] - calls[1][0][0] == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+    assert calls[1][1] == checkpoint
+    assert calls[1][2] is None
+    assert [row.key for row in page.rows] == ["reachable_after_candidate_recut"]
+
+
 def test_span_attribute_key_cursor_empty_retained_window_terminates_in_one_request():
     retained_start = datetime(1970, 1, 1, tzinfo=UTC)
     selector = AttributeReadSelector(
@@ -10154,6 +10394,7 @@ def test_span_attribute_key_api_cursor_binds_and_continues_exact_search(monkeypa
                 None,
                 0,
                 (),
+                kwargs["window_end"] - timedelta(hours=12),
             )
         return AttributeKeyCursorPageRead(
             (AttributeKeyRow("final_status", "string", 1),),
@@ -10222,6 +10463,9 @@ def test_span_attribute_key_api_cursor_binds_and_continues_exact_search(monkeypa
     assert second_response.data["exact_match"] is True
     assert second_response.data["has_more"] is False
     assert calls[1][1]["exact_key"] == "final_status"
+    assert calls[1][1]["segment_start"] == (
+        calls[0][1]["window_end"] - timedelta(hours=12)
+    )
 
 
 @pytest.mark.parametrize("failure_stage", ["retained_window", "cursor_page"])

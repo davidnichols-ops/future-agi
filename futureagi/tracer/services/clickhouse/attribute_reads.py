@@ -3862,18 +3862,26 @@ class AttributeReadSelector:
                         ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
                         if candidate_limit > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
                         or (
-                            cursor_before is None
-                            and (
-                                (
-                                    exact_key is None
-                                    and current_segment_end - current_segment_start
-                                    > ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                            (
+                                exact_key is None
+                                and (
+                                    (
+                                        cursor_before is None
+                                        and current_segment_end - current_segment_start
+                                        > ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                                    )
+                                    or (
+                                        cursor_before is not None
+                                        and current_segment_end - current_segment_start
+                                        > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                                    )
                                 )
-                                or (
-                                    exact_key is not None
-                                    and current_segment_end - current_segment_start
-                                    > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
-                                )
+                            )
+                            or (
+                                exact_key is not None
+                                and cursor_before is None
+                                and current_segment_end - current_segment_start
+                                > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
                             )
                         )
                         else None
@@ -3914,9 +3922,9 @@ class AttributeReadSelector:
                     and current_segment_end - active_segment_start
                     > ATTRIBUTE_READ_EXPLICIT_SEGMENT
                 ):
-                    # A prior ordered page already proved this checkpoint. Do
-                    # not let a wide cursor from another pod strand the browse
-                    # by requiring the same large statement to succeed again.
+                    # Recover a cursor from a wider rolling-deploy slice at the
+                    # ordinary six-hour frontier before applying the dense
+                    # checkpoint recut below.
                     anchor_checkpoint_window(cursor_before)
                     continue
                 if is_read_budget_error(exc) and candidate_limit > (
@@ -3926,6 +3934,23 @@ class AttributeReadSelector:
                     # a correctness requirement. Retry the same physical
                     # checkpoint at the production-qualified base size.
                     candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                    continue
+                if (
+                    is_read_budget_error(exc)
+                    and active_segment_start is not None
+                    and cursor_before is not None
+                    and current_segment_end - active_segment_start
+                    > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                ):
+                    # A prior ordered page already proved this checkpoint.
+                    # Re-anchor the identical keyset frontier inside the
+                    # production-safe five-minute slice; no row at or below the
+                    # checkpoint is skipped, and the failed statement publishes
+                    # no progress.
+                    anchor_checkpoint_window(
+                        cursor_before,
+                        width=ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+                    )
                     continue
                 if (
                     is_read_budget_error(exc)
@@ -4005,6 +4030,22 @@ class AttributeReadSelector:
                     # progress invariant below converts this into an honest
                     # unavailable response rather than a looping continuation.
                     break
+                if (
+                    is_read_budget_error(exc)
+                    and exact_key is None
+                    and candidate_limit > 1
+                    and len(candidate_ids) > 1
+                ):
+                    # Generic key browsing hydrates every Map-key subcolumn for
+                    # the finite candidate set.  A small number of unusually
+                    # wide spans can therefore cross the replay result/timeout
+                    # envelope even though the ordered candidate page itself
+                    # completed.  Retry the identical physical frontier with a
+                    # smaller finite batch.  No candidate has been consumed yet,
+                    # so this cannot skip a key or publish progress from the
+                    # failed replay.
+                    candidate_limit = max(candidate_limit // 2, 1)
+                    continue
                 if (
                     is_read_budget_error(exc)
                     and active_segment_start is not None
@@ -4985,6 +5026,11 @@ class AttributeReadSelector:
                         else ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
                         if adaptive_search_probe
                         or widened_probe
+                        or (
+                            unpinned_cursor_read
+                            and cursor_before is None
+                            and not needle
+                        )
                         or (
                             candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                             and not dense_typed_oversample
