@@ -505,7 +505,12 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             if sort_direction not in {"asc", "desc"}:
                 return self._gm.bad_request("sort_direction must be asc or desc")
             sort_query = f"-{sort_by}" if sort_direction == "desc" else sort_by
-            queryset = queryset.order_by(sort_query)
+            # A complete picker may follow multiple numbered pages. Every
+            # supported sort field can tie (especially created_at during bulk
+            # imports), so keep the ordering total and stable across requests;
+            # otherwise rows can move between pages and be skipped/duplicated.
+            id_sort = "-id" if sort_direction == "desc" else "id"
+            queryset = queryset.order_by(sort_query, id_sort)
 
             try:
                 page_number = int(self.request.query_params.get("page_number", 0))

@@ -206,6 +206,46 @@ class TestObserveProjectListAPI:
         assert data["table"][0]["id"] == str(observe_project.id)
         assert data["table"][0]["issues"] == 0
 
+    def test_list_projects_adds_stable_id_tie_breaker(
+        self, auth_client, organization, workspace, observe_project
+    ):
+        """Numbered project pages must remain deterministic when sort values tie."""
+        second = Project.objects.create(
+            name="Second Observe Project",
+            organization=organization,
+            workspace=workspace,
+            model_type=AIModel.ModelTypes.GENERATIVE_LLM,
+            trace_type="observe",
+        )
+        tied_at = datetime(2026, 8, 12, 12, tzinfo=UTC)
+        Project.objects.filter(id__in=[observe_project.id, second.id]).update(
+            created_at=tied_at
+        )
+
+        with patch("tracer.views.project.V2AnalyticsQueryService") as service_class:
+            service_class.return_value.supports_per_query_read_settings = False
+            responses = [
+                auth_client.get(
+                    "/tracer/project/list_projects/",
+                    {
+                        "project_type": "observe",
+                        "sort_by": "created_at",
+                        "sort_direction": "desc",
+                        "page_number": page_number,
+                        "page_size": 1,
+                    },
+                )
+                for page_number in (0, 1)
+            ]
+
+        assert all(response.status_code == status.HTTP_200_OK for response in responses)
+        actual_ids = [get_result(response)["table"][0]["id"] for response in responses]
+        expected_ids = [
+            str(value)
+            for value in sorted([observe_project.id, second.id], reverse=True)
+        ]
+        assert actual_ids == expected_ids
+
     def test_list_projects_reads_activity_from_hourly_rollup_once(
         self, auth_client, observe_project
     ):
