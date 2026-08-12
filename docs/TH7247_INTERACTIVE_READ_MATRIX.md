@@ -50,6 +50,16 @@ for tracing lists and graphs are encoded in the shared `created_at` or
 | `GET /tracer/trace/voice_call_detail/` | Point identity, not a period list. | N | N | N | N | N | N | Not paged; accepts `trace_id` and legacy `traceId`. | Voice-call drawer and eval `TracingTestMode`. | [trace.py](../futureagi/tracer/views/trace.py) `TraceView.voice_call_detail`; [test_trace.py](../futureagi/tracer/tests/test_trace.py). |
 | `GET /tracer/trace/get_trace_export_data/`<br>`GET /tracer/observation-span/get_spans_export_data/`<br>`GET /tracer/trace-session/get_trace_session_export_data/` | Same W1-W6 filters as their Observe list. | Y | Y | Y | Y | C | C | Trace export forces list page zero with `page_size=100` and numbered mode. Span and session exports force page zero with `page_size=20` and `cursor_mode=true`, so a budget-bound filtered read can publish one fully classified and hydrated result chunk. All three return one bounded page. If `has_more`, a lower bound, or incomplete metadata remains, the CSV ends with `# export truncated after N rows; refine filters ...`; if candidate membership or ordering is inexact, that terminal marker discloses it explicitly even when the bounded chunk is otherwise complete. Any non-200 list response propagates before CSV generation; the public export contracts document `400/500/503`. These are not all-row exports. | All three URLs are in the endpoint catalog; no direct live caller was found in `frontend/src` at this freeze. | [bounded_csv.py](../futureagi/tracer/utils/bounded_csv.py); the three export actions in [trace.py](../futureagi/tracer/views/trace.py), [observation_span.py](../futureagi/tracer/views/observation_span.py), and [trace_session.py](../futureagi/tracer/views/trace_session.py); [test_bounded_page_exports.py](../futureagi/tracer/tests/test_bounded_page_exports.py). |
 
+### Export compatibility note
+
+The material public contract change in this section is CSV scope. The same four
+download URLs and CSV media type remain, but a synchronous download now means
+one bounded, explicitly classified page rather than every matching retained
+row: trace is capped at 100 rows; span, session, and Users are capped at 20.
+Callers that assumed a complete all-row file must refine filters or move to a
+future asynchronous export workflow. A sorted Users export is rejected with a
+typed `422` because cursor ordering cannot preserve that sort.
+
 ### Users response honesty
 
 The default Users cursor is ordered by a bounded `span_user_rollup` candidate
@@ -73,12 +83,12 @@ presentation value. The supporting contract is
 | `GET /tracer/trace/{id}/`<br>`GET /tracer/observation-span/{id}/`<br>`GET /tracer/trace-session/{id}/` | Point identity reads. | N | N | N | N | N | N | Not paged; finite identity-scoped CH25 readers. | Trace/span/session drawers, task/eval previews. | The three `retrieve` methods in [trace.py](../futureagi/tracer/views/trace.py), [observation_span.py](../futureagi/tracer/views/observation_span.py), and [trace_session.py](../futureagi/tracer/views/trace_session.py); [test_span_reader_stream_query.py](../futureagi/tracer/tests/test_span_reader_stream_query.py). |
 | `GET /tracer/trace/get_trace_id_by_index_observe/`<br>`GET /tracer/observation-span/get_trace_id_by_index_spans_as_observe/` | W1-W6 via the same list filters. | Y | Y | Y | Y | C | C | Bounded neighbor scan under one wall; incomplete membership returns retryable `503`, not a guessed neighbor. | Observe trace/span drawer next/previous controls. | The two action methods; [test_navigation_bounded_ch25.py](../futureagi/tracer/tests/test_navigation_bounded_ch25.py). |
 | `GET /tracer/trace/get_trace_id_by_index/`<br>`GET /tracer/observation-span/get_trace_id_by_index_spans_as_base/`<br>`POST /tracer/trace/compare_traces/` | Experiment/project-version filters are accepted. | U | U | U | U | U | U | **Not TH-7247 qualified.** These remain PG implementations; `compare_traces` builds the full comparison before selecting `index`. They must not be described as sharing the bounded Observe selector. | Run-insights drawer navigation and compare drawer. | Explicit `CH25-TODO` blocks in [trace.py](../futureagi/tracer/views/trace.py) `get_trace_id_by_index` / `compare_traces` and [observation_span.py](../futureagi/tracer/views/observation_span.py) `get_trace_id_by_index_spans_as_base`. |
-| `POST /tracer/trace/get_graph_methods/` | W1-W6 in body filters. | Y | Y | Y | Y | C | C | Date-only uses a synchronous rollup; filtered reads publish exact or explicitly sampled/degraded metadata. No pagination. | Observe `PrimaryGraph` / `GraphSection`. | [trace.py](../futureagi/tracer/views/trace.py) `TraceView.get_graph_methods`; [test_graph_rollup_fast_path.py](../futureagi/tracer/tests/test_graph_rollup_fast_path.py); [PrimaryGraph.test.jsx](../frontend/src/sections/projects/LLMTracing/GraphSection/__tests__/PrimaryGraph.test.jsx). |
+| `POST /tracer/trace/get_graph_methods/` | W1-W6 in body filters. | Y | Y | Y | Y | C | C | Date-only uses a synchronous rollup; filtered reads publish exact or explicitly sampled/degraded metadata. Finite trace-union classifiers use at most five candidates per statement, a 1.5-second statement cap, and the shared 9.5-second request wall. No pagination. | Observe `PrimaryGraph` / `GraphSection`. | [trace.py](../futureagi/tracer/views/trace.py) `TraceView.get_graph_methods`; [bounded_graph_reads.py](../futureagi/tracer/services/clickhouse/bounded_graph_reads.py); [test_bounded_graph_reads.py](../futureagi/tracer/tests/test_bounded_graph_reads.py); [PrimaryGraph.test.jsx](../frontend/src/sections/projects/LLMTracing/GraphSection/__tests__/PrimaryGraph.test.jsx). |
 | `POST /tracer/observation-span/get_graph_methods/` | W1-W6 in body filters. | Y | Y | Y | Y | C | C | Same bounded graph contract; no pagination. | Observe span graph through `GraphSection`. | [observation_span.py](../futureagi/tracer/views/observation_span.py) `ObservationSpanView.get_graph_methods`; [test_graph_rollup_fast_path.py](../futureagi/tracer/tests/test_graph_rollup_fast_path.py) `test_span_filtered_w1_w6_and_sparse_dense_eval_annotation_matrix_is_sampled`. |
-| `POST /tracer/trace-session/get_session_graph_data/` | W1-W6 in body filters. | Y | Y | Y | Y | C | C | Date-only representable metrics use `spans_per_session`; filtered/distinct-trace shapes use bounded graph reads with completeness metadata. | Sessions graph (`Sessions-view.jsx`). | [trace_session.py](../futureagi/tracer/views/trace_session.py) `TraceSessionView.get_session_graph_data`; [test_graph_rollup_fast_path.py](../futureagi/tracer/tests/test_graph_rollup_fast_path.py). |
+| `POST /tracer/trace-session/get_session_graph_data/` | W1-W6 in body filters. | Y | Y | Y | Y | C | C | Date-only representable metrics use `spans_per_session`; filtered/distinct-trace shapes use bounded graph reads with completeness metadata. Finite remap candidates stay relational and are replayed through `IN (SELECT ...)`, preserving ClickHouse `PREWHERE` validity. | Sessions graph (`Sessions-view.jsx`). | [trace_session.py](../futureagi/tracer/views/trace_session.py) `TraceSessionView.get_session_graph_data`; [exact_graph_reads.py](../futureagi/tracer/services/clickhouse/exact_graph_reads.py); [test_exact_graph_finite_remap_sql.py](../futureagi/tracer/tests/test_exact_graph_finite_remap_sql.py). |
 | `GET /tracer/project/get_graph_data/` | W1-W6 in query `filters`; `interval` is hour/day/week/month. | Y | Y | Y | Y | C | C | Exact/rollup/pending contract; unpublished incomplete output becomes `503`. | Legacy `ChartsView` through `endpoints.project.showCharts`. | [project.py](../futureagi/tracer/views/project.py) `ProjectView.get_graph_data`; [test_project_graph_response_contract.py](../futureagi/tracer/tests/test_project_graph_response_contract.py); [ChartsView.jsx](../frontend/src/sections/projects/ChartsView/ChartsView.jsx). |
 | `POST /tracer/project/get_user_metrics/` | W1-W6 in body filters for one `end_user_id`. | Y | Y | C | C | C | C | Point-user aggregate, not paged; one 9.5-second bounded read. | Users detail `UserSummaryCardsSection`. | [project.py](../futureagi/tracer/views/project.py) `ProjectView.get_user_metrics`; [test_user_graph_latest_state_ch25.py](../futureagi/tracer/tests/test_user_graph_latest_state_ch25.py). |
-| `POST /tracer/project/get_users_aggregate_graph_data/` | W1-W6 in body filters. | Y | Y | C | C | C | C | Exact/explicitly sampled graph metadata; no pagination. | Users overview graph in `UsersView`. | [project.py](../futureagi/tracer/views/project.py) `ProjectView.get_users_aggregate_graph_data`; [test_bounded_graph_reads.py](../futureagi/tracer/tests/test_bounded_graph_reads.py). |
+| `POST /tracer/project/get_users_aggregate_graph_data/` | W1-W6 in body filters. | Y | Y | C | C | C | C | Exact/explicitly sampled graph metadata; no pagination. Finite end-user/session remap candidates stay relational and are replayed through `IN (SELECT ...)`. | Users overview graph in `UsersView`. | [project.py](../futureagi/tracer/views/project.py) `ProjectView.get_users_aggregate_graph_data`; [exact_graph_reads.py](../futureagi/tracer/services/clickhouse/exact_graph_reads.py); [test_exact_graph_finite_remap_sql.py](../futureagi/tracer/tests/test_exact_graph_finite_remap_sql.py). |
 | `POST /tracer/project/get_user_graph_data/?project_id=...&end_user_id=...` | W1-W6 in body filters. | Y | Y | C | C | C | C | Five finite per-user series; no pagination. | Users detail `UserMetricsGraphSection`. | [project.py](../futureagi/tracer/views/project.py) `ProjectView.get_user_graph_data`; [test_project_graph_response_contract.py](../futureagi/tracer/tests/test_project_graph_response_contract.py). |
 | `POST /tracer/dashboard/query/`<br>`POST /tracer/dashboard/{dashboard_id}/widgets/{widget_id}/query/`<br>`POST /tracer/dashboard/{dashboard_id}/widgets/preview/` | Native presets include Today, 7D, 30D, 3M, 6M, 12M and custom start/end. | Y | Y | Y | Y | C | C | Up to five metrics; exact/rollup/pending/degraded per-metric metadata. No list pagination. | `WidgetChart`, dashboard editor/preview via `useDashboards`. | [dashboard.py serializer](../futureagi/tracer/serializers/dashboard.py) `DashboardQuerySerializer`; [dashboard.py](../futureagi/tracer/views/dashboard.py); [test_dashboard_fast_path.py](../futureagi/tracer/tests/test_dashboard_fast_path.py); [WidgetChart.test.jsx](../frontend/src/sections/dashboards/__tests__/WidgetChart.test.jsx). |
 | `GET /tracer/dashboard/metrics/` | Catalog metadata, not selected W1-W6. | N | N | N | N | N | N | Backward-compatible unpaged response when no search/category/source/page parameter is supplied; otherwise one-based pages, `page_size <= 200`, and `has_more`. | Dashboard metric picker via `useDashboardMetrics` / `useDashboardMetricsPaginated`. | [dashboard.py](../futureagi/tracer/views/dashboard.py) `DashboardViewSet.metrics`; [useDashboards.js](../frontend/src/hooks/useDashboards.js); [useDashboards.test.js](../frontend/src/hooks/__tests__/useDashboards.test.js). |
@@ -86,7 +96,7 @@ presentation value. The supporting contract is
 | `GET /api/traces/span-attribute-keys/` | **Not selected W1-W6.** With `page_size`, the cursor is frozen over all retained project data. Without `page_size`, legacy exact/adaptive lookup remains. | N | N | N | N | N | N | Signed cursor, `page_size <= 50`, deduplicated server-side seen state, `has_more` / `next_cursor`; counts are explicitly non-exact. | Journey Attributes, Run Insights attribute keys, Observe trace attribute properties, eval field mapping. | [span_attributes.py](../futureagi/tracer/views/span_attributes.py) `SpanAttributeKeysView`; [test_attribute_reads_recut.py](../futureagi/tracer/tests/test_attribute_reads_recut.py); [attribute-key-pagination.test.jsx](../frontend/src/components/run-insights/traces-tab/__tests__/attribute-key-pagination.test.jsx). |
 | `GET /api/traces/span-attribute-values/` | **Not selected W1-W6.** Always a six-hour compatibility sample ending at a frozen current time. | N | N | N | N | N | N | No cursor and no read more; `limit <= 500`; always labelled sampled on a usable response. | No live caller found in `frontend/src`; autocomplete now calls dashboard `filter_values`. | [span_attributes.py](../futureagi/tracer/views/span_attributes.py) `SpanAttributeValuesView`; [attribute_reads.py](../futureagi/tracer/services/clickhouse/attribute_reads.py) `ATTRIBUTE_READ_EXPLICIT_SEGMENT`. |
 | `GET /api/traces/span-attribute-detail/` | Fixed 365-day exact snapshot identity, not selected W1-W6. | N | N | N | N | N | N | Cached exact snapshot with pending/refresh metadata; not paged. | Journey `AttributeDetail`. | [span_attributes.py](../futureagi/tracer/views/span_attributes.py) `SpanAttributeDetailView`; [AttributeDetail.jsx](../frontend/src/sections/journey/attributes/AttributeDetail.jsx); [test_exact_aggregation_contract.py](../futureagi/tracer/tests/test_exact_aggregation_contract.py). |
-| `GET /tracer/dashboard/filter_values/` | **Not selected W1-W6.** Cursor-backed trace/system/custom-attribute catalogs freeze retained project data. The no-`page_size` compatibility system path uses a fixed 7-day lookback. | N | N | N | N | N | N | Signed cursor for pageable trace values, `page_size <= 50`; `has_more`, `browse_status`, `next_cursor`; FE de-duplicates physical pages and follows advancing cursors under one action deadline. Dataset/simulation branches have separate contracts. | `AutocompleteTextValueSelector`, `TraceFilterPanel`, dashboard metric/filter pickers, dataset-column picker. | [dashboard.py](../futureagi/tracer/views/dashboard.py) `DashboardViewSet.filter_values`; [useDashboards.js](../frontend/src/hooks/useDashboards.js) `useDashboardFilterValues`; [test_filter_value_read_metadata.py](../futureagi/tracer/tests/test_filter_value_read_metadata.py); [AutocompleteTextValueSelector.test.jsx](../frontend/src/components/ComplexFilter/ValueSelectors/__tests__/AutocompleteTextValueSelector.test.jsx). |
+| `GET /tracer/dashboard/filter_values/` | **Not selected W1-W6.** Cursor-backed trace/system/custom-attribute catalogs freeze retained project data. The no-`page_size` compatibility system path uses a fixed 7-day lookback. | N | N | N | N | N | N | Signed cursor for pageable trace values, `page_size <= 50`; `has_more`, `browse_status`, `next_cursor`. The public system-value action starts one 6-second deadline before project/cursor preparation; a bounded pause returns an advancing checkpoint over the same retained-data window. FE de-duplicates physical pages, rejects non-advancing cursors, and applies a 9.8-second request timeout. Dataset/simulation branches have separate contracts. | `AutocompleteTextValueSelector`, `TraceFilterPanel`, dashboard metric/filter pickers, dataset-column picker. Voice Call system `Ended Reason` and a raw custom attribute also named `ended_reason` remain independently category-qualified as `system_metric` and `custom_attribute`. | [dashboard.py](../futureagi/tracer/views/dashboard.py) `DashboardViewSet.filter_values`; [filter_value_reads.py](../futureagi/tracer/services/clickhouse/filter_value_reads.py); [useDashboards.js](../frontend/src/hooks/useDashboards.js) `useDashboardFilterValues`; [test_filter_value_http_deadline.py](../futureagi/tracer/tests/test_filter_value_http_deadline.py); [test_filter_value_read_metadata.py](../futureagi/tracer/tests/test_filter_value_read_metadata.py); [TraceFilterPanel.test.jsx](../frontend/src/sections/projects/LLMTracing/__tests__/TraceFilterPanel.test.jsx); [AutocompleteTextValueSelector.test.jsx](../frontend/src/components/ComplexFilter/ValueSelectors/__tests__/AutocompleteTextValueSelector.test.jsx). |
 | `GET /tracer/observation-span/get_span_attributes_list/` | **Not selected W1-W6.** Recent dense inventory is a labelled six-hour sample; sparse/exact lookup can use adaptive bands up to one year. | N | N | N | N | N | N | No cursor/read more. | No live caller found in `frontend/src` at this freeze. | [observation_span.py](../futureagi/tracer/views/observation_span.py) `get_span_attributes_list` / `_get_span_attribute_inventory`; [test_eval_attributes_list.py](../futureagi/tracer/tests/test_eval_attributes_list.py). |
 | `GET /tracer/observation-span/get_eval_attributes_list/` | Same sampled/adaptive inventory contract; `row_type` controls spans/traces/sessions/voice paths. It does not honor the current UI date preset. | N | N | N | N | N | N | No cursor/read more; trace/session indexed paths use a bounded cardinality sample. | Eval task create/edit drawers, Run Insights spans, Sessions/Users/Observe filters, Alerts, eval `TracingTestMode`. | [observation_span.py](../futureagi/tracer/views/observation_span.py) `get_eval_attributes_list`; [useExactEvalAttributeFields.js](../frontend/src/sections/evals/components/useExactEvalAttributeFields.js); [test_eval_attributes_list.py](../futureagi/tracer/tests/test_eval_attributes_list.py). |
 | `GET /tracer/trace-session/get_session_filter_values/` | No selected time window. Session/user dimensions read current live dictionaries; first/last-message reads are separately bounded/sampled. | N | N | N | N | N | N | Offset `page`, `page_size <= 500`; only message values expose `next`. FE currently requests page zero with size 100 and provides no Load more. | Session-specific fields in `TraceFilterPanel`. | [trace_session.py](../futureagi/tracer/views/trace_session.py) `get_session_filter_values`; [TraceFilterPanel.jsx](../frontend/src/sections/projects/LLMTracing/TraceFilterPanel.jsx); [test_trace_session.py](../futureagi/tracer/tests/test_trace_session.py). |
@@ -94,6 +104,31 @@ presentation value. The supporting contract is
 | `GET /tracer/observation-span/get_evaluation_details/` | Point span + eval-config identity. | N | N | N | N | N | N | Not paged; tenant-authorized finite CH detail. | Trace detail/eval error localization drawers. | [observation_span.py](../futureagi/tracer/views/observation_span.py) `get_evaluation_details`; [EvalErrorLocalization.jsx](../frontend/src/components/traceDetail/EvalErrorLocalization.jsx). |
 | `GET /tracer/trace/get_properties/`<br>`GET /tracer/observation-span/get_observation_span_fields/` | Static metadata, no time window. | N | N | N | N | N | N | Not paged and no telemetry scan. | Trace property API hook; add-to-dataset field picker. | The two action methods; [llm-tracing.js](../frontend/src/api/project/llm-tracing.js); [add-dataset.jsx](../frontend/src/components/traceDetailDrawer/addToDataset/add-dataset.jsx). |
 | `GET /tracer/trace-session/{id}/eval_logs/` | Session identity; no W preset. | N | N | N | N | N | N | Page is 0-based, `page_size <= 100`; session-target eval rows only. | Session drawer `SessionEvalsList`. | [trace_session.py](../futureagi/tracer/views/trace_session.py) `TraceSessionView.eval_logs`; [SessionEvalsList.jsx](../frontend/src/sections/projects/TracesDrawer/SessionEvalsList.jsx); [test_trace_session.py](../futureagi/tracer/tests/test_trace_session.py). |
+
+### Graph corrections found by runtime qualification
+
+- Session and Users exact graph SQL previously exposed a ClickHouse scalar-array
+  alias on the right side of `IN` inside `PREWHERE`. The corrected source builds
+  the finite physical-ID candidates as a relational CTE and uses
+  `IN (SELECT candidate_id FROM candidate_relation)`. This is a SQL-validity
+  correction, not a sampling shortcut.
+- ClickHouse returns `toStartOfMonth` as a Python `date` with the production
+  native-client settings. The trace metric reducer previously accepted only
+  `datetime`, so the Whatfix W6 `has_eval` graph failed after its database work
+  had succeeded. It now accepts `date` or `datetime`, normalizes both through
+  `BaseQueryBuilder._normalize_timestamp`, and continues to reject strings and
+  nulls as schema drift.
+- A W6 annotator trace graph then showed that the finite, at-most-five-trace
+  relation classifier could legitimately need more than its old 750ms
+  statement slice for a candidate-scoped `Score FINAL` read. Its statement cap
+  is now 1.5 seconds, still clamped by the shared 9.5-second request wall; a
+  failed batch remains atomic and becomes a sanitized retryable error rather
+  than a published prefix.
+
+The regression anchors are
+[test_exact_graph_finite_remap_sql.py](../futureagi/tracer/tests/test_exact_graph_finite_remap_sql.py)
+and
+[test_bounded_graph_reads.py](../futureagi/tracer/tests/test_bounded_graph_reads.py).
 
 ## Eval/task and annotation surfaces: exact scope and known gaps
 
@@ -119,8 +154,15 @@ the lower-level trace/span/session selector has bounded tests.
 
 - The normal tracing list/filter/graph database wall is 9.5 seconds, leaving
   transport and serialization headroom below the requested ten-second SLA.
-  Users list/export uses one stricter 8-second wall; eval-list charts use two
-  seconds. Each sequential phase receives only the remaining wall time.
+  The pageable dashboard **system** filter-value action starts a stricter
+  request-owned 6-second wall before project/cursor preparation; lower-level
+  attribute readers retain their 8-second ceiling but receive only the
+  remaining public deadline when one is supplied. Users list/export uses one
+  8-second wall, and eval-list charts use two seconds. Each sequential phase
+  receives only the remaining wall time.
+- The frontend dashboard filter-value request timeout is 9.8 seconds. It is an
+  HTTP fail-safe, not extra database time, and its abort signal is carried to
+  every physical cursor-page request.
 - Interactive ClickHouse statements use finite memory, byte, result, thread,
   query-count, payload, and process-concurrency controls. TH-7247 does not use
   an application `max_rows_to_read` source-row ceiling on these paths.
@@ -138,22 +180,72 @@ the lower-level trace/span/session selector has bounded tests.
 
 ## Runtime evidence and remaining release gaps
 
+### Evidence provenance
+
+The release source anchors are core `c5d8c8852d23ee75b3edd37baf2549f030e789fc`
+and EE `45f8a5691297caba3acb74f0134b5ee6caa964b4`. The immutable builds are:
+
+- OSS build `2893cbc4-f502-4d40-8848-b9efb811a332`, digest
+  `sha256:e2cddb5aee2863dc7dfea6cd294f241f39290f7a78a4122785b6022bfea2cf93`;
+- EE build `fe36952e-0964-4e43-a990-b78b39777260`, digest
+  `sha256:15460252cfc4f81c9f91a09dba5f96469573f85b7236b7454c1095fd7967882e`,
+  built from that exact OSS digest.
+
+Cloud Build and Artifact Registry reported the same digests. The workload
+measurements below were made in isolated pods from an immutable EE base plus
+exact current-source overlays. The final backend overlay had 34 verified files
+and manifest SHA-256
+`9287ef29452b4a4e48c8718a681e736d1ba791b1c11e4f7d9b17e96636b55b76`.
+The final no-overlay smoke then ran from the exact immutable EE digest above:
+the pod's spec and image ID matched, all 39 critical hashes matched, the
+runtime-manifest SHA-256 was
+`b972bf13a727b85cc3140c010c1eba7eb25e8912613e564e1bece4f57191dc33`,
+and `runtime_overlays=0`. It repeated the high-risk W6 graph/export cells and a
+default Colektia smoke, not every page and filter combination below; in
+particular, continuation page two was not rerun from the final digest.
+
+### Default-list runtime matrix
+
+Times are end-to-end milliseconds. Every exercised cell returned HTTP 200 with
+positive rows and `query_complete: true`. W1 and W6 exercised two pages with an
+advancing signed cursor and no overlap. W2-W5 exercised page one only; those
+unrun page-two cells remain explicit rather than inferred.
+
+| Window | Trace p1 / p2 | Span p1 / p2 | Session p1 / p2 | Users p1 / p2 | Coverage boundary |
+| --- | ---: | ---: | ---: | ---: | --- |
+| W1 Today | 539 / 453 | 221 / 257 | 589 / 521 | 665 / 711 | Both pages positive; cursor advanced without overlap. |
+| W2 7 days | 750 / - | 307 / - | 1,091 / - | 1,409 / - | Page one returned five rows, `has_more`, and a signed cursor; page two not exercised. |
+| W3 30 days | 646 / - | 307 / - | 1,301 / - | 2,587 / - | Same page-one-only qualification. |
+| W4 3 months | 770 / - | 498 / - | 1,940 / - | 2,962 / - | Same page-one-only qualification. |
+| W5 6 months | 747 / - | 420 / - | 1,706 / - | 3,035 / - | Same page-one-only qualification. |
+| W6 12 months | 739 / 773 | 489 / 214 | 2,253 / 1,943 | 5,049 / 6,634 | Both pages positive; cursor advanced without overlap. |
+
+The W2-W5 qualification was for default filters only. Sparse, dense, system,
+combined, eval, and annotation shapes were not run for those four windows.
+Later export- and graph-only commits did not change these list paths. Users
+still declares `query_exact: false` and `ordering_exact: false`; a complete
+cursor page is not a claim that its candidate population or ordering is exact.
+
+### Other endpoint evidence
+
 | Surface | Evidence at this freeze | Honest status |
 | --- | --- | --- |
-| Trace list on tested Colektia IDs | A frozen-end newest-20 request returned the same ordered slice for 1M and 12M in both request orders. Warm page one was 0.95-1.26s and page two 0.88-1.27s, with no overlap. | Qualified for the tested IDs and shapes only. |
-| Reported user `45293328` | Trace Today/12M was 0.97/1.18s; Sessions Today/12M was 0.14/0.59s; continuations exhausted without overlap. | Qualified for that identity only. |
-| Users default and 12M | Repeated default Today first/second pages were 0.67-0.76s. Repeated 12M pages were 3.38-4.65s with 25 rows and no overlap. A fallback-only empty-candidate case terminated honestly in 0.65s. | Qualified for tested unfiltered/default shapes. Candidate ordering remains explicitly non-exact. |
-| Users dense `call_id` | A 12M request returned an advancing one-row result at about 8.04s; the selector itself was about 8.03s. | **Marginal/unqualified:** it exceeded the internal 8-second reserve even though it was below ten seconds. |
-| Attribute keys/values on tested Colektia ID | Two 50-key retained-data pages had no overlap and an advancing signed cursor. A missing exact key completed in 3.70s. Dense `call_id` pages completed in 4.87/5.17s. | Qualified for tested identities/types only. |
-| System `Ended Reason` | Isolated cursor pages completed in 8.17/8.47s. The compatibility value endpoint returned a truthful six-hour sample in 0.76s. | Below ten seconds but **marginal**; production monitoring is required. |
-| Export compatibility | Focused unit contracts prove the trace 100-row numbered bound, span/session 20-row cursor bounds, error propagation, deterministic/formula-safe CSV, and in-band truncation. | No isolated EE endpoint runtime has yet qualified the three list exports; do not call them production-green from unit tests alone. |
-| Eval and annotator filters | SQL/parser and selector contracts exist. The tested projects had no representative project-fenced annotator population; live eval-fixture discovery timed out before a filtered page was exercised. | **Not release-qualified.** |
-| Whatfix | No authoritative Whatfix project/identity runtime result is captured in the current evidence bundle. | **Not release-qualified.** |
-| Full W1-W6 x F0-F5 matrix | Unit/parity coverage exists for the shared list and graph compilers, including sparse/dense/system/eval/annotation shapes. Runtime evidence covers only the cases above. | **Partial.** Builder-only coverage is not endpoint proof. |
-| Eval-task lists/usage and eval-log details | Source inspection proves full-queryset/full-period work before paging as documented above. | **Known pre-existing release gap** if these surfaces are included in the under-ten-second objective. |
+| Final immutable default smoke | From the no-overlay EE digest, project listing took 31ms. Colektia W6 default trace/span/session/Users calls returned HTTP 200 in 962/848/2,059/3,623ms. | The final artifact is qualified for these first-page smoke shapes only. Continuation page two and the full historical matrix were not repeated from this digest. |
+| Frozen newest-20 ordering | With one frozen end time, the tested Colektia trace request returned the exact same ordered newest 20 for W3 (30 days) and W6 (12 months), in 996ms and 1,317ms. | This proves the expected invariant for that population: widening the lower bound does not change the first 20 when all 20 are already inside the narrower window. It is not a universal promise for a sparse project whose twentieth row predates W3. |
+| Colektia W6 filters | Representative trace calls completed in 7.91s dense, 8.12s sparse, 7.55s system, and 7.30s combined. The largest passing call in the strict run was a dense W6 session request at 9.307s. | Qualified for the exercised identities and shapes only; the narrow margin on the largest call requires monitoring. |
+| Colektia graphs | Trace W1/W6 returned complete 7/13-point series in 21/196ms. Session W1/W6 returned complete 7/13-point series in 40/6,295ms. Users W1/W6 returned honest `pending` with zero published points in 30/26ms. | Trace and session data are qualified for these shapes. Users response-state handling is qualified, but Users graph data is **not** qualified by a pending response. W2-W5 graphs were not exercised. |
+| System `Ended Reason`: startup, first request, continuation, warm request | ASGI boot, including URL-graph prewarm, took 14,962ms before the worker served traffic; the resolver check after prewarm took 14ms. On a fresh route-prewarmed worker, retained-data page one took 2,361ms and page two 8,364ms; a warm page-one repeat took 2,091ms. Both first-pass pages returned complete continuation metadata, zero values, and an advancing/no-overlap signed cursor. | The endpoint wall and empty-continuation behavior are qualified under ten seconds. The tested Whatfix retained-data catalog was honestly empty, so this does **not** prove positive `ended_reason` membership. Startup time is not an HTTP-latency sample. |
+| Attribute keys/values | Two 50-key retained-data pages had no overlap and an advancing signed cursor. A missing exact key completed in 3.70s; dense `call_id` pages completed in 4.87/5.17s. | Qualified for the tested identities and attribute types only. |
+| Four W6 bounded CSV exports | From the no-overlay final digest, trace returned HTTP 200 in 4,242ms (1,891,781 bytes / 858 lines), span in 1,077ms (87,230 bytes / 233 lines), session in 2,059ms (707,372 bytes / 78 lines), and Users in 2,961ms (2,797 bytes / 22 lines). Every response ended with the expected `truncated` classification; none contained a failed or incomplete marker. | Qualified for the new bounded-page CSV semantics only. This is a material compatibility change from an all-row interpretation: trace requests at most 100 list rows; span, session, and Users at most 20, while CSV hydration can produce multiple lines per selected entity. The terminal marker states when the file is not the whole population. |
+| Whatfix eval/annotator lists | Retained qualification runs exercised W1/W6 eval/annotator shapes under ten seconds; the slowest cold eval trace call was 8.498s. In the final annotator rerun, W1 trace/span/session took 89/80/112ms; W6 trace p1/p2 375/285ms, span 350/266ms, and session 605/487ms. Those annotator calls returned complete empty pages; W6 signed cursors advanced without overlap. | Timing, failure-boundary, and continuation behavior are qualified for the empty population. No positive matching row was observed, so F5-E/F5-A remain `C`, not `Y`. |
+| Whatfix eval/annotator graphs | From the no-overlay final digest, W6 `has_eval` trace returned complete HTTP 200 with 13 points in 1,626ms, and W6 `has_annotation` trace returned honest `sampled`/`sample_limit`, 13 points, HTTP 200 in 2,533ms. Earlier exact-overlay qualification also observed eval session/Users as honest `pending` in 30/24ms; W1 annotator trace complete with 8 points in 86ms and session/Users `pending` in 24/24ms; W6 annotator session/Users `pending` in 38/31ms. | The final artifact's trace graph result-state behavior is qualified for these W6 shapes. Pending session/Users graph data and positive eval/annotator membership remain unqualified. |
+| Full W1-W6 x F0-F5 matrix | Default list page one was run for all six windows, page two for W1/W6, and selected W6 sparse/dense/system/combined plus W1/W6 eval/annotation shapes. Unit/parity coverage also exists for the shared compilers. | **Partial.** W2-W5 page two, W2-W5 non-default filters, most W2-W5 graphs, and positive F5 membership are missing. Compiler tests are not endpoint-scale proof. |
+| Explicit pre-existing gaps | The PG base trace/span navigation and trace compare paths remain outside the bounded Observe selector; legacy Charts/Alerts lack a representative W1-W6 x F0-F5 endpoint matrix; eval-task lists/usage and eval-log detail still do work before pagination as documented above. | **Not TH-7247 release-qualified.** These must not inherit green status from nearby bounded selectors. |
 
 Production inspection used only standalone ClickHouse `SELECT`/`WITH` with a
 unique query ID, `readonly=2`, a ten-second-or-lower execution ceiling, finite
 threads, 36 GiB memory, and `max_rows_to_read=0`. Isolated API evidence used
-read-only PostgreSQL transactions and blocked ClickHouse mutation methods. No
-browser session is part of this evidence.
+read-only PostgreSQL transactions and blocked ClickHouse mutation methods. The
+final no-overlay digest smoke recorded 52 PostgreSQL reads and 104 ClickHouse
+calls (four connection/bootstrap calls and 100 with `readonly=2`), with zero
+blocked-write attempts. No browser session is part of this evidence.
