@@ -78649,6 +78649,12 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Updated at",
           "type": "string"
         },
+        "version_id": {
+          "title": "Version id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
         "version_number": {
           "title": "Version number",
           "type": "integer",

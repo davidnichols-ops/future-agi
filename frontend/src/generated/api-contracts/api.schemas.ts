@@ -10152,6 +10152,8 @@ export interface CompositeEvalDetailResponseResultApi {
   tags?: string[];
   created_at?: string;
   updated_at?: string;
+  /** @minLength 1 */
+  version_id?: string;
   version_number?: number;
 }
 

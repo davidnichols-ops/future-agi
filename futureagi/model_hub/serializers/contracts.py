@@ -2529,6 +2529,7 @@ class CompositeEvalDetailResponseResultSerializer(
     tags = serializers.ListField(child=serializers.CharField(), required=False)
     created_at = serializers.CharField(required=False, allow_blank=True)
     updated_at = serializers.CharField(required=False, allow_blank=True)
+    version_id = serializers.CharField(required=False, allow_null=True)
     version_number = serializers.IntegerField(required=False, allow_null=True)
 
 

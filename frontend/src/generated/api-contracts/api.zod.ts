@@ -19579,6 +19579,7 @@ export const modelHubEvalTemplatesCompositeListResponseResultChildrenItemConfigD
 
 
 
+
 export const ModelHubEvalTemplatesCompositeListResponse = zod.object({
   "status": zod.boolean(),
   "result": zod.object({
@@ -19605,6 +19606,7 @@ export const ModelHubEvalTemplatesCompositeListResponse = zod.object({
   "tags": zod.array(zod.string().min(1)).optional(),
   "created_at": zod.string().optional(),
   "updated_at": zod.string().optional(),
+  "version_id": zod.string().min(1).optional(),
   "version_number": zod.number().optional()
 })
 })
@@ -19655,6 +19657,7 @@ export const modelHubEvalTemplatesCompositePartialUpdateResponseResultChildrenIt
 
 
 
+
 export const ModelHubEvalTemplatesCompositePartialUpdateResponse = zod.object({
   "status": zod.boolean(),
   "result": zod.object({
@@ -19681,6 +19684,7 @@ export const ModelHubEvalTemplatesCompositePartialUpdateResponse = zod.object({
   "tags": zod.array(zod.string().min(1)).optional(),
   "created_at": zod.string().optional(),
   "updated_at": zod.string().optional(),
+  "version_id": zod.string().min(1).optional(),
   "version_number": zod.number().optional()
 })
 })
