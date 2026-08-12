@@ -1373,7 +1373,7 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
 
             # Pause exits the workflow; resuming starts a fresh run that picks up
             # the remaining pending/running entries.
-            start_eval_task_workflow_sync(eval_task)
+            start_eval_task_workflow_sync(eval_task, replace_existing=True)
 
             return self._gm.success_response(
                 {"message": "Eval task unpaused successfully"}
@@ -1622,7 +1622,18 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 # request returns without doing that work synchronously.
                 if edit_type == "fresh_run":
                     soft_delete_live(eval_task)
-                start_eval_task_workflow_sync(eval_task)
+                # Temporal must not see the rerun until the PENDING state and
+                # all config/result changes are committed.  A fast worker can
+                # otherwise attempt its guarded PENDING -> RUNNING transition
+                # against the old row and leave an active workflow stranded
+                # behind a PENDING task.  Keep callback failures non-robust so
+                # the existing API error contract still surfaces dispatch
+                # failures; the committed PENDING row is safe to retry.
+                transaction.on_commit(
+                    lambda: start_eval_task_workflow_sync(
+                        eval_task, replace_existing=True
+                    )
+                )
 
                 return self._gm.success_response(
                     {

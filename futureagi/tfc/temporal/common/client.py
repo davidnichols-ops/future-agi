@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHandle
-from temporalio.common import WorkflowIDReusePolicy
+from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
 T = TypeVar("T")
 
@@ -288,6 +288,9 @@ async def start_workflow_async(
     *,
     cancel_existing: bool = True,
     id_reuse_policy: WorkflowIDReusePolicy = WorkflowIDReusePolicy.TERMINATE_IF_RUNNING,
+    id_conflict_policy: WorkflowIDConflictPolicy = (
+        WorkflowIDConflictPolicy.UNSPECIFIED
+    ),
 ) -> WorkflowHandle:
     """
     Start a workflow asynchronously with common options.
@@ -299,6 +302,7 @@ async def start_workflow_async(
         task_queue: Temporal task queue name
         cancel_existing: If True, cancel existing running workflow first
         id_reuse_policy: Policy for reusing workflow IDs
+        id_conflict_policy: Policy when the workflow ID is already running
 
     Returns:
         WorkflowHandle for the started workflow
@@ -322,6 +326,7 @@ async def start_workflow_async(
         id=workflow_id,
         task_queue=task_queue,
         id_reuse_policy=id_reuse_policy,
+        id_conflict_policy=id_conflict_policy,
     )
 
 
