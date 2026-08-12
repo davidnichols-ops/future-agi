@@ -22935,7 +22935,6 @@ export interface TraceVoiceCallDetailResultApi {
   /** @minLength 1 */
   created_at?: string | null;
   duration_seconds?: number | null;
-  /** @minLength 1 */
   recording_url?: string | null;
   /** @minLength 1 */
   stereo_recording_url?: string | null;
@@ -22943,7 +22942,6 @@ export interface TraceVoiceCallDetailResultApi {
   cost_breakdown?: TraceVoiceCallDetailResultApiCostBreakdown | null;
   /** @minLength 1 */
   error_message?: string | null;
-  /** @minLength 1 */
   call_summary?: string | null;
   /** @minLength 1 */
   ended_reason?: string | null;

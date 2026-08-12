@@ -648,8 +648,8 @@ const jsonValueSchema: zod.ZodType<JsonValue> =
         '"duration_seconds": zod.number().nullish(),',
       ],
       [
-        '"recording_url": zod.string().min(1).optional(),',
-        '"recording_url": zod.string().min(1).nullish(),',
+        '"recording_url": zod.string().optional(),',
+        '"recording_url": zod.string().nullish(),',
       ],
       [
         '"stereo_recording_url": zod.string().min(1).optional(),',
@@ -668,8 +668,8 @@ const jsonValueSchema: zod.ZodType<JsonValue> =
         '"error_message": zod.string().min(1).nullish(),',
       ],
       [
-        '"call_summary": zod.string().min(1).optional(),',
-        '"call_summary": zod.string().min(1).nullish(),',
+        '"call_summary": zod.string().optional(),',
+        '"call_summary": zod.string().nullish(),',
       ],
       [
         '"ended_reason": zod.string().min(1).optional(),',

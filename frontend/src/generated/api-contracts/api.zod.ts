@@ -43182,8 +43182,6 @@ export const TracerTraceVoiceCallDetailQueryParams = zod.object({
 
 
 
-
-
 export const TracerTraceVoiceCallDetailResponse = zod.object({
   "status": zod.boolean(),
   "result": zod.object({
@@ -43199,12 +43197,12 @@ export const TracerTraceVoiceCallDetailResponse = zod.object({
   "ended_at": zod.string().min(1).nullish(),
   "created_at": zod.string().min(1).nullish(),
   "duration_seconds": zod.number().nullish(),
-  "recording_url": zod.string().min(1).nullish(),
+  "recording_url": zod.string().nullish(),
   "stereo_recording_url": zod.string().min(1).nullish(),
   "cost_cents": zod.number().nullish(),
   "cost_breakdown": zod.record(zod.string(), zod.unknown()).nullish(),
   "error_message": zod.string().min(1).nullish(),
-  "call_summary": zod.string().min(1).nullish(),
+  "call_summary": zod.string().nullish(),
   "ended_reason": zod.string().min(1).nullish(),
   "overall_score": zod.number().nullish(),
   "response_time_ms": zod.number().nullish(),

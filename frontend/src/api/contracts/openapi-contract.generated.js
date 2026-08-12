@@ -93508,7 +93508,6 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "recording_url": {
           "title": "Recording url",
           "type": "string",
-          "minLength": 1,
           "x-nullable": true
         },
         "stereo_recording_url": {
@@ -93537,7 +93536,6 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "call_summary": {
           "title": "Call summary",
           "type": "string",
-          "minLength": 1,
           "x-nullable": true
         },
         "ended_reason": {
