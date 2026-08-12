@@ -11,7 +11,7 @@ const flattenPages = (data) =>
   data.pages.flatMap((page) => page?.data?.results || []);
 
 export function useWorkspacesList({ enabled = true } = {}) {
-  const { currentOrganizationId, isReady: orgReady } = useOrganization();
+  const { currentOrganizationId } = useOrganization();
 
   const query = useInfiniteQuery({
     // A cached list must never be served to a different org.
@@ -29,10 +29,21 @@ export function useWorkspacesList({ enabled = true } = {}) {
     enabled: enabled && !!currentOrganizationId,
   });
 
+  // Spreading the result would read every property, marking them all tracked
+  // and re-rendering consumers on transitions none of them use. Adding a
+  // property here is the price of a consumer needing one.
   return {
-    ...query,
+    data: query.data,
+    fetchNextPage: query.fetchNextPage,
+    // A disabled query is still pending, which is what the switcher renders on.
+    isPending: query.isPending,
+    isFetchingNextPage: query.isFetchingNextPage,
+    isError: query.isError,
     // A disabled query is not "loading", but callers have nothing to render.
-    isLoading: query.isLoading || (enabled && !orgReady),
+    // Gate on the same value as `enabled`: org resolution can finish without
+    // producing an id — a failed org list still sets isReady — which would
+    // otherwise leave this "not loading, no error, no data" forever.
+    isLoading: query.isLoading || (enabled && !currentOrganizationId),
   };
 }
 
@@ -44,5 +55,7 @@ export function useWorkspaceFromList(workspaceId, { enabled = true } = {}) {
     [query.data, workspaceId],
   );
 
+  // `query` is the narrowed object above, not the tracked proxy, so spreading
+  // it here reads only plain properties.
   return { ...query, workspace };
 }

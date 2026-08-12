@@ -12,16 +12,17 @@ import { useAuthContext } from "src/auth/hooks";
 import { useOrganization } from "src/contexts/OrganizationContext";
 import { enqueueSnackbar } from "src/components/snackbar";
 import logger from "src/utils/logger";
+import {
+  SS_KEY_ORG_ID,
+  SS_KEY_WORKSPACE_DISPLAY_NAME,
+  SS_KEY_WORKSPACE_ID,
+  SS_KEY_WORKSPACE_NAME,
+  SS_KEY_WORKSPACE_ORG_ID,
+  SS_KEY_WORKSPACE_ROLE,
+  SS_KEY_WS_LEVEL,
+} from "src/utils/sessionKeys";
 
 // --- sessionStorage helpers ---------------------------------------------------
-
-const SS_KEY_WORKSPACE_ID = "workspaceId";
-const SS_KEY_WORKSPACE_NAME = "workspaceName";
-const SS_KEY_WORKSPACE_DISPLAY_NAME = "workspaceDisplayName";
-const SS_KEY_WORKSPACE_ROLE = "workspaceRole";
-const SS_KEY_WS_LEVEL = "wsLevel";
-const SS_KEY_WORKSPACE_ORG_ID = "workspaceOrgId";
-const SS_KEY_ORG_ID = "organizationId";
 
 const EMPTY_WORKSPACE = {
   id: null,
@@ -32,7 +33,7 @@ const EMPTY_WORKSPACE = {
   orgId: null,
 };
 
-function readSessionWorkspace() {
+export function readSessionWorkspace() {
   try {
     return {
       id: sessionStorage.getItem(SS_KEY_WORKSPACE_ID) || null,
@@ -53,7 +54,7 @@ function readSessionWorkspace() {
   }
 }
 
-function readSessionOrgId() {
+export function readSessionOrgId() {
   try {
     return sessionStorage.getItem(SS_KEY_ORG_ID) || null;
   } catch {
@@ -63,13 +64,13 @@ function readSessionOrgId() {
 
 // Sessions written before workspaceOrgId existed have no orgId, so they fail
 // the check and get reseeded.
-function readSessionWorkspaceForOrg(orgId) {
+export function readSessionWorkspaceForOrg(orgId) {
   const stored = readSessionWorkspace();
   if (!stored.id || !orgId || stored.orgId !== orgId) return null;
   return stored;
 }
 
-function writeSessionWorkspace({
+export function writeSessionWorkspace({
   id,
   name,
   displayName,

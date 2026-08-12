@@ -19,11 +19,18 @@ import { useQueryClient } from "@tanstack/react-query";
 import { setUser } from "@sentry/react";
 import logger from "src/utils/logger";
 import useFalconStore from "src/sections/falcon-ai/store/useFalconStore";
+import {
+  SS_KEY_ORG_DISPLAY_NAME,
+  SS_KEY_ORG_ID,
+  SS_KEY_ORG_LEVEL,
+  SS_KEY_ORG_NAME,
+  SS_KEY_ORG_ROLE,
+  SS_KEY_USER_ID,
+} from "src/utils/sessionKeys";
 
 // Session storage key for per-tab user tracking
-const SESSION_USER_ID_KEY = "currentUserId";
+
 // Session storage key for this tab's organization
-const SESSION_ORG_ID_KEY = "organizationId";
 
 // Helper to decode JWT and extract user ID (without verification)
 function decodeTokenUserId(token) {
@@ -47,20 +54,24 @@ function decodeTokenUserId(token) {
 
 // Pin the backend-resolved org before `user` reaches the tree, so no consumer
 // can fire an org-scoped request before the org is known.
-function pinResolvedOrganization(user) {
+export function pinResolvedOrganization(user) {
   const org = user?.organization;
-  const orgId = org?.id || sessionStorage.getItem(SESSION_ORG_ID_KEY);
+  const orgId = org?.id || sessionStorage.getItem(SS_KEY_ORG_ID);
   if (!orgId) return null;
 
-  sessionStorage.setItem(SESSION_ORG_ID_KEY, orgId);
+  const previousOrgId = sessionStorage.getItem(SS_KEY_ORG_ID);
+  sessionStorage.setItem(SS_KEY_ORG_ID, orgId);
   if (org?.id) {
-    if (org.name) sessionStorage.setItem("organizationName", org.name);
-    if (org.display_name)
-      sessionStorage.setItem("organizationDisplayName", org.display_name);
-    if (user?.organization_role)
-      sessionStorage.setItem("organizationRole", user.organization_role);
-    if (user?.org_level != null)
-      sessionStorage.setItem("orgLevel", String(user.org_level));
+    const orgChanged = previousOrgId !== org.id;
+    const put = (key, value) => {
+      if (value != null && value !== "")
+        sessionStorage.setItem(key, String(value));
+      else if (orgChanged) sessionStorage.removeItem(key);
+    };
+    put(SS_KEY_ORG_NAME, org.name);
+    put(SS_KEY_ORG_DISPLAY_NAME, org.display_name);
+    put(SS_KEY_ORG_ROLE, user?.organization_role);
+    put(SS_KEY_ORG_LEVEL, user?.org_level);
   }
   return orgId;
 }
@@ -101,7 +112,7 @@ export function AuthProvider({ children }) {
       if (accessToken) {
         // Without this the backend answers for whichever org was last switched
         // to in any tab.
-        const storedOrgId = sessionStorage.getItem(SESSION_ORG_ID_KEY);
+        const storedOrgId = sessionStorage.getItem(SS_KEY_ORG_ID);
         const response = await axios.get(endpoints.auth.me, {
           headers: {
             Authorization: `Bearer ${accessToken}`,
@@ -124,7 +135,7 @@ export function AuthProvider({ children }) {
         }
 
         // Store user ID in sessionStorage for cross-tab user detection
-        sessionStorage.setItem(SESSION_USER_ID_KEY, user?.id);
+        sessionStorage.setItem(SS_KEY_USER_ID, user?.id);
 
         setSession(accessToken, pinResolvedOrganization(user));
         if (user?.remember_me) {
@@ -187,13 +198,13 @@ export function AuthProvider({ children }) {
       if (event.key !== STORAGE_KEY) return;
 
       const newToken = event.newValue;
-      const currentUserId = sessionStorage.getItem(SESSION_USER_ID_KEY);
+      const currentUserId = sessionStorage.getItem(SS_KEY_USER_ID);
 
       // Token was cleared (logout in another tab)
       if (!newToken) {
         logger.info("Token cleared in another tab, logging out this tab");
         queryClient.clear();
-        sessionStorage.removeItem(SESSION_USER_ID_KEY);
+        sessionStorage.removeItem(SS_KEY_USER_ID);
         dispatch({ type: "LOGOUT" });
         window.location.href = "/auth/jwt/login";
         return;
@@ -208,7 +219,7 @@ export function AuthProvider({ children }) {
           "Different user detected in another tab. Forcing logout to prevent data leakage.",
         );
         queryClient.clear();
-        sessionStorage.removeItem(SESSION_USER_ID_KEY);
+        sessionStorage.removeItem(SS_KEY_USER_ID);
         sessionStorage.setItem(
           "auth_error",
           "Another user logged in from a different tab. Please log in again.",
@@ -246,7 +257,7 @@ export function AuthProvider({ children }) {
     }
 
     // Store user ID in sessionStorage for cross-tab user detection
-    sessionStorage.setItem(SESSION_USER_ID_KEY, user.id);
+    sessionStorage.setItem(SS_KEY_USER_ID, user.id);
 
     identifyUser(user);
     identifyPostHogUser(user);
@@ -318,7 +329,7 @@ export function AuthProvider({ children }) {
       resetUser();
       resetPostHogUser();
       sessionStorage.removeItem("2fa_challenge");
-      sessionStorage.removeItem(SESSION_USER_ID_KEY);
+      sessionStorage.removeItem(SS_KEY_USER_ID);
       localStorage.removeItem("initial-render"); // Clear flag so next login triggers redirect logic
       useFalconStore.getState().resetAll();
       dispatch({
