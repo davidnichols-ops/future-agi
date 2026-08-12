@@ -109,7 +109,11 @@ GRAPH_UNINDEXED_SAMPLE_RETRY_SLICE = timedelta(minutes=1)
 # the six-candidate per-stratum sentinel above, one failed wide probe, eight
 # seeds, eight possible narrow retries, ten classifiers, and five decoration
 # reads fit the 32-query endpoint ceiling.
-GRAPH_TRACE_UNION_QUERY_TIMEOUT_MS = 750
+# Relational classifiers can include one candidate-scoped ``Score FINAL``
+# read. Give that finite <=5-trace batch enough time to finish while the shared
+# request deadline below still clamps every later batch and remains the
+# authoritative wall for the complete graph.
+GRAPH_TRACE_UNION_QUERY_TIMEOUT_MS = 1_500
 GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE = 5
 GRAPH_TRACE_UNION_MAX_QUERY_COUNT = 32
 GRAPH_TRACE_UNION_READ_SETTINGS = {

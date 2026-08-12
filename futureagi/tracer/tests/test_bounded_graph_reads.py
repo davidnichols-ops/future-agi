@@ -2966,6 +2966,119 @@ def test_trace_classifier_failure_is_atomic_and_sanitized() -> None:
     assert "private classifier timeout" not in str(caught.value)
 
 
+class _TraceUnionClassifierBuilder:
+    def build_filter_match_query_from_seed_rows(
+        self,
+        candidate_rows,
+        *,
+        include_filter_witnesses,
+    ):
+        assert include_filter_witnesses is False
+        return "SELECT trace_id", {
+            "candidate_trace_ids": tuple(row["trace_id"] for row in candidate_rows)
+        }
+
+
+class _TraceUnionClassifierAnalytics:
+    def __init__(self, *, fail_after=None):
+        self.calls = []
+        self.fail_after = fail_after
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.calls.append((query, params, timeout_ms, settings))
+        if self.fail_after is not None and len(self.calls) > self.fail_after:
+            raise ReadDeadlineExceeded("private classifier timeout")
+        return _Result(
+            [
+                {
+                    "trace_id": trace_id,
+                    "root_span_id": f"root-{trace_id}",
+                    "start_time": START + timedelta(seconds=index),
+                }
+                for index, trace_id in enumerate(params["candidate_trace_ids"])
+            ]
+        )
+
+
+def _trace_union_stratum(count):
+    return bounded_graph_reads._DeferredTraceStratum(
+        builder=_TraceUnionClassifierBuilder(),
+        candidate_rows=tuple(
+            {
+                "trace_id": f"trace-{index}",
+                "root_span_id": f"seed-root-{index}",
+                "start_time": START + timedelta(seconds=index),
+            }
+            for index in range(count)
+        ),
+    )
+
+
+@pytest.mark.unit
+def test_trace_union_classifier_receives_finite_1500ms_cap(monkeypatch):
+    analytics = _TraceUnionClassifierAnalytics()
+    clock = iter([0.0, 0.0, 0.0])
+    monkeypatch.setattr(bounded_graph_reads, "monotonic", lambda: next(clock))
+
+    result = bounded_graph_reads._classify_deferred_trace_strata(
+        analytics=analytics,
+        strata=[_trace_union_stratum(2)],
+        distributed_started=0.0,
+        deadline_ms=9_500,
+        acquisition_query_count=1,
+        candidate_rows_per_stratum=5,
+        visible_rows_per_stratum=5,
+    )
+
+    assert analytics.calls[0][2] == 1_500
+    assert set(result[0]) == {"trace-0", "trace-1"}
+
+
+@pytest.mark.unit
+def test_trace_union_classifier_cap_is_clamped_by_remaining_shared_wall(monkeypatch):
+    analytics = _TraceUnionClassifierAnalytics()
+    clock = iter([8.25, 8.25, 8.25])
+    monkeypatch.setattr(bounded_graph_reads, "monotonic", lambda: next(clock))
+
+    bounded_graph_reads._classify_deferred_trace_strata(
+        analytics=analytics,
+        strata=[_trace_union_stratum(1)],
+        distributed_started=0.0,
+        deadline_ms=9_500,
+        acquisition_query_count=1,
+        candidate_rows_per_stratum=5,
+        visible_rows_per_stratum=5,
+    )
+
+    assert analytics.calls[0][2] == 1_250
+
+
+@pytest.mark.unit
+def test_trace_union_classifier_over_cap_failure_is_typed_and_atomic(monkeypatch):
+    # Six identities require two finite batches. The first succeeds privately;
+    # the second reaches its enforced cap. No classified prefix may cross the
+    # helper's return boundary unless every batch succeeds.
+    analytics = _TraceUnionClassifierAnalytics(fail_after=1)
+    clock = iter([0.0, 0.0, 0.0, 0.0, 0.0])
+    monkeypatch.setattr(bounded_graph_reads, "monotonic", lambda: next(clock))
+
+    with pytest.raises(BoundedGraphReadError) as caught:
+        bounded_graph_reads._classify_deferred_trace_strata(
+            analytics=analytics,
+            strata=[_trace_union_stratum(6)],
+            distributed_started=0.0,
+            deadline_ms=9_500,
+            acquisition_query_count=1,
+            candidate_rows_per_stratum=5,
+            visible_rows_per_stratum=5,
+        )
+
+    assert [call[2] for call in analytics.calls] == [1_500, 1_500]
+    assert caught.value.error_code == "read_budget_exceeded"
+    assert caught.value.retryable is True
+    assert "private classifier timeout" not in str(caught.value)
+
+
 @pytest.mark.unit
 def test_distributed_sample_uses_one_shared_deadline_instead_of_equal_slices(
     monkeypatch,
