@@ -40496,42 +40496,77 @@ export const TracerProjectListProjectIdsResponse = zod.object({
 JOIN on observation_spans (was 12+ seconds).
  * @summary List projects filtered by organization ID.
  */
+export const tracerProjectListProjectsQueryFiltersDefault = `[]`;
+export const tracerProjectListProjectsQuerySortByDefault = `created_at`;
+export const tracerProjectListProjectsQuerySortDirectionDefault = `desc`;
+export const tracerProjectListProjectsQueryPageNumberDefault = 0;
+export const tracerProjectListProjectsQueryPageNumberMin = 0;
+
+export const tracerProjectListProjectsQueryPageSizeDefault = 20;
+export const tracerProjectListProjectsQueryPageSizeMax = 100;
+
+
+
 export const TracerProjectListProjectsQueryParams = zod.object({
-  "page": zod.number().optional().describe('A page number within the paginated result set.'),
-  "limit": zod.number().optional().describe('Number of results to return per page.')
+  "name": zod.string().optional(),
+  "project_type": zod.string().optional(),
+  "tags": zod.string().optional(),
+  "filters": zod.string().default(tracerProjectListProjectsQueryFiltersDefault),
+  "sort_by": zod.string().default(tracerProjectListProjectsQuerySortByDefault),
+  "sort_direction": zod.enum(['asc', 'desc']).default(tracerProjectListProjectsQuerySortDirectionDefault),
+  "page_number": zod.number().min(tracerProjectListProjectsQueryPageNumberMin).default(tracerProjectListProjectsQueryPageNumberDefault),
+  "page_size": zod.number().min(1).max(tracerProjectListProjectsQueryPageSizeMax).default(tracerProjectListProjectsQueryPageSizeDefault)
 })
 
-export const tracerProjectListProjectsResponseResultsItemNameMax = 255;
+export const tracerProjectListProjectsResponseStatusDefault = true;
+export const tracerProjectListProjectsResponseResultMetadataTotalRowsMin = 0;
+
+export const tracerProjectListProjectsResponseResultMetadataPageNumberMin = 0;
+
+export const tracerProjectListProjectsResponseResultMetadataPageSizeMax = 100;
+
+export const tracerProjectListProjectsResponseResultMetadataTotalPagesMin = 0;
+
+
+export const tracerProjectListProjectsResponseResultTableItemLast30DaysVolMin = 0;
+
+export const tracerProjectListProjectsResponseResultTableItemDailyVolumeItemMin = 0;
+
+
+
+export const tracerProjectListProjectsResponseResultTableItemRunCountMin = 0;
+
+export const tracerProjectListProjectsResponseResultTableItemIssuesMin = 0;
+
 
 
 
 export const TracerProjectListProjectsResponse = zod.object({
-  "count": zod.number(),
-  "next": zod.string().url().optional(),
-  "previous": zod.string().url().optional(),
-  "results": zod.array(zod.object({
-  "id": zod.string().uuid().optional(),
-  "model_type": zod.enum(['Numeric', 'ScoreCategorical', 'Ranking', 'BinaryClassification', 'Regression', 'ObjectDetection', 'Segmentation', 'GenerativeLLM', 'GenerativeImage', 'GenerativeVideo', 'TTS', 'STT', 'MultiModal']),
-  "name": zod.string().min(1).max(tracerProjectListProjectsResponseResultsItemNameMax),
-  "trace_type": zod.enum(['experiment', 'observe']),
+  "status": zod.boolean().default(tracerProjectListProjectsResponseStatusDefault),
+  "result": zod.object({
   "metadata": zod.object({
-
-}).passthrough().optional(),
-  "organization": zod.string().uuid().optional(),
-  "workspace": zod.string().uuid().optional(),
-  "created_at": zod.string().datetime({"offset":true}).optional(),
-  "updated_at": zod.string().datetime({"offset":true}).optional(),
-  "config": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "source": zod.enum(['demo', 'prototype', 'simulator']).optional(),
-  "session_config": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "tags": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.')
+  "total_rows": zod.number().min(tracerProjectListProjectsResponseResultMetadataTotalRowsMin),
+  "page_number": zod.number().min(tracerProjectListProjectsResponseResultMetadataPageNumberMin),
+  "page_size": zod.number().min(1).max(tracerProjectListProjectsResponseResultMetadataPageSizeMax),
+  "total_pages": zod.number().min(tracerProjectListProjectsResponseResultMetadataTotalPagesMin)
+}),
+  "table": zod.array(zod.object({
+  "id": zod.string().uuid(),
+  "name": zod.string().min(1),
+  "last_30_days_vol": zod.number().min(tracerProjectListProjectsResponseResultTableItemLast30DaysVolMin),
+  "daily_volume": zod.array(zod.number().min(tracerProjectListProjectsResponseResultTableItemDailyVolumeItemMin)),
+  "created_at": zod.string().datetime({"offset":true}),
+  "updated_at": zod.string().datetime({"offset":true}),
+  "last_active": zod.string().datetime({"offset":true}),
+  "activity_query_complete": zod.boolean(),
+  "activity_error_code": zod.string().min(1),
+  "activity_query_exact": zod.boolean(),
+  "activity_query_provenance": zod.string().min(1),
+  "run_count": zod.number().min(tracerProjectListProjectsResponseResultTableItemRunCountMin),
+  "issues": zod.number().min(tracerProjectListProjectsResponseResultTableItemIssuesMin),
+  "tags": zod.array(zod.string().min(1))
 }))
+})
 })
 
 
@@ -42731,44 +42766,12 @@ export const TracerTraceGetGraphMethodsResponse = zod.object({
 /**
  * Fetch all properties for graphing.
  */
-export const TracerTraceGetPropertiesQueryParams = zod.object({
-  "page": zod.number().optional().describe('A page number within the paginated result set.'),
-  "limit": zod.number().optional().describe('Number of results to return per page.')
-})
-
-export const tracerTraceGetPropertiesResponseResultsItemNameMax = 2000;
-
-export const tracerTraceGetPropertiesResponseResultsItemExternalIdMax = 255;
-
+export const tracerTraceGetPropertiesResponseStatusDefault = true;
 
 
 export const TracerTraceGetPropertiesResponse = zod.object({
-  "count": zod.number(),
-  "next": zod.string().url().optional(),
-  "previous": zod.string().url().optional(),
-  "results": zod.array(zod.object({
-  "id": zod.string().uuid().optional(),
-  "project": zod.string().uuid(),
-  "project_version": zod.string().uuid().optional(),
-  "name": zod.string().max(tracerTraceGetPropertiesResponseResultsItemNameMax).optional(),
-  "metadata": zod.object({
-
-}).passthrough().optional(),
-  "input": zod.object({
-
-}).passthrough().optional(),
-  "output": zod.object({
-
-}).passthrough().optional(),
-  "error": zod.object({
-
-}).passthrough().optional(),
-  "session": zod.string().uuid().optional(),
-  "external_id": zod.string().max(tracerTraceGetPropertiesResponseResultsItemExternalIdMax).optional(),
-  "tags": zod.object({
-
-}).passthrough().optional()
-}))
+  "status": zod.boolean().default(tracerTraceGetPropertiesResponseStatusDefault),
+  "result": zod.array(zod.string().min(1))
 })
 
 

@@ -840,6 +840,7 @@ import type {
   ProjectDetailResponseApi,
   ProjectGraphDataResponseApi,
   ProjectIdListResponseApi,
+  ProjectListResponseApi,
   ProjectUserGraphDataRequestApi,
   ProjectUserGraphDataResponseApi,
   ProjectUserMetricsRequestApi,
@@ -1109,6 +1110,7 @@ import type {
   TraceErrorTaskUpdateRequestApi,
   TraceErrorTaskUpdateResponseApi,
   TraceObserveListResponseApi,
+  TracePropertiesResponseApi,
   TracePrototypeListResponseApi,
   TraceSessionApi,
   TraceSessionGraphDataRequestApi,
@@ -1188,7 +1190,6 @@ import type {
   TracerProjectList200,
   TracerProjectListParams,
   TracerProjectListProjectIdsParams,
-  TracerProjectListProjects200,
   TracerProjectListProjectsParams,
   TracerProjectProjectSdkCode200,
   TracerProjectProjectSdkCodeParams,
@@ -1208,8 +1209,6 @@ import type {
   TracerTraceGetEvalNames200,
   TracerTraceGetEvalNamesParams,
   TracerTraceGetGraphMethodsParams,
-  TracerTraceGetProperties200,
-  TracerTraceGetPropertiesParams,
   TracerTraceGetTraceExportDataParams,
   TracerTraceGetTraceIdByIndex200,
   TracerTraceGetTraceIdByIndexObserve200,
@@ -64530,7 +64529,7 @@ export const tracerProjectListProjectIds = async (params?: TracerProjectListProj
 
 
 export type tracerProjectListProjectsResponse200 = {
-  data: TracerProjectListProjects200
+  data: ProjectListResponseApi
   status: 200
 }
 
@@ -67238,7 +67237,7 @@ export const tracerTraceGetGraphMethods = async (observeGraphDataRequestApi: Obs
 
 
 export type tracerTraceGetPropertiesResponse200 = {
-  data: TracerTraceGetProperties200
+  data: TracePropertiesResponseApi
   status: 200
 }
 
@@ -67256,31 +67255,20 @@ export type tracerTraceGetPropertiesResponseError = (tracerTraceGetPropertiesRes
 
 export type tracerTraceGetPropertiesResponse = (tracerTraceGetPropertiesResponseSuccess | tracerTraceGetPropertiesResponseError)
 
-export const getTracerTraceGetPropertiesUrl = (params?: TracerTraceGetPropertiesParams,) => {
-  const normalizedParams = new URLSearchParams();
+export const getTracerTraceGetPropertiesUrl = () => {
 
-  Object.entries(params || {}).forEach(([key, value]) => {
 
-    if (Array.isArray(value)) {
-      value
-        .filter((item) => item !== undefined && item !== null)
-        .forEach((item) => normalizedParams.append(key, item.toString()))
-    } else if (value !== undefined && value !== null) {
-      normalizedParams.append(key, value.toString())
-    }
-  });
 
-  const stringifiedParams = normalizedParams.toString();
 
-  return stringifiedParams.length > 0 ? `/tracer/trace/get_properties/?${stringifiedParams}` : `/tracer/trace/get_properties/`
+  return `/tracer/trace/get_properties/`
 }
 
 /**
  * Fetch all properties for graphing.
  */
-export const tracerTraceGetProperties = async (params?: TracerTraceGetPropertiesParams, options?: RequestInit): Promise<tracerTraceGetPropertiesResponse> => {
+export const tracerTraceGetProperties = async ( options?: RequestInit): Promise<tracerTraceGetPropertiesResponse> => {
 
-  return apiMutator<tracerTraceGetPropertiesResponse>(getTracerTraceGetPropertiesUrl(params),
+  return apiMutator<tracerTraceGetPropertiesResponse>(getTracerTraceGetPropertiesUrl(),
   {
     ...options,
     method: 'GET'

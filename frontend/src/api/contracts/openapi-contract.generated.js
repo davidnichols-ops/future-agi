@@ -34365,51 +34365,74 @@ export const OPENAPI_CONTRACT = Object.freeze({
     "/tracer/project/list_projects/": {
       "get": {
         "operationId": "tracer_project_list_projects",
-        "runtimeRequestValidation": false,
-        "runtimeResponseValidation": false,
+        "runtimeRequestValidation": true,
+        "runtimeResponseValidation": true,
         "requestBody": null,
         "queryParameters": {
-          "page": {
+          "name": {
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string"
             }
           },
-          "limit": {
+          "project_type": {
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string"
+            }
+          },
+          "tags": {
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "filters": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "[]"
+            }
+          },
+          "sort_by": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "created_at"
+            }
+          },
+          "sort_direction": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "desc"
+            }
+          },
+          "page_number": {
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          "page_size": {
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
             }
           }
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/Project"
-                }
-              }
-            }
+            "$ref": "#/definitions/ProjectListResponse"
           },
           "default": {
             "$ref": "#/definitions/ManagementAPIErrorResponse"
@@ -35994,50 +36017,12 @@ export const OPENAPI_CONTRACT = Object.freeze({
       "get": {
         "operationId": "tracer_trace_get_properties",
         "runtimeRequestValidation": false,
-        "runtimeResponseValidation": false,
+        "runtimeResponseValidation": true,
         "requestBody": null,
-        "queryParameters": {
-          "page": {
-            "required": false,
-            "schema": {
-              "type": "integer"
-            }
-          },
-          "limit": {
-            "required": false,
-            "schema": {
-              "type": "integer"
-            }
-          }
-        },
+        "queryParameters": {},
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/Trace"
-                }
-              }
-            }
+            "$ref": "#/definitions/TracePropertiesResponse"
           },
           "default": {
             "$ref": "#/definitions/ManagementAPIErrorResponse"
@@ -65791,6 +65776,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "ProjectListResponse": {
+      "required": [
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean",
+          "default": true
+        },
+        "result": {
+          "$ref": "#/definitions/ProjectListResult"
+        }
+      }
+    },
     "ProjectUserGraphDataRequest": {
       "type": "object",
       "properties": {
@@ -73169,6 +73170,26 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "result": {
           "$ref": "#/definitions/TraceObserveListResult"
+        }
+      }
+    },
+    "TracePropertiesResponse": {
+      "required": [
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean",
+          "default": true
+        },
+        "result": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },
@@ -88944,6 +88965,24 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "ProjectListResult": {
+      "required": [
+        "metadata",
+        "table"
+      ],
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "$ref": "#/definitions/ProjectListMetadata"
+        },
+        "table": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProjectListItem"
+          }
+        }
+      }
+    },
     "ProjectUserGraphDataResult": {
       "required": [
         "session",
@@ -100779,6 +100818,135 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Trace type",
           "type": "string",
           "minLength": 1
+        }
+      }
+    },
+    "ProjectListItem": {
+      "required": [
+        "id",
+        "name",
+        "last_30_days_vol",
+        "daily_volume",
+        "created_at",
+        "updated_at",
+        "last_active",
+        "activity_query_complete",
+        "activity_error_code",
+        "activity_query_exact",
+        "activity_query_provenance",
+        "run_count",
+        "issues",
+        "tags"
+      ],
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string",
+          "format": "uuid"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string",
+          "minLength": 1
+        },
+        "last_30_days_vol": {
+          "title": "Last 30 days vol",
+          "type": "integer",
+          "minimum": 0,
+          "x-nullable": true
+        },
+        "daily_volume": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x-nullable": true
+        },
+        "created_at": {
+          "title": "Created at",
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "title": "Updated at",
+          "type": "string",
+          "format": "date-time"
+        },
+        "last_active": {
+          "title": "Last active",
+          "type": "string",
+          "format": "date-time",
+          "x-nullable": true
+        },
+        "activity_query_complete": {
+          "title": "Activity query complete",
+          "type": "boolean"
+        },
+        "activity_error_code": {
+          "title": "Activity error code",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "activity_query_exact": {
+          "title": "Activity query exact",
+          "type": "boolean"
+        },
+        "activity_query_provenance": {
+          "title": "Activity query provenance",
+          "type": "string",
+          "minLength": 1
+        },
+        "run_count": {
+          "title": "Run count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "issues": {
+          "title": "Issues",
+          "type": "integer",
+          "minimum": 0
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "ProjectListMetadata": {
+      "required": [
+        "total_rows",
+        "page_number",
+        "page_size",
+        "total_pages"
+      ],
+      "type": "object",
+      "properties": {
+        "total_rows": {
+          "title": "Total rows",
+          "type": "integer",
+          "minimum": 0
+        },
+        "page_number": {
+          "title": "Page number",
+          "type": "integer",
+          "minimum": 0
+        },
+        "page_size": {
+          "title": "Page size",
+          "type": "integer",
+          "maximum": 100,
+          "minimum": 1
+        },
+        "total_pages": {
+          "title": "Total pages",
+          "type": "integer",
+          "minimum": 0
         }
       }
     },

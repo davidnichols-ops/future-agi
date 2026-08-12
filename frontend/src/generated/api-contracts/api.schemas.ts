@@ -21589,6 +21589,53 @@ export interface ProjectIdListResponseApi {
   result: ProjectIdListResultApi;
 }
 
+export interface ProjectListMetadataApi {
+  /** @minimum 0 */
+  total_rows: number;
+  /** @minimum 0 */
+  page_number: number;
+  /**
+     * @minimum 1
+     * @maximum 100
+     */
+  page_size: number;
+  /** @minimum 0 */
+  total_pages: number;
+}
+
+export interface ProjectListItemApi {
+  id: string;
+  /** @minLength 1 */
+  name: string;
+  /** @minimum 0 */
+  last_30_days_vol: number;
+  daily_volume: number[];
+  created_at: string;
+  updated_at: string;
+  last_active: string;
+  activity_query_complete: boolean;
+  /** @minLength 1 */
+  activity_error_code: string;
+  activity_query_exact: boolean;
+  /** @minLength 1 */
+  activity_query_provenance: string;
+  /** @minimum 0 */
+  run_count: number;
+  /** @minimum 0 */
+  issues: number;
+  tags: string[];
+}
+
+export interface ProjectListResultApi {
+  metadata: ProjectListMetadataApi;
+  table: ProjectListItemApi[];
+}
+
+export interface ProjectListResponseApi {
+  status?: boolean;
+  result: ProjectListResultApi;
+}
+
 export type ProjectDetailResultApiModelType = typeof ProjectDetailResultApiModelType[keyof typeof ProjectDetailResultApiModelType];
 
 
@@ -22802,6 +22849,11 @@ export interface TraceAgentGraphResultApi {
 export interface TraceAgentGraphResponseApi {
   status: boolean;
   result: TraceAgentGraphResultApi;
+}
+
+export interface TracePropertiesResponseApi {
+  status?: boolean;
+  result: string[];
 }
 
 export type TraceObserveListMetadataApiQueryStatus = typeof TraceObserveListMetadataApiQueryStatus[keyof typeof TraceObserveListMetadataApiQueryStatus];
@@ -28486,22 +28538,30 @@ limit?: number;
 };
 
 export type TracerProjectListProjectsParams = {
+name?: string;
+project_type?: string;
+tags?: string;
+filters?: string;
+sort_by?: string;
+sort_direction?: TracerProjectListProjectsSortDirection;
 /**
- * A page number within the paginated result set.
+ * @minimum 0
  */
-page?: number;
+page_number?: number;
 /**
- * Number of results to return per page.
+ * @minimum 1
+ * @maximum 100
  */
-limit?: number;
+page_size?: number;
 };
 
-export type TracerProjectListProjects200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: ProjectApi[];
-};
+export type TracerProjectListProjectsSortDirection = typeof TracerProjectListProjectsSortDirection[keyof typeof TracerProjectListProjectsSortDirection];
+
+
+export const TracerProjectListProjectsSortDirection = {
+  asc: 'asc',
+  desc: 'desc',
+} as const;
 
 export type TracerProjectProjectSdkCodeParams = {
 /**
@@ -28779,24 +28839,6 @@ allow_sampled?: boolean;
  * Recompute and atomically replace the last complete exact result.
  */
 refresh?: boolean;
-};
-
-export type TracerTraceGetPropertiesParams = {
-/**
- * A page number within the paginated result set.
- */
-page?: number;
-/**
- * Number of results to return per page.
- */
-limit?: number;
-};
-
-export type TracerTraceGetProperties200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: TraceApi[];
 };
 
 export type TracerTraceGetTraceExportDataParams = {
