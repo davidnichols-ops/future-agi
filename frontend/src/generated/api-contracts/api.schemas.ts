@@ -19979,6 +19979,211 @@ export interface EvalTaskCreateResponseApi {
   result: EvalTaskCreateResultApi;
 }
 
+export interface EvalTaskUsageStatsApi {
+  /** @minimum 0 */
+  total_runs: number;
+  /** @minimum 0 */
+  runs_period: number;
+  /** @minimum 0 */
+  success_count: number;
+  /** @minimum 0 */
+  error_count: number;
+  /**
+     * @minimum 0
+     * @maximum 100
+     */
+  pass_rate: number;
+  total_runs_is_lower_bound?: boolean;
+  runs_period_is_lower_bound?: boolean;
+}
+
+export interface EvalTaskUsageEvalApi {
+  id: string;
+  /** @minLength 1 */
+  name: string;
+  /** @minLength 1 */
+  output_type: string;
+  template_id: string;
+  model: string;
+}
+
+export interface EvalTaskUsageChartPointApi {
+  timestamp: string;
+  /** @minimum 0 */
+  calls: number;
+  /** @minimum 0 */
+  pass_count: number;
+  /** @minimum 0 */
+  fail_count: number;
+  avg_score: number;
+  /** @minimum 0 */
+  avg_latency_ms: number;
+}
+
+export type EvalTaskUsageLogApiStatus = typeof EvalTaskUsageLogApiStatus[keyof typeof EvalTaskUsageLogApiStatus];
+
+
+export const EvalTaskUsageLogApiStatus = {
+  success: 'success',
+  error: 'error',
+} as const;
+
+/**
+ * Any valid JSON value.
+ */
+export type EvalTaskUsageLogDetailApiWarnings = { [key: string]: unknown };
+
+/**
+ * Any valid JSON value.
+ */
+export type EvalTaskUsageLogDetailApiResultsExplanation = { [key: string]: unknown };
+
+/**
+ * Any valid JSON value.
+ */
+export type EvalTaskUsageLogDetailApiInputVariables = { [key: string]: unknown };
+
+export interface EvalTaskUsageLogDetailApi {
+  detail_complete: boolean;
+  omitted_fields: string[];
+  eval_name: string;
+  model: string;
+  /** Any valid JSON value. */
+  warnings: EvalTaskUsageLogDetailApiWarnings;
+  output_type: string;
+  target_type: string;
+  span_name: string;
+  span_id: string;
+  trace_id: string;
+  session_id: string;
+  session_name: string;
+  output_bool: boolean;
+  output_float: number;
+  output_str: string;
+  /** Any valid JSON value. */
+  results_explanation: EvalTaskUsageLogDetailApiResultsExplanation;
+  error_message: string;
+  /** Any valid JSON value. */
+  input_variables: EvalTaskUsageLogDetailApiInputVariables;
+}
+
+/**
+ * Any valid JSON value.
+ */
+export type EvalTaskUsageLogApiWarnings = { [key: string]: unknown };
+
+export interface EvalTaskUsageLogApi {
+  id: string;
+  input: string;
+  result: string;
+  score: number;
+  reason: string;
+  status: EvalTaskUsageLogApiStatus;
+  /** @minLength 1 */
+  source: string;
+  /** Any valid JSON value. */
+  warnings: EvalTaskUsageLogApiWarnings;
+  created_at: string;
+  span_id: string;
+  trace_id: string;
+  session_id: string;
+  eval_id: string;
+  eval_name: string;
+  model: string;
+  detail: EvalTaskUsageLogDetailApi;
+}
+
+export interface EvalTaskUsageLogsApi {
+  /** @minimum 0 */
+  count: number;
+  /** @minLength 1 */
+  next: string;
+  /** @minLength 1 */
+  previous: string;
+  results: EvalTaskUsageLogApi[];
+  /** @minimum 0 */
+  total_pages: number;
+  /** @minimum 1 */
+  current_page: number;
+  has_more?: boolean;
+  count_is_lower_bound?: boolean;
+  page_limit_reached?: boolean;
+}
+
+export type EvalTaskUsageAggregationMetadataApiError = typeof EvalTaskUsageAggregationMetadataApiError[keyof typeof EvalTaskUsageAggregationMetadataApiError];
+
+
+export const EvalTaskUsageAggregationMetadataApiError = {
+  sample_limit: 'sample_limit',
+} as const;
+
+export interface EvalTaskUsageAggregationMetadataApi {
+  query_complete: boolean;
+  sampled: boolean;
+  error: EvalTaskUsageAggregationMetadataApiError;
+  /** @minLength 1 */
+  provenance: string;
+  /** @minimum 1 */
+  row_limit: number;
+  /** @minimum 0 */
+  rows_scanned: number;
+  /** @minimum 0 */
+  rows_matched: number;
+}
+
+export type EvalTaskUsageResultApiQueryStatus = typeof EvalTaskUsageResultApiQueryStatus[keyof typeof EvalTaskUsageResultApiQueryStatus];
+
+
+export const EvalTaskUsageResultApiQueryStatus = {
+  complete: 'complete',
+  sampled: 'sampled',
+} as const;
+
+export type EvalTaskUsageResultApiError = typeof EvalTaskUsageResultApiError[keyof typeof EvalTaskUsageResultApiError];
+
+
+export const EvalTaskUsageResultApiError = {
+  sample_limit: 'sample_limit',
+} as const;
+
+/**
+ * Any valid JSON value.
+ */
+export type EvalTaskUsageResultApiEvalAggregation = { [key: string]: unknown };
+
+/**
+ * Any valid JSON value.
+ */
+export type EvalTaskUsageResultApiSpanAggregation = { [key: string]: unknown };
+
+export interface EvalTaskUsageResultApi {
+  eval_task_id: string;
+  stats?: EvalTaskUsageStatsApi;
+  evals?: EvalTaskUsageEvalApi[];
+  chart?: EvalTaskUsageChartPointApi[];
+  logs?: EvalTaskUsageLogsApi;
+  /** @minLength 1 */
+  period_requested?: string;
+  /** @minLength 1 */
+  period_used?: string;
+  /** Any valid JSON value. */
+  eval_aggregation?: EvalTaskUsageResultApiEvalAggregation;
+  /** Any valid JSON value. */
+  span_aggregation?: EvalTaskUsageResultApiSpanAggregation;
+  aggregation_metadata?: EvalTaskUsageAggregationMetadataApi;
+  query_complete?: boolean;
+  query_status?: EvalTaskUsageResultApiQueryStatus;
+  query_sampled?: boolean;
+  error?: EvalTaskUsageResultApiError;
+  /** @minLength 1 */
+  provenance?: string;
+}
+
+export interface EvalTaskUsageResponseApi {
+  status?: boolean;
+  result: EvalTaskUsageResultApi;
+}
+
 export interface EvalTaskDeleteRequestApi {
   eval_task_ids: string[];
 }
@@ -25891,6 +26096,10 @@ refresh?: boolean;
 export type ApiTracesSpanAttributeKeysListParams = {
 project_id: string;
 /**
+ * Attribute contract to browse. filter returns only keys supported by attribute filters; eval_mapping also returns JSON-only keys that an evaluation mapping can resolve.
+ */
+discovery_mode?: ApiTracesSpanAttributeKeysListDiscoveryMode;
+/**
  * @minLength 1
  * @maxLength 512
  */
@@ -25906,6 +26115,14 @@ page_size?: number;
  */
 cursor?: string;
 };
+
+export type ApiTracesSpanAttributeKeysListDiscoveryMode = typeof ApiTracesSpanAttributeKeysListDiscoveryMode[keyof typeof ApiTracesSpanAttributeKeysListDiscoveryMode];
+
+
+export const ApiTracesSpanAttributeKeysListDiscoveryMode = {
+  filter: 'filter',
+  eval_mapping: 'eval_mapping',
+} as const;
 
 export type ApiTracesSpanAttributeValuesListParams = {
 project_id: string;
@@ -27851,22 +28068,45 @@ export type TracerEvalTaskGetEvalTaskLogs200 = {
 };
 
 export type TracerEvalTaskGetUsageParams = {
+eval_task_id: string;
+period?: TracerEvalTaskGetUsagePeriod;
+eval_id?: string;
 /**
- * A page number within the paginated result set.
+ * @minimum 1
+ * @maximum 100
  */
 page?: number;
 /**
- * Number of results to return per page.
+ * @minimum 1
+ * @maximum 100
+ */
+page_size?: number;
+/**
+ * Legacy alias for page_size.
+ * @minimum 1
+ * @maximum 100
  */
 limit?: number;
+eval_aggregation?: boolean;
+span_aggregation?: boolean;
+include_summary?: boolean;
+start_date?: string;
+end_date?: string;
 };
 
-export type TracerEvalTaskGetUsage200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: EvalTaskApi[];
-};
+export type TracerEvalTaskGetUsagePeriod = typeof TracerEvalTaskGetUsagePeriod[keyof typeof TracerEvalTaskGetUsagePeriod];
+
+
+export const TracerEvalTaskGetUsagePeriod = {
+  '30m': '30m',
+  '6h': '6h',
+  '1d': '1d',
+  '7d': '7d',
+  '30d': '30d',
+  '90d': '90d',
+  '180d': '180d',
+  '365d': '365d',
+} as const;
 
 export type TracerEvalTaskListEvalTasksParams = {
 project_id?: string;
@@ -28855,6 +29095,10 @@ project_id: string;
  * @minLength 1
  */
 filters?: string;
+/**
+ * JSON-encoded list of custom attribute keys to include as CSV columns. Comma-separated simple keys remain supported.
+ */
+attribute_keys?: string;
 };
 
 export type TracerTraceGetTraceIdByIndexParams = {
@@ -28990,6 +29234,10 @@ project_id: string;
  * @minLength 1
  */
 filters?: string;
+/**
+ * JSON-encoded list of custom attribute keys to include as CSV columns. Comma-separated simple keys remain supported.
+ */
+attribute_keys?: string;
 /**
  * One-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page, use the additive continuation cursor, or narrow the time range.
  * @minimum 1

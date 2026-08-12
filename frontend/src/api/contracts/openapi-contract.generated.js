@@ -8801,6 +8801,17 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "format": "uuid"
             }
           },
+          "discovery_mode": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "filter",
+                "eval_mapping"
+              ],
+              "default": "filter"
+            }
+          },
           "q": {
             "required": false,
             "schema": {
@@ -31347,51 +31358,106 @@ export const OPENAPI_CONTRACT = Object.freeze({
     "/tracer/eval-task/get_usage/": {
       "get": {
         "operationId": "tracer_eval-task_get_usage",
-        "runtimeRequestValidation": false,
+        "runtimeRequestValidation": true,
         "runtimeResponseValidation": true,
         "requestBody": null,
         "queryParameters": {
+          "eval_task_id": {
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "period": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "30m",
+                "6h",
+                "1d",
+                "7d",
+                "30d",
+                "90d",
+                "180d",
+                "365d"
+              ],
+              "default": "30d"
+            }
+          },
+          "eval_id": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
           "page": {
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 1
+            }
+          },
+          "page_size": {
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
             }
           },
           "limit": {
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          "eval_aggregation": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "span_aggregation": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "include_summary": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          "start_date": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "end_date": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
             }
           }
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/EvalTask"
-                }
-              }
-            }
+            "$ref": "#/definitions/EvalTaskUsageResponse"
           },
           "400": {
             "$ref": "#/definitions/ApiErrorResponse"
@@ -36063,6 +36129,12 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "minLength": 1,
               "default": "[]"
             }
+          },
+          "attribute_keys": {
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         },
         "responses": {
@@ -36474,6 +36546,12 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "type": "string",
               "minLength": 1,
               "default": "[]"
+            }
+          },
+          "attribute_keys": {
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           "page": {
@@ -55346,6 +55424,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "result": {
           "$ref": "#/definitions/EvalTaskUpdateResult"
+        }
+      }
+    },
+    "EvalTaskUsageResponse": {
+      "required": [
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean",
+          "default": true
+        },
+        "result": {
+          "$ref": "#/definitions/EvalTaskUsageResult"
         }
       }
     },
@@ -82889,6 +82983,90 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "EvalTaskUsageResult": {
+      "required": [
+        "eval_task_id"
+      ],
+      "type": "object",
+      "properties": {
+        "eval_task_id": {
+          "title": "Eval task id",
+          "type": "string",
+          "format": "uuid"
+        },
+        "stats": {
+          "$ref": "#/definitions/EvalTaskUsageStats"
+        },
+        "evals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EvalTaskUsageEval"
+          }
+        },
+        "chart": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EvalTaskUsageChartPoint"
+          }
+        },
+        "logs": {
+          "$ref": "#/definitions/EvalTaskUsageLogs"
+        },
+        "period_requested": {
+          "title": "Period requested",
+          "type": "string",
+          "minLength": 1
+        },
+        "period_used": {
+          "title": "Period used",
+          "type": "string",
+          "minLength": 1
+        },
+        "eval_aggregation": {
+          "title": "Eval aggregation",
+          "type": "object",
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "span_aggregation": {
+          "title": "Span aggregation",
+          "type": "object",
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "aggregation_metadata": {
+          "$ref": "#/definitions/EvalTaskUsageAggregationMetadata"
+        },
+        "query_complete": {
+          "title": "Query complete",
+          "type": "boolean"
+        },
+        "query_status": {
+          "title": "Query status",
+          "type": "string",
+          "enum": [
+            "complete",
+            "sampled"
+          ]
+        },
+        "query_sampled": {
+          "title": "Query sampled",
+          "type": "boolean"
+        },
+        "error": {
+          "title": "Error",
+          "type": "string",
+          "enum": [
+            "sample_limit"
+          ]
+        },
+        "provenance": {
+          "title": "Provenance",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "EvalTemplateBulkDeleteResponseResult": {
       "required": [
         "deleted_count"
@@ -97676,6 +97854,241 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "EvalTaskUsageAggregationMetadata": {
+      "required": [
+        "query_complete",
+        "sampled",
+        "error",
+        "provenance",
+        "row_limit",
+        "rows_scanned",
+        "rows_matched"
+      ],
+      "type": "object",
+      "properties": {
+        "query_complete": {
+          "title": "Query complete",
+          "type": "boolean"
+        },
+        "sampled": {
+          "title": "Sampled",
+          "type": "boolean"
+        },
+        "error": {
+          "title": "Error",
+          "type": "string",
+          "enum": [
+            "sample_limit"
+          ],
+          "x-nullable": true
+        },
+        "provenance": {
+          "title": "Provenance",
+          "type": "string",
+          "minLength": 1
+        },
+        "row_limit": {
+          "title": "Row limit",
+          "type": "integer",
+          "minimum": 1
+        },
+        "rows_scanned": {
+          "title": "Rows scanned",
+          "type": "integer",
+          "minimum": 0
+        },
+        "rows_matched": {
+          "title": "Rows matched",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "EvalTaskUsageChartPoint": {
+      "required": [
+        "timestamp",
+        "calls",
+        "pass_count",
+        "fail_count",
+        "avg_score",
+        "avg_latency_ms"
+      ],
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "title": "Timestamp",
+          "type": "string",
+          "format": "date-time"
+        },
+        "calls": {
+          "title": "Calls",
+          "type": "integer",
+          "minimum": 0
+        },
+        "pass_count": {
+          "title": "Pass count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "fail_count": {
+          "title": "Fail count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "avg_score": {
+          "title": "Avg score",
+          "type": "number",
+          "x-nullable": true
+        },
+        "avg_latency_ms": {
+          "title": "Avg latency ms",
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "EvalTaskUsageEval": {
+      "required": [
+        "id",
+        "name",
+        "output_type",
+        "template_id",
+        "model"
+      ],
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string",
+          "format": "uuid"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string",
+          "minLength": 1
+        },
+        "output_type": {
+          "title": "Output type",
+          "type": "string",
+          "minLength": 1
+        },
+        "template_id": {
+          "title": "Template id",
+          "type": "string",
+          "format": "uuid",
+          "x-nullable": true
+        },
+        "model": {
+          "title": "Model",
+          "type": "string",
+          "x-nullable": true
+        }
+      }
+    },
+    "EvalTaskUsageLogs": {
+      "required": [
+        "count",
+        "next",
+        "previous",
+        "results",
+        "total_pages",
+        "current_page"
+      ],
+      "type": "object",
+      "properties": {
+        "count": {
+          "title": "Count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "next": {
+          "title": "Next",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "previous": {
+          "title": "Previous",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EvalTaskUsageLog"
+          }
+        },
+        "total_pages": {
+          "title": "Total pages",
+          "type": "integer",
+          "minimum": 0
+        },
+        "current_page": {
+          "title": "Current page",
+          "type": "integer",
+          "minimum": 1
+        },
+        "has_more": {
+          "title": "Has more",
+          "type": "boolean"
+        },
+        "count_is_lower_bound": {
+          "title": "Count is lower bound",
+          "type": "boolean"
+        },
+        "page_limit_reached": {
+          "title": "Page limit reached",
+          "type": "boolean"
+        }
+      }
+    },
+    "EvalTaskUsageStats": {
+      "required": [
+        "total_runs",
+        "runs_period",
+        "success_count",
+        "error_count",
+        "pass_rate"
+      ],
+      "type": "object",
+      "properties": {
+        "total_runs": {
+          "title": "Total runs",
+          "type": "integer",
+          "minimum": 0
+        },
+        "runs_period": {
+          "title": "Runs period",
+          "type": "integer",
+          "minimum": 0
+        },
+        "success_count": {
+          "title": "Success count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "error_count": {
+          "title": "Error count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "pass_rate": {
+          "title": "Pass rate",
+          "type": "number",
+          "maximum": 100,
+          "minimum": 0
+        },
+        "total_runs_is_lower_bound": {
+          "title": "Total runs is lower bound",
+          "type": "boolean"
+        },
+        "runs_period_is_lower_bound": {
+          "title": "Runs period is lower bound",
+          "type": "boolean"
+        }
+      }
+    },
     "EvalTemplateListChartsItem": {
       "required": [
         "chart",
@@ -104040,6 +104453,109 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "EvalTaskUsageLog": {
+      "required": [
+        "id",
+        "input",
+        "result",
+        "score",
+        "reason",
+        "status",
+        "source",
+        "warnings",
+        "created_at",
+        "span_id",
+        "trace_id",
+        "session_id",
+        "eval_id",
+        "eval_name",
+        "model",
+        "detail"
+      ],
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string",
+          "format": "uuid"
+        },
+        "input": {
+          "title": "Input",
+          "type": "string"
+        },
+        "result": {
+          "title": "Result",
+          "type": "string"
+        },
+        "score": {
+          "title": "Score",
+          "type": "number",
+          "x-nullable": true
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string",
+          "enum": [
+            "success",
+            "error"
+          ]
+        },
+        "source": {
+          "title": "Source",
+          "type": "string",
+          "minLength": 1
+        },
+        "warnings": {
+          "title": "Warnings",
+          "type": "object",
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "created_at": {
+          "title": "Created at",
+          "type": "string",
+          "format": "date-time"
+        },
+        "span_id": {
+          "title": "Span id",
+          "type": "string",
+          "x-nullable": true
+        },
+        "trace_id": {
+          "title": "Trace id",
+          "type": "string",
+          "x-nullable": true
+        },
+        "session_id": {
+          "title": "Session id",
+          "type": "string",
+          "x-nullable": true
+        },
+        "eval_id": {
+          "title": "Eval id",
+          "type": "string",
+          "format": "uuid",
+          "x-nullable": true
+        },
+        "eval_name": {
+          "title": "Eval name",
+          "type": "string",
+          "x-nullable": true
+        },
+        "model": {
+          "title": "Model",
+          "type": "string",
+          "x-nullable": true
+        },
+        "detail": {
+          "$ref": "#/definitions/EvalTaskUsageLogDetail"
+        }
+      }
+    },
     "EvalTemplateChartPoint": {
       "required": [
         "timestamp",
@@ -104871,6 +105387,126 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Value",
           "type": "number",
           "x-nullable": true
+        }
+      }
+    },
+    "EvalTaskUsageLogDetail": {
+      "required": [
+        "detail_complete",
+        "omitted_fields",
+        "eval_name",
+        "model",
+        "warnings",
+        "output_type",
+        "target_type",
+        "span_name",
+        "span_id",
+        "trace_id",
+        "session_id",
+        "session_name",
+        "output_bool",
+        "output_float",
+        "output_str",
+        "results_explanation",
+        "error_message",
+        "input_variables"
+      ],
+      "type": "object",
+      "properties": {
+        "detail_complete": {
+          "title": "Detail complete",
+          "type": "boolean"
+        },
+        "omitted_fields": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "eval_name": {
+          "title": "Eval name",
+          "type": "string",
+          "x-nullable": true
+        },
+        "model": {
+          "title": "Model",
+          "type": "string",
+          "x-nullable": true
+        },
+        "warnings": {
+          "title": "Warnings",
+          "type": "object",
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "output_type": {
+          "title": "Output type",
+          "type": "string",
+          "x-nullable": true
+        },
+        "target_type": {
+          "title": "Target type",
+          "type": "string",
+          "x-nullable": true
+        },
+        "span_name": {
+          "title": "Span name",
+          "type": "string",
+          "x-nullable": true
+        },
+        "span_id": {
+          "title": "Span id",
+          "type": "string",
+          "x-nullable": true
+        },
+        "trace_id": {
+          "title": "Trace id",
+          "type": "string",
+          "x-nullable": true
+        },
+        "session_id": {
+          "title": "Session id",
+          "type": "string",
+          "x-nullable": true
+        },
+        "session_name": {
+          "title": "Session name",
+          "type": "string",
+          "x-nullable": true
+        },
+        "output_bool": {
+          "title": "Output bool",
+          "type": "boolean",
+          "x-nullable": true
+        },
+        "output_float": {
+          "title": "Output float",
+          "type": "number",
+          "x-nullable": true
+        },
+        "output_str": {
+          "title": "Output str",
+          "type": "string",
+          "x-nullable": true
+        },
+        "results_explanation": {
+          "title": "Results explanation",
+          "type": "object",
+          "x-nullable": true,
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "error_message": {
+          "title": "Error message",
+          "type": "string",
+          "x-nullable": true
+        },
+        "input_variables": {
+          "title": "Input variables",
+          "type": "object",
+          "x-json-value": true,
+          "description": "Any valid JSON value."
         }
       }
     },

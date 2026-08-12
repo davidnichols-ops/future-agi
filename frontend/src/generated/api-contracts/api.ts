@@ -421,6 +421,7 @@ import type {
   EvalTaskMessageResponseApi,
   EvalTaskUpdateRequestApi,
   EvalTaskUpdateResponseApi,
+  EvalTaskUsageResponseApi,
   EvalTemplateApi,
   EvalTemplateBulkDeleteRequestApi,
   EvalTemplateBulkDeleteResponseApi,
@@ -1143,7 +1144,6 @@ import type {
   TracerEvalTaskGetEvalDetailsParams,
   TracerEvalTaskGetEvalTaskLogs200,
   TracerEvalTaskGetEvalTaskLogsParams,
-  TracerEvalTaskGetUsage200,
   TracerEvalTaskGetUsageParams,
   TracerEvalTaskList200,
   TracerEvalTaskListEvalTasksParams,
@@ -17620,6 +17620,9 @@ export const getApiTracesSpanAttributeKeysListUrl = (params: ApiTracesSpanAttrib
 /**
  * Cursor mode walks retained project data newest-first in bounded pages;
 exact ``q`` lookup remains available for direct key discovery.
+``discovery_mode=eval_mapping`` includes JSON-only keys that eval mapping
+can resolve but attribute filters cannot query. The default ``filter``
+mode retains the narrower filterable-key contract.
 The no-page-size form is retained for older clients.
 
 GET /api/traces/span-attribute-keys/?project_id=<uuid>&page_size=10
@@ -60091,7 +60094,7 @@ export const tracerEvalTaskGetEvalTaskLogs = async (params?: TracerEvalTaskGetEv
 
 
 export type tracerEvalTaskGetUsageResponse200 = {
-  data: TracerEvalTaskGetUsage200
+  data: EvalTaskUsageResponseApi
   status: 200
 }
 
@@ -60119,7 +60122,7 @@ export type tracerEvalTaskGetUsageResponseError = (tracerEvalTaskGetUsageRespons
 
 export type tracerEvalTaskGetUsageResponse = (tracerEvalTaskGetUsageResponseSuccess | tracerEvalTaskGetUsageResponseError)
 
-export const getTracerEvalTaskGetUsageUrl = (params?: TracerEvalTaskGetUsageParams,) => {
+export const getTracerEvalTaskGetUsageUrl = (params: TracerEvalTaskGetUsageParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -60138,7 +60141,7 @@ export const getTracerEvalTaskGetUsageUrl = (params?: TracerEvalTaskGetUsagePara
   return stringifiedParams.length > 0 ? `/tracer/eval-task/get_usage/?${stringifiedParams}` : `/tracer/eval-task/get_usage/`
 }
 
-export const tracerEvalTaskGetUsage = async (params?: TracerEvalTaskGetUsageParams, options?: RequestInit): Promise<tracerEvalTaskGetUsageResponse> => {
+export const tracerEvalTaskGetUsage = async (params: TracerEvalTaskGetUsageParams, options?: RequestInit): Promise<tracerEvalTaskGetUsageResponse> => {
 
   return apiMutator<tracerEvalTaskGetUsageResponse>(getTracerEvalTaskGetUsageUrl(params),
   {
@@ -67333,7 +67336,7 @@ export const getTracerTraceGetTraceExportDataUrl = (params: TracerTraceGetTraceE
 }
 
 /**
- * Export one bounded list page, disclosing any remaining rows in-band.
+ * Export one bounded trace/voice page and disclose remaining rows.
  */
 export const tracerTraceGetTraceExportData = async (params: TracerTraceGetTraceExportDataParams, options?: RequestInit): Promise<tracerTraceGetTraceExportDataResponse> => {
 
