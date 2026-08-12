@@ -15,7 +15,7 @@ from tracer.services.clickhouse.filter_value_reads import (
     read_span_system_filter_value_cursor_page,
     read_span_system_filter_values,
 )
-from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+from tracer.services.clickhouse.read_budget import ReadDeadline, ReadDeadlineExceeded
 
 NOW = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
 PROJECT_ID = "00000000-0000-4000-8000-000000000001"
@@ -323,3 +323,35 @@ def test_system_value_cursor_shares_one_deadline_across_adjacent_slices(monkeypa
     assert read.values == ()
     assert read.has_more is True
     assert read.next_segment_end == NOW - FILTER_VALUE_CURSOR_INITIAL_SEGMENT
+
+
+def test_system_value_cursor_inherits_elapsed_request_deadline(monkeypatch):
+    clock = {"now": 100.0}
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.read_budget.time.monotonic",
+        lambda: clock["now"],
+    )
+    deadline = ReadDeadline.start(7_000)
+    clock["now"] += 1.25
+
+    class Analytics:
+        calls = []
+
+        def execute_ch_query(self, _query, _params, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(data=[])
+
+    analytics = Analytics()
+    read = read_span_system_filter_value_cursor_page(
+        analytics,
+        project_ids=[PROJECT_ID],
+        metric_name="ended_reason",
+        page_size=20,
+        window_start=NOW - FILTER_VALUE_CURSOR_INITIAL_SEGMENT,
+        window_end=NOW,
+        deadline=deadline,
+    )
+
+    assert len(analytics.calls) == 1
+    assert analytics.calls[0]["timeout_ms"] == 5_750
+    assert read.has_more is False

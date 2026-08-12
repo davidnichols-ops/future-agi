@@ -233,6 +233,10 @@ _DASHBOARD_TRACE_READ_SETTINGS = {
 _DASHBOARD_TRACE_MAX_CONCURRENT_METRICS = 2
 _DASHBOARD_EXACT_QUERY_TIMEOUT_MS = 9_500
 
+# Begin this wall before project/cursor preparation and leave three seconds of
+# the public ten-second SLA for response construction and transport.
+_FILTER_VALUES_INTERACTIVE_TIMEOUT_MS = 7_000
+
 # Public dashboard misses must return in the same wall budget as the rest of
 # the interactive analytics surface. The rollup route issues at most two
 # statements (span states plus the independently keyed trace-count states),
@@ -1930,6 +1934,12 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         if source == "simulation":
             return self._filter_values_simulation(request, metric_name, metric_type)
 
+        system_filter_value_deadline = (
+            ReadDeadline.start(_FILTER_VALUES_INTERACTIVE_TIMEOUT_MS)
+            if metric_type == "system_metric"
+            else None
+        )
+
         # Traces source (default)
         # Validate project_ids belong to this workspace
         workspace_project_ids = {
@@ -2198,6 +2208,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         seen_value_digests=seen_state.digests,
                         seen_value_contains=seen_state.contains,
                         seen_value_count=seen_state.seen_count,
+                        deadline=system_filter_value_deadline,
                     )
                     next_cursor = None
                     if page_read.has_more:

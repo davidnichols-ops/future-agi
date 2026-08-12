@@ -457,6 +457,7 @@ def read_span_system_filter_value_cursor_page(
     seen_value_digests: tuple[str, ...] = (),
     seen_value_contains: Callable[[str], bool] | None = None,
     seen_value_count: int | None = None,
+    deadline: ReadDeadline | None = None,
 ) -> FilterValueCursorPageRead:
     """Walk exact system values over a frozen retained-data window.
 
@@ -468,7 +469,7 @@ def read_span_system_filter_value_cursor_page(
 
     if not 1 <= int(page_size) <= 50:
         raise ValueError("filter-value page_size must be between 1 and 50")
-    deadline = ReadDeadline.start(FILTER_VALUE_READ_TIMEOUT_MS)
+    deadline = deadline or ReadDeadline.start(FILTER_VALUE_READ_TIMEOUT_MS)
     start = _utc(window_start)
     end = _utc(window_end)
     current_end = _utc(segment_end or end)

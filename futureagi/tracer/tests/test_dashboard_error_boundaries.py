@@ -537,6 +537,8 @@ def test_dashboard_query_uses_direct_write_backend_independent_of_routing(
         [("time_bucket", "DateTime('UTC')"), ("metric_0", "Float64")],
         1.0,
     )
+    v2_client.server_enforced_readonly = False
+    v2_client.server_profile_locked = False
 
     with (
         patch(
@@ -601,6 +603,8 @@ def test_widget_trace_queries_use_direct_write_backend_independent_of_routing(
         [("time_bucket", "DateTime('UTC')"), ("metric_0", "Float64")],
         1.0,
     )
+    v2_client.server_enforced_readonly = False
+    v2_client.server_profile_locked = False
 
     with (
         patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True),
@@ -740,8 +744,8 @@ def test_dashboard_poll_degrades_fast_path_clickhouse_failures(
         )
 
     assert response.status_code == 200
-    assert response.json()["result"]["query_status"] == "degraded"
-    assert response.json()["result"]["query_provenance"] == "bounded_unavailable"
+    assert response.json()["result"]["query_status"] == "pending"
+    assert response.json()["result"]["query_refreshing"] is True
     mock_analytics_cls.assert_called_once()
     payload = json.dumps(response.json())
     assert "private" not in payload

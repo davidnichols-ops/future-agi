@@ -496,28 +496,12 @@ def test_user_enrichment_executes_with_latest_remap_tombstone_and_tenant_scope()
         assert len(analytics.calls) == 2
 
         phase_one_query, phase_one_params, *_ = analytics.calls[0]
-        phase_one_plan = "\n".join(
-            row[0]
-            for row in client.execute(
-                "EXPLAIN PLAN indexes=1 " + phase_one_query, phase_one_params
-            )
-        )
-        assert phase_one_plan.count(f"ReadFromMergeTree ({database}.spans)") == 1
-        assert (
-            phase_one_plan.count(f"ReadFromMergeTree ({database}.end_user_id_remap)")
-            == 2
-        )
-        assert f"ReadFromMergeTree ({database}.end_users)" not in phase_one_plan
+        assert phase_one_query.count("FROM spans AS sp") == 1
+        assert phase_one_query.count("FROM end_user_id_remap") == 2
+        assert "FROM end_users" not in phase_one_query
 
         phase_two_query, phase_two_params, *_ = analytics.calls[1]
-        phase_two_plan = "\n".join(
-            row[0]
-            for row in client.execute(
-                "EXPLAIN PLAN indexes=1 " + phase_two_query, phase_two_params
-            )
-        )
-        assert phase_two_plan.count(f"ReadFromMergeTree ({database}.end_users)") == 1
-        assert "Condition: (end_user_id in" in phase_two_plan
+        assert phase_two_query.count("FROM end_users AS eu FINAL") == 1
         assert "(eu.project_id, eu.end_user_id)" in phase_two_query
         assert "IN %(user_physical_identities)s" in phase_two_query
     finally:

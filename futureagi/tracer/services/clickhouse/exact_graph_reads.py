@@ -2637,7 +2637,9 @@ def _finite_survivor_map_ctes(
     window.  Resolving those IDs must not construct a window over the complete
     tenant remap table.  This shape probes old IDs, treats candidate new IDs as
     possible group keys, expands only the touched groups, and materializes the
-    resulting tiny map once as a scalar tuple array.
+    resulting tiny map once as a scalar tuple array.  Candidate IDs themselves
+    stay relational: ClickHouse does not accept a scalar array alias as the
+    right-hand side of ``IN`` in ``PREWHERE``.
     """
 
     identifiers = (
@@ -2653,16 +2655,22 @@ def _finite_survivor_map_ctes(
     target_relation = f"{prefix}_target_new_ids"
     pair_name = f"{prefix}_pairs"
     return f"""
-    (
-        SELECT groupUniqArray(assumeNotNull({candidate_column}))
+    {candidate_ids_name} AS (
+        SELECT DISTINCT
+            assumeNotNull({candidate_column}) AS {candidate_column}
         FROM {candidate_relation}
-    ) AS {candidate_ids_name},
+        WHERE isNotNull({candidate_column})
+    ),
     {target_relation} AS (
         SELECT DISTINCT new_id
         FROM {remap_table} FINAL
-        PREWHERE old_id IN {candidate_ids_name}
+        PREWHERE old_id IN (
+            SELECT {candidate_column}
+            FROM {candidate_ids_name}
+        )
         UNION DISTINCT
-        SELECT arrayJoin({candidate_ids_name}) AS new_id
+        SELECT {candidate_column} AS new_id
+        FROM {candidate_ids_name}
     ),
     (
         SELECT groupArray(tuple(any_id, survivor_id))
@@ -3074,10 +3082,7 @@ def _session_aggregate_source_sql(
                    toUUID('00000000-0000-0000-0000-000000000000'),
                physical_session_id,
                candidate_remap.survivor_id) AS session_id
-        FROM (
-            SELECT arrayJoin(candidate_session_remap_candidate_ids)
-                AS physical_session_id
-        ) AS candidate_session_ids
+        FROM candidate_session_remap_candidate_ids AS candidate_session_ids
         LEFT JOIN ts_survivor_map AS candidate_remap
           ON physical_session_id = candidate_remap.any_id
     ){membership_ctes}
@@ -3443,16 +3448,13 @@ def _user_aggregate_source_sql(
         SELECT DISTINCT
             {resolved_id_expr("physical_end_user_id", "candidate_eu_remap")}
                 AS end_user_id
-        FROM (
-            SELECT arrayJoin(candidate_end_user_remap_candidate_ids)
-                AS physical_end_user_id
-        ) AS candidate_end_user_ids
+        FROM candidate_end_user_remap_candidate_ids AS candidate_end_user_ids
         LEFT JOIN eu_survivor_map AS candidate_eu_remap
           ON physical_end_user_id = candidate_eu_remap.any_id
     ),
     candidate_physical_users AS (
-        SELECT arrayJoin(candidate_end_user_remap_candidate_ids)
-            AS physical_end_user_id
+        SELECT physical_end_user_id
+        FROM candidate_end_user_remap_candidate_ids
         UNION DISTINCT
         SELECT any_id AS physical_end_user_id
         FROM eu_survivor_map

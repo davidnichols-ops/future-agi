@@ -169,6 +169,7 @@ def test_user_rollup_cursor_keeps_string_tie_order_across_pages(ch_client):
     """ORDER BY and keyset continuation use the same public String domain."""
 
     table = f"_test_user_rollup_cursor_{uuid.uuid4().hex[:8]}"
+    curated_table = "end_users"
     organization_id = str(uuid.uuid4())
     project_id = str(uuid.uuid4())
     # Keep every row in the same non-zero DateTime64(6) bucket.  A Python
@@ -186,6 +187,19 @@ def test_user_rollup_cursor_keeps_string_tie_order_across_pages(ch_client):
             last_seen AggregateFunction(max, Nullable(DateTime64(6, 'UTC')))
         ) ENGINE = AggregatingMergeTree
         ORDER BY (project_id, end_user_id, hour_first_seen)
+        """
+    )
+    ch_client.execute(
+        f"""
+        CREATE TABLE {curated_table} (
+            project_id UUID,
+            end_user_id UUID,
+            organization_id UUID,
+            user_id String,
+            version UInt64,
+            is_deleted UInt8
+        ) ENGINE = ReplacingMergeTree(version)
+        ORDER BY (organization_id, project_id, end_user_id)
         """
     )
     try:
@@ -236,6 +250,7 @@ def test_user_rollup_cursor_keeps_string_tie_order_across_pages(ch_client):
         assert len(actual) == len(set(actual)) == len(end_user_ids)
     finally:
         ch_client.execute(f"DROP TABLE {table}")
+        ch_client.execute(f"DROP TABLE {curated_table}")
 
 
 def test_exact_system_graph_statement_reads_current_latest_state(ch_client):

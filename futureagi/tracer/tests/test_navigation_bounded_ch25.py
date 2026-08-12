@@ -79,7 +79,7 @@ def test_trace_navigation_preserves_newest_first_list_direction():
     assert selector.call_args.kwargs["target_id"] == "trace-current"
     assert selector.call_args.kwargs["scan_limit"] == 4095
     assert selector.call_args.kwargs["page_size"] == 200
-    assert selector.call_args.kwargs["deadline_ms"] == 20_000
+    assert selector.call_args.kwargs["deadline_ms"] == 9_500
     assert selector.call_args.kwargs["max_query_count"] == 128
 
 
@@ -109,7 +109,7 @@ def test_span_navigation_preserves_newest_first_list_direction():
     assert selector.call_args.kwargs["target_id"] == "span-current"
     assert selector.call_args.kwargs["scan_limit"] == 4095
     assert selector.call_args.kwargs["page_size"] == 200
-    assert selector.call_args.kwargs["deadline_ms"] == 20_000
+    assert selector.call_args.kwargs["deadline_ms"] == 9_500
     assert selector.call_args.kwargs["max_query_count"] == 128
     assert selector.call_args.kwargs["require_unique_target"] is True
 

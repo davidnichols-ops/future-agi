@@ -10565,15 +10565,30 @@ def test_dashboard_query_replays_legacy_metric_filter_without_400(
 
     assert response.status_code == 200
     assert captured["namespace"] == "dashboard-query"
-    assert captured["identity"]["query_config"]["metrics"][0]["filters"] == [
-        {
-            "metric_name": "status",
-            "metric_type": "system_metric",
-            "operator": "equal_to",
-            "source": "traces",
-            "value": "OK",
-        }
-    ]
+    normalized_filter = captured["identity"]["query_config"]["metrics"][0][
+        "filters"
+    ][0]
+    assert {
+        key: value
+        for key, value in normalized_filter.items()
+        if key != "canonical_filter"
+    } == {
+        "metric_name": "status",
+        "metric_type": "system_metric",
+        "operator": "equal_to",
+        "source": "traces",
+        "value": "OK",
+    }
+    assert normalized_filter["canonical_filter"] == {
+        "column_id": "status",
+        "source": "traces",
+        "filter_config": {
+            "filter_type": "text",
+            "filter_op": "equals",
+            "filter_value": "OK",
+            "col_type": "SYSTEM_METRIC",
+        },
+    }
 
 
 @pytest.mark.django_db

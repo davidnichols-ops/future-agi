@@ -230,7 +230,10 @@ class TestTraceSessionRetrieveAPI:
         monkeypatch.setattr(
             session_utils,
             "_try_session_navigation_ch",
-            lambda req, pid, sid, query_data=None: (str(s1.id), str(s3.id)),
+            lambda req, pid, sid, query_data=None, deadline=None: (
+                str(s1.id),
+                str(s3.id),
+            ),
         )
 
         response = auth_client.get(f"/tracer/trace-session/{s2.id}/")
@@ -254,7 +257,7 @@ class TestTraceSessionRetrieveAPI:
         monkeypatch.setattr(
             session_utils,
             "_try_session_navigation_ch",
-            lambda req, pid, sid, query_data=None: (str(s1.id), None),
+            lambda req, pid, sid, query_data=None, deadline=None: (str(s1.id), None),
         )
 
         response = auth_client.get(f"/tracer/trace-session/{s2.id}/")
@@ -278,7 +281,7 @@ class TestTraceSessionRetrieveAPI:
         monkeypatch.setattr(
             session_utils,
             "_try_session_navigation_ch",
-            lambda req, pid, sid, query_data=None: (None, str(s2.id)),
+            lambda req, pid, sid, query_data=None, deadline=None: (None, str(s2.id)),
         )
 
         response = auth_client.get(f"/tracer/trace-session/{s1.id}/")
@@ -1598,7 +1601,7 @@ class TestTraceSessionWorkspaceScopeAPI:
         assert "positionCaseInsensitiveUTF8(val, %(filter_value_search)s)" in query
         assert params["filter_value_search"] == "Needle"
         assert params["result_limit"] == 51
-        assert call.kwargs["timeout_ms"] == 9_500
+        assert call.kwargs["timeout_ms"] == 8_000
         settings = call.kwargs["settings"]
         assert "max_rows_to_read" not in settings
         assert settings["max_bytes_to_read"] == 36 * 1024 * 1024 * 1024
