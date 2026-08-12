@@ -3063,6 +3063,7 @@ const TraceFilterPanel = ({
   isSimulator = false,
   freeSoloValues = false,
   isSpansView = false,
+  attributeSource: attributeSourceOverride,
 }) => {
   const { observeId: routeObserveId } = useParams();
   const observeId = projectIdProp || routeObserveId;
@@ -3070,7 +3071,8 @@ const TraceFilterPanel = ({
   const dynamicPropertySource =
     isSpansView || tab === "spans" ? "spans" : "traces";
   const exactAttributeSource =
-    source === "traces" ? dynamicPropertySource : source;
+    attributeSourceOverride ||
+    (source === "traces" ? dynamicPropertySource : source);
   const {
     data: dynamicProperties = [],
     isLoading: dynamicPropsLoading,
@@ -3917,6 +3919,7 @@ TraceFilterPanel.propTypes = {
   isSimulator: PropTypes.bool,
   freeSoloValues: PropTypes.oneOfType([PropTypes.bool, PropTypes.func]),
   isSpansView: PropTypes.bool,
+  attributeSource: PropTypes.oneOf(["traces", "spans"]),
 };
 
 export default React.memo(TraceFilterPanel);

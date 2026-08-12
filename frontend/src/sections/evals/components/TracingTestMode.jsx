@@ -467,9 +467,9 @@ const TracingTestMode = React.forwardRef(
       projectId: selectedProjectId,
       rowType,
       search: mappingSearch,
-      // Only the audited task trace/span flow enables server-side exact
-      // discovery. Session and voice mappings retain the existing freeSolo
-      // path until their attribute-path contracts are verified separately.
+      // Task mappings for every row type discover the same retained span-map
+      // keys. The hook maps each raw key into the resolver's canonical path
+      // grammar (including indexed trace/session prefixes).
       enabled: allowCustomFieldPath,
     });
 

@@ -1,4 +1,5 @@
 from rest_framework import serializers
+
 from tfc.utils.serializer_fields import JsonValueField
 from tracer.services.clickhouse.attribute_reads import (
     validate_attribute_key,
@@ -11,6 +12,16 @@ SPAN_ATTRIBUTE_KEY_TYPES = SPAN_ATTRIBUTE_TYPES
 
 class SpanAttributeProjectQuerySerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
+    discovery_mode = serializers.ChoiceField(
+        choices=["filter", "eval_mapping"],
+        required=False,
+        default="filter",
+        help_text=(
+            "Attribute contract to browse. filter returns only keys supported by "
+            "attribute filters; eval_mapping also returns JSON-only keys that an "
+            "evaluation mapping can resolve."
+        ),
+    )
     q = serializers.CharField(
         required=False,
         allow_blank=False,

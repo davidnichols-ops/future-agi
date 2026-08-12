@@ -16,6 +16,12 @@ const EXACT_ATTRIBUTE_ROW_TYPES = {
   spans: "spans",
   trace: "traces",
   traces: "traces",
+  session: "sessions",
+  sessions: "sessions",
+  voice: "voiceCalls",
+  voicecall: "voiceCalls",
+  voicecalls: "voiceCalls",
+  voice_calls: "voiceCalls",
 };
 
 export function normalizeExactAttributeRowType(rowType) {
@@ -34,9 +40,12 @@ export function mergeTracingFieldNames(genericFields, exactFields) {
 
 export function retainedAttributeFieldName(attributeKey, rowType) {
   if (typeof attributeKey !== "string" || !attributeKey) return null;
-  return normalizeExactAttributeRowType(rowType) === "traces"
-    ? `spans.0.${attributeKey}`
-    : attributeKey;
+  const normalizedRowType = normalizeExactAttributeRowType(rowType);
+  if (normalizedRowType === "traces") return `spans.0.${attributeKey}`;
+  if (normalizedRowType === "sessions") {
+    return `traces.0.spans.0.${attributeKey}`;
+  }
+  return attributeKey;
 }
 
 function combineQueryReadStates(...states) {
@@ -55,10 +64,15 @@ export function useExactEvalAttributeFields({
   const queryClient = useQueryClient();
   const normalizedRowType = normalizeExactAttributeRowType(rowType);
   const debouncedSearch = useDebounce(String(search || "").trim(), 350);
-  const exactSearch =
-    normalizedRowType === "traces" && debouncedSearch.startsWith("spans.0.")
-      ? debouncedSearch.slice("spans.0.".length)
-      : debouncedSearch;
+  let exactSearch = debouncedSearch;
+  if (normalizedRowType === "traces" && exactSearch.startsWith("spans.0.")) {
+    exactSearch = exactSearch.slice("spans.0.".length);
+  } else if (
+    normalizedRowType === "sessions" &&
+    exactSearch.startsWith("traces.0.spans.0.")
+  ) {
+    exactSearch = exactSearch.slice("traces.0.spans.0.".length);
+  }
   const retainedQueryKey = [
     "eval-attribute-retained",
     projectId,
@@ -100,6 +114,7 @@ export function useExactEvalAttributeFields({
               params: {
                 project_id: projectId,
                 page_size: 10,
+                discovery_mode: "eval_mapping",
                 ...(cursor ? { cursor } : {}),
               },
             })
@@ -134,6 +149,7 @@ export function useExactEvalAttributeFields({
               params: {
                 project_id: projectId,
                 page_size: 10,
+                discovery_mode: "eval_mapping",
                 q: exactSearch,
                 ...(cursor ? { cursor } : {}),
               },

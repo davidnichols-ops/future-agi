@@ -111,6 +111,7 @@ describe("useExactEvalAttributeFields", () => {
           params: {
             project_id: "00000000-0000-4000-8000-000000000901",
             page_size: 10,
+            discovery_mode: "eval_mapping",
           },
         }),
       );
@@ -122,6 +123,7 @@ describe("useExactEvalAttributeFields", () => {
           params: {
             project_id: "00000000-0000-4000-8000-000000000901",
             page_size: 10,
+            discovery_mode: "eval_mapping",
             q: "final_status",
           },
         }),
@@ -161,6 +163,7 @@ describe("useExactEvalAttributeFields", () => {
         params: {
           project_id: "project-synthetic",
           page_size: 10,
+          discovery_mode: "eval_mapping",
           cursor: "retained-page-2",
         },
       }),
@@ -536,20 +539,46 @@ describe("useExactEvalAttributeFields", () => {
     expect(result.current.data).toEqual(["retained_status"]);
   });
 
-  it.each(["sessions", "voiceCalls"])(
-    "does not probe unsupported %s mappings",
-    (rowType) => {
-      renderHook(
+  it.each([
+    ["sessions", "traces.0.spans.0.final_status"],
+    ["voiceCalls", "final_status"],
+  ])(
+    "discovers retained %s mapping fields through the eval cursor",
+    async (rowType, expectedField) => {
+      mocks.get.mockImplementation((_url, { params }) =>
+        Promise.resolve(
+          params.q
+            ? retainedPage(["final_status"], {
+                lookup_mode: "exact",
+                exact_match: true,
+              })
+            : retainedPage(["retained_status"]),
+        ),
+      );
+
+      const { result } = renderHook(
         () =>
           useExactEvalAttributeFields({
             projectId: "project-synthetic",
             rowType,
-            search: "final_status",
+            search: expectedField,
           }),
         { wrapper: createWrapper() },
       );
 
-      expect(mocks.get).not.toHaveBeenCalled();
+      await waitFor(() => expect(result.current.data).toContain(expectedField));
+      expect(result.current.isSupportedRowType).toBe(true);
+      expect(mocks.get).toHaveBeenCalledWith(
+        "/api/traces/span-attribute-keys/",
+        expect.objectContaining({
+          params: expect.objectContaining({
+            project_id: "project-synthetic",
+            page_size: 10,
+            discovery_mode: "eval_mapping",
+            q: "final_status",
+          }),
+        }),
+      );
     },
   );
 
@@ -557,6 +586,12 @@ describe("useExactEvalAttributeFields", () => {
     expect(retainedAttributeFieldName("llm.model", "spans")).toBe("llm.model");
     expect(retainedAttributeFieldName("llm.model", "traces")).toBe(
       "spans.0.llm.model",
+    );
+    expect(retainedAttributeFieldName("llm.model", "sessions")).toBe(
+      "traces.0.spans.0.llm.model",
+    );
+    expect(retainedAttributeFieldName("llm.model", "voiceCalls")).toBe(
+      "llm.model",
     );
     expect(retainedAttributeFieldName("", "traces")).toBeNull();
   });

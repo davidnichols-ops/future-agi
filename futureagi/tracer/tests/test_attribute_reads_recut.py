@@ -7805,6 +7805,16 @@ def test_span_attribute_keys_contract_accepts_exact_probe_and_read_state():
     assert query.is_valid(), query.errors
     assert query.validated_data["q"] == "final_status"
     assert query.validated_data["page_size"] == 10
+    assert query.validated_data["discovery_mode"] == "filter"
+    eval_query = SpanAttributeProjectQuerySerializer(
+        data={
+            "project_id": project_id,
+            "page_size": 10,
+            "discovery_mode": "eval_mapping",
+        }
+    )
+    assert eval_query.is_valid(), eval_query.errors
+    assert eval_query.validated_data["discovery_mode"] == "eval_mapping"
     assert {
         "query_complete",
         "query_status",
@@ -10466,6 +10476,89 @@ def test_span_attribute_key_api_cursor_binds_and_continues_exact_search(monkeypa
     assert calls[1][1]["segment_start"] == (
         calls[0][1]["window_end"] - timedelta(hours=12)
     )
+
+
+def test_span_attribute_key_api_eval_mapping_mode_is_signed_and_reads_all_json(
+    monkeypatch,
+):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    calls = []
+
+    def read_page(self, project_ids, **kwargs):
+        calls.append((self._json_attribute_mode, project_ids, kwargs))
+        if len(calls) == 1:
+            return AttributeKeyCursorPageRead(
+                (AttributeKeyRow("json_only", "json", 1),),
+                _metadata(),
+                True,
+                "continuation",
+                kwargs["window_end"] - timedelta(hours=6),
+                None,
+                None,
+                0,
+                (attribute_key_cursor_digest("json_only"),),
+            )
+        return AttributeKeyCursorPageRead(
+            (),
+            _metadata(),
+            False,
+            "exhausted",
+            kwargs["window_start"],
+            None,
+            None,
+            0,
+            (attribute_key_cursor_digest("json_only"),),
+        )
+
+    monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "retained_window_start",
+        lambda _self, _projects, *, window_end: NOW - timedelta(days=400),
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._project_is_in_request_scope",
+        lambda _request, _project_id: True,
+    )
+    first_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "project_id": PROJECT_A,
+            "page_size": 10,
+            "discovery_mode": "eval_mapping",
+        },
+    )
+    first_response = SpanAttributeKeysView.as_view()(first_request)
+
+    assert first_response.status_code == 200
+    assert first_response.data["result"][0]["key"] == "json_only"
+    assert first_response.data["result"][0]["type"] == "json"
+    assert calls[0][0] == "all"
+    cursor = first_response.data["next_cursor"]
+    assert cursor
+
+    replay_as_filter = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"project_id": PROJECT_A, "page_size": 10, "cursor": cursor},
+    )
+    replay_response = SpanAttributeKeysView.as_view()(replay_as_filter)
+    assert replay_response.status_code == 400
+    assert len(calls) == 1
+
+    second_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "project_id": PROJECT_A,
+            "page_size": 10,
+            "discovery_mode": "eval_mapping",
+            "cursor": cursor,
+        },
+    )
+    second_response = SpanAttributeKeysView.as_view()(second_request)
+    assert second_response.status_code == 200
+    assert second_response.data["has_more"] is False
+    assert calls[1][0] == "all"
 
 
 @pytest.mark.parametrize("failure_stage", ["retained_window", "cursor_page"])

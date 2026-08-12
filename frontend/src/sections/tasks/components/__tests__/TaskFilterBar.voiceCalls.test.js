@@ -13,10 +13,29 @@ import {
   buildApiFilterArray,
   buildTaskPreviewListParams,
 } from "../TaskLivePreview";
-import { convertNewToOld, convertOldToNew } from "../TaskFilterBar";
+import {
+  convertNewToOld,
+  convertOldToNew,
+  taskFilterPanelSources,
+} from "../TaskFilterBar";
 import { VOICE_CALL_FILTER_FIELDS } from "src/sections/projects/LLMTracing/voiceCallFilterFields";
 
 describe("TaskFilterBar voice-call filter contract", () => {
+  it.each([
+    ["spans", "traces"],
+    ["traces", "traces"],
+    ["sessions", "sessions"],
+    ["voiceCalls", "traces"],
+  ])(
+    "keeps %s value semantics while browsing raw keys through spans",
+    (rowType, source) => {
+      expect(taskFilterPanelSources(rowType)).toEqual({
+        source,
+        attributeSource: "spans",
+      });
+    },
+  );
+
   it("encodes and hydrates all 15 canonical Task picker fields", () => {
     const panelRows = VOICE_CALL_FILTER_FIELDS.map((field) => ({
       field: field.value,

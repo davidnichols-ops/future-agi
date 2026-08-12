@@ -108,6 +108,7 @@ function renderPanel({
   showQueryTab = false,
   projectId,
   source,
+  attributeSource,
 }) {
   const anchorEl = document.createElement("button");
   document.body.appendChild(anchorEl);
@@ -126,6 +127,7 @@ function renderPanel({
         showQueryTab={showQueryTab}
         projectId={projectId}
         source={source}
+        attributeSource={attributeSource}
       />
     </QueryClientProvider>
   );
@@ -1209,6 +1211,54 @@ describe("voice-call property parity", () => {
 });
 
 describe("exact manual attribute fallback", () => {
+  it("decouples retained key discovery from session value semantics", () => {
+    dashboardFilterValuesMock.mockClear();
+    exactAttributePropertiesMock.mockClear();
+    const finalStatus = {
+      id: "final_status",
+      name: "final_status",
+      category: "attribute",
+      rawCategory: "custom_attribute",
+      type: "string",
+      attributeTypes: ["string"],
+      attributeTypesExact: false,
+      apiColType: "SPAN_ATTRIBUTE",
+    };
+    const { anchorEl } = renderPanel({
+      properties: [finalStatus],
+      projectId: "project-session-task",
+      source: "sessions",
+      attributeSource: "spans",
+      currentFilters: [
+        {
+          field: "final_status",
+          fieldName: "final_status",
+          fieldCategory: "attribute",
+          fieldType: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          operator: "in",
+          value: [],
+        },
+      ],
+    });
+
+    expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: "project-session-task",
+        source: "spans",
+      }),
+    );
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metricName: "final_status",
+        metricType: "custom_attribute",
+        source: "sessions",
+      }),
+    );
+
+    document.body.removeChild(anchorEl);
+  });
+
   it("uses cursor-discovered attributes as the canonical paginated inventory", () => {
     const systemProperty = {
       id: "status",

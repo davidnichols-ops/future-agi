@@ -160,6 +160,9 @@ class SpanAttributeKeysView(APIView):
 
     Cursor mode walks retained project data newest-first in bounded pages;
     exact ``q`` lookup remains available for direct key discovery.
+    ``discovery_mode=eval_mapping`` includes JSON-only keys that eval mapping
+    can resolve but attribute filters cannot query. The default ``filter``
+    mode retains the narrower filterable-key contract.
     The no-page-size form is retained for older clients.
 
     GET /api/traces/span-attribute-keys/?project_id=<uuid>&page_size=10
@@ -178,12 +181,15 @@ class SpanAttributeKeysView(APIView):
         try:
             project_id = str(request.validated_query_data["project_id"])
             query_params = request.validated_query_data
+            discovery_mode = query_params["discovery_mode"]
             exact_key = query_params.get("q")
             page_size = query_params.get("page_size")
             cursor_token = query_params.get("cursor")
             selector = AttributeReadSelector(
                 typed_only=True,
-                json_attribute_mode="structured",
+                json_attribute_mode=(
+                    "all" if discovery_mode == "eval_mapping" else "structured"
+                ),
             )
             if not _project_is_in_request_scope(request, project_id):
                 return self._gm.not_found("Project not found")
@@ -199,6 +205,12 @@ class SpanAttributeKeysView(APIView):
                     "project_id": project_id,
                     "mode": "recent_attribute_keys",
                 }
+                # Keep the default cursor query byte-for-byte compatible with
+                # cursors emitted by older pods. Eval mapping is a distinct
+                # key contract and is explicitly signed so its cursor cannot
+                # be replayed against the narrower filter inventory.
+                if discovery_mode != "filter":
+                    cursor_query["discovery_mode"] = discovery_mode
                 if exact_key is not None:
                     # Signed cursor and server-side seen state are scoped to
                     # the normalized exact key. A continuation for one search

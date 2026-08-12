@@ -460,6 +460,16 @@ const rowTypeToFilterSource = (rowType) => {
   return "traces";
 };
 
+// Attribute values remain scoped to the task row surface, while raw custom
+// attribute names always come from the underlying span maps. Keeping both
+// sources explicit prevents session value requests from being mislabeled as
+// trace requests merely to unlock exact key pagination.
+// eslint-disable-next-line react-refresh/only-export-components
+export const taskFilterPanelSources = (rowType) => ({
+  source: rowTypeToFilterSource(rowType),
+  attributeSource: "spans",
+});
+
 // ── Main ──
 const TaskFilterBar = ({
   control,
@@ -586,6 +596,7 @@ const TaskFilterBar = ({
   }, [isPanelOpen, anchorToBar]);
 
   const hasFilters = panelFilters.length > 0;
+  const filterPanelSources = taskFilterPanelSources(rowType);
 
   return (
     <Box ref={barRef} sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
@@ -688,7 +699,11 @@ const TaskFilterBar = ({
         projectId={projectId}
         isSimulator={isSimulator}
         tab={rowTypeToFilterTab(rowType)}
-        source={rowTypeToFilterSource(rowType)}
+        source={filterPanelSources.source}
+        // Task custom attributes always live on the selected rows' spans.
+        // Keep the semantic row source for value lookup (sessions must remain
+        // sessions) while browsing raw keys through the retained span cursor.
+        attributeSource={filterPanelSources.attributeSource}
         onApply={(next) => applyPanelFilters(next || [])}
       />
     </Box>
