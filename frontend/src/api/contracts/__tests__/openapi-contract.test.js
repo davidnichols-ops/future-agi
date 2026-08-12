@@ -281,12 +281,12 @@ describe("OpenAPI runtime contract", () => {
     expect(result).toMatchObject({ ok: true });
   });
 
-  it("does not enforce inferred legacy contracts until the endpoint is runtime-backed", () => {
+  it("enforces the bounded project-list query contract", () => {
     const endpoint = findOpenApiEndpoint(
       "/tracer/project/list_projects/",
       "get",
     );
-    expect(endpoint.contract.runtimeRequestValidation).toBe(false);
+    expect(endpoint.contract.runtimeRequestValidation).toBe(true);
 
     expect(
       validateContractedRequestConfig({
@@ -298,7 +298,21 @@ describe("OpenAPI runtime contract", () => {
           page_size: 25,
         },
       }),
-    ).toMatchObject({ ok: true, skipped: true });
+    ).toMatchObject({ ok: true });
+
+    for (const params of [
+      { project_type: "observe", page_number: -1, page_size: 25 },
+      { project_type: "observe", page_number: 0, page_size: 101 },
+      { project_type: "observe", page: 1, limit: 25 },
+    ]) {
+      expect(
+        validateContractedRequestConfig({
+          url: "/tracer/project/list_projects/",
+          method: "get",
+          params,
+        }).ok,
+      ).toBe(false);
+    }
   });
 
   it("validates list query params the way DRF query serializers receive them", () => {
