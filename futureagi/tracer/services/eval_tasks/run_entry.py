@@ -14,7 +14,9 @@ import logging
 from typing import TYPE_CHECKING
 
 from tracer.models.custom_eval_config import CustomEvalConfig
+from tracer.models.eval_task import EvalTask
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger, EvalTargetType
+from tracer.services.clickhouse.v2.eval_loader import EvalTelemetryReadError
 from tracer.services.eval_tasks.config_hash import resolved_config_hash
 from tracer.services.eval_tasks.entries import mark_terminal, writing_onto_entry
 
@@ -28,8 +30,9 @@ def run_entry(entry: EvalLogger) -> str:
     """Run the eval for one entry and record its terminal status; returns it.
 
     No-op (returns ``"deleted"``) if the entry was soft-deleted mid-run — a
-    Delete & rerun landing while it ran. Every failure converges to a terminal
-    state here so one bad item never aborts the drain.
+    Delete & rerun landing while it ran. Eval/data failures converge to a
+    terminal state; infrastructure read failures propagate to the activity's
+    bounded retry policy.
     """
     fresh = EvalLogger.objects.filter(id=entry.id).first()
     if fresh is None:
@@ -38,10 +41,21 @@ def run_entry(entry: EvalLogger) -> str:
     config = CustomEvalConfig.objects.select_related("project").get(
         id=fresh.custom_eval_config_id
     )
+    # Infrastructure reads happen before the terminalizing evaluator boundary:
+    # a transient PG failure loading task ownership must be retried by Temporal,
+    # not recorded as a permanent eval-entry error on its first attempt.
+    task_project = (
+        EvalTask.objects.select_related("project").get(id=fresh.eval_task_id).project
+    )
     config_hash = resolved_config_hash(config)
 
     try:
-        _run_for_target(fresh, config)
+        _run_for_target(fresh, config, task_project=task_project)
+    except EvalTelemetryReadError:
+        # CH transport/query pressure is infrastructure, not an eval result.
+        # Bubble it to the activity so its bounded retry policy can retry the
+        # same still-RUNNING entry instead of freezing a transient miss.
+        raise
     except Exception as e:  # Every failure becomes a terminal state.
         skipped_reason = getattr(e, "skipped_reason", None)
         if skipped_reason:
@@ -71,7 +85,9 @@ def run_entry(entry: EvalLogger) -> str:
     return status
 
 
-def _run_for_target(entry: EvalLogger, config: CustomEvalConfig) -> None:
+def _run_for_target(
+    entry: EvalLogger, config: CustomEvalConfig, *, task_project
+) -> None:
     """Dispatch to the per-target_type evaluation core (reused from eval.py),
     forcing eval input to load from ClickHouse for the duration."""
     from tracer.services.clickhouse.v2.eval_loader import (
@@ -110,7 +126,7 @@ def _run_for_target(entry: EvalLogger, config: CustomEvalConfig) -> None:
                     "project__organization",
                     "project__workspace",
                 ),
-                project_id=config.project_id,
+                project_id=task_project.id,
             )
             run_params = _process_mapping(config.mapping, span, template_id)
             result = _execute_evaluation(
@@ -119,6 +135,8 @@ def _run_for_target(entry: EvalLogger, config: CustomEvalConfig) -> None:
                 eval_task_id=task_id,
                 run_params=run_params,
                 type=OBSERVE,
+                observation_span=span,
+                project_id=task_project.id,
             )
             # Single evals write inside _execute_evaluation; composites return the
             # logger kwargs for the caller to persist (mirrors the span wrapper).
@@ -132,7 +150,7 @@ def _run_for_target(entry: EvalLogger, config: CustomEvalConfig) -> None:
                     "project__organization",
                     "project__workspace",
                 ),
-                project_id=config.project_id,
+                project_id=task_project.id,
             )
             task_selection = (
                 entry.output_metadata.get("_task_selection")
@@ -158,7 +176,7 @@ def _run_for_target(entry: EvalLogger, config: CustomEvalConfig) -> None:
                 run_params=run_params,
             )
         elif entry.target_type == EvalTargetType.SESSION:
-            session = get_trace_session(entry.trace_session_id, project=config.project)
+            session = get_trace_session(entry.trace_session_id, project=task_project)
             run_params = resolve_session_mapping_lean_first(
                 config.mapping, session, template_id
             )

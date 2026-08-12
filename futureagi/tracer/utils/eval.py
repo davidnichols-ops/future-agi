@@ -289,11 +289,15 @@ def build_trace_context(trace, *, anchor_span_id: str | None = None) -> dict:
         from tracer.services.clickhouse.v2 import get_reader
 
         trace_id = getattr(trace, "id", None)
+        project_id = getattr(trace, "project_id", None)
         if trace_id is None:
             _agg, _spans = {}, []
         else:
             with get_reader() as reader:
-                _ch_spans = reader.list_by_trace(str(trace_id))
+                _ch_spans = reader.list_by_trace(
+                    str(trace_id),
+                    project_id=(str(project_id) if project_id is not None else None),
+                )
             _span_count = len(_ch_spans)
             _error_count = sum(1 for s in _ch_spans if s.status == "ERROR")
             _total_tokens = sum((s.total_tokens or 0) for s in _ch_spans)
@@ -368,9 +372,9 @@ def build_session_context(session) -> dict | None:
         # ONE set and a net-new session (no PG row) yields its real trace set.
         # ``session`` here is either a saved PG ``TraceSession`` (span/trace-level
         # callers) or the unsaved vehicle ``evaluate_trace_session_observe`` builds
-        # — both carry ``.id`` and ``.project_id`` (the vehicle's is the eval
-        # config's project). Trace itself is still PG, so the ids drive a PG
-        # ``id__in`` filter (Trace is never re-keyed; only the session surrogate).
+        # — both carry ``.id`` and the owning ``.project_id``. Trace itself is
+        # still PG, so the ids drive a PG ``id__in`` filter (Trace is never
+        # re-keyed; only the session surrogate).
         session_id = getattr(session, "id", None)
         project_id = getattr(session, "project_id", None)
         if session_id is None or project_id is None:
@@ -380,7 +384,11 @@ def build_session_context(session) -> dict | None:
                 _session_trace_ids = reader.session_trace_ids(
                     str(project_id), str(session_id)
                 )
-        trace_qs = Trace.objects.filter(id__in=_session_trace_ids, deleted=False)
+        trace_qs = Trace.objects.filter(
+            project_id=project_id,
+            id__in=_session_trace_ids,
+            deleted=False,
+        )
         # Cap at 100 traces for the in-prompt summary; the agent uses
         # explore_trace for deeper drill-down.
         traces_page = list(trace_qs.order_by("created_at")[:100])
@@ -410,11 +418,14 @@ def build_session_context(session) -> dict | None:
         # the input resolves to itself, so both reads see the same session. (A
         # straddler's NEW id would split here — empty span-agg vs full trace set —
         # but no entry point produces one.)
-        if session_id is None:
+        if session_id is None or project_id is None:
             _ch_spans = []
         else:
             with get_reader() as reader:
-                _ch_spans = reader.list_by_session(str(session_id))
+                _ch_spans = reader.list_by_session(
+                    str(session_id),
+                    project_id=(str(project_id) if project_id is not None else None),
+                )
 
         _start_time = None
         _end_time = None
@@ -1112,6 +1123,9 @@ def _execute_composite_on_span(
     eval_task_id,
     run_params=None,
     feedback_id=None,
+    *,
+    observation_span=None,
+    project_id=None,
 ):
     """Execute a composite `EvalTemplate` against a tracer span.
 
@@ -1130,15 +1144,26 @@ def _execute_composite_on_span(
         # `select_related` FK preload is honored on the PG fallback path,
         # and project/organization/workspace lazy-load from PG on attribute
         # access in the CH path.
-        from tracer.services.clickhouse.v2.eval_loader import get_observation_span
-
-        observation_span = get_observation_span(
-            observation_span_id,
-            select_related=("project", "project__organization", "project__workspace"),
+        from tracer.services.clickhouse.v2.eval_loader import (
+            EvalTelemetryReadError,
+            get_observation_span,
         )
+
+        if observation_span is None:
+            observation_span = get_observation_span(
+                observation_span_id,
+                select_related=(
+                    "project",
+                    "project__organization",
+                    "project__workspace",
+                ),
+                project_id=project_id,
+            )
         custom_eval_config = CustomEvalConfig.objects.get(
             id=custom_eval_config_id, deleted=False
         )
+    except EvalTelemetryReadError:
+        raise
     except (ObservationSpan.DoesNotExist, CustomEvalConfig.DoesNotExist) as e:
         raise ValueError(f"Span composite eval load failed: {e}") from e
 
@@ -1500,22 +1525,36 @@ def _execute_evaluation(
     type,
     run_params=None,
     feedback_id=None,
+    *,
+    observation_span=None,
+    project_id=None,
 ):
     from evaluations.constants import FUTUREAGI_EVAL_TYPES
     from evaluations.engine import EvalRequest, run_eval
 
     raw_mapping = run_params.copy()
     try:
-        from tracer.services.clickhouse.v2.eval_loader import get_observation_span
-
-        observation_span = get_observation_span(
-            observation_span_id,
-            select_related=("project", "project__organization", "project__workspace"),
+        from tracer.services.clickhouse.v2.eval_loader import (
+            EvalTelemetryReadError,
+            get_observation_span,
         )
+
+        if observation_span is None:
+            observation_span = get_observation_span(
+                observation_span_id,
+                select_related=(
+                    "project",
+                    "project__organization",
+                    "project__workspace",
+                ),
+                project_id=project_id,
+            )
 
         custom_eval_config = CustomEvalConfig.objects.get(
             id=custom_eval_config_id, deleted=False
         )
+    except EvalTelemetryReadError:
+        raise
     except ObservationSpan.DoesNotExist:
         raise ValueError("Observation span not found")  # noqa: B904
     except CustomEvalConfig.DoesNotExist:
@@ -1539,6 +1578,8 @@ def _execute_evaluation(
             eval_task_id=eval_task_id,
             run_params=run_params,
             feedback_id=feedback_id,
+            observation_span=observation_span,
+            project_id=project_id,
         )
 
     # Apply the shared empty-input rules so eval tasks behave the same as
@@ -2848,7 +2889,10 @@ def _session_traces_ch(trace_session) -> list:
     guard.
     """
     from tracer.services.clickhouse.v2 import get_reader
-    from tracer.services.clickhouse.v2.eval_loader import get_trace
+    from tracer.services.clickhouse.v2.eval_loader import (
+        EvalTelemetryReadError,
+        get_trace,
+    )
 
     _project_id = getattr(trace_session, "project_id", None)
     _session_id = getattr(trace_session, "id", None)
@@ -2860,21 +2904,36 @@ def _session_traces_ch(trace_session) -> list:
     if memo is not None and cache_key in memo:
         return memo[cache_key]
 
-    with get_reader() as reader:
-        _trace_ids = reader.session_trace_ids(str(_project_id), str(_session_id))
+    try:
+        with get_reader() as reader:
+            _trace_ids = reader.session_trace_ids(str(_project_id), str(_session_id))
+    except EvalTelemetryReadError:
+        raise
+    except Exception as e:
+        raise EvalTelemetryReadError(
+            "Evaluation session traces could not be loaded from ClickHouse."
+        ) from e
 
-    with get_reader() as reader:
-        root_starts = reader.per_trace_root_span_start_times(
-            [str(t) for t in _trace_ids]
-        )
-        traces = []
-        for tid in _trace_ids:
-            try:
-                traces.append(
-                    get_trace(str(tid), reader=reader, project_id=_project_id)
-                )
-            except Trace.DoesNotExist:
-                continue
+    try:
+        with get_reader() as reader:
+            root_starts = reader.per_trace_root_span_start_times(
+                [str(t) for t in _trace_ids],
+                project_ids=[str(_project_id)],
+            )
+            traces = []
+            for tid in _trace_ids:
+                try:
+                    traces.append(
+                        get_trace(str(tid), reader=reader, project_id=_project_id)
+                    )
+                except Trace.DoesNotExist:
+                    continue
+    except EvalTelemetryReadError:
+        raise
+    except Exception as e:
+        raise EvalTelemetryReadError(
+            "Evaluation session trace ordering could not be loaded from ClickHouse."
+        ) from e
 
     def _trace_order(t):
         key = root_starts.get(str(t.id)) or t.created_at
@@ -2932,7 +2991,7 @@ def _resolve_session_path(trace_session: TraceSession, path: str):
             # it at all). ``session_trace_ids`` is remap-aware on the input id AND each
             # span's id, so a straddler yields its old∪new traces as one set and a
             # net-new session yields its real set. The vehicle carries ``.id`` and
-            # ``.project_id`` (the eval config's project). Trace stays PG → ``id__in``.
+            # its owning ``.project_id``. Trace stays PG → ``id__in``.
             _project_id = getattr(trace_session, "project_id", None)
             _session_id = getattr(trace_session, "id", None)
             if _project_id is None or _session_id is None:

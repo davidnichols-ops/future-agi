@@ -114,6 +114,20 @@ def test_session_trace_ids_is_final_oom_safe():
     _assert_final_oom_safe(client, "spans.project_id = %(p)s")
 
 
+def test_list_by_session_keeps_legacy_unscoped_contract():
+    client = _RecordingClient()
+    _reader_with(client).list_by_session("s1")
+    assert "spans.project_id = %(project_id)s" not in client.sql
+    assert client.params == {"session_id": "s1"}
+
+
+def test_list_by_session_prunes_by_project_when_supplied():
+    client = _RecordingClient()
+    _reader_with(client).list_by_session("s1", project_id="p1")
+    assert "spans.project_id = %(project_id)s" in client.sql
+    assert client.params == {"session_id": "s1", "project_id": "p1"}
+
+
 def test_totals_by_trace_ids_prunes_by_project():
     # totals_by_trace_ids is NON-FINAL (analytics convention) so it keeps
     # is_deleted = 0 and gets no skip-index setting; the only lever here is

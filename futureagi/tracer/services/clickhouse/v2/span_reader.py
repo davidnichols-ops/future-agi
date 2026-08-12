@@ -689,7 +689,9 @@ class CHSpanReader:
         return _row_to_chspan(rows[0]) if rows else None
 
     # ─── All spans in a session ──────────────────────────────────────────────
-    def list_by_session(self, session_id: str) -> list[CHSpan]:
+    def list_by_session(
+        self, session_id: str, *, project_id: str | None = None
+    ) -> list[CHSpan]:
         """For session-level evals (`EvalLogger.target_type='session'`).
 
         P3b step1.5 (DESIGN §3 / id_remap_sql): ``session_id`` is the OLD curated
@@ -701,17 +703,26 @@ class CHSpanReader:
         stays the span's RAW id (these are real span rows). Pre-flip NO span
         matches a ``new_id``, so the resolved id == the span's own id and this is
         a byte-identical no-op (gate B).
+
+        ``project_id`` is optional for backward compatibility. Callers that know
+        the session's tenant must pass it so the primary-key prefix prunes the
+        read and duplicate ids cannot mix spans across projects.
         """
         remap_join = remap_left_join(
             "spans.trace_session_id", "trace_session_id_remap", "ts_remap"
         )
         resolved_ts = resolved_id_expr("spans.trace_session_id", "ts_remap")
+        where = [f"{resolved_ts} = %(session_id)s", "is_deleted = 0"]
+        params = {"session_id": session_id}
+        if project_id:
+            where.append("spans.project_id = %(project_id)s")
+            params["project_id"] = str(project_id)
         rows = self._client.query(
             f"SELECT {_SELECT_SQL} FROM spans FINAL "
             f"{remap_join} "
-            f"WHERE {resolved_ts} = %(session_id)s AND is_deleted = 0 "
+            f"WHERE {' AND '.join(where)} "
             "ORDER BY start_time, id",
-            parameters={"session_id": session_id},
+            parameters=params,
         ).result_rows
         return [_row_to_chspan(r) for r in rows]
 
