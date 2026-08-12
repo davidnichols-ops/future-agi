@@ -44,7 +44,9 @@ class DeleteProjectTool(BaseTool):
         trace_count = project.trace_count
 
         # Cascade soft-delete + publish collector cache-invalidation.
-        soft_delete_projects(Project.objects.filter(id=project.id), project.trace_type)
+        soft_delete_projects(
+            Project.objects.filter(id=project.id), project.trace_type
+        )
 
         info = key_value_block(
             [
