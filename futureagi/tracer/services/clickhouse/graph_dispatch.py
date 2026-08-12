@@ -828,8 +828,15 @@ def _fetch_trace_system_metrics(
 
         for row in partial_rows:
             time_bucket = value(row, "time_bucket", None)
-            if not isinstance(time_bucket, datetime):
+            if not isinstance(time_bucket, (date, datetime)):
                 raise AssertionError("trace metric query returned an invalid bucket")
+            # ClickHouse returns ``Date`` for calendar buckets such as
+            # ``toStartOfMonth`` while hour buckets arrive as ``DateTime``.
+            # Normalize both valid wire types before merging metric batches so
+            # the exact trace reducer and zero-fill formatter share one key
+            # type.  Do not coerce strings/nulls: those still indicate schema
+            # drift and must fail before publication.
+            time_bucket = BaseQueryBuilder._normalize_timestamp(time_bucket, interval)
             traffic = float(value(row, "traffic_count", 0) or 0)
             totals = bucket_totals.setdefault(
                 time_bucket,

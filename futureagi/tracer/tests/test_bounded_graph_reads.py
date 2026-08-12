@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -3893,6 +3893,77 @@ def test_trace_metric_batches_merge_exact_nullable_averages(monkeypatch):
     assert metrics["completion_tokens"][0]["value"] == 18
     assert metrics["error_rate"][0]["value"] == 25
     assert metadata["query_count"] == _sample().query_count + 3
+
+
+@pytest.mark.unit
+def test_trace_metric_month_bucket_accepts_clickhouse_date_without_losing_exactness():
+    trace_id = "11111111-1111-4111-8111-111111111111"
+    analytics = _SequenceAnalytics(
+        [
+            [
+                {
+                    "trace_id": trace_id,
+                    "id": "span-1",
+                    "start_time": START,
+                }
+            ],
+            [
+                {
+                    # ClickHouse ``toStartOfMonth`` returns Date rather than
+                    # DateTime with the production native-client settings.
+                    "time_bucket": date(2026, 1, 1),
+                    "graph_latency_sum": 25,
+                    "graph_latency_count": 1,
+                    "total_tokens": 10,
+                    "graph_cost_sum": 2,
+                    "graph_cost_count": 1,
+                    "traffic_count": 1,
+                    "prompt_tokens": 4,
+                    "completion_tokens": 6,
+                    "graph_error_count": 0,
+                }
+            ],
+        ]
+    )
+
+    metrics, metadata = graph_dispatch._fetch_trace_system_metrics(
+        analytics=analytics,
+        sample=_sample(),
+        project_id=PROJECT_ID,
+        interval="month",
+        started=graph_dispatch.monotonic(),
+        timeout_ms=1_200,
+    )
+
+    assert metrics["latency"][0]["timestamp"] == "2026-01-01T00:00:00"
+    assert metrics["latency"][0]["value"] == 25.0
+    assert metrics["traffic"][0]["traffic"] == 1
+    assert metadata["query_complete"] is True
+    assert metadata["query_count"] == _sample().query_count + 2
+
+
+@pytest.mark.unit
+def test_trace_metric_bucket_still_rejects_non_temporal_schema_drift():
+    trace_id = "11111111-1111-4111-8111-111111111111"
+    analytics = _SequenceAnalytics(
+        [
+            [{"trace_id": trace_id, "id": "span-1", "start_time": START}],
+            [{"time_bucket": "2026-01-01", "traffic_count": 1}],
+        ]
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="trace metric query returned an invalid bucket",
+    ):
+        graph_dispatch._fetch_trace_system_metrics(
+            analytics=analytics,
+            sample=_sample(),
+            project_id=PROJECT_ID,
+            interval="month",
+            started=graph_dispatch.monotonic(),
+            timeout_ms=1_200,
+        )
 
 
 @pytest.mark.unit
