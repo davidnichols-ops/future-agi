@@ -252,9 +252,13 @@ ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT = timedelta(days=60)
 # doomed halvings. No cursor progress is published until that retry succeeds.
 # Every successful statement therefore stays inside the same byte/time
 # ceilings while sparse retained history remains reachable in practical pages.
-# The first six-hour slice is the authoritative production-qualified read.
-# Every wider empty-slice growth probe is speculative: a short failure moves no
-# cursor state and retries the identical frontier at five minutes. Sixty days
+# A generic key page starts with the same production-qualified five-minute
+# slice used by exact key discovery. This keeps the newest page below the dense
+# tenant latency cliff; proven empty slices still grow geometrically, while
+# signed physical checkpoints preserve the same no-skip continuation contract.
+# Every empty-slice growth probe wider than the ordinary six-hour ceiling is
+# speculative: a short failure moves no cursor state and retries the identical
+# frontier at five minutes. Sixty days
 # remains the intermediate ceiling when a still-wider historical probe fails,
 # so partition-pruned years can collapse quickly without sacrificing range.
 ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT = timedelta(days=60)
@@ -3547,11 +3551,29 @@ class AttributeReadSelector:
         emitted_digests: list[str] = []
         emitted: dict[str, AttributeKeyRow] = {}
         candidate_pages = 0
-        candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+        is_initial_generic_page = (
+            exact_key is None
+            and resolved_seen_count == 0
+            and not has_physical_checkpoint
+            and current_segment_end == end
+        )
+        # Page one needs at most one new key per candidate to fill its public
+        # result. Hydrating 64 wide Map/JSON rows for a ten-key response made
+        # the common dense path pay over six times the required replay cost.
+        # Duplicate/stale continuations retain the proven 64-row base and can
+        # still grow to the existing 512-row accelerator without moving an
+        # unverified cursor.
+        candidate_limit = (
+            min(ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT, effective_page_size)
+            if is_initial_generic_page
+            else ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+        )
         cursor_before = before_identity
         empty_segment_width = (
             current_segment_end - active_segment_start
             if active_segment_start is not None
+            else ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+            if is_initial_generic_page
             else ATTRIBUTE_READ_EXPLICIT_SEGMENT
         )
         # Once ClickHouse rejects a widened empty slice, remember that ceiling

@@ -8280,7 +8280,7 @@ def test_span_attribute_key_cursor_collapses_empty_historical_suffix(monkeypatch
     assert page.rows == ()
     assert page.has_more is False
     assert page.browse_status == "exhausted"
-    assert widths[0] == timedelta(hours=6)
+    assert widths[0] == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
     assert all(
         later == earlier * 2
         for earlier, later in zip(widths, widths[1:-1], strict=False)
@@ -8288,6 +8288,66 @@ def test_span_attribute_key_cursor_collapses_empty_historical_suffix(monkeypatch
     assert max(widths) > timedelta(days=60)
     assert ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS in timeouts
     assert len(widths) < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
+
+
+def test_span_attribute_key_cursor_sizes_initial_dense_read_to_public_page(
+    monkeypatch,
+):
+    identities = tuple(
+        (
+            PROJECT_A,
+            f"trace-page-{index}",
+            f"span-page-{index}",
+            NOW - timedelta(seconds=index + 1),
+        )
+        for index in range(10)
+    )
+    candidate_calls: list[tuple[timedelta, int]] = []
+    replay_sizes: list[int] = []
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    def candidates(_projects, segment, **kwargs):
+        candidate_calls.append((segment[1] - segment[0], kwargs["candidate_limit"]))
+        return identities, True, {}
+
+    def verify(*_args, **kwargs):
+        candidate_ids = kwargs["candidate_ids"]
+        replay_sizes.append(len(candidate_ids))
+        return [
+            {
+                "project_id": identity[0],
+                "trace_id": identity[1],
+                "id": identity[2],
+                "start_time": identity[3],
+                "is_deleted": 0,
+                "string_keys": [f"key-{index}"],
+                "number_keys": [],
+                "boolean_keys": [],
+                "attributes_extra": "{}",
+            }
+            for index, identity in enumerate(candidate_ids)
+        ]
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(selector, "_verify_latest", verify)
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+    )
+
+    assert candidate_calls == [(ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT, 10)]
+    assert replay_sizes == [10]
+    assert [row.key for row in page.rows] == [f"key-{index}" for index in range(10)]
+    assert page.has_more is True
+    assert page.next_before_identity == identities[-1]
 
 
 @pytest.mark.parametrize("failure_stage", ["candidate", "replay"])
@@ -8481,8 +8541,8 @@ def test_span_attribute_key_cursor_recuts_base_replay_without_skipping_keys(
         seen_key_digests=first.seen_key_digests,
     )
 
-    assert candidate_calls[:2] == [(64, None), (32, None)]
-    assert candidate_calls[2:4] == [
+    assert candidate_calls[0] == (2, None)
+    assert candidate_calls[1:3] == [
         (64, identities[1]),
         (32, identities[1]),
     ]
@@ -9714,7 +9774,7 @@ def test_span_attribute_key_cursor_compresses_widened_truncated_segment(
     monkeypatch.setattr(
         "tracer.services.clickhouse.attribute_reads."
         "ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES",
-        3,
+        12,
     )
 
     first = selector.read_key_cursor_page(
@@ -9964,7 +10024,9 @@ def test_span_attribute_key_cursor_shrinks_widened_window_on_read_budget(
         window_end=NOW,
     )
 
-    assert timedelta(hours=12) in attempted_widths
+    assert (
+        sum(width > ATTRIBUTE_READ_EXPLICIT_SEGMENT for width in attempted_widths) == 1
+    )
     assert page.has_more is True
     assert page.browse_status == "continuation"
     assert page.next_segment_end < NOW
@@ -10012,8 +10074,15 @@ def test_span_attribute_key_cursor_remembers_safe_width_after_slow_budget_failur
         window_end=NOW,
     )
 
-    assert attempted_widths.count(timedelta(hours=12)) == 1
-    assert all(width <= timedelta(hours=6) for width in attempted_widths[2:])
+    failed_index = next(
+        index
+        for index, width in enumerate(attempted_widths)
+        if width > ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    )
+    assert all(
+        width <= ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+        for width in attempted_widths[failed_index + 1 :]
+    )
     assert clock() < 102.0
     assert page.has_more is True
     assert page.browse_status == "continuation"
@@ -10041,15 +10110,12 @@ def test_span_attribute_key_cursor_caps_generic_growth_before_dense_retry(
         width = segment[1] - segment[0]
         timeout_ms = kwargs.get("query_timeout_ms")
         attempted.append((width, timeout_ms))
-        if width == ATTRIBUTE_READ_EXPLICIT_SEGMENT:
+        if width <= ATTRIBUTE_READ_EXPLICIT_SEGMENT:
             clock_value[0] += 0.02
             return (), False, {}
-        if width > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT:
-            assert timeout_ms == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
-            clock_value[0] += ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS / 1000
-            raise ReadDeadlineExceeded("speculative generic growth timed out")
-        clock_value[0] += 0.01
-        return (), False, {}
+        assert timeout_ms == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+        clock_value[0] += ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS / 1000
+        raise ReadDeadlineExceeded("speculative generic growth timed out")
 
     monkeypatch.setattr(selector, "_candidate_ids", candidates)
     monkeypatch.setattr(selector, "_verify_latest", lambda *_args, **_kwargs: [])
@@ -10061,14 +10127,19 @@ def test_span_attribute_key_cursor_caps_generic_growth_before_dense_retry(
         window_end=NOW,
     )
 
-    assert attempted[:3] == [
-        (ATTRIBUTE_READ_EXPLICIT_SEGMENT, None),
-        (
-            ATTRIBUTE_READ_EXPLICIT_SEGMENT * 2,
-            ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
-        ),
-        (ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT, None),
-    ]
+    assert attempted[0] == (ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT, None)
+    first_speculative_index = next(
+        index
+        for index, (_width, timeout) in enumerate(attempted)
+        if timeout is not None
+    )
+    speculative_width, speculative_timeout = attempted[first_speculative_index]
+    assert speculative_width > ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    assert speculative_timeout == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+    assert attempted[first_speculative_index + 1] == (
+        ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+        None,
+    )
     assert clock() < 101.0
     assert selector._deadline is not None
     assert selector._deadline - clock() > 7.0
@@ -10115,9 +10186,12 @@ def test_span_attribute_key_cursor_jumps_from_slow_base_window_to_five_minutes(
         window_end=NOW,
     )
 
-    assert attempted_widths[0] == timedelta(hours=6)
-    assert attempted_widths[1:] == [timedelta(minutes=5)] * (
-        ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
+    assert attempted_widths[:2] == [
+        ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+        ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT * 2,
+    ]
+    assert attempted_widths[2:] == [ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT] * (
+        ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES - 1
     )
     assert clock() < 102.0
     assert page.has_more is True
@@ -10176,8 +10250,13 @@ def test_span_attribute_key_cursor_keeps_safe_width_after_stale_candidate(
         window_end=NOW,
     )
 
-    assert attempted_widths[0] == timedelta(hours=6)
-    assert all(width == timedelta(minutes=5) for width in attempted_widths[1:])
+    assert attempted_widths[:2] == [
+        ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+        ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+    ]
+    assert all(
+        width == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT for width in attempted_widths[2:]
+    )
     assert page.has_more is True
 
 
@@ -10245,10 +10324,13 @@ def test_span_attribute_key_cursor_exact_json_fallback_shrinks_without_reprobe(
 
 
 def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypatch):
-    from tracer.views.span_attributes import SpanAttributeKeysView
+    from tracer.views.span_attributes import (
+        SPAN_ATTRIBUTE_RETAINED_DATA_START,
+        SpanAttributeKeysView,
+    )
 
     identity = (PROJECT_A, "trace-1", "span-1", NOW - timedelta(hours=1))
-    retained_start = NOW - timedelta(days=400)
+    retained_start = SPAN_ATTRIBUTE_RETAINED_DATA_START
     seen = (attribute_key_cursor_digest("alpha"),)
     calls = []
 
@@ -10283,7 +10365,9 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     monkeypatch.setattr(
         AttributeReadSelector,
         "retained_window_start",
-        lambda _self, _projects, *, window_end: retained_start,
+        lambda *_args, **_kwargs: pytest.fail(
+            "page one must not spend a ClickHouse read on retained metadata"
+        ),
     )
     monkeypatch.setattr(
         "tracer.views.span_attributes._project_is_in_request_scope",
@@ -10304,7 +10388,7 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     assert first_response.data["browse_status"] == "continuation"
     assert "browse_limit" not in first_response.data
     assert calls[0][1]["window_start"] == retained_start
-    assert calls[0][1]["continue_operation"] is True
+    assert "continue_operation" not in calls[0][1]
     contract = SpanAttributeKeysResponseSerializer(data=first_response.data)
     assert contract.is_valid(), contract.errors
     cursor = first_response.data["next_cursor"]
@@ -10319,7 +10403,7 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     assert second_response.status_code == 200
     assert second_response.data["result"][0]["key"] == "beta"
     assert calls[1][1]["window_start"] == retained_start
-    assert calls[1][1]["continue_operation"] is False
+    assert "continue_operation" not in calls[1][1]
     assert calls[1][1]["window_end"] == calls[0][1]["window_end"]
     assert calls[1][1]["segment_start"] == (
         calls[0][1]["window_end"] - timedelta(hours=12)
@@ -10561,7 +10645,6 @@ def test_span_attribute_key_api_eval_mapping_mode_is_signed_and_reads_all_json(
     assert calls[1][0] == "all"
 
 
-@pytest.mark.parametrize("failure_stage", ["retained_window", "cursor_page"])
 @pytest.mark.parametrize(
     "failure_code",
     [
@@ -10572,7 +10655,7 @@ def test_span_attribute_key_api_eval_mapping_mode_is_signed_and_reads_all_json(
     ],
 )
 def test_span_attribute_key_cursor_operational_failures_are_sanitized_503(
-    monkeypatch, failure_stage, failure_code
+    monkeypatch, failure_code
 ):
     from tracer.views.span_attributes import SpanAttributeKeysView
 
@@ -10581,22 +10664,7 @@ def test_span_attribute_key_cursor_operational_failures_are_sanitized_503(
             raise ReadDeadlineExceeded("private key cursor deadline")
         raise ServerException("private key cursor ClickHouse detail", failure_code)
 
-    if failure_stage == "retained_window":
-        monkeypatch.setattr(AttributeReadSelector, "retained_window_start", fail)
-        monkeypatch.setattr(
-            AttributeReadSelector,
-            "read_key_cursor_page",
-            lambda *_args, **_kwargs: pytest.fail(
-                "cursor read crossed a failed retained-window preflight"
-            ),
-        )
-    else:
-        monkeypatch.setattr(
-            AttributeReadSelector,
-            "retained_window_start",
-            lambda _self, _projects, *, window_end: NOW - timedelta(days=400),
-        )
-        monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", fail)
+    monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", fail)
     monkeypatch.setattr(
         "tracer.views.span_attributes._project_is_in_request_scope",
         lambda _request, _project_id: True,

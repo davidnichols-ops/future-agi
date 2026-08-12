@@ -290,14 +290,14 @@ class SpanAttributeKeysView(APIView):
                     window_end = cursor_state.window_end
                 else:
                     window_end = datetime.now(UTC)
-                    retained_start = selector.retained_window_start(
-                        project_ids,
-                        window_end=window_end,
-                    )
-                    window_start = retained_attribute_window_start(
-                        retained_start,
-                        window_end=window_end,
-                    )
+                    # The system.parts lower-bound read was only a pagination
+                    # accelerator, but it added a third ClickHouse round trip
+                    # to the latency-sensitive first property page. Epoch is
+                    # the selector's already-established conservative bound:
+                    # it cannot skip retained spans, and geometric empty-slice
+                    # growth still proves exhaustion in a bounded number of
+                    # reads. Existing signed cursors keep their frozen window.
+                    window_start = SPAN_ATTRIBUTE_RETAINED_DATA_START
                     segment_end = window_end
                     segment_start = None
                     before_identity = None
@@ -341,7 +341,6 @@ class SpanAttributeKeysView(APIView):
                     seen_key_contains=seen_state.contains,
                     seen_key_count=seen_state.seen_count,
                     exact_key=exact_key,
-                    continue_operation=not bool(cursor_token),
                 )
                 if not page_read.metadata.query_complete:
                     logger.warning(
