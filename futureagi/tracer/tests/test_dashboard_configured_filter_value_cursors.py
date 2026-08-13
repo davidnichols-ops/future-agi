@@ -383,7 +383,7 @@ def test_annotation_configured_choices_preserve_json_values_and_search_them(
                 {"value": 0, "label": "Zero code"},
                 {"value": None, "label": "Null fallback"},
                 {"value": "", "label": "Empty fallback"},
-                "Plain string",
+                {"value": "Plain string", "label": "Plain string"},
                 {"value": False, "label": "Duplicate disabled"},
                 {"value": 0, "label": "Duplicate zero"},
             ],
