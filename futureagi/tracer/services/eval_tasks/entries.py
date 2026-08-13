@@ -392,25 +392,23 @@ def _resolve_entry_fks(
     for start in range(0, len(ids), _FK_CHUNK):
         chunk = ids[start : start + _FK_CHUNK]
         if row_type == RowType.TRACES:
-            # Only root.id is used below, so skip the fat JSON columns.
             roots = reader.list_root_spans_by_trace_ids(
-                chunk, include_heavy=False, project_id=project_id
+                chunk, project_id=project_id, columns=["id", "trace_id"]
             )
             fks.update(
                 {
-                    trace_id: {"observation_span_id": root.id, "trace_id": trace_id}
+                    trace_id: {"observation_span_id": root["id"], "trace_id": trace_id}
                     for trace_id, root in roots.items()
                 }
             )
         else:
-            # SPANS / VOICE_CALLS: only id + trace_id are used.
             spans = reader.list_by_ids(
-                chunk, include_heavy=False, project_id=project_id
+                chunk, project_id=project_id, columns=["id", "trace_id"]
             )
             trace_by_span_id: dict[str, str] = {}
             for span in spans:
-                span_id = str(span.id)
-                trace_id = str(span.trace_id or "")
+                span_id = str(span["id"])
+                trace_id = str(span.get("trace_id") or "")
                 previous_trace = trace_by_span_id.setdefault(span_id, trace_id)
                 if previous_trace != trace_id:
                     # EvalLogger stores only observation_span_id. If another
@@ -419,11 +417,11 @@ def _resolve_entry_fks(
                     raise EvalTaskSelectionRejected(_SAFE_AMBIGUOUS_SPAN_MESSAGE)
             fks.update(
                 {
-                    str(s.id): {
-                        "observation_span_id": str(s.id),
-                        "trace_id": s.trace_id,
+                    str(span["id"]): {
+                        "observation_span_id": str(span["id"]),
+                        "trace_id": span["trace_id"],
                     }
-                    for s in spans
+                    for span in spans
                 }
             )
     return fks

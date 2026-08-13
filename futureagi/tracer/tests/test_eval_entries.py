@@ -7,7 +7,6 @@ shape and stamping the config hash. Idempotent via the PR 3b unique indexes.
 
 import uuid
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
 from django.utils import timezone
@@ -108,8 +107,8 @@ def test_entry_fk_resolution_rejects_off_page_cross_trace_span_id_collision():
     class CollisionReader:
         def list_by_ids(self, *_args, **_kwargs):
             return [
-                SimpleNamespace(id="shared", trace_id="trace-a"),
-                SimpleNamespace(id="shared", trace_id="trace-b"),
+                {"id": "shared", "trace_id": "trace-a"},
+                {"id": "shared", "trace_id": "trace-b"},
             ]
 
     with pytest.raises(
@@ -347,7 +346,7 @@ class TestSoftDeleteLive:
 
 
 class _RecordingReader:
-    """Wraps a real CHSpanReader, recording the ``include_heavy`` kwarg each
+    """Wraps a real CHSpanReader, recording the ``columns`` kwarg each
     id-resolution method was called with while delegating everything else."""
 
     def __init__(self, inner):
@@ -355,11 +354,11 @@ class _RecordingReader:
         self.calls: dict[str, object] = {}
 
     def list_by_ids(self, *args, **kwargs):
-        self.calls["list_by_ids"] = kwargs.get("include_heavy")
+        self.calls["list_by_ids"] = kwargs.get("columns")
         return self._inner.list_by_ids(*args, **kwargs)
 
     def list_root_spans_by_trace_ids(self, *args, **kwargs):
-        self.calls["list_root_spans_by_trace_ids"] = kwargs.get("include_heavy")
+        self.calls["list_root_spans_by_trace_ids"] = kwargs.get("columns")
         return self._inner.list_root_spans_by_trace_ids(*args, **kwargs)
 
     def __getattr__(self, name):
@@ -376,21 +375,21 @@ def _spy_reader(monkeypatch):
 
 @pytest.mark.integration
 @pytest.mark.django_db
-class TestMaterializeLeanRead:
-    """Materialize only needs id/trace_id, so it must issue the lean read (no
-    attributes_extra) — hydrating the fat columns OOMs large tasks."""
+class TestMaterializeProjectedRead:
+    """Materialize only needs id/trace_id, so it must project the read down to
+    those two columns — selecting the full CHSpan OOMs large tasks."""
 
-    def test_spans_materialize_requests_lean_read(
+    def test_spans_materialize_requests_projected_read(
         self, project, custom_eval_config, monkeypatch
     ):
         _make_spans(project, 3)
         task = _task(project, evals=[custom_eval_config])
         spy = _spy_reader(monkeypatch)
         materialize_pending(task)
-        assert spy.calls.get("list_by_ids") is False
+        assert spy.calls.get("list_by_ids") == ["id", "trace_id"]
         assert _live(task).count() == 3  # still materializes correctly
 
-    def test_traces_materialize_requests_lean_read(
+    def test_traces_materialize_requests_projected_read(
         self, project, custom_eval_config, monkeypatch
     ):
         trace = Trace.objects.create(project=project, name="tr-lean")
@@ -406,5 +405,5 @@ class TestMaterializeLeanRead:
         task = _task(project, row_type=RowType.TRACES, evals=[custom_eval_config])
         spy = _spy_reader(monkeypatch)
         materialize_pending(task)
-        assert spy.calls.get("list_root_spans_by_trace_ids") is False
+        assert spy.calls.get("list_root_spans_by_trace_ids") == ["id", "trace_id"]
         assert _live(task).count() == 1  # still anchored + materialized
