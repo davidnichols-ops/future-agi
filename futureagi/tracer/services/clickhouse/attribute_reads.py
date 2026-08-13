@@ -254,6 +254,14 @@ ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES = ATTRIBUTE_READ_MAX_QUERY_COUNT
 # next cursor resumes the already-advanced frozen window without skipping data.
 ATTRIBUTE_KEY_CURSOR_EXACT_MAX_CANDIDATE_PAGES = 8
 ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT = timedelta(minutes=5)
+# Generic retained-key continuations can cross a historical density cliff even
+# after the ordinary five-minute recut.  Keep that established width for first
+# pages and sparse growth, but leave one smaller exact retry at the unchanged
+# physical frontier.  Five seconds is already the qualified dense floor for
+# the sibling retained-value cursor.  This is a work-slice minimum, not a
+# retained-window or result limit: only a complete candidate/replay proof may
+# move the signed cursor past the slice.
+ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT = timedelta(seconds=5)
 # Exact-key JSON discovery starts at the same production-qualified five-minute
 # slice, but a newly dense interval must not turn that soft starting point into
 # an API failure. Halve an unproven exact slice down to thirty seconds before
@@ -3631,6 +3639,50 @@ class AttributeReadSelector:
             )
             return remaining_ms <= retry_reserve_ms
 
+        def generic_candidate_timeout_ms(
+            segment_width: timedelta,
+        ) -> int | None:
+            """Reserve the dense retry for a generic continuation probe.
+
+            Page one's initial five-minute read remains authoritative.  Once a
+            request or an incoming cursor has proven progress, wider probes are
+            accelerators: a short failure must leave enough wall for the same
+            frontier at the five-second dense floor.
+            """
+
+            if exact_key is not None:
+                return None
+            is_continuation_probe = (
+                not is_initial_generic_page or request_has_progress()
+            )
+            if (
+                is_continuation_probe
+                and segment_width > ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT
+            ):
+                return ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+            return None
+
+        def generic_replay_timeout_ms(
+            candidate_count: int,
+        ) -> int | None:
+            """Bound optional continuation hydration before its exact fallback."""
+
+            if exact_key is not None:
+                return None
+            is_continuation_replay = (
+                not is_initial_generic_page or request_has_progress()
+            )
+            replay_and_fallback_fit = (
+                self._query_count + 2 <= ATTRIBUTE_READ_MAX_QUERY_COUNT
+            )
+            if (
+                is_continuation_replay
+                and candidate_count > 1
+                and replay_and_fallback_fit
+            ):
+                return ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+            return None
+
         def anchor_checkpoint_window(
             checkpoint: PhysicalSpanIdentity,
             *,
@@ -3924,29 +3976,14 @@ class AttributeReadSelector:
                         ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
                         if candidate_limit > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
                         or (
-                            (
-                                exact_key is None
-                                and (
-                                    (
-                                        cursor_before is None
-                                        and current_segment_end - current_segment_start
-                                        > ATTRIBUTE_READ_EXPLICIT_SEGMENT
-                                    )
-                                    or (
-                                        cursor_before is not None
-                                        and current_segment_end - current_segment_start
-                                        > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
-                                    )
-                                )
-                            )
-                            or (
-                                exact_key is not None
-                                and cursor_before is None
-                                and current_segment_end - current_segment_start
-                                > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
-                            )
+                            exact_key is not None
+                            and cursor_before is None
+                            and current_segment_end - current_segment_start
+                            > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
                         )
-                        else None
+                        else generic_candidate_timeout_ms(
+                            current_segment_end - current_segment_start
+                        )
                     ),
                     candidate_query_settings={"use_skip_indexes": 0},
                 )
@@ -4026,6 +4063,22 @@ class AttributeReadSelector:
                     continue
                 if (
                     is_read_budget_error(exc)
+                    and active_segment_start is not None
+                    and cursor_before is not None
+                    and current_segment_end - active_segment_start
+                    > ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT
+                ):
+                    # Five minutes is not a universal generic-key density floor.
+                    # Preserve the exact keyset checkpoint and recut only the
+                    # unconsumed physical slice.  The failed statement proved
+                    # nothing and therefore cannot advance the public cursor.
+                    anchor_checkpoint_window(
+                        cursor_before,
+                        width=ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT,
+                    )
+                    continue
+                if (
+                    is_read_budget_error(exc)
                     and active_segment_start is None
                     and empty_segment_width
                     > ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT
@@ -4055,24 +4108,105 @@ class AttributeReadSelector:
                     else:
                         empty_segment_width = max_empty_segment_width
                     continue
+                if (
+                    is_read_budget_error(exc)
+                    and empty_segment_width
+                    > ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT
+                ):
+                    # An empty temporal continuation has no row checkpoint, but
+                    # its segment end is still frozen. Retry the identical
+                    # unconsumed frontier at the dense floor; publish movement
+                    # only after that smaller statement completes.
+                    max_empty_segment_width = min(
+                        max_empty_segment_width,
+                        ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT,
+                    )
+                    if cursor_before is not None:
+                        anchor_checkpoint_window(
+                            cursor_before,
+                            width=max_empty_segment_width,
+                        )
+                    else:
+                        empty_segment_width = max_empty_segment_width
+                    continue
                 raise
             candidate_pages += 1
             try:
-                rows = self._verify_latest(
-                    sql=(
-                        _LATEST_TARGET_SQL
-                        if exact_key is not None
-                        else _LATEST_BROWSE_SQL
-                    ),
-                    project_ids=projects,
-                    candidate_ids=candidate_ids,
-                    attribute_key=exact_key,
-                    query_timeout_ms=(
-                        ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
-                        if candidate_limit > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
-                        else None
-                    ),
+                replay_candidate_ids = candidate_ids
+                expanded_replay_fallback_available = (
+                    candidate_limit > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                    and self._query_count + 2 <= ATTRIBUTE_READ_MAX_QUERY_COUNT
                 )
+                force_authoritative_replay = False
+                while True:
+                    try:
+                        rows = self._verify_latest(
+                            sql=(
+                                _LATEST_TARGET_SQL
+                                if exact_key is not None
+                                else _LATEST_BROWSE_SQL
+                            ),
+                            project_ids=projects,
+                            candidate_ids=replay_candidate_ids,
+                            attribute_key=exact_key,
+                            query_timeout_ms=(
+                                None
+                                if force_authoritative_replay
+                                else ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+                                if exact_key is not None
+                                and len(replay_candidate_ids)
+                                > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                                else generic_replay_timeout_ms(
+                                    len(replay_candidate_ids),
+                                )
+                            ),
+                        )
+                    except Exception as exc:
+                        if (
+                            is_read_budget_error(exc)
+                            and exact_key is None
+                            and len(replay_candidate_ids) > 1
+                        ):
+                            if force_authoritative_replay:
+                                # The smaller exact replay already owned the
+                                # remaining wall. A further retry cannot be
+                                # guaranteed to fit and no identity from this
+                                # candidate page has been certified.
+                                raise
+                            if self._query_count >= ATTRIBUTE_READ_MAX_QUERY_COUNT:
+                                # The loop admitted one candidate/replay pair.
+                                # If that authoritative replay consumed the last
+                                # statement slot, do not manufacture an over-cap
+                                # retry; no identity in this batch is proven.
+                                raise
+                            if expanded_replay_fallback_available:
+                                # Preserve the historical base-size fallback for
+                                # an optional 128/256/512-row accelerator. The
+                                # already-complete candidate proof makes its
+                                # newest 64-row prefix authoritative without
+                                # repeating the ordered ClickHouse scan.
+                                replay_candidate_ids = replay_candidate_ids[
+                                    :ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                                ]
+                                expanded_replay_fallback_available = False
+                                force_authoritative_replay = True
+                                continue
+                            # Keep the already-complete ordered candidate page.
+                            # Replaying its newest half exactly avoids paying for
+                            # the same candidate sort again. The discarded suffix
+                            # remains behind the last verified identity and is
+                            # therefore reachable by ordinary keyset continuation.
+                            replay_candidate_ids = replay_candidate_ids[
+                                : max(len(replay_candidate_ids) // 2, 1)
+                            ]
+                            force_authoritative_replay = True
+                            continue
+                        raise
+                    break
+                if len(replay_candidate_ids) < len(candidate_ids):
+                    candidate_ids = replay_candidate_ids
+                    candidate_limit = len(candidate_ids)
+                    segment_truncated = True
             except Exception as exc:
                 if (
                     is_read_budget_error(exc)
@@ -4110,22 +4244,6 @@ class AttributeReadSelector:
                     # progress invariant below converts this into an honest
                     # unavailable response rather than a looping continuation.
                     break
-                if (
-                    is_read_budget_error(exc)
-                    and exact_key is None
-                    and candidate_limit > 1
-                    and len(candidate_ids) > 1
-                ):
-                    # Generic key browsing hydrates every Map-key subcolumn for
-                    # the finite candidate set.  A small number of unusually
-                    # wide spans can therefore cross the replay result/timeout
-                    # envelope even though the ordered candidate page itself
-                    # completed.  Retry the identical physical frontier with a
-                    # smaller finite batch.  No candidate has been consumed yet,
-                    # so this cannot skip a key or publish progress from the
-                    # failed replay.
-                    candidate_limit = max(candidate_limit // 2, 1)
-                    continue
                 if (
                     is_read_budget_error(exc)
                     and active_segment_start is not None

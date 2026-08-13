@@ -33,6 +33,8 @@ from tracer.services.clickhouse.attribute_cursor_state import (
 from tracer.services.clickhouse.attribute_reads import (
     _LATEST_CARDINALITY_SQL,
     _STRATIFIED_CANDIDATE_SQL,
+    ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT,
+    ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT,
     ATTRIBUTE_KEY_CURSOR_EXACT_MAX_CANDIDATE_PAGES,
     ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT,
     ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT,
@@ -116,6 +118,7 @@ def test_production_attribute_reads_reserve_transport_inside_ten_second_sla():
     assert ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS < ATTRIBUTE_READ_WALL_TIMEOUT_MS
     assert ATTRIBUTE_READ_METADATA_TIMEOUT_MS < ATTRIBUTE_READ_WALL_TIMEOUT_MS
     assert ATTRIBUTE_VALUE_CURSOR_INITIAL_SEGMENT == timedelta(seconds=5)
+    assert ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT == timedelta(seconds=5)
     assert ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS == 4_000
     assert ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS < 5_000
 
@@ -8659,17 +8662,51 @@ def test_span_attribute_key_cursor_retries_expanded_batch_without_moving_checkpo
     )
 
     assert [row.key for row in page.rows] == [unique_key]
-    assert calls[:3] == [
-        (64, None, None),
-        (128, identities[63], ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS),
-        (
+    assert calls[0] == (
+        64,
+        None,
+        ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
+    )
+    if failure_stage == "candidate":
+        assert calls[1] == (
+            128,
+            identities[63],
+            ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
+        )
+        assert calls[2] == (
             64,
             identities[63],
             ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
-        ),
-    ]
-    if failure_stage == "replay":
-        assert replay_calls[1][1] == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+        )
+    else:
+        assert len(calls) > 2
+        assert all(
+            limit <= ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+            and timeout == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+            for limit, _checkpoint, timeout in calls
+        )
+        checkpoints = [checkpoint for _limit, checkpoint, _timeout in calls[1:]]
+        physical_checkpoints = [
+            checkpoint for checkpoint in checkpoints if checkpoint is not None
+        ]
+        assert len(physical_checkpoints) == len(set(physical_checkpoints))
+        assert [
+            identity_indexes[checkpoint] for checkpoint in physical_checkpoints
+        ] == (
+            sorted(identity_indexes[checkpoint] for checkpoint in physical_checkpoints)
+        )
+        speculative_indexes = [
+            index
+            for index, (_size, timeout) in enumerate(replay_calls)
+            if timeout == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+        ]
+        assert speculative_indexes
+        assert all(
+            index + 1 < len(replay_calls)
+            and replay_calls[index + 1][1] is None
+            and replay_calls[index + 1][0] <= replay_calls[index][0]
+            for index in speculative_indexes
+        )
 
 
 @pytest.mark.parametrize(
@@ -8760,10 +8797,7 @@ def test_span_attribute_key_cursor_recuts_base_replay_without_skipping_keys(
     )
 
     assert candidate_calls[0] == (2, None)
-    assert candidate_calls[1:3] == [
-        (64, identities[1]),
-        (32, identities[1]),
-    ]
+    assert candidate_calls[1:] == [(64, identities[1])]
     assert [row.key for row in first.rows] == ["wide_key_00", "wide_key_01"]
     assert [row.key for row in second.rows] == ["wide_key_02", "wide_key_03"]
     assert set(first.seen_key_digests).isdisjoint(second.appended_key_digests)
@@ -10187,8 +10221,351 @@ def test_span_attribute_key_cursor_recuts_dense_checkpoint_at_same_keyset_fronti
     assert calls[1][0][1] == checkpoint[3] + ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
     assert calls[1][0][1] - calls[1][0][0] == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
     assert calls[1][1] == checkpoint
-    assert calls[1][2] is None
+    assert calls[1][2] == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
     assert [row.key for row in page.rows] == ["reachable_after_candidate_recut"]
+
+
+@pytest.mark.parametrize(
+    ("segment_start", "expected_widths"),
+    [
+        (
+            None,
+            (
+                ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+                ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+                ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT,
+                ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT,
+            ),
+        ),
+        (
+            NOW - timedelta(days=1),
+            (
+                timedelta(days=1),
+                ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+                ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+                ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT,
+                ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT,
+            ),
+        ),
+    ],
+    ids=("legacy-five-field", "wide-six-field"),
+)
+def test_span_attribute_key_cursor_dense_retry_keeps_late_pages_exact(
+    monkeypatch,
+    segment_start,
+    expected_widths,
+):
+    checkpoint = (
+        PROJECT_A,
+        "trace-dense-history",
+        "span-z-dense-history",
+        NOW - timedelta(hours=1),
+    )
+    identities = (
+        (
+            PROJECT_A,
+            "trace-dense-history",
+            "span-y-dense-history",
+            checkpoint[3] - timedelta(seconds=1),
+        ),
+        (
+            PROJECT_A,
+            "trace-dense-history",
+            "span-x-dense-history",
+            checkpoint[3] - timedelta(seconds=2),
+        ),
+    )
+    rows = {
+        identity: {
+            "project_id": identity[0],
+            "trace_id": identity[1],
+            "id": identity[2],
+            "start_time": identity[3],
+            "is_deleted": 0,
+            "string_keys": [f"late_unique_{index}"],
+            "number_keys": [],
+            "boolean_keys": [],
+            "attributes_extra": "{}",
+        }
+        for index, identity in enumerate(identities)
+    }
+    candidate_calls: list[
+        tuple[
+            timedelta,
+            tuple[str, str, str, datetime] | None,
+            int | None,
+        ]
+    ] = []
+    replay_calls: list[tuple[int, int | None]] = []
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        wall_timeout_ms=ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    def order_key(identity):
+        return identity[3], identity[2], identity[1], identity[0]
+
+    def candidates(_projects, segment, **kwargs):
+        width = segment[1] - segment[0]
+        before_identity = kwargs.get("before_identity")
+        candidate_calls.append((width, before_identity, kwargs.get("query_timeout_ms")))
+        if width > ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT:
+            raise ReadDeadlineExceeded("dense historical candidate timed out")
+        matches = tuple(
+            identity
+            for identity in identities
+            if segment[0] <= identity[3] < segment[1]
+            and (
+                before_identity is None
+                or order_key(identity) < order_key(before_identity)
+            )
+        )
+        limit = kwargs["candidate_limit"]
+        return matches[:limit], len(matches) > limit, {}
+
+    def verify(*_args, **kwargs):
+        candidate_ids = kwargs.get("candidate_ids", ())
+        replay_calls.append((len(candidate_ids), kwargs.get("query_timeout_ms")))
+        return [rows[identity] for identity in candidate_ids]
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(selector, "_verify_latest", verify)
+
+    first = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_end=NOW,
+        segment_start=segment_start,
+        before_identity=checkpoint,
+    )
+    second = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        segment_start=first.next_segment_start,
+        before_identity=first.next_before_identity,
+        resume_identity=first.next_resume_identity,
+        resume_key_offset=first.next_resume_key_offset,
+        seen_key_digests=first.seen_key_digests,
+    )
+
+    assert [row.key for row in first.rows] == ["late_unique_0"]
+    assert [row.key for row in second.rows] == ["late_unique_1"]
+    assert set(first.seen_key_digests).isdisjoint(second.appended_key_digests)
+    assert first.metadata.query_complete is True
+    assert second.metadata.query_complete is True
+    assert tuple(call[0] for call in candidate_calls[: len(expected_widths)]) == (
+        expected_widths
+    )
+    assert tuple(call[2] for call in candidate_calls[: len(expected_widths)]) == (
+        *(ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS for _ in expected_widths[:-2]),
+        None,
+        None,
+    )
+    assert replay_calls == [
+        (0, None),
+        (2, ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS),
+        (1, None),
+    ]
+
+
+def test_span_attribute_key_cursor_dense_floor_failure_is_fail_closed(monkeypatch):
+    checkpoint = (
+        PROJECT_A,
+        "trace-unreadable-history",
+        "span-unreadable-history",
+        NOW - timedelta(hours=1),
+    )
+    calls: list[tuple[timedelta, int | None]] = []
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        wall_timeout_ms=ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    def candidates(_projects, segment, **kwargs):
+        calls.append((segment[1] - segment[0], kwargs.get("query_timeout_ms")))
+        raise ReadDeadlineExceeded("dense floor still unreadable")
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **_kwargs: pytest.fail(
+            "failed candidates must not reach latest-state replay"
+        ),
+    )
+
+    for _attempt in range(2):
+        with pytest.raises(ReadDeadlineExceeded, match="dense floor still unreadable"):
+            selector.read_key_cursor_page(
+                [PROJECT_A],
+                page_size=1,
+                window_start=NOW - timedelta(days=1),
+                window_end=NOW,
+                segment_end=NOW,
+                before_identity=checkpoint,
+            )
+
+    assert calls[:3] == [
+        (
+            ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+            ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
+        ),
+        (
+            ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+            ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
+        ),
+        (ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT, None),
+    ]
+    assert calls[3:] == calls[:3]
+
+
+def test_span_attribute_key_cursor_reuses_candidate_proof_while_recutting_replay(
+    monkeypatch,
+):
+    checkpoint = (
+        PROJECT_A,
+        "trace-replay-prefix",
+        "span-replay-checkpoint",
+        NOW - timedelta(minutes=10),
+    )
+    identities = tuple(
+        (
+            PROJECT_A,
+            f"trace-replay-prefix-{index}",
+            f"span-replay-prefix-{index}",
+            checkpoint[3] - timedelta(microseconds=index + 1),
+        )
+        for index in range(64)
+    )
+    candidate_calls = 0
+    replay_calls: list[tuple[int, int | None]] = []
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        wall_timeout_ms=ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    def candidates(_projects, _segment, **_kwargs):
+        nonlocal candidate_calls
+        candidate_calls += 1
+        return identities, True, {}
+
+    def verify(*_args, **kwargs):
+        candidate_ids = kwargs["candidate_ids"]
+        timeout_ms = kwargs.get("query_timeout_ms")
+        replay_calls.append((len(candidate_ids), timeout_ms))
+        if (
+            len(candidate_ids) > 1
+            and timeout_ms == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+        ):
+            raise ReadDeadlineExceeded("wide latest-state replay timed out")
+        identity = candidate_ids[0]
+        return [
+            {
+                "project_id": identity[0],
+                "trace_id": identity[1],
+                "id": identity[2],
+                "start_time": identity[3],
+                "is_deleted": 0,
+                "string_keys": ["verified_after_replay_recut"],
+                "number_keys": [],
+                "boolean_keys": [],
+                "attributes_extra": "{}",
+            }
+        ]
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(selector, "_verify_latest", verify)
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_end=checkpoint[3] + ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+        before_identity=checkpoint,
+    )
+
+    assert [row.key for row in page.rows] == ["verified_after_replay_recut"]
+    assert candidate_calls == 1
+    assert replay_calls == [
+        (64, ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS),
+        (32, None),
+    ]
+    assert page.next_before_identity == identities[0]
+
+
+def test_span_attribute_key_cursor_single_identity_replay_failure_does_not_skip(
+    monkeypatch,
+):
+    checkpoint = (
+        PROJECT_A,
+        "trace-huge-replay",
+        "span-z-huge-replay",
+        NOW - timedelta(minutes=1),
+    )
+    huge_identity = (
+        PROJECT_A,
+        "trace-huge-replay",
+        "span-a-huge-replay",
+        checkpoint[3],
+    )
+    candidate_calls = 0
+    replay_calls = 0
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        wall_timeout_ms=ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    def candidates(*_args, **_kwargs):
+        nonlocal candidate_calls
+        candidate_calls += 1
+        return (huge_identity,), False, {}
+
+    def verify(*_args, **kwargs):
+        nonlocal replay_calls
+        replay_calls += 1
+        assert kwargs["candidate_ids"] == (huge_identity,)
+        assert kwargs.get("query_timeout_ms") is None
+        raise ReadDeadlineExceeded("single identity cannot be hydrated")
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(selector, "_verify_latest", verify)
+
+    for _attempt in range(2):
+        with pytest.raises(
+            ReadDeadlineExceeded,
+            match="single identity cannot be hydrated",
+        ):
+            selector.read_key_cursor_page(
+                [PROJECT_A],
+                page_size=1,
+                window_start=NOW - timedelta(days=1),
+                window_end=NOW,
+                segment_end=checkpoint[3]
+                + ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT,
+                segment_start=checkpoint[3],
+                before_identity=checkpoint,
+            )
+
+    assert candidate_calls == 2
+    assert replay_calls == 2
 
 
 def test_span_attribute_key_cursor_empty_retained_window_terminates_in_one_request():
@@ -10390,17 +10767,21 @@ def test_span_attribute_key_cursor_caps_generic_growth_before_dense_retry(
     )
 
     assert attempted[0] == (ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT, None)
-    first_speculative_index = next(
+    first_failed_growth_index = next(
         index
-        for index, (_width, timeout) in enumerate(attempted)
-        if timeout is not None
+        for index, (width, _timeout) in enumerate(attempted)
+        if width > ATTRIBUTE_READ_EXPLICIT_SEGMENT
     )
-    speculative_width, speculative_timeout = attempted[first_speculative_index]
-    assert speculative_width > ATTRIBUTE_READ_EXPLICIT_SEGMENT
-    assert speculative_timeout == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
-    assert attempted[first_speculative_index + 1] == (
+    assert all(
+        timeout == ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+        for _width, timeout in attempted[1:]
+    )
+    assert attempted[first_failed_growth_index][1] == (
+        ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+    )
+    assert attempted[first_failed_growth_index + 1] == (
         ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
-        None,
+        ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
     )
     assert clock() < 101.0
     assert selector._deadline is not None
