@@ -4484,7 +4484,7 @@ class TestDashboardQueryBuilder:
         assert "eval_output_str" in sql
         assert "eval_score" in sql
 
-    def test_eval_string_output_filter_uses_string_operator_coercion(self):
+    def test_eval_pass_fail_filter_uses_canonical_label_coercion(self):
         eval_id = str(uuid.uuid4())
         config = {
             "project_ids": ["proj1"],
@@ -4511,9 +4511,111 @@ class TestDashboardQueryBuilder:
             ],
         }
 
-        _, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
 
-        assert params["_evf_0_val"] == "%0%"
+        assert "'Passed', 'Failed'" in sql
+        assert params["_evf_0_val"] == "%Failed%"
+
+    @pytest.mark.parametrize(
+        ("operator", "value", "expected"),
+        [
+            ("equal_to", "Passed", "Passed"),
+            ("equal_to", "Failed", "Failed"),
+            ("equal_to", True, "Passed"),
+            ("equal_to", 0.0, "Failed"),
+            ("contains", ["Passed", "Failed"], ["Passed", "Failed"]),
+            ("contains", [1.0, 0.0], ["Passed", "Failed"]),
+        ],
+    )
+    def test_eval_pass_fail_filter_accepts_public_and_legacy_values(
+        self, operator, value, expected
+    ):
+        eval_id = str(uuid.uuid4())
+        config = {
+            "project_ids": ["proj1"],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [
+                {
+                    "id": "pass-rate-filtered",
+                    "name": "pass_rate",
+                    "type": "eval_metric",
+                    "config_id": eval_id,
+                    "output_type": "PASS_FAIL",
+                    "aggregation": "avg",
+                    "filters": [
+                        {
+                            "metric_type": "eval_metric",
+                            "metric_name": eval_id,
+                            "operator": operator,
+                            "value": value,
+                            "output_type": "PASS_FAIL",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        sql, params, _ = DashboardQueryBuilder(config).build_all_queries()[0]
+
+        assert "if((e.eval_score >= 1.0" in sql
+        assert "'Passed', 'Failed')" in sql
+        assert params["_evf_0_val"] == expected
+
+    def test_eval_pass_fail_canonical_filter_and_joined_paths_use_labels(self):
+        eval_id = str(uuid.uuid4())
+        joined_eval_id = str(uuid.uuid4())
+        config = _normalize_dashboard_query_filters(
+            {
+                "project_ids": ["proj1"],
+                "granularity": "day",
+                "time_range": {"preset": "7D"},
+                "metrics": [
+                    {
+                        "id": "pass-rate-filtered",
+                        "name": "pass_rate",
+                        "type": "eval_metric",
+                        "config_id": eval_id,
+                        "output_type": "PASS_FAIL",
+                        "aggregation": "avg",
+                        "filters": [
+                            {
+                                "column_id": joined_eval_id,
+                                "output_type": "PASS_FAIL",
+                                "filter_config": {
+                                    "col_type": "EVAL_METRIC",
+                                    "filter_type": "text",
+                                    "filter_op": "in",
+                                    "filter_value": ["Passed"],
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "breakdowns": [
+                    {
+                        "name": eval_id,
+                        "type": "eval_metric",
+                        "config_id": eval_id,
+                        "output_type": "PASS_FAIL",
+                    },
+                    {
+                        "name": joined_eval_id,
+                        "type": "eval_metric",
+                        "config_id": joined_eval_id,
+                        "output_type": "PASS_FAIL",
+                    },
+                ],
+            }
+        )
+
+        sql, params, _ = DashboardQueryBuilder(config).build_all_queries()[0]
+
+        assert "if((e.eval_score >= 1.0" in sql
+        assert "if((ev_bd1.eval_score >= 1.0" in sql
+        assert "if((ev_f0.eval_score >= 1.0" in sql
+        assert "'Passed', 'Failed'" in sql
+        assert params["_evf_0_val"] == ["Passed"]
 
     def test_eval_metric_compiles_typed_canonical_span_filters(self):
         canonical_filters = [
@@ -4684,6 +4786,85 @@ class TestDashboardQueryBuilder:
         assert "sum(if(e.eval_output_str = '', NULL" in sql
         assert "lower(e.eval_output_str) IN ('passed', 'pass', 'true', '1')" in sql
         assert "sum(e.eval_score)" not in sql
+
+    def test_eval_metric_avg_keeps_structured_score_rows(self):
+        """A structured output is not numeric text, so the numeric-detection
+        branch must accept the nested score or every such row is NULLed out.
+        """
+        config = {
+            "project_ids": ["proj1"],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [
+                {
+                    "id": "e2",
+                    "name": "conversation_hallucination",
+                    "type": "eval_metric",
+                    "config_id": str(uuid.uuid4()),
+                    "aggregation": "avg",
+                }
+            ],
+        }
+        builder = DashboardQueryBuilder(config)
+        queries = builder.build_all_queries()
+        sql, _, _ = queries[0]
+        assert (
+            "JSONType(e.eval_output_str, 'score') IN ('Double', 'Int64', 'UInt64')"
+            in sql
+        )
+
+    def test_pass_fail_paths_render_one_shared_predicate(self):
+        """The time-series predicate is unchanged to the byte, and the breakdown
+        label and the eval filter now render it instead of a 'Passed' literal.
+        """
+        eval_id = str(uuid.uuid4())
+        metric = {
+            "id": "e_pf",
+            "name": "pass_fail_eval",
+            "type": "eval_metric",
+            "config_id": eval_id,
+            "output_type": "PASS_FAIL",
+            "aggregation": "pass_rate",
+        }
+        builder = DashboardQueryBuilder(
+            {
+                "project_ids": ["proj1"],
+                "organization_id": str(uuid.uuid4()),
+                "granularity": "day",
+                "time_range": {"preset": "7D"},
+                "metrics": [metric],
+                "breakdowns": [metric],
+            }
+        )
+
+        sql, _, _ = builder.build_all_queries()[0]
+        breakdown_expr = builder._resolve_all_breakdowns({})[0]["expr"]
+        filter_clauses, _ = builder._build_subquery_filters(
+            [
+                {
+                    "metric_type": "eval_metric",
+                    "metric_name": eval_id,
+                    "output_type": "PASS_FAIL",
+                    "operator": "equal_to",
+                    "value": 1.0,
+                }
+            ],
+            {},
+            "f_",
+        )
+
+        assert (
+            "(e.eval_score >= 1.0 OR lower(e.eval_output_str) IN "
+            "('passed', 'pass', 'true', '1'))" in sql
+        ), "the time-series pass predicate must render exactly as it did before"
+        assert (
+            "(ev0.eval_score >= 1.0 OR lower(ev0.eval_output_str) IN "
+            "('passed', 'pass', 'true', '1'))" in breakdown_expr
+        ), "the PASS_FAIL breakdown label must not read a structured row as Fail"
+        assert (
+            "(eval_score >= 1.0 OR lower(eval_output_str) IN "
+            "('passed', 'pass', 'true', '1'))" in filter_clauses[0]
+        ), "the PASS_FAIL eval filter must select what the widget labels Pass"
 
     def test_eval_metric_combines_project_and_dataset_breakdowns(self):
         config = {

@@ -24,7 +24,7 @@ against the exact successor merge head.
 | `GET /api/traces/span-attribute-keys/` | Bounded latest-state key discovery for one project or an authorized workspace. Workspace reads traverse at most 64 projects per physical request and preserve all observed key/type lanes across batches. | Signed cursor; `page_size=1..50`; exact-key `q`; `discovery_mode=filter|eval_mapping`. Partial substring discovery is local over explicitly loaded retained pages. Each explicit Load-more or Retry action makes one physical request; an initial non-empty search can start independent retained and exact lanes. | LLM Tracing and Voice Basic/Query property pickers; Journey Attributes; eval mapping/test mode; Run Insights trace/span tabs; Widget Editor Trace Attributes; alert filters; Custom Columns; Sessions/Users/User Trace; eval-task create/edit drawers. |
 | `GET /api/traces/span-attribute-values/` | Legacy compatibility suggestions for one project and exact attribute key. The response is explicitly sampled from a bounded recent six-hour slice; exhaustive retained-history values use dashboard `filter_values`. | No cursor. Required `project_id` and `key`; optional case-insensitive substring `q`; `limit=1..500`. | No current direct frontend caller was found. |
 | `GET /api/traces/span-attribute-detail/` | Serves the last complete exact attribute snapshot over its fixed 365-day horizon and may schedule an out-of-band refresh when a snapshot is absent or refresh is requested. It is not an all-retained-history read. | No cursor. Required `project_id` and `key`; optional `refresh`, default `false`. | Journey Attributes. |
-| `GET /tracer/dashboard/filter_values/` | One request-owned four-second wall covers authorization, PostgreSQL metadata, ClickHouse reads, and label hydration. Supports custom, system, project, session, eval, annotation, and annotator values without materializing a workspace-wide vocabulary. Workspace/large explicit scopes advance in authorized 64-project batches. JSON arrays resume within a cell, including arrays with more than 500 members. | Signed cursor; `page_size=1..50`; cursor use requires the same page size; server `search`; `attribute_type`. Each Load more/Retry makes one request. Loaded values survive a bounded fresh-chain Retry. Configured eval/annotation choices preserve typed JSON including `false` and `0`. | LLM Tracing and Voice Basic/Query value pickers; ComplexFilter autocomplete; Widget Editor values; saved filter labels; TaskFilterBar; annotation add-items dialogs. |
+| `GET /tracer/dashboard/filter_values/` | One request-owned four-second wall covers authorization, PostgreSQL metadata, ClickHouse reads, and label hydration. Supports custom, system, project, session, eval, annotation, and annotator values without materializing a workspace-wide vocabulary. Workspace/large explicit scopes advance in authorized 64-project batches. JSON arrays resume within a cell, including arrays with more than 500 members. PASS_FAIL eval choices use the public `Passed`/`Failed` labels while structured and scalar output rows share one truth predicate. | Signed cursor; `page_size=1..50`; cursor use requires the same page size; server `search`; `attribute_type`. Each Load more/Retry makes one request. Loaded values survive a bounded fresh-chain Retry. Configured eval/annotation choices preserve typed JSON including `false` and `0`. | LLM Tracing and Voice Basic/Query value pickers; ComplexFilter autocomplete; Widget Editor values; saved filter labels; TaskFilterBar; annotation add-items dialogs. |
 | `GET /tracer/dashboard/metrics/` | Callers that do not need custom attributes can set `exclude_custom_attributes=true`, avoiding the legacy capped ClickHouse attribute-catalog scan and workspace project materialization. Widget custom attributes now come from the signed key cursor. | Optional one-based `page`; `page_size=1..200`; `search`, `category`, and `source`; no cursor. Unpaged/unfiltered calls preserve the full cached legacy catalog. Cursor-backed custom attributes use `/span-attribute-keys/`. | Widget Editor, TraceFilterPanel catalog, tracing graphs, annotation rule dialog. |
 | `GET /tracer/trace/list_traces/` | Bounded prototype trace selector and relational filter compilation for custom attributes, eval results, and annotation completeness. Metadata needed by classifiers is frozen once per operation instead of re-read per batch. | Numbered pages only: zero-based `page_number`; `page_size=1..500`; no cursor contract. Incomplete proof returns sanitized `503`; unsafe deep pages may return `422`. | Run Insights traces. |
 | `GET /tracer/trace/list_traces_of_session/` | Same bounded trace filtering and eval/annotation semantics for Observe/session-scoped trace surfaces. | Signed row cursor/read-more plus zero-based numbered compatibility (`page_number`, `page_size=1..500`); no silent sampled success unless explicitly requested. | LLM Tracing TraceGrid; task/eval live and test previews; annotation add-items; session trace views. |
@@ -42,7 +42,7 @@ against the exact successor merge head.
 ## Schema and ingestion scope
 
 There is no PostgreSQL span/trace table change and no ClickHouse span/trace
-DDL. This PR does add exactly two concurrent partial PostgreSQL indexes on
+DDL. This PR adds exactly two concurrent partial PostgreSQL indexes on
 `EvalLogger` for bounded usage reads:
 
 - `eval_logger_task_created_idx` on
@@ -51,9 +51,20 @@ DDL. This PR does add exactly two concurrent partial PostgreSQL indexes on
   `(eval_task_id, custom_eval_config, created_at, id)`.
 
 Both indexes apply only where `eval_task_id IS NOT NULL AND deleted = false`.
-They add no table, column, or constraint. The SELECT-only rule below governs
-production qualification; it does not mean that the eventual deployment has
-no migration DDL.
+They add no table, column, or constraint.
+
+The merged `dev` dependency also changes the existing ClickHouse
+`usage_apicalllog.eval_score` materialized expression so scalar and structured
+eval outputs share one numeric score and restores its `idx_eval_score` skip
+index. ClickHouse requires the index to be dropped before `MODIFY COLUMN` and
+re-added afterward. Historical parts are populated only by the separate,
+explicitly authorized `backfill_eval_score` command; that command can issue
+DROP/MODIFY/ADD/MATERIALIZE mutations and is **not** part of this release
+qualifier. The SELECT-only pod must retain
+`NO_STARTUP_DB_MUTATIONS=true` and `STARTUP_DB_MUTATION_MODE=disabled`, and the
+harness must reject any mutation dispatch. Thus qualification neither applies
+DDL nor runs/materializes the backfill; deployment/backfill is a distinct
+reviewed operation.
 
 ## Release qualification acceptance matrix
 

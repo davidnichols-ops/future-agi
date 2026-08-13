@@ -11767,8 +11767,11 @@ export const modelHubAnnotationQueuesListResponseResultsItemLabelsItemOrderMax =
 export const modelHubAnnotationQueuesListResponseResultsItemAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesListResponseResultsItemAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesListResponseResultsItemAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesListResponse = zod.object({
@@ -11805,7 +11808,7 @@ export const ModelHubAnnotationQueuesListResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesListResponseResultsItemAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesListResponseResultsItemAnnotatorIdsDefault),
@@ -11818,8 +11821,8 @@ export const ModelHubAnnotationQueuesListResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 }))
@@ -11995,8 +11998,11 @@ export const modelHubAnnotationQueuesReadResponseLabelsItemOrderMax = 2147483647
 export const modelHubAnnotationQueuesReadResponseAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesReadResponseAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesReadResponseAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesReadResponse = zod.object({
@@ -12029,7 +12035,7 @@ export const ModelHubAnnotationQueuesReadResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesReadResponseAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesReadResponseAnnotatorIdsDefault),
@@ -12042,8 +12048,8 @@ export const ModelHubAnnotationQueuesReadResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
@@ -12102,8 +12108,11 @@ export const modelHubAnnotationQueuesUpdateResponseLabelsItemOrderMax = 21474836
 export const modelHubAnnotationQueuesUpdateResponseAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesUpdateResponseAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesUpdateResponseAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesUpdateResponse = zod.object({
@@ -12136,7 +12145,7 @@ export const ModelHubAnnotationQueuesUpdateResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesUpdateResponseAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesUpdateResponseAnnotatorIdsDefault),
@@ -12149,8 +12158,8 @@ export const ModelHubAnnotationQueuesUpdateResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
@@ -12206,8 +12215,11 @@ export const modelHubAnnotationQueuesPartialUpdateResponseLabelsItemOrderMax = 2
 export const modelHubAnnotationQueuesPartialUpdateResponseAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesPartialUpdateResponseAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesPartialUpdateResponseAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesPartialUpdateResponse = zod.object({
@@ -12240,7 +12252,7 @@ export const ModelHubAnnotationQueuesPartialUpdateResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesPartialUpdateResponseAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesPartialUpdateResponseAnnotatorIdsDefault),
@@ -12253,8 +12265,8 @@ export const ModelHubAnnotationQueuesPartialUpdateResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
@@ -12617,8 +12629,11 @@ export const modelHubAnnotationQueuesRestoreResponseResultLabelsItemOrderMax = 2
 export const modelHubAnnotationQueuesRestoreResponseResultAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesRestoreResponseResultAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesRestoreResponseResultAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesRestoreResponse = zod.object({
@@ -12653,7 +12668,7 @@ export const ModelHubAnnotationQueuesRestoreResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesRestoreResponseResultAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesRestoreResponseResultAnnotatorIdsDefault),
@@ -12666,8 +12681,8 @@ export const ModelHubAnnotationQueuesRestoreResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
@@ -12701,8 +12716,11 @@ export const modelHubAnnotationQueuesUpdateStatusResponseResultLabelsItemOrderMa
 export const modelHubAnnotationQueuesUpdateStatusResponseResultAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesUpdateStatusResponseResultAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesUpdateStatusResponseResultAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesUpdateStatusResponse = zod.object({
@@ -12737,7 +12755,7 @@ export const ModelHubAnnotationQueuesUpdateStatusResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesUpdateStatusResponseResultAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesUpdateStatusResponseResultAnnotatorIdsDefault),
@@ -12750,8 +12768,8 @@ export const ModelHubAnnotationQueuesUpdateStatusResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
@@ -13210,6 +13228,8 @@ export const modelHubAnnotationQueuesItemsListResponseResultsItemOrderMax = 2147
 
 
 
+
+
 export const modelHubAnnotationQueuesItemsListResponseResultsItemReviewStatusMax = 20;
 
 
@@ -13234,7 +13254,11 @@ export const ModelHubAnnotationQueuesItemsListResponse = zod.object({
 }).passthrough().optional(),
   "assigned_to": zod.string().uuid().optional(),
   "assigned_to_name": zod.string().min(1).optional(),
-  "assigned_users": zod.string().optional(),
+  "assigned_users": zod.array(zod.object({
+  "id": zod.string().uuid(),
+  "name": zod.string().min(1),
+  "email": zod.string().email().min(1)
+})).optional(),
   "reserved_by": zod.string().uuid().optional(),
   "reserved_by_name": zod.string().min(1).optional(),
   "reservation_expires_at": zod.string().datetime({"offset":true}).optional(),
@@ -13243,9 +13267,11 @@ export const ModelHubAnnotationQueuesItemsListResponse = zod.object({
   "reviewed_by_name": zod.string().min(1).optional(),
   "reviewed_at": zod.string().datetime({"offset":true}).optional(),
   "review_notes": zod.string().optional(),
-  "source_preview": zod.string().optional(),
-  "comment_count": zod.string().optional(),
-  "open_feedback_count": zod.string().optional(),
+  "source_preview": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "comment_count": zod.number().optional(),
+  "open_feedback_count": zod.number().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 }))
 })
@@ -13473,6 +13499,8 @@ export const modelHubAnnotationQueuesItemsReadResponseOrderMax = 2147483647;
 
 
 
+
+
 export const modelHubAnnotationQueuesItemsReadResponseReviewStatusMax = 20;
 
 
@@ -13493,7 +13521,11 @@ export const ModelHubAnnotationQueuesItemsReadResponse = zod.object({
 }).passthrough().optional(),
   "assigned_to": zod.string().uuid().optional(),
   "assigned_to_name": zod.string().min(1).optional(),
-  "assigned_users": zod.string().optional(),
+  "assigned_users": zod.array(zod.object({
+  "id": zod.string().uuid(),
+  "name": zod.string().min(1),
+  "email": zod.string().email().min(1)
+})).optional(),
   "reserved_by": zod.string().uuid().optional(),
   "reserved_by_name": zod.string().min(1).optional(),
   "reservation_expires_at": zod.string().datetime({"offset":true}).optional(),
@@ -13502,9 +13534,11 @@ export const ModelHubAnnotationQueuesItemsReadResponse = zod.object({
   "reviewed_by_name": zod.string().min(1).optional(),
   "reviewed_at": zod.string().datetime({"offset":true}).optional(),
   "review_notes": zod.string().optional(),
-  "source_preview": zod.string().optional(),
-  "comment_count": zod.string().optional(),
-  "open_feedback_count": zod.string().optional(),
+  "source_preview": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "comment_count": zod.number().optional(),
+  "open_feedback_count": zod.number().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
 
@@ -13552,6 +13586,8 @@ export const modelHubAnnotationQueuesItemsUpdateResponseOrderMax = 2147483647;
 
 
 
+
+
 export const modelHubAnnotationQueuesItemsUpdateResponseReviewStatusMax = 20;
 
 
@@ -13572,7 +13608,11 @@ export const ModelHubAnnotationQueuesItemsUpdateResponse = zod.object({
 }).passthrough().optional(),
   "assigned_to": zod.string().uuid().optional(),
   "assigned_to_name": zod.string().min(1).optional(),
-  "assigned_users": zod.string().optional(),
+  "assigned_users": zod.array(zod.object({
+  "id": zod.string().uuid(),
+  "name": zod.string().min(1),
+  "email": zod.string().email().min(1)
+})).optional(),
   "reserved_by": zod.string().uuid().optional(),
   "reserved_by_name": zod.string().min(1).optional(),
   "reservation_expires_at": zod.string().datetime({"offset":true}).optional(),
@@ -13581,9 +13621,11 @@ export const ModelHubAnnotationQueuesItemsUpdateResponse = zod.object({
   "reviewed_by_name": zod.string().min(1).optional(),
   "reviewed_at": zod.string().datetime({"offset":true}).optional(),
   "review_notes": zod.string().optional(),
-  "source_preview": zod.string().optional(),
-  "comment_count": zod.string().optional(),
-  "open_feedback_count": zod.string().optional(),
+  "source_preview": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "comment_count": zod.number().optional(),
+  "open_feedback_count": zod.number().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
 
@@ -13631,6 +13673,8 @@ export const modelHubAnnotationQueuesItemsPartialUpdateResponseOrderMax = 214748
 
 
 
+
+
 export const modelHubAnnotationQueuesItemsPartialUpdateResponseReviewStatusMax = 20;
 
 
@@ -13651,7 +13695,11 @@ export const ModelHubAnnotationQueuesItemsPartialUpdateResponse = zod.object({
 }).passthrough().optional(),
   "assigned_to": zod.string().uuid().optional(),
   "assigned_to_name": zod.string().min(1).optional(),
-  "assigned_users": zod.string().optional(),
+  "assigned_users": zod.array(zod.object({
+  "id": zod.string().uuid(),
+  "name": zod.string().min(1),
+  "email": zod.string().email().min(1)
+})).optional(),
   "reserved_by": zod.string().uuid().optional(),
   "reserved_by_name": zod.string().min(1).optional(),
   "reservation_expires_at": zod.string().datetime({"offset":true}).optional(),
@@ -13660,9 +13708,11 @@ export const ModelHubAnnotationQueuesItemsPartialUpdateResponse = zod.object({
   "reviewed_by_name": zod.string().min(1).optional(),
   "reviewed_at": zod.string().datetime({"offset":true}).optional(),
   "review_notes": zod.string().optional(),
-  "source_preview": zod.string().optional(),
-  "comment_count": zod.string().optional(),
-  "open_feedback_count": zod.string().optional(),
+  "source_preview": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "comment_count": zod.number().optional(),
+  "open_feedback_count": zod.number().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
 

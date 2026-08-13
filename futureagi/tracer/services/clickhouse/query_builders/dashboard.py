@@ -20,6 +20,13 @@ from typing import Any
 from uuid import UUID
 
 from tracer.constants.dashboard import DASHBOARD_NUMERIC_ONLY_AGGREGATIONS
+from tracer.services.clickhouse.eval_expressions import (
+    EVAL_FALSY_OUTPUTS,
+    EVAL_NUMERIC_OUTPUT_PATTERN,
+    EVAL_TRUTHY_OUTPUTS,
+    eval_has_structured_score,
+    sql_str_set,
+)
 from tracer.services.clickhouse.query_builders.expressions import (
     annotation_numeric_value_expr,
 )
@@ -251,6 +258,27 @@ def _eval_source_bucket_expr(exclude: str) -> str:
     parts.append("e.source = '', '(unknown)', ")
     parts.append(f"'(no {exclude})')")
     return "".join(parts)
+
+
+def eval_pass_expr(score_col: str, output_str_col: str) -> str:
+    """SQL predicate: this eval row reads as a pass, by score or by output text."""
+    return (
+        f"({score_col} >= 1.0 OR lower({output_str_col}) IN "
+        f"{sql_str_set(EVAL_TRUTHY_OUTPUTS)})"
+    )
+
+
+def eval_pass_fail_label_expr(score_col: str, output_str_col: str) -> str:
+    """Return the canonical public PASS_FAIL label for an eval row."""
+    return f"if({eval_pass_expr(score_col, output_str_col)}, 'Passed', 'Failed')"
+
+
+def eval_fail_expr(score_col: str, output_str_col: str) -> str:
+    """SQL predicate: this eval row reads as a fail."""
+    return (
+        f"({score_col} < 1.0 AND lower({output_str_col}) NOT IN "
+        f"{sql_str_set(EVAL_TRUTHY_OUTPUTS)})"
+    )
 
 
 def rescale_rate_to_percent(agg_expr: str, aggregation: str) -> str:
@@ -1385,14 +1413,10 @@ class DashboardQueryBuilder:
         params["workspace_id"] = self.workspace_id
 
         _output_str_lower = "lower(e.eval_output_str)"
-        _is_pass = (
-            f"(e.eval_score >= 1.0 OR {_output_str_lower} IN "
-            "('passed', 'pass', 'true', '1'))"
-        )
-        _is_fail = (
-            f"(e.eval_score < 1.0 AND {_output_str_lower} NOT IN "
-            "('passed', 'pass', 'true', '1'))"
-        )
+        _truthy = sql_str_set(EVAL_TRUTHY_OUTPUTS)
+        _falsy = sql_str_set(EVAL_FALSY_OUTPUTS)
+        _is_pass = eval_pass_expr("e.eval_score", "e.eval_output_str")
+        _is_fail = eval_fail_expr("e.eval_score", "e.eval_output_str")
         _unified_score = f"if({_is_pass}, 1.0, e.eval_score)"
 
         _EVAL_AGGREGATIONS: dict[str, str] = {
@@ -1411,13 +1435,17 @@ class DashboardQueryBuilder:
             if output_type == "PASS_FAIL":
                 col_expr = _unified_score
             else:
-                # Some templates with missing output_type still emit pass/fail strings.
+                # Templates with no output_type still emit pass/fail strings,
+                # bare numbers, or a structured object carrying a score.
+                _has_number = (
+                    f"match(e.eval_output_str, '{EVAL_NUMERIC_OUTPUT_PATTERN}') "
+                    f"OR {eval_has_structured_score('e.eval_output_str')}"
+                )
                 col_expr = (
                     "if(e.eval_output_str = '', NULL, "
-                    f"if({_output_str_lower} IN ('passed', 'pass', 'true', '1'), 1.0, "
-                    f"if({_output_str_lower} IN ('failed', 'fail', 'false', '0'), 0.0, "
-                    "if(match(e.eval_output_str, '^-?[0-9]+\\.?[0-9]*$'), "
-                    "e.eval_score, NULL))))"
+                    f"if({_output_str_lower} IN {_truthy}, 1.0, "
+                    f"if({_output_str_lower} IN {_falsy}, 0.0, "
+                    f"if({_has_number}, e.eval_score, NULL))))"
                 )
             agg_expr = AGGREGATIONS.get(aggregation, "avg({col})").format(col=col_expr)
 
@@ -1571,7 +1599,11 @@ class DashboardQueryBuilder:
                 ).upper()
 
                 if ev_tid == eval_template_id:
-                    if bd_output_type in ("PASS_FAIL", "CHOICE", "CHOICES"):
+                    if bd_output_type == "PASS_FAIL":
+                        bd_expr = eval_pass_fail_label_expr(
+                            "e.eval_score", "e.eval_output_str"
+                        )
+                    elif bd_output_type in ("CHOICE", "CHOICES"):
                         bd_expr = (
                             "if(e.eval_output_str = '', '(not set)', e.eval_output_str)"
                         )
@@ -1585,7 +1617,14 @@ class DashboardQueryBuilder:
                     param_key = f"_ev_bd{bd_idx}_tid"
                     params[param_key] = ev_tid
                     need_eval_join[ev_alias] = param_key
-                    if bd_output_type in ("PASS_FAIL", "CHOICE", "CHOICES"):
+                    if bd_output_type == "PASS_FAIL":
+                        label_expr = eval_pass_fail_label_expr(
+                            f"{ev_alias}.eval_score", f"{ev_alias}.eval_output_str"
+                        )
+                        bd_expr = (
+                            f"if({ev_alias}.id IS NULL, '(not set)', {label_expr})"
+                        )
+                    elif bd_output_type in ("CHOICE", "CHOICES"):
                         bd_expr = (
                             f"if({ev_alias}.id IS NULL OR "
                             f"{ev_alias}.eval_output_str = '', '(not set)', "
@@ -1670,7 +1709,13 @@ class DashboardQueryBuilder:
                 f_out_type = (f.get("output_type") or "SCORE").upper()
 
                 if ev_tid == eval_template_id:
-                    if f_out_type in ("PASS_FAIL", "CHOICE", "CHOICES"):
+                    if f_out_type == "PASS_FAIL":
+                        eval_col = eval_pass_fail_label_expr(
+                            "e.eval_score", "e.eval_output_str"
+                        )
+                        where_parts.append(f"{eval_col} {op_symbol} %({val_key})s")
+                        params[val_key] = _coerce_pass_fail_filter_value(val, op)
+                    elif f_out_type in ("CHOICE", "CHOICES"):
                         where_parts.append(
                             f"e.eval_output_str {op_symbol} %({val_key})s"
                         )
@@ -1683,7 +1728,13 @@ class DashboardQueryBuilder:
                     fkey = f"_evf_{i}_tid"
                     params[fkey] = ev_tid
                     need_eval_join[ev_alias] = fkey
-                    if f_out_type in ("PASS_FAIL", "CHOICE", "CHOICES"):
+                    if f_out_type == "PASS_FAIL":
+                        ev_col = eval_pass_fail_label_expr(
+                            f"{ev_alias}.eval_score", f"{ev_alias}.eval_output_str"
+                        )
+                        where_parts.append(f"{ev_col} {op_symbol} %({val_key})s")
+                        params[val_key] = _coerce_pass_fail_filter_value(val, op)
+                    elif f_out_type in ("CHOICE", "CHOICES"):
                         ev_col = f"{ev_alias}.eval_output_str"
                         where_parts.append(f"{ev_col} {op_symbol} %({val_key})s")
                         params[val_key] = _coerce_string_filter_value(val, op)
@@ -2647,10 +2698,10 @@ class DashboardQueryBuilder:
 
                 # Use materialized columns for fast extraction
                 if output_type == "PASS_FAIL":
-                    val_expr = (
-                        f"if({alias}.id IS NULL, '(not set)', "
-                        f"if({alias}.eval_output_str = 'Passed', 'Pass', 'Fail'))"
+                    label_expr = eval_pass_fail_label_expr(
+                        f"{alias}.eval_score", f"{alias}.eval_output_str"
                     )
+                    val_expr = f"if({alias}.id IS NULL, '(not set)', {label_expr})"
                 elif output_type in ("CHOICE", "CHOICES"):
                     val_expr = (
                         f"if({alias}.id IS NULL, '(not set)', {alias}.eval_output_str)"
@@ -2895,7 +2946,23 @@ class DashboardQueryBuilder:
                 # collapse row versions. Live/status predicates deliberately
                 # stay outside LIMIT 1 BY so a tombstone cannot resurrect an
                 # older successful version.
-                if output_type in ("PASS_FAIL", "CHOICE", "CHOICES"):
+                if output_type == "PASS_FAIL":
+                    # Use the same score-or-text predicate as the time-series
+                    # and breakdown paths, but retain this branch's bounded
+                    # tenant/template/time latest-row subquery. The columns
+                    # are unqualified inside the single derived table so the
+                    # shared expression remains byte-identical everywhere.
+                    # Filter values exposed by the dashboard API are the
+                    # canonical labels ``Passed`` / ``Failed``.  Keep the
+                    # shared truth predicate, but compare its result as the
+                    # same String domain so ClickHouse never receives a
+                    # Float64-vs-String predicate.  Numeric 1/0 values from
+                    # older saved widgets are normalized by the helper too.
+                    eval_col = eval_pass_fail_label_expr(
+                        "eval_score", "eval_output_str"
+                    )
+                    filter_value = _coerce_pass_fail_filter_value(val, op)
+                elif output_type in ("CHOICE", "CHOICES"):
                     eval_col = f"{latest_alias}.eval_output_str"
                     filter_value = _coerce_string_filter_value(val, op)
                 elif output_type == "SCORE":
@@ -3263,3 +3330,33 @@ def _coerce_string_filter_value(val: Any, operator: str) -> Any:
         value = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return f"%{value}%"
     return str(val)
+
+
+def _coerce_pass_fail_filter_value(val: Any, operator: str) -> Any:
+    """Normalize PASS_FAIL filters to the public ``Passed``/``Failed`` labels.
+
+    The filter-values endpoint emits labels, while legacy saved widgets may
+    still contain numeric or boolean 1/0 values.  Normalize both forms before
+    applying the ordinary String operator coercion.
+    """
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, bool):
+            return "Passed" if value else "Failed"
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value == 1:
+                return "Passed"
+            if value == 0:
+                return "Failed"
+        if isinstance(value, str):
+            token = value.strip().lower()
+            if token in {"passed", "pass", "true", "1", "1.0"}:
+                return "Passed"
+            if token in {"failed", "fail", "false", "0", "0.0"}:
+                return "Failed"
+        return value
+
+    normalized = (
+        [normalize(item) for item in val] if isinstance(val, list) else normalize(val)
+    )
+    return _coerce_string_filter_value(normalized, operator)
