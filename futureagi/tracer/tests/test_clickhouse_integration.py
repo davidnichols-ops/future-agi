@@ -940,7 +940,8 @@ class TestEvalScoreMaterialization:
             for label, trace_id in ch_eval_output_rows["trace_ids"].items()
         }
         filter_passes = {
-            label_by_trace_id[row[0]] for row in _run(subquery, filter_params)
+            label_by_trace_id[row[0]]
+            for row in _run(subquery, {**params, **filter_params})
         }
 
         assert breakdown_passes == filter_passes == set(EVAL_PASSING_SHAPES), (
