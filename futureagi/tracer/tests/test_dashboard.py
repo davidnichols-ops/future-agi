@@ -2619,11 +2619,22 @@ class TestMetricsEndpoint:
         assert first_payload["query_complete"] is True
         assert first_payload["query_status"] == "complete"
         assert "query_error_code" not in first_payload
-        assert mock_selector_cls.call_args_list[0].kwargs == {
-            "typed_only": True,
-            "json_attribute_mode": "arrays",
-            "wall_timeout_ms": ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
+        selector_init = mock_selector_cls.call_args_list[0].kwargs
+        assert set(selector_init) == {
+            "typed_only",
+            "json_attribute_mode",
+            "wall_timeout_ms",
         }
+        assert selector_init["typed_only"] is True
+        assert selector_init["json_attribute_mode"] == "arrays"
+        # Project authorization and cursor setup consume the same request-owned
+        # wall. The selector therefore receives the positive *remaining*
+        # budget rather than starting a new independent timeout.
+        assert (
+            0
+            < selector_init["wall_timeout_ms"]
+            <= ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS
+        )
         first_kwargs = selector.read_value_cursor_page.call_args_list[0].kwargs
         assert first_kwargs["window_start"] == retained_start
         assert first_kwargs["continue_operation"] is True
