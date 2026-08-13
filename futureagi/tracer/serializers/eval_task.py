@@ -42,7 +42,7 @@ class EvalTaskUsageQuerySerializer(StrictInputSerializer):
     end_date = serializers.DateTimeField(required=False)
     eval_aggregation = serializers.BooleanField(required=False, default=False)
     span_aggregation = serializers.BooleanField(required=False, default=False)
-    page = serializers.IntegerField(required=False, default=0, min_value=0)
+    # `page` is owned by ExtendedPageNumberPagination, not this contract.
     page_size = serializers.IntegerField(required=False, default=25, min_value=1)
 
     def validate_page_size(self, value):

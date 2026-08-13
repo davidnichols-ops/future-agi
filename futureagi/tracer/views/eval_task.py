@@ -736,7 +736,10 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
     # computations live in `services/eval_tasks/usage.py`.
     # ──────────────────────────────────────────────────────────────────
     @action(detail=False, methods=["get"])
-    @validated_request(query_serializer=EvalTaskUsageQuerySerializer)
+    @validated_request(
+        query_serializer=EvalTaskUsageQuerySerializer,
+        framework_query_params=("page", "limit"),
+    )
     def get_usage(self, request, *args, **kwargs):
         try:
             query = request.validated_query_data
