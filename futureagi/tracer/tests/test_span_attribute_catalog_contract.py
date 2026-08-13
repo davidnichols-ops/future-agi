@@ -33,7 +33,8 @@ def test_catalog_schema_is_additive_and_independent_of_spans() -> None:
     assert [extract_table_name(stmt) for stmt in statements] == [
         "span_attribute_key_catalog",
         "span_attribute_value_catalog",
-        "span_attribute_catalog_coverage",
+        "span_attribute_catalog_checkpoints",
+        "span_attribute_catalog_activations",
     ]
     executable = "\n".join(statements).lower()
     assert "alter table" not in executable
@@ -41,19 +42,27 @@ def test_catalog_schema_is_additive_and_independent_of_spans() -> None:
     assert re.search(r"\bfrom\s+spans\b", executable) is None
     assert "occurrence" not in executable
     assert re.search(r"\bcount\w*\s+", executable) is None
+    assert re.search(r"\bfinal\b", executable) is None
 
 
 def test_catalog_schema_pins_scale_and_identity_invariants() -> None:
     statements = _ddl_statements()
-    assert len(statements) == 3
+    assert len(statements) == 4
     assert sum("ENGINE = AggregatingMergeTree" in stmt for stmt in statements) == 2
     assert (
-        sum("ENGINE = ReplacingMergeTree(version)" in stmt for stmt in statements) == 1
+        sum("ENGINE = ReplacingMergeTree(_version)" in stmt for stmt in statements) == 2
     )
     assert all(
         "PARTITION BY cityHash64(project_id) % 64" in stmt for stmt in statements
     )
-    assert all("catalog_epoch" in stmt.partition("ORDER BY")[2] for stmt in statements)
+    assert all(
+        "PARTITION BY (cityHash64(project_id) % 64, catalog_epoch)" not in stmt
+        for stmt in statements
+    )
+    assert all(
+        "catalog_epoch" in stmt.partition("ORDER BY")[2] for stmt in statements[:3]
+    )
+    assert "ORDER BY (project_id)" in statements[3]
     assert "value_fingerprint FixedString(64)" in statements[1]
     assert "SimpleAggregateFunction(anyLast, String)" in statements[1]
     assert "ngrambf_v1" in statements[0]
@@ -69,6 +78,67 @@ def test_catalog_schema_pins_scale_and_identity_invariants() -> None:
         )
         assert "Replicated" in rewritten
         assert "ON CLUSTER 'default'" in rewritten
+
+
+def test_catalog_checkpoint_contract_is_restartable_and_gap_explicit() -> None:
+    checkpoint = _ddl_statements()[2]
+    assert "source_version_fence       UInt64" in checkpoint
+    for column in (
+        "cursor_observation_type",
+        "cursor_service_name",
+        "cursor_trace_id",
+        "cursor_span_id",
+    ):
+        assert re.search(rf"\b{column}\s+String\b", checkpoint)
+    assert all(
+        re.search(rf"\b{column}\s+UInt64\b", checkpoint)
+        for column in (
+            "source_rows",
+            "processed_rows",
+            "key_rows",
+            "value_rows",
+            "gap_count",
+        )
+    )
+    assert "gap_reasons                Array(String)" in checkpoint
+    assert re.search(r"\brun_id\s+UUID\b", checkpoint)
+    assert re.search(r"\bworker_id\s+String\b", checkpoint)
+    assert re.search(r"\berror\s+String\b", checkpoint)
+    assert re.search(r"\bstarted_at\s+DateTime64\(6, 'UTC'\)", checkpoint)
+    assert re.search(r"\bupdated_at\s+DateTime64\(6, 'UTC'\)", checkpoint)
+    assert "finished_at                Nullable(DateTime64(6, 'UTC'))" in checkpoint
+    assert re.search(r"\b_version\s+UInt64\b", checkpoint)
+    assert all(
+        f"'{status}'" in checkpoint
+        for status in (
+            "pending",
+            "running",
+            "complete",
+            "gap",
+            "failed",
+        )
+    )
+    assert (
+        "ORDER BY (project_id, catalog_epoch, window_start, window_end)" in checkpoint
+    )
+
+
+def test_catalog_activation_contract_is_one_state_per_project() -> None:
+    activation = _ddl_statements()[3]
+    assert re.search(r"\bcatalog_epoch\s+UInt16\b", activation)
+    for column in (
+        "handoff_start",
+        "handoff_end",
+        "writer_watermark",
+        "qualified_at",
+        "updated_at",
+    ):
+        assert re.search(rf"\b{column}\s+DateTime64\(6, 'UTC'\)", activation)
+    assert all(
+        f"'{status}'" in activation for status in ("shadow", "active", "disabled")
+    )
+    assert re.search(r"\b_version\s+UInt64\b", activation)
+    assert "ORDER BY (project_id)" in activation
 
 
 def test_python_codec_matches_shared_golden_fixtures() -> None:

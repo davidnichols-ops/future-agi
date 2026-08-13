@@ -9,10 +9,12 @@
 -- bounded catalog batches from ingestion and populate history explicitly.
 --
 -- SCALE / SAFETY CONTRACT
---   * Three independent tables keep key discovery, selectable values, and
---     coverage state independently operable.
---   * Project-hash partitioning has a fixed 64-bucket ceiling. It avoids both
---     a partition per tenant and time-window fan-out for retained lookups.
+--   * Four independent tables keep key discovery, selectable values,
+--     checkpoint progress, and reader activation independently operable.
+--   * Project-hash partitioning has a fixed 64-bucket ceiling across every
+--     epoch. `catalog_epoch` remains in each sorting key for logical generation
+--     isolation, but it is deliberately not a partition dimension: successive
+--     rebuilds cannot create unbounded partition fan-out.
 --   * `catalog_epoch` is part of every sorting key so a rebuild/cutover never
 --     mixes generations.
 --   * There are intentionally NO occurrence counters. Replayed ingestion can
@@ -89,26 +91,60 @@ ORDER BY
 )
 SETTINGS index_granularity = 8192;
 
-CREATE TABLE IF NOT EXISTS span_attribute_catalog_coverage
+CREATE TABLE IF NOT EXISTS span_attribute_catalog_checkpoints
 (
-    project_id       UUID,
-    catalog_source   Enum8('writer' = 1, 'backfill' = 2),
-    catalog_epoch    UInt16,
-    watermark        Nullable(DateTime64(6, 'UTC')),
-    coverage_status  Enum8(
+    project_id                 UUID,
+    catalog_epoch              UInt16,
+    window_start               DateTime64(6, 'UTC'),
+    window_end                 DateTime64(6, 'UTC'),
+    source_version_fence       UInt64,
+    cursor_observation_type    String,
+    cursor_service_name        String,
+    cursor_trace_id            String,
+    cursor_span_id             String,
+    status                     Enum8(
         'pending' = 1,
         'running' = 2,
         'complete' = 3,
         'gap' = 4,
         'failed' = 5
     ),
-    gap_start        Nullable(DateTime64(6, 'UTC')),
-    gap_end          Nullable(DateTime64(6, 'UTC')),
-    gap_reason       String DEFAULT '',
-    updated_at       DateTime64(6, 'UTC') DEFAULT now64(6, 'UTC'),
-    version          DateTime64(6, 'UTC') DEFAULT now64(6, 'UTC')
+    source_rows                UInt64,
+    processed_rows             UInt64,
+    key_rows                   UInt64,
+    value_rows                 UInt64,
+    gap_count                  UInt64,
+    gap_reasons                Array(String),
+    run_id                     UUID,
+    worker_id                  String,
+    error                      String,
+    started_at                 DateTime64(6, 'UTC'),
+    updated_at                 DateTime64(6, 'UTC'),
+    finished_at                Nullable(DateTime64(6, 'UTC')),
+    _version                   UInt64
 )
-ENGINE = ReplacingMergeTree(version)
+ENGINE = ReplacingMergeTree(_version)
 PARTITION BY cityHash64(project_id) % 64
-ORDER BY (project_id, catalog_source, catalog_epoch)
+ORDER BY (project_id, catalog_epoch, window_start, window_end)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS span_attribute_catalog_activations
+(
+    project_id        UUID,
+    catalog_epoch     UInt16,
+    handoff_start     DateTime64(6, 'UTC'),
+    handoff_end       DateTime64(6, 'UTC'),
+    writer_watermark  DateTime64(6, 'UTC'),
+    status            Enum8(
+        'shadow' = 1,
+        'active' = 2,
+        'disabled' = 3
+    ),
+    qualified_at      DateTime64(6, 'UTC'),
+    updated_at        DateTime64(6, 'UTC'),
+    _version          UInt64
+)
+ENGINE = ReplacingMergeTree(_version)
+PARTITION BY cityHash64(project_id) % 64
+ORDER BY (project_id)
 SETTINGS index_granularity = 8192;
