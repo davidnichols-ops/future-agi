@@ -136,13 +136,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             elif key == "session_id" and value:
                 pname = "mf_session_id"
                 params[pname] = str(value)
-                ch_conditions.append(
-                    f"trace_id IN ("
-                    f"SELECT DISTINCT id FROM spans "
-                    f"WHERE session_id = %({pname})s "
-                    f"AND is_deleted = 0"
-                    f")"
-                )
+                ch_conditions.append(f"trace_session_id = toUUID(%({pname})s)")
             elif key == "date_range" and isinstance(value, list) and len(value) == 2:
                 params["mf_dr_start"] = _parse_dt(value[0])
                 params["mf_dr_end"] = _parse_dt(value[1])
@@ -239,19 +233,18 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         elif metric_type == ERROR_FREE_SESSION_RATES:
             query = f"""
                 SELECT
-                    CASE WHEN uniq(session_id) = 0 THEN NULL
-                         ELSE uniqIf(session_id, error_count = 0) / uniq(session_id)
+                    CASE WHEN uniq(trace_session_id) = 0 THEN NULL
+                         ELSE uniqIf(trace_session_id, error_count = 0) / uniq(trace_session_id)
                     END AS value
                 FROM (
                     SELECT
-                        session_id,
+                        trace_session_id,
                         countIf(status = 'ERROR') AS error_count
                     FROM {SPANS_TABLE}
                     {base_where}
                       {time_win}
-                      AND session_id != ''
-                      AND session_id IS NOT NULL
-                    GROUP BY session_id
+                      AND trace_session_id IS NOT NULL
+                    GROUP BY trace_session_id
                 )
             """
 
@@ -435,9 +428,8 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                     FROM {SPANS_TABLE}
                     {base_where}
                       {time_win}
-                      AND session_id != ''
-                      AND session_id IS NOT NULL
-                    GROUP BY session_id
+                      AND trace_session_id IS NOT NULL
+                    GROUP BY trace_session_id
                 )
             """
 
@@ -660,20 +652,19 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             query = f"""
                 SELECT
                     timestamp,
-                    CASE WHEN uniq(session_id) = 0 THEN 0
-                         ELSE uniqIf(session_id, error_count = 0) / uniq(session_id)
+                    CASE WHEN uniq(trace_session_id) = 0 THEN 0
+                         ELSE uniqIf(trace_session_id, error_count = 0) / uniq(trace_session_id)
                     END AS value
                 FROM (
                     SELECT
                         {bucket_expr} AS timestamp,
-                        session_id,
+                        trace_session_id,
                         countIf(status = 'ERROR') AS error_count
                     FROM {SPANS_TABLE}
                     {base_where}
                       {time_filter}
-                      AND session_id != ''
-                      AND session_id IS NOT NULL
-                    GROUP BY timestamp, session_id
+                      AND trace_session_id IS NOT NULL
+                    GROUP BY timestamp, trace_session_id
                 )
                 GROUP BY timestamp
                 ORDER BY timestamp
