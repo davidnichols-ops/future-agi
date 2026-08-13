@@ -2,8 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import PropTypes from "prop-types";
 import { Box } from "@mui/material";
 import { useParams } from "react-router";
-import { useQuery } from "@tanstack/react-query";
-import axios, { endpoints } from "src/utils/axios";
 import { useUrlState } from "src/routes/hooks/use-url-state";
 
 import TraceGrid from "../../LLMTracing/TraceGrid";
@@ -12,6 +10,7 @@ import CustomColumnDialog from "../../LLMTracing/CustomColumnDialog";
 import FilterChips from "../../LLMTracing/FilterChips";
 import ColumnConfigureDropDown from "src/sections/project-detail/ColumnDropdown/ColumnConfigureDropDown";
 import { transformDateFilterToBackendFilters } from "../common";
+import { useCursorAttributeInventory } from "../../LLMTracing/useCursorAttributeInventory";
 
 // Trace view embedded inside UserDetails — mounts TraceGrid pre-filtered
 // to the current user, with the full ObserveToolbar (filter, display,
@@ -111,18 +110,22 @@ const UserTraceTabV2 = ({ dateFilter }) => {
     return base;
   }, [userId, dateFilter]);
 
-  const { data: evalAttributes } = useQuery({
-    queryKey: ["eval-attributes", projectId],
-    queryFn: () =>
-      axios.get(endpoints.project.getEvalAttributeList(), {
-        params: {
-          filters: JSON.stringify({ project_id: projectId }),
-        },
-      }),
-    select: (data) => data.data?.result,
+  const [customAttributeSearch, setCustomAttributeSearch] = useState("");
+  const preservedCustomAttributeKeys = useMemo(
+    () =>
+      (columns || [])
+        .filter((column) => column?.groupBy === "Custom Columns")
+        .map((column) => column.id)
+        .filter(Boolean),
+    [columns],
+  );
+  const { attributes, inventoryControlProps } = useCursorAttributeInventory({
+    projectId,
+    discoveryMode: "eval_mapping",
+    search: customAttributeSearch,
+    preservedKeys: preservedCustomAttributeKeys,
     enabled: Boolean(projectId),
   });
-  const attributes = useMemo(() => evalAttributes || [], [evalAttributes]);
 
   const handleAddCustomColumns = (newCols) => {
     setColumns((prev) => {
@@ -248,6 +251,8 @@ const UserTraceTabV2 = ({ dateFilter }) => {
         existingColumns={columns}
         onAddColumns={handleAddCustomColumns}
         onRemoveColumns={handleRemoveCustomColumns}
+        onAttributeSearchChange={setCustomAttributeSearch}
+        inventoryControlProps={inventoryControlProps}
       />
     </Box>
   );

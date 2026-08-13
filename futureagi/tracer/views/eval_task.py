@@ -6,11 +6,12 @@ from itertools import islice
 
 import structlog
 from django.db import models, transaction
-from django.db.models import Count, F, Func, Max, Prefetch, Q, Value
+from django.db.models import Count, Exists, F, Func, Max, OuterRef, Prefetch, Q, Value
 from django.db.models.functions import Cast, Coalesce, Left, Length, NullIf
 from django.utils import timezone
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
+from rest_framework.fields import DateTimeField
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.utils.urls import replace_query_param
 from rest_framework.viewsets import ModelViewSet
@@ -792,6 +793,190 @@ def _compute_span_aggregation(rows):
     return dict(result)
 
 
+_EVAL_TASK_LIST_NUMBER_FIELDS = {"sampling_rate": "sampling_rate"}
+_EVAL_TASK_LIST_DATETIME_FIELDS = {
+    "created_at": "created_at",
+    "last_run": "last_run",
+}
+# Keep every result-table text filter and text sort in ``FilterEngine``.
+# Python's Unicode ``str.lower`` and code-point ordering are not equivalent to
+# PostgreSQL's locale-dependent ILIKE/collation semantics, and a different
+# ordering would move rows across page boundaries.
+_EVAL_TASK_LIST_SORT_FIELDS = {
+    **_EVAL_TASK_LIST_NUMBER_FIELDS,
+    **_EVAL_TASK_LIST_DATETIME_FIELDS,
+}
+
+
+def _eval_task_number_filter_q(field_name, filter_op, filter_value):
+    """Compile FilterEngine's NORMAL numeric semantics for one model field."""
+
+    if filter_op == "is_null":
+        return Q(**{f"{field_name}__isnull": True})
+    if filter_op == "is_not_null":
+        return Q(**{f"{field_name}__isnull": False})
+
+    if filter_op in ("between", "not_between"):
+        if not (
+            isinstance(filter_value, list)
+            and len(filter_value) == 2
+            and all(isinstance(value, int | float) for value in filter_value)
+        ):
+            return None
+        lower, upper = filter_value
+        inside = Q(**{f"{field_name}__gte": lower}) & Q(**{f"{field_name}__lte": upper})
+        if filter_op == "not_between":
+            return Q(**{f"{field_name}__isnull": False}) & ~inside
+        return inside
+
+    if not isinstance(filter_value, int | float):
+        return None
+    lookup = {
+        "greater_than": "gt",
+        "less_than": "lt",
+        "equals": "exact",
+        "greater_than_or_equal": "gte",
+        "less_than_or_equal": "lte",
+    }.get(filter_op)
+    if filter_op == "not_equals":
+        return Q(**{f"{field_name}__isnull": False}) & ~Q(**{field_name: filter_value})
+    if lookup is None:
+        return None
+    return Q(**{f"{field_name}__{lookup}": filter_value})
+
+
+def _eval_task_filter_datetime(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def _eval_task_datetime_filter_q(field_name, filter_op, filter_value):
+    """Compile FilterEngine's strict UTC datetime operations."""
+
+    if filter_op == "is_null":
+        return Q(**{f"{field_name}__isnull": True})
+    if filter_op == "is_not_null":
+        return Q(**{f"{field_name}__isnull": False})
+
+    if filter_op in ("between", "not_between"):
+        if not isinstance(filter_value, list) or len(filter_value) != 2:
+            return None
+        bounds = [_eval_task_filter_datetime(value) for value in filter_value]
+        if any(value is None for value in bounds):
+            return None
+        inside = Q(**{f"{field_name}__gte": bounds[0]}) & Q(
+            **{f"{field_name}__lte": bounds[1]}
+        )
+        if filter_op == "not_between":
+            return Q(**{f"{field_name}__isnull": False}) & ~inside
+        return inside
+
+    value = _eval_task_filter_datetime(filter_value)
+    if value is None:
+        return None
+    if filter_op == "equals":
+        return Q(**{f"{field_name}__date": value.date()})
+    if filter_op == "not_equals":
+        return Q(**{f"{field_name}__isnull": False}) & ~Q(
+            **{f"{field_name}__date": value.date()}
+        )
+    lookup = {
+        "greater_than": "gt",
+        "less_than": "lt",
+        "greater_than_or_equal": "gte",
+        "less_than_or_equal": "lte",
+    }.get(filter_op)
+    if lookup is None:
+        return None
+    return Q(**{f"{field_name}__{lookup}": value})
+
+
+def _eval_task_list_orm_queryset(
+    queryset, *, filters, sort_params, include_project_name
+):
+    """Return an exactly translatable task-list queryset, or ``None``.
+
+    ``FilterEngine`` accepts arbitrary result-dict fields. Only the scalar
+    public task columns whose Python semantics can be reproduced in SQL take
+    this path. Everything else deliberately falls back to the legacy engine.
+    """
+
+    sort_fields = dict(_EVAL_TASK_LIST_SORT_FIELDS)
+
+    candidate = queryset
+    for filter_item in filters:
+        column_id, filter_config = FilterEngine._normalize_filter_params(filter_item)
+        if not column_id or not filter_config:
+            continue
+        if filter_config.get("col_type") not in (None, "NORMAL"):
+            return None
+
+        filter_type = filter_config.get("filter_type")
+        filter_op = filter_config.get("filter_op")
+        filter_value = filter_config.get("filter_value")
+        condition = None
+        if filter_type == "number" and column_id in _EVAL_TASK_LIST_NUMBER_FIELDS:
+            condition = _eval_task_number_filter_q(
+                _EVAL_TASK_LIST_NUMBER_FIELDS[column_id], filter_op, filter_value
+            )
+        elif filter_type == "datetime" and column_id in _EVAL_TASK_LIST_DATETIME_FIELDS:
+            condition = _eval_task_datetime_filter_q(
+                _EVAL_TASK_LIST_DATETIME_FIELDS[column_id], filter_op, filter_value
+            )
+        else:
+            return None
+        if condition is None:
+            return None
+        candidate = candidate.filter(condition)
+
+    if sort_params:
+        ordering = []
+        for sort_param in sort_params:
+            field_name = sort_fields.get(sort_param.get("column_id"))
+            if field_name is None:
+                return None
+            if sort_param.get("direction", "asc") == "desc":
+                ordering.append(F(field_name).desc(nulls_first=True))
+            else:
+                ordering.append(F(field_name).asc(nulls_last=True))
+        # Python's stable sorts preserve the queryset's original -created_at
+        # order whenever every requested key ties.
+        ordering.append(F("created_at").desc())
+        candidate = candidate.order_by(*ordering)
+    else:
+        candidate = candidate.order_by("-created_at")
+    return candidate
+
+
+def _serialize_eval_task_list_page(tasks, *, include_project_name):
+    datetime_field = DateTimeField()
+    result = []
+    for eval_task in tasks:
+        row = {
+            "id": str(eval_task.id),
+            "name": eval_task.name,
+            "status": eval_task.status,
+            "run_type": eval_task.run_type,
+            "filters_applied": eval_task.filters,
+            "created_at": datetime_field.to_representation(eval_task.created_at),
+            "evals_applied": [
+                eval_config.name for eval_config in eval_task._list_evals
+            ],
+            "sampling_rate": eval_task.sampling_rate,
+            "last_run": datetime_field.to_representation(eval_task.last_run)
+            if eval_task.last_run is not None
+            else None,
+        }
+        if include_project_name:
+            row["project_name"] = eval_task.project.name
+        result.append(row)
+    return result
+
+
 class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
     permission_classes = [IsAuthenticated]
     _gm = GeneralMethods()
@@ -923,6 +1108,47 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
 
         return queryset
 
+    def _eval_task_orm_page(self, queryset, query_data, *, include_project_name):
+        filters = query_data.get("filters", [])
+        sort_params = query_data.get("sort_params", [])
+        queryset = _eval_task_list_orm_queryset(
+            queryset,
+            filters=filters,
+            sort_params=sort_params,
+            include_project_name=include_project_name,
+        )
+        if queryset is None:
+            return None
+
+        # Both legacy list implementations discard tasks whose related manager
+        # has no visible CustomEvalConfig. The related manager subclasses
+        # CustomEvalConfig.objects, so deleted configs are invisible here too.
+        active_eval = CustomEvalConfig.objects.filter(eval_tasks=OuterRef("pk"))
+        queryset = queryset.annotate(_has_active_eval=Exists(active_eval)).filter(
+            _has_active_eval=True
+        )
+        total_rows = queryset.count()
+
+        page_number = query_data.get("page_number", 0)
+        page_size = query_data.get("page_size", 30)
+        start = int(page_number) * int(page_size)
+        end = start + int(page_size)
+        page_queryset = (
+            queryset.prefetch_related(None)
+            .select_related("project")
+            .prefetch_related(
+                Prefetch(
+                    "evals",
+                    queryset=CustomEvalConfig.objects.only("id", "name"),
+                    to_attr="_list_evals",
+                )
+            )[start:end]
+        )
+        result = _serialize_eval_task_list_page(
+            list(page_queryset), include_project_name=include_project_name
+        )
+        return result, total_rows
+
     @validated_request(request_serializer=EvalTaskSerializer)
     def update(self, request, *args, **kwargs):
         return super().update(request, *args, **kwargs)
@@ -1019,71 +1245,72 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
             query_data = request.validated_query_data
 
             queryset = self.get_queryset()
-            serializer = self.get_serializer(queryset, many=True)
-            eval_tasks = serializer.data
+            orm_page = self._eval_task_orm_page(
+                queryset, query_data, include_project_name=False
+            )
+            if orm_page is not None:
+                result, total_rows = orm_page
+            else:
+                # Compatibility path for arbitrary result-dict filters/sorts
+                # whose FilterEngine behavior cannot be translated exactly.
+                serializer = self.get_serializer(queryset, many=True)
+                eval_tasks = serializer.data
 
-            # Collect all eval IDs to batch query CustomEvalConfig (avoids N+1)
-            all_eval_ids = set()
-            for eval_task in eval_tasks:
-                all_eval_ids.update(eval_task.get("evals", []))
+                # Collect all eval IDs to batch query CustomEvalConfig (avoids N+1)
+                all_eval_ids = set()
+                for eval_task in eval_tasks:
+                    all_eval_ids.update(eval_task.get("evals", []))
 
-            # Single query to fetch all CustomEvalConfigs
-            eval_configs = CustomEvalConfig.objects.filter(
-                id__in=all_eval_ids, deleted=False
-            ).values("id", "name")
-            eval_name_lookup = {str(ec["id"]): ec["name"] for ec in eval_configs}
+                eval_configs = CustomEvalConfig.objects.filter(
+                    id__in=all_eval_ids, deleted=False
+                ).values("id", "name")
+                eval_name_lookup = {str(ec["id"]): ec["name"] for ec in eval_configs}
 
-            result = []
+                result = []
+                for eval_task in eval_tasks:
+                    eval_ids = eval_task.get("evals", [])
+                    if not eval_ids:
+                        continue
+                    eval_names = [
+                        eval_name_lookup.get(str(eval_id))
+                        for eval_id in eval_ids
+                        if str(eval_id) in eval_name_lookup
+                    ]
+                    result.append(
+                        {
+                            "id": str(eval_task["id"]),
+                            "name": eval_task["name"],
+                            "status": eval_task["status"],
+                            "run_type": eval_task.get("run_type"),
+                            "filters_applied": eval_task["filters"],
+                            "created_at": eval_task["created_at"],
+                            "evals_applied": eval_names,
+                            "sampling_rate": eval_task["sampling_rate"],
+                            "last_run": eval_task["last_run"],
+                        }
+                    )
 
-            for eval_task in eval_tasks:
-                eval_ids = eval_task.get("evals", [])
-                if not eval_ids:
-                    continue
+                filters = query_data.get("filters", [])
+                if filters:
+                    result = FilterEngine(result).apply_filters(filters)
 
-                # Use the lookup instead of querying in loop
-                eval_names = [
-                    eval_name_lookup.get(str(eval_id))
-                    for eval_id in eval_ids
-                    if str(eval_id) in eval_name_lookup
-                ]
+                sort_params = query_data.get("sort_params", [])
+                if sort_params:
+                    for sort_param in reversed(sort_params):
+                        sort_key = sort_param.get("column_id")
+                        reverse = sort_param.get("direction", "asc") == "desc"
 
-                parsed_data = {
-                    "id": str(eval_task["id"]),
-                    "name": eval_task["name"],
-                    "status": eval_task["status"],
-                    "run_type": eval_task.get("run_type"),
-                    "filters_applied": eval_task["filters"],
-                    "created_at": eval_task["created_at"],
-                    "evals_applied": eval_names,
-                    "sampling_rate": eval_task["sampling_rate"],
-                    "last_run": eval_task["last_run"],
-                }
-                result.append(parsed_data)
+                        def sort_key_func(x):
+                            value = x.get(sort_key)  # noqa: B023
+                            return (value is None, value)
 
-            filters = query_data.get("filters", [])
-            if filters:
-                filter_engine = FilterEngine(result)
-                result = filter_engine.apply_filters(filters)
+                        result.sort(key=sort_key_func, reverse=reverse)
 
-            sort_params = query_data.get("sort_params", [])
-            if sort_params:
-                for sort_param in reversed(sort_params):
-                    sort_key = sort_param.get("column_id")
-                    sort_direction = sort_param.get("direction", "asc")
-                    reverse = sort_direction == "desc"
-
-                    def sort_key_func(x):
-                        value = x.get(sort_key)  # noqa: B023
-                        return (value is None, value)
-
-                    result.sort(key=sort_key_func, reverse=reverse)
-
-            total_rows = len(result)
-            page_number = query_data.get("page_number", 0)
-            page_size = query_data.get("page_size", 30)
-            start = int(page_number) * int(page_size)
-            end = start + int(page_size)
-            result = result[start:end]
+                total_rows = len(result)
+                page_number = query_data.get("page_number", 0)
+                page_size = query_data.get("page_size", 30)
+                start = int(page_number) * int(page_size)
+                result = result[start : start + int(page_size)]
 
             # Update config to include project name
             config = get_default_eval_task_config()
@@ -1934,55 +2161,58 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
             query_data = request.validated_query_data
 
             queryset = self.get_queryset()
+            orm_page = self._eval_task_orm_page(
+                queryset, query_data, include_project_name=True
+            )
+            if orm_page is not None:
+                result, total_rows = orm_page
+            else:
+                # Preserve FilterEngine's arbitrary result-dict semantics when
+                # a requested field/type/operator cannot be compiled to ORM.
+                result = []
+                for eval_task in queryset:
+                    # ``evals`` is prefetched in ``get_queryset`` — calling
+                    # ``.exists()`` would bypass that cache.
+                    if not eval_task.evals.all():
+                        continue
+                    result.append(
+                        {
+                            "id": str(eval_task.id),
+                            "name": eval_task.name,
+                            "project_name": eval_task.project.name,
+                            "status": eval_task.status,
+                            "run_type": eval_task.run_type,
+                            "filters_applied": eval_task.filters,
+                            "created_at": eval_task.created_at,
+                            "evals_applied": [
+                                eval.name for eval in eval_task.evals.all()
+                            ],
+                            "sampling_rate": eval_task.sampling_rate,
+                            "last_run": eval_task.last_run,
+                        }
+                    )
 
-            result = []
-            for eval_task in queryset:
-                # ``evals`` is prefetched in ``get_queryset`` — calling
-                # ``.exists()`` would fire a fresh COUNT(*) query per row
-                # and bypass the cache. Check the prefetched list directly.
-                if not eval_task.evals.all():
-                    continue
+                filters = query_data.get("filters", [])
+                if filters:
+                    result = FilterEngine(result).apply_filters(filters)
 
-                parsed_data = {
-                    "id": str(eval_task.id),
-                    "name": eval_task.name,
-                    "project_name": eval_task.project.name,
-                    "status": eval_task.status,
-                    "run_type": eval_task.run_type,
-                    "filters_applied": eval_task.filters,
-                    "created_at": eval_task.created_at,
-                    "evals_applied": [eval.name for eval in eval_task.evals.all()],
-                    "sampling_rate": eval_task.sampling_rate,
-                    "last_run": eval_task.last_run,
-                }
-                result.append(parsed_data)
+                sort_params = query_data.get("sort_params", [])
+                if sort_params:
+                    for sort_param in reversed(sort_params):
+                        sort_key = sort_param.get("column_id")
+                        reverse = sort_param.get("direction", "asc") == "desc"
 
-            filters = query_data.get("filters", [])
-            if filters:
-                filter_engine = FilterEngine(result)
-                result = filter_engine.apply_filters(filters)
+                        def sort_key_func(x):
+                            value = x.get(sort_key)  # noqa: B023
+                            return (value is None, value)
 
-            sort_params = query_data.get("sort_params", [])
-            if sort_params:
-                for sort_param in reversed(sort_params):
-                    sort_key = sort_param.get("column_id")
-                    sort_direction = sort_param.get("direction", "asc")
-                    reverse = sort_direction == "desc"
+                        result.sort(key=sort_key_func, reverse=reverse)
 
-                    def sort_key_func(x):
-                        value = x.get(sort_key)  # noqa: B023
-                        # Return a tuple where the first element indicates if the value is None
-                        # This ensures None values are consistently sorted to the end
-                        return (value is None, value)
-
-                    result.sort(key=sort_key_func, reverse=reverse)
-
-            total_rows = len(result)
-            page_number = query_data.get("page_number", 0)
-            page_size = query_data.get("page_size", 10)
-            start = int(page_number) * int(page_size)
-            end = start + int(page_size)
-            result = result[start:end]
+                total_rows = len(result)
+                page_number = query_data.get("page_number", 0)
+                page_size = query_data.get("page_size", 10)
+                start = int(page_number) * int(page_size)
+                result = result[start : start + int(page_size)]
 
             # Update config to include project name
             config = get_default_eval_task_config(is_project_name_visible=True)

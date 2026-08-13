@@ -9599,6 +9599,7 @@ The no-page-size form is retained for older clients.
 GET /api/traces/span-attribute-keys/?project_id=<uuid>&page_size=10
  * @summary Discover span attribute keys for a project.
  */
+export const apiTracesSpanAttributeKeysListQueryWorkspaceScopeDefault = false;
 export const apiTracesSpanAttributeKeysListQueryDiscoveryModeDefault = `filter`;
 export const apiTracesSpanAttributeKeysListQueryQMax = 512;
 
@@ -9609,7 +9610,8 @@ export const apiTracesSpanAttributeKeysListQueryCursorMax = 8192;
 
 
 export const ApiTracesSpanAttributeKeysListQueryParams = zod.object({
-  "project_id": zod.string().uuid(),
+  "project_id": zod.string().uuid().optional(),
+  "workspace_scope": zod.boolean().default(apiTracesSpanAttributeKeysListQueryWorkspaceScopeDefault),
   "discovery_mode": zod.enum(['filter', 'eval_mapping']).default(apiTracesSpanAttributeKeysListQueryDiscoveryModeDefault).describe('Attribute contract to browse. filter returns only keys supported by attribute filters; eval_mapping also returns JSON-only keys that an evaluation mapping can resolve.'),
   "q": zod.string().min(1).max(apiTracesSpanAttributeKeysListQueryQMax).optional(),
   "page_size": zod.number().min(1).max(apiTracesSpanAttributeKeysListQueryPageSizeMax).optional(),
@@ -34685,6 +34687,9 @@ export const TracerDashboardMetricsResponse = zod.object({
   "unit": zod.string().optional(),
   "output_type": zod.string().optional(),
   "choices": zod.array(zod.object({
+
+}).passthrough().describe('Any valid JSON value.')).optional(),
+  "choice_options": zod.array(zod.object({
 
 }).passthrough().describe('Any valid JSON value.')).optional(),
   "allowed_aggregations": zod.array(zod.string().min(1)).optional(),

@@ -1558,6 +1558,30 @@ class TestWidgetReadEndpoints:
 
 
 class TestMetricsEndpoint:
+    def test_metrics_cache_separates_attribute_and_finite_catalogs(self):
+        from tracer.services.dashboard_metrics_catalog import (
+            get_cached_metrics_catalog,
+        )
+
+        workspace = SimpleNamespace(id="workspace-a")
+        observed_keys = []
+
+        def cached_empty_catalog(cache_key):
+            observed_keys.append(cache_key)
+            return []
+
+        with patch(
+            "tracer.services.dashboard_metrics_catalog.cache.get",
+            side_effect=cached_empty_catalog,
+        ):
+            get_cached_metrics_catalog(workspace, include_custom_attributes=True)
+            get_cached_metrics_catalog(workspace, include_custom_attributes=False)
+
+        assert len(observed_keys) == 2
+        assert observed_keys[0] != observed_keys[1]
+        assert observed_keys[0].endswith(":1")
+        assert observed_keys[1].endswith(":0")
+
     @pytest.mark.django_db
     def test_metrics_without_project_ids_returns_all(self, auth_client):
         """Unified metrics endpoint returns all metrics even without project_ids."""
@@ -1606,6 +1630,78 @@ class TestMetricsEndpoint:
         assert "cost" in metric_names
         # latency_ms ("Duration") was removed from the catalog (duplicate of latency)
         assert "latency_ms" not in metric_names
+
+    @pytest.mark.django_db
+    @patch("tracer.services.dashboard_metrics_catalog.V2AnalyticsQueryService")
+    def test_metrics_can_exclude_capped_attributes_without_losing_finite_catalog(
+        self,
+        mock_analytics_cls,
+        auth_client,
+        organization,
+        workspace,
+        observe_project,
+        custom_eval_config,
+        _annotation_label_factory,
+    ):
+        from model_hub.models.choices import (
+            DataTypeChoices,
+            SourceChoices,
+            StatusType,
+        )
+        from model_hub.models.develop_dataset import Column, Dataset
+
+        custom_eval_config.project = observe_project
+        custom_eval_config.save(update_fields=["project"])
+        annotation_label = _annotation_label_factory("Retained Annotation")
+        dataset = Dataset.objects.create(
+            name="Retained Dataset",
+            organization=organization,
+            workspace=workspace,
+        )
+        column = Column.objects.create(
+            name="Retained Dataset Number",
+            data_type=DataTypeChoices.FLOAT.value,
+            source=SourceChoices.OTHERS.value,
+            status=StatusType.RUNNING.value,
+            dataset=dataset,
+        )
+
+        with (
+            patch(
+                "tracer.services.dashboard_metrics_catalog.cache.get",
+                return_value=None,
+            ),
+            patch("tracer.services.dashboard_metrics_catalog.cache.set"),
+            patch(
+                "tracer.services.dashboard_metrics_catalog.Project.objects.filter"
+            ) as project_filter,
+        ):
+            response = auth_client.get(
+                "/tracer/dashboard/metrics/",
+                {
+                    "exclude_custom_attributes": "true",
+                    "page": 1,
+                    "page_size": 200,
+                },
+            )
+
+        assert response.status_code == 200
+        metrics = response.json()["result"]["metrics"]
+        metric_names = {metric["name"] for metric in metrics}
+        categories = {metric["category"] for metric in metrics}
+        assert "latency" in metric_names
+        assert str(custom_eval_config.eval_template_id) in metric_names
+        assert str(annotation_label.id) in metric_names
+        assert str(column.id) in metric_names
+        assert {
+            "system_metric",
+            "eval_metric",
+            "annotation_metric",
+            "custom_column",
+        } <= categories
+        assert "custom_attribute" not in categories
+        project_filter.assert_not_called()
+        mock_analytics_cls.return_value.get_span_attribute_keys_ch_for_projects.assert_not_called()
 
     @pytest.mark.django_db
     def test_metrics_keeps_configured_evals_when_direct_usage_read_times_out(
@@ -6218,18 +6314,27 @@ class TestDashboardQueryExecution:
         assert "WHERE latest_is_deleted = 0" in sql
 
     @pytest.mark.django_db
+    @patch(
+        "tracer.services.clickhouse.v2.trace_session_dict_reader.resolve_session_fields"
+    )
     @patch("tracer.views.dashboard.V2AnalyticsQueryService")
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
-    def test_filter_values_session_search_is_literal_and_limits_to_20(
-        self, _mock_enabled, mock_analytics_cls, auth_client, observe_project
+    def test_legacy_no_page_session_search_is_raw_and_reports_sample_cap(
+        self,
+        _mock_enabled,
+        mock_analytics_cls,
+        mock_resolve_session_fields,
+        auth_client,
+        observe_project,
     ):
         mock_service = MagicMock()
         mock_result = MagicMock()
-        mock_result.data = []
+        mock_result.data = [{"val": f"abc123-{index:02d}"} for index in range(21)]
         mock_service.execute_ch_query.return_value = mock_result
         mock_analytics_cls.return_value = mock_service
+        mock_resolve_session_fields.return_value = {}
 
-        auth_client.get(
+        response = auth_client.get(
             "/tracer/dashboard/filter_values/",
             {
                 "source": "traces",
@@ -6244,6 +6349,11 @@ class TestDashboardQueryExecution:
         assert "positionCaseInsensitiveUTF8" in sql
         assert params["filter_value_search"] == "abc123"
         assert params["result_limit"] == 21
+        payload = response.json()["result"]
+        assert len(payload["values"]) == 20
+        assert payload["query_complete"] is False
+        assert payload["query_status"] == "sampled"
+        assert payload["query_error_code"] == "sample_limit"
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.V2AnalyticsQueryService")

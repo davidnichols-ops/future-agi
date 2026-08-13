@@ -373,7 +373,7 @@ describe("queryReadState", () => {
     expect(getQueryReadState(payload)).toBe("degraded");
     expect(getFilterValueReadState(payload)).toBe("sampled");
     expect(getFilterValueReadMessage("sampled")).toBe(
-      "Recent values — search or enter an exact value.",
+      "Showing configured or recent suggestions only. Enter an exact value.",
     );
   });
 

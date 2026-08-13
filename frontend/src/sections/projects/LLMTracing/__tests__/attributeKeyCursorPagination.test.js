@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  compactAttributeKeyRetryPage,
   getAttributeKeyNextCursor,
   getNextAttributeKeyPageParam,
   isAttributeKeyCursorChainStopped,
@@ -17,7 +18,41 @@ const page = (keys, overrides = {}) => ({
 });
 
 describe("attribute key cursor pagination", () => {
-  it("drains advancing empty checkpoints into one visible page", async () => {
+  it("compacts a fresh retry without dropping older rows or type families", () => {
+    const compacted = compactAttributeKeyRetryPage(
+      {
+        pages: [
+          {
+            result: [
+              { key: "older.only", type: "string", types: ["string"] },
+              { key: "mixed", type: "string", types: ["string"] },
+            ],
+          },
+        ],
+      },
+      {
+        result: [
+          { key: "fresh.only", type: "boolean", types: ["boolean"] },
+          { key: "mixed", type: "number", types: ["number"] },
+        ],
+        has_more: true,
+        next_cursor: "fresh-cursor",
+      },
+    );
+
+    expect(compacted.result.map(({ key }) => key)).toEqual([
+      "older.only",
+      "mixed",
+      "fresh.only",
+    ]);
+    expect(compacted.result.find(({ key }) => key === "mixed").types).toEqual([
+      "string",
+      "number",
+    ]);
+    expect(compacted.next_cursor).toBe("fresh-cursor");
+  });
+
+  it("publishes advancing checkpoints one explicit request at a time", async () => {
     const requestPage = vi
       .fn()
       .mockResolvedValueOnce(page([], { next_cursor: "checkpoint-1" }))
@@ -30,8 +65,31 @@ describe("attribute key cursor pagination", () => {
         }),
       );
 
-    const result = await readAttributeKeyPage({
+    const firstPage = await readAttributeKeyPage({
       pageParam: null,
+      requestPage,
+      signal: new AbortController().signal,
+    });
+    expect(requestPage).toHaveBeenCalledTimes(1);
+    expect(firstPage.result).toEqual([]);
+    expect(firstPage.next_cursor).toBe("checkpoint-1");
+
+    const secondPage = await readAttributeKeyPage({
+      pageParam: firstPage.next_cursor,
+      publishedData: { pages: [firstPage], pageParams: [null] },
+      requestPage,
+      signal: new AbortController().signal,
+    });
+    expect(requestPage).toHaveBeenCalledTimes(2);
+    expect(secondPage.result).toEqual([]);
+    expect(secondPage.next_cursor).toBe("checkpoint-2");
+
+    const thirdPage = await readAttributeKeyPage({
+      pageParam: secondPage.next_cursor,
+      publishedData: {
+        pages: [firstPage, secondPage],
+        pageParams: [null, firstPage.next_cursor],
+      },
       requestPage,
       signal: new AbortController().signal,
     });
@@ -41,9 +99,11 @@ describe("attribute key cursor pagination", () => {
       "checkpoint-1",
       "checkpoint-2",
     ]);
-    expect(result.result).toEqual([{ key: "older.attribute", type: "string" }]);
-    expect(result.has_more).toBe(false);
-    expect(getAttributeKeyNextCursor(result)).toBeUndefined();
+    expect(thirdPage.result).toEqual([
+      { key: "older.attribute", type: "string" },
+    ]);
+    expect(thirdPage.has_more).toBe(false);
+    expect(getAttributeKeyNextCursor(thirdPage)).toBeUndefined();
   });
 
   it("treats terminal browse status as authoritative over stale has_more", () => {
@@ -78,8 +138,16 @@ describe("attribute key cursor pagination", () => {
       .mockResolvedValueOnce(page([], { next_cursor: "same-cursor" }))
       .mockResolvedValueOnce(page([], { next_cursor: "same-cursor" }));
 
-    const result = await readAttributeKeyPage({
+    const firstPage = await readAttributeKeyPage({
       pageParam: null,
+      requestPage,
+      signal: new AbortController().signal,
+    });
+    expect(isAttributeKeyCursorStopped(firstPage)).toBe(false);
+
+    const result = await readAttributeKeyPage({
+      pageParam: firstPage.next_cursor,
+      publishedData: { pages: [firstPage], pageParams: [null] },
       requestPage,
       signal: new AbortController().signal,
     });
@@ -118,7 +186,7 @@ describe("attribute key cursor pagination", () => {
     expect(isAttributeKeyCursorStopped(result)).toBe(true);
   });
 
-  it("preserves progress across bounded chunks longer than twelve checkpoints", async () => {
+  it("preserves every cursor across arbitrarily many explicit gestures", async () => {
     const responseByCursor = new Map();
     responseByCursor.set(null, page([], { next_cursor: "checkpoint-1" }));
     for (let index = 1; index <= 14; index += 1) {
@@ -138,31 +206,38 @@ describe("attribute key cursor pagination", () => {
     const requestPage = vi.fn((cursor) =>
       Promise.resolve(responseByCursor.get(cursor ?? null)),
     );
-    const firstChunk = await readAttributeKeyPage({
-      pageParam: null,
-      requestPage,
-      signal: new AbortController().signal,
-    });
-    expect(firstChunk.result).toEqual([]);
-    expect(firstChunk.has_more).toBe(true);
-    expect(firstChunk.next_cursor).toBe("checkpoint-13");
+    const publishedData = { pages: [], pageParams: [] };
+    let cursor = null;
+    let finalPage;
+    for (let gesture = 0; gesture < 16; gesture += 1) {
+      const currentCursor = cursor;
+      finalPage = await readAttributeKeyPage({
+        pageParam: currentCursor,
+        publishedData,
+        requestPage,
+        signal: new AbortController().signal,
+      });
+      publishedData.pages.push(finalPage);
+      publishedData.pageParams.push(currentCursor);
+      cursor = getAttributeKeyNextCursor(finalPage);
+      expect(requestPage).toHaveBeenCalledTimes(gesture + 1);
+    }
 
-    const secondChunk = await readAttributeKeyPage({
-      pageParam: firstChunk.next_cursor,
-      requestPage,
-      signal: new AbortController().signal,
-    });
-
-    expect(secondChunk.result).toEqual([
+    expect(finalPage.result).toEqual([
       { key: "eventual.attribute", type: "string" },
     ]);
-    expect(secondChunk.has_more).toBe(false);
+    expect(finalPage.has_more).toBe(false);
     expect(requestPage).toHaveBeenCalledTimes(16);
-    expect(firstChunk.__attributeKeyFollowedCursors).toHaveLength(12);
-    expect(secondChunk.__attributeKeyFollowedCursors).toEqual([
-      "checkpoint-14",
-      "checkpoint-15",
+    expect(requestPage.mock.calls.map(([pageCursor]) => pageCursor)).toEqual([
+      null,
+      ...Array.from({ length: 15 }, (_, index) => `checkpoint-${index + 1}`),
     ]);
+    expect(
+      publishedData.pages.every(
+        (publishedPage) =>
+          publishedPage.__attributeKeyFollowedCursors.length === 0,
+      ),
+    ).toBe(true);
   });
 
   it("does not de-duplicate a normal refetch against its unchanged old cache", async () => {
@@ -186,7 +261,7 @@ describe("attribute key cursor pagination", () => {
     expect(isAttributeKeyCursorStopped(result)).toBe(false);
   });
 
-  it("fills load more across duplicate-heavy pages and excludes published keys", async () => {
+  it("keeps duplicate-heavy progress gap-free across explicit gestures", async () => {
     const published = page(["already.loaded"], {
       next_cursor: "load-more-start",
     });
@@ -202,12 +277,38 @@ describe("attribute key cursor pagination", () => {
         page(["new.one", "new.three"], { next_cursor: "signed-final" }),
       );
 
-    const result = await readAttributeKeyPage({
+    const firstPage = await readAttributeKeyPage({
       pageParam: "load-more-start",
       pageSize: 3,
       publishedData: {
         pages: [published],
         pageParams: [null],
+      },
+      requestPage,
+      signal: new AbortController().signal,
+    });
+    expect(requestPage).toHaveBeenCalledTimes(1);
+    expect(firstPage.result.map(({ key }) => key)).toEqual(["new.one"]);
+
+    const secondPage = await readAttributeKeyPage({
+      pageParam: firstPage.next_cursor,
+      pageSize: 3,
+      publishedData: {
+        pages: [published, firstPage],
+        pageParams: [null, "load-more-start"],
+      },
+      requestPage,
+      signal: new AbortController().signal,
+    });
+    expect(requestPage).toHaveBeenCalledTimes(2);
+    expect(secondPage.result.map(({ key }) => key)).toEqual(["new.two"]);
+
+    const thirdPage = await readAttributeKeyPage({
+      pageParam: secondPage.next_cursor,
+      pageSize: 3,
+      publishedData: {
+        pages: [published, firstPage, secondPage],
+        pageParams: [null, "load-more-start", firstPage.next_cursor],
       },
       requestPage,
       signal: new AbortController().signal,
@@ -218,16 +319,13 @@ describe("attribute key cursor pagination", () => {
       "physical-2",
       "physical-3",
     ]);
-    expect(result.result.map(({ key }) => key)).toEqual([
-      "new.one",
-      "new.two",
-      "new.three",
-    ]);
-    expect(result.next_cursor).toBe("signed-final");
-    expect(result.__attributeKeyFollowedCursors).toEqual([
-      "physical-2",
-      "physical-3",
-    ]);
+    expect(thirdPage.result.map(({ key }) => key)).toEqual(["new.three"]);
+    expect(thirdPage.next_cursor).toBe("signed-final");
+    expect(
+      [firstPage, secondPage, thirdPage].every(
+        (result) => result.__attributeKeyFollowedCursors.length === 0,
+      ),
+    ).toBe(true);
   });
 
   it("does not re-request a cursor consumed inside the visible page", () => {

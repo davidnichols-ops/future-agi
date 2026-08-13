@@ -8,6 +8,7 @@ Endpoints:
 """
 
 import re
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 
@@ -16,6 +17,7 @@ from clickhouse_connect.driver.exceptions import (
     DatabaseError as ClickHouseConnectDatabaseError,
 )
 from clickhouse_driver.errors import Error as ClickHouseError
+from django.db import DatabaseError, connection, transaction
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -39,6 +41,9 @@ from tracer.services.clickhouse.attribute_cursor_state import (
 from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
     ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+    ATTRIBUTE_READ_MAX_PROJECTS,
+    AttributeKeyCursorPageRead,
+    AttributeReadMetadata,
     AttributeReadSelector,
 )
 from tracer.services.clickhouse.list_cursor import (
@@ -48,6 +53,8 @@ from tracer.services.clickhouse.list_cursor import (
     encode_list_cursor,
 )
 from tracer.services.clickhouse.read_budget import (
+    ReadDeadline,
+    ReadDeadlineExceeded,
     is_clickhouse_api_read_unavailable_error,
 )
 from tracer.services.exact_aggregation_cache import read_or_schedule_exact_snapshot
@@ -80,6 +87,72 @@ def _project_is_in_request_scope(request, project_id: str) -> bool:
     """Run the only PostgreSQL query allowed by these telemetry endpoints."""
 
     return project_queryset_for_request(request).filter(id=project_id).exists()
+
+
+def _workspace_project_batch(
+    request,
+    *,
+    after_project_id: str | None = None,
+) -> tuple[tuple[str, ...], bool]:
+    """Return one bounded, authorized project batch for a workspace walk."""
+
+    projects = project_queryset_for_request(request).order_by("id")
+    if after_project_id:
+        projects = projects.filter(id__gt=after_project_id)
+    project_ids = list(
+        projects.values_list("id", flat=True)[: ATTRIBUTE_READ_MAX_PROJECTS + 1]
+    )
+    return (
+        tuple(
+            str(project_id) for project_id in project_ids[:ATTRIBUTE_READ_MAX_PROJECTS]
+        ),
+        len(project_ids) > ATTRIBUTE_READ_MAX_PROJECTS,
+    )
+
+
+def _workspace_projects_are_in_request_scope(
+    request,
+    project_ids: tuple[str, ...],
+) -> bool:
+    """Re-authorize the bounded project batch embedded in a signed cursor."""
+
+    authorized_ids = {
+        str(project_id)
+        for project_id in project_queryset_for_request(request)
+        .filter(id__in=project_ids)
+        .values_list("id", flat=True)
+    }
+    return authorized_ids == set(project_ids)
+
+
+def _run_span_attribute_pg_read(deadline: ReadDeadline, read):
+    """Run one attribute-scope ORM read inside the request-owned wall."""
+
+    timeout_ms = deadline.remaining_ms(ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS)
+    if connection.vendor != "postgresql":
+        result = read()
+        deadline.remaining_ms(floor_ms=1)
+        return result
+    already_in_atomic_block = connection.in_atomic_block
+    try:
+        transaction_context = (
+            nullcontext() if already_in_atomic_block else transaction.atomic()
+        )
+        with transaction_context:
+            with connection.cursor() as cursor:
+                if not already_in_atomic_block:
+                    cursor.execute("SET TRANSACTION READ ONLY")
+                cursor.execute(
+                    "SET LOCAL statement_timeout = %s",
+                    [f"{timeout_ms}ms"],
+                )
+            result = read()
+    except DatabaseError as exc:
+        raise ReadDeadlineExceeded(
+            "Span-attribute PostgreSQL read exceeded its request deadline"
+        ) from exc
+    deadline.remaining_ms(floor_ms=1)
+    return result
 
 
 def _clickhouse_error_code(exc: Exception) -> int | None:
@@ -179,34 +252,44 @@ class SpanAttributeKeysView(APIView):
     def get(self, request, *args, **kwargs):
         project_id = ""
         selector: AttributeReadSelector | None = None
+        request_deadline = ReadDeadline.start(ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS)
         try:
-            project_id = str(request.validated_query_data["project_id"])
             query_params = request.validated_query_data
+            workspace_scope = bool(query_params.get("workspace_scope", False))
+            project_id = str(query_params.get("project_id") or "")
             discovery_mode = query_params["discovery_mode"]
             exact_key = query_params.get("q")
             page_size = query_params.get("page_size")
             cursor_token = query_params.get("cursor")
-            selector = AttributeReadSelector(
-                typed_only=True,
-                json_attribute_mode=(
-                    "all" if discovery_mode == "eval_mapping" else "structured"
-                ),
-                wall_timeout_ms=ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
-            )
-            if not _project_is_in_request_scope(request, project_id):
+            if not workspace_scope and not _project_is_in_request_scope(
+                request, project_id
+            ):
                 return self._gm.not_found("Project not found")
 
             if page_size is not None:
                 page_size = int(page_size)
-                project_ids = [project_id]
+                project_ids: tuple[str, ...] | list[str]
+                batch_end_project_id = ""
+                has_later_projects = False
+                project_ids = () if workspace_scope else [project_id]
                 cursor_scope = cursor_scope_for_request(
                     request,
-                    project_ids=project_ids,
+                    # Workspace cursors are tenant-bound here and carry only
+                    # one bounded, re-authorized project batch in their signed
+                    # order. Never materialize an unbounded workspace id list.
+                    project_ids=[] if workspace_scope else project_ids,
                 )
-                cursor_query = {
-                    "project_id": project_id,
-                    "mode": "recent_attribute_keys",
-                }
+                cursor_query = (
+                    {
+                        "workspace_scope": True,
+                        "mode": "recent_attribute_keys",
+                    }
+                    if workspace_scope
+                    else {
+                        "project_id": project_id,
+                        "mode": "recent_attribute_keys",
+                    }
+                )
                 # Keep the default cursor query byte-for-byte compatible with
                 # cursors emitted by older pods. Eval mapping is a distinct
                 # key contract and is explicitly signed so its cursor cannot
@@ -226,20 +309,76 @@ class SpanAttributeKeysView(APIView):
                         query=cursor_query,
                         page_size=page_size,
                     )
-                    if len(cursor_state.order) not in {5, 6}:
+                    expected_order_lengths = {8, 9} if workspace_scope else {5, 6}
+                    if len(cursor_state.order) not in expected_order_lengths:
                         raise ListCursorError(
                             "invalid_cursor",
                             "The continuation cursor is invalid.",
                         )
+                    physical_order = cursor_state.order
+                    if workspace_scope:
+                        (
+                            batch_end_project_id,
+                            raw_project_ids,
+                            has_later_projects,
+                        ) = cursor_state.order[:3]
+                        physical_order = cursor_state.order[3:]
+                        if (
+                            not isinstance(batch_end_project_id, str)
+                            or not isinstance(raw_project_ids, tuple)
+                            or len(raw_project_ids) > ATTRIBUTE_READ_MAX_PROJECTS
+                            or not isinstance(has_later_projects, bool)
+                            or any(
+                                not isinstance(value, str) or not value
+                                for value in raw_project_ids
+                            )
+                            or tuple(sorted(set(raw_project_ids))) != raw_project_ids
+                            or (
+                                raw_project_ids
+                                and batch_end_project_id != raw_project_ids[-1]
+                            )
+                            or (
+                                not raw_project_ids
+                                and (not batch_end_project_id or not has_later_projects)
+                            )
+                        ):
+                            raise ListCursorError(
+                                "invalid_cursor",
+                                "The continuation cursor is invalid.",
+                            )
+                        if raw_project_ids:
+                            project_ids = raw_project_ids
+                            if not _run_span_attribute_pg_read(
+                                request_deadline,
+                                lambda: _workspace_projects_are_in_request_scope(
+                                    request, project_ids
+                                ),
+                            ):
+                                raise ListCursorError(
+                                    "cursor_mismatch",
+                                    "The continuation cursor no longer matches this workspace.",
+                                )
+                        else:
+                            project_ids, has_later_projects = (
+                                _run_span_attribute_pg_read(
+                                    request_deadline,
+                                    lambda: _workspace_project_batch(
+                                        request,
+                                        after_project_id=batch_end_project_id,
+                                    ),
+                                )
+                            )
+                            if project_ids:
+                                batch_end_project_id = project_ids[-1]
                     (
                         segment_end,
                         raw_before_identity,
                         raw_resume_identity,
                         resume_key_offset,
                         seen_reference,
-                    ) = cursor_state.order[:5]
+                    ) = physical_order[:5]
                     raw_segment_start = (
-                        cursor_state.order[5] if len(cursor_state.order) == 6 else None
+                        physical_order[5] if len(physical_order) == 6 else None
                     )
                     if (
                         not isinstance(segment_end, datetime)
@@ -291,6 +430,13 @@ class SpanAttributeKeysView(APIView):
                     window_start = cursor_state.window_start
                     window_end = cursor_state.window_end
                 else:
+                    if workspace_scope:
+                        project_ids, has_later_projects = _run_span_attribute_pg_read(
+                            request_deadline,
+                            lambda: _workspace_project_batch(request),
+                        )
+                        if project_ids:
+                            batch_end_project_id = project_ids[-1]
                     window_end = datetime.now(UTC)
                     # The system.parts lower-bound read was only a pagination
                     # accelerator, but it added a third ClickHouse round trip
@@ -329,21 +475,64 @@ class SpanAttributeKeysView(APIView):
                         "The continuation cursor is invalid.",
                     )
 
-                page_read = selector.read_key_cursor_page(
-                    project_ids,
-                    page_size=page_size,
-                    window_start=window_start,
-                    window_end=window_end,
-                    segment_end=segment_end,
-                    segment_start=segment_start,
-                    before_identity=before_identity,
-                    resume_identity=resume_identity,
-                    resume_key_offset=resume_key_offset,
-                    seen_key_digests=seen_state.digests,
-                    seen_key_contains=seen_state.contains,
-                    seen_key_count=seen_state.seen_count,
-                    exact_key=exact_key,
-                )
+                if project_ids:
+                    selector = AttributeReadSelector(
+                        typed_only=True,
+                        json_attribute_mode=(
+                            "all" if discovery_mode == "eval_mapping" else "structured"
+                        ),
+                        wall_timeout_ms=request_deadline.remaining_ms(
+                            ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS
+                        ),
+                    )
+                    page_read = selector.read_key_cursor_page(
+                        project_ids,
+                        page_size=page_size,
+                        window_start=window_start,
+                        window_end=window_end,
+                        segment_end=segment_end,
+                        segment_start=segment_start,
+                        before_identity=before_identity,
+                        resume_identity=resume_identity,
+                        resume_key_offset=resume_key_offset,
+                        seen_key_digests=seen_state.digests,
+                        seen_key_contains=seen_state.contains,
+                        seen_key_count=seen_state.seen_count,
+                        exact_key=exact_key,
+                        # A workspace key can migrate storage families between
+                        # projects. Remember key+type identities so a later
+                        # authorized batch can publish a newly observed family
+                        # without re-emitting the same family forever.
+                        dedupe_by_type=workspace_scope,
+                        # A positive workspace exact lookup proves only this
+                        # batch/type. Continue the bounded physical walk and
+                        # then every later project batch to cover all observed
+                        # retained type families for the requested key.
+                        exhaustive_exact_types=(
+                            workspace_scope and exact_key is not None
+                        ),
+                    )
+                else:
+                    request_deadline.remaining_ms(floor_ms=1)
+                    page_read = AttributeKeyCursorPageRead(
+                        (),
+                        AttributeReadMetadata(
+                            query_complete=True,
+                            query_status="complete",
+                            query_error_code=None,
+                            query_window_start=window_start,
+                            query_window_end=window_end,
+                            query_count=0,
+                        ),
+                        False,
+                        "exhausted",
+                        window_start,
+                        None,
+                        None,
+                        0,
+                        seen_state.digests,
+                        seen_key_count=seen_state.seen_count,
+                    )
                 if not page_read.metadata.query_complete:
                     logger.warning(
                         "span_attribute_key_cursor_incomplete",
@@ -355,9 +544,18 @@ class SpanAttributeKeysView(APIView):
                         "Span attribute keys are temporarily unavailable. Please retry.",
                         code="service_unavailable",
                     )
+                exact_match = exact_key is not None and (
+                    seen_state.seen_count > 0
+                    or any(row.key == exact_key for row in page_read.rows)
+                )
+                advance_project_batch = (
+                    workspace_scope and not page_read.has_more and has_later_projects
+                )
                 next_cursor = None
-                published_has_more = page_read.has_more
-                published_browse_status = page_read.browse_status
+                published_has_more = page_read.has_more or advance_project_batch
+                published_browse_status = (
+                    "continuation" if advance_project_batch else page_read.browse_status
+                )
                 if published_has_more:
                     appended_digests = (
                         page_read.appended_key_digests
@@ -373,15 +571,28 @@ class SpanAttributeKeysView(APIView):
                             and all(char in "0123456789abcdef" for char in value)
                         ),
                     )
-                    next_order = (
-                        page_read.next_segment_end,
-                        page_read.next_before_identity or (),
-                        page_read.next_resume_identity or (),
-                        page_read.next_resume_key_offset,
-                        seen_reference,
-                    )
-                    if page_read.next_segment_start is not None:
-                        next_order = (*next_order, page_read.next_segment_start)
+                    if advance_project_batch:
+                        # The next request resolves and reads exactly one next
+                        # authorized project batch. The physical checkpoint is
+                        # reset because each batch gets the same frozen window.
+                        next_order = (window_end, (), (), 0, seen_reference)
+                    else:
+                        next_order = (
+                            page_read.next_segment_end,
+                            page_read.next_before_identity or (),
+                            page_read.next_resume_identity or (),
+                            page_read.next_resume_key_offset,
+                            seen_reference,
+                        )
+                        if page_read.next_segment_start is not None:
+                            next_order = (*next_order, page_read.next_segment_start)
+                    if workspace_scope:
+                        next_order = (
+                            batch_end_project_id,
+                            () if advance_project_batch else tuple(project_ids),
+                            has_later_projects,
+                            *next_order,
+                        )
                     next_cursor = encode_list_cursor(
                         resource="span_attribute_keys",
                         scope=cursor_scope,
@@ -412,9 +623,7 @@ class SpanAttributeKeysView(APIView):
                         **(
                             {
                                 "lookup_mode": "exact",
-                                "exact_match": any(
-                                    row.key == exact_key for row in page_read.rows
-                                ),
+                                "exact_match": exact_match,
                             }
                             if exact_key is not None
                             else {}
@@ -429,6 +638,15 @@ class SpanAttributeKeysView(APIView):
             # hundreds of millions of rows on the incident tenant and could
             # recreate the original 503. UI consumers paginate the retained
             # catalog and filter those verified typed names locally.
+            selector = AttributeReadSelector(
+                typed_only=True,
+                json_attribute_mode=(
+                    "all" if discovery_mode == "eval_mapping" else "structured"
+                ),
+                wall_timeout_ms=request_deadline.remaining_ms(
+                    ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS
+                ),
+            )
             read = selector.discover_keys([project_id], exact_key=exact_key)
             if _attribute_read_metadata_is_unavailable(read.metadata):
                 logger.warning(

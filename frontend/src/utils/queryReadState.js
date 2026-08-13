@@ -4,7 +4,7 @@ export const QUERY_READ_RETRY_MESSAGE =
 export const QUERY_READ_SAMPLED_MESSAGE = "Showing the newest matching rows.";
 
 export const FILTER_VALUE_SAMPLED_MESSAGE =
-  "Recent values — search or enter an exact value.";
+  "Showing configured or recent suggestions only. Enter an exact value.";
 
 export const FILTER_VALUE_UNAVAILABLE_MESSAGE =
   "Suggestions are temporarily unavailable. Enter an exact value or retry.";

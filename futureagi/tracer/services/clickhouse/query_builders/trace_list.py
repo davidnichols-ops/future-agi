@@ -225,6 +225,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         columns: list[str] | None = None,
         annotation_label_ids: list[str] | None = None,
         annotation_label_ids_by_project: dict[str, list[str]] | None = None,
+        eval_filter_metadata: dict[str, Any] | None = None,
         bounded_internal_scan: bool = False,
         bounded_identity_only: bool = False,
         bounded_membership_filters: list[dict] | None = None,
@@ -258,6 +259,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             if annotation_label_ids_by_project is not None
             else None
         )
+        self.eval_filter_metadata = eval_filter_metadata
         self._bounded_internal_scan = bool(bounded_internal_scan)
         self._bounded_identity_only = bool(bounded_identity_only)
         # Graph sampling may narrow root seeding/order to one temporal
@@ -3596,6 +3598,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     ),
                     strict_enduser_project_correlation=True,
                     annotation_label_set_known=self._annotation_label_set_known,
+                    eval_filter_metadata=self.eval_filter_metadata,
                 )
                 residual_predicate, residual_params = residual_builder.translate(
                     residual_filters

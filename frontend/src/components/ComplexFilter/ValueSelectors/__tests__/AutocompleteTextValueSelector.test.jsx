@@ -45,6 +45,9 @@ const fullTypedValuePage = (featuredValue, prefix) => [
 describe("AutocompleteTextValueSelector", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // A single bounded gesture can deliberately leave deep cursor fixtures
+    // unused, so discard queued one-shot implementations between tests.
+    mocks.get.mockReset();
     mocks.params = { observeId: "project-large" };
   });
 
@@ -98,7 +101,7 @@ describe("AutocompleteTextValueSelector", () => {
       1,
       "/filter-values/",
       expect.objectContaining({
-        timeout: 9_800,
+        timeout: 4_800,
         params: expect.objectContaining({
           project_ids: "project-large",
           metric_name: "call.status",
@@ -311,7 +314,7 @@ describe("AutocompleteTextValueSelector", () => {
     );
   });
 
-  it("automatically follows an empty continuation until values arrive", async () => {
+  it("keeps an empty continuation explicit until the user resumes it", async () => {
     mocks.get
       .mockResolvedValueOnce({
         data: {
@@ -346,6 +349,11 @@ describe("AutocompleteTextValueSelector", () => {
     );
 
     fireEvent.mouseDown(screen.getByRole("combobox"));
+    const retry = await screen.findByRole("option", {
+      name: "Retry loading values",
+    });
+    expect(mocks.get).toHaveBeenCalledOnce();
+    fireEvent.click(retry);
     expect(
       await screen.findByRole("option", { name: "completed" }),
     ).toBeVisible();
@@ -361,7 +369,7 @@ describe("AutocompleteTextValueSelector", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("fills load more across duplicate-heavy physical pages", async () => {
+  it("keeps duplicate-heavy physical pages behind explicit actions", async () => {
     mocks.get
       .mockResolvedValueOnce({
         data: {
@@ -419,6 +427,10 @@ describe("AutocompleteTextValueSelector", () => {
     fireEvent.click(screen.getByRole("option", { name: "Load more values" }));
 
     expect(await screen.findByRole("option", { name: "ended" })).toBeVisible();
+    expect(
+      screen.getByRole("option", { name: "Load more values" }),
+    ).toBeVisible();
+    fireEvent.click(screen.getByRole("option", { name: "Load more values" }));
     expect(await screen.findByRole("option", { name: "failed" })).toBeVisible();
     expect(screen.getAllByRole("option", { name: "completed" })).toHaveLength(
       1,
@@ -433,12 +445,12 @@ describe("AutocompleteTextValueSelector", () => {
     );
   });
 
-  it("bounds a 48-page empty chain and resumes it through explicit retry actions", async () => {
+  it("bounds a sparse chain and resumes it through explicit retry actions", async () => {
     let responseIndex = 0;
     mocks.get.mockImplementation(async () => {
       const current = responseIndex;
       responseIndex += 1;
-      if (current < 48) {
+      if (current < 4) {
         return {
           data: {
             result: {
@@ -475,14 +487,18 @@ describe("AutocompleteTextValueSelector", () => {
 
     fireEvent.mouseDown(screen.getByRole("combobox"));
     await screen.findByRole("option", { name: "Retry loading values" });
-    expect(mocks.get).toHaveBeenCalledTimes(13);
+    expect(mocks.get).toHaveBeenCalledOnce();
 
-    for (const expectedRequestCount of [26, 39]) {
+    for (
+      let expectedRequests = 2;
+      expectedRequests <= 4;
+      expectedRequests += 1
+    ) {
       fireEvent.click(
         screen.getByRole("option", { name: "Retry loading values" }),
       );
       await waitFor(() =>
-        expect(mocks.get).toHaveBeenCalledTimes(expectedRequestCount),
+        expect(mocks.get).toHaveBeenCalledTimes(expectedRequests),
       );
       await screen.findByRole("option", { name: "Retry loading values" });
     }
@@ -493,12 +509,12 @@ describe("AutocompleteTextValueSelector", () => {
     expect(
       await screen.findByRole("option", { name: "eventually-found" }),
     ).toBeVisible();
-    expect(mocks.get).toHaveBeenCalledTimes(49);
+    expect(mocks.get).toHaveBeenCalledTimes(5);
     expect(mocks.get).toHaveBeenNthCalledWith(
-      49,
+      5,
       "/filter-values/",
       expect.objectContaining({
-        params: expect.objectContaining({ cursor: "cursor-48" }),
+        params: expect.objectContaining({ cursor: "cursor-4" }),
       }),
     );
     expect(
@@ -532,13 +548,13 @@ describe("AutocompleteTextValueSelector", () => {
     const retry = await screen.findByRole("option", {
       name: "Retry loading values",
     });
-    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(mocks.get).toHaveBeenCalledOnce();
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
 
     fireEvent.click(retry);
-    // Retry retains the consumed-cursor guard and therefore fails closed on
-    // the first repeated checkpoint instead of issuing the same request twice.
-    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+    // The repeated cursor returned by that explicit request is rejected before
+    // another physical request can be issued.
     expect(
       await screen.findByRole("option", { name: "Retry loading values" }),
     ).toBeVisible();
@@ -599,7 +615,7 @@ describe("AutocompleteTextValueSelector", () => {
       if (requestNumber === 2) {
         throw new Error("transient continuation failure");
       }
-      if (requestNumber <= 15) {
+      if (requestNumber <= 4) {
         return {
           data: {
             result: {
@@ -647,33 +663,45 @@ describe("AutocompleteTextValueSelector", () => {
     expect(screen.getByRole("option", { name: "completed" })).toBeVisible();
 
     fireEvent.click(retry);
-    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(15));
-    // Twelve continuations and the 9.5-second soft check are per-action guards.
-    // The latter is evaluated only between completed HTTP requests, so the
-    // deterministic hop bound is what this regression exercises.
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(3));
+    // The retry gesture consumes exactly one sparse page, then retains the
+    // exact signed checkpoint for another explicit action.
     expect(screen.getByRole("option", { name: "completed" })).toBeVisible();
     const retryBoundedContinuation = await screen.findByRole("option", {
       name: "Retry loading values",
     });
     expect(mocks.get).toHaveBeenNthCalledWith(
-      15,
+      3,
       "/filter-values/",
       expect.objectContaining({
-        params: expect.objectContaining({ cursor: "empty-12" }),
+        params: expect.objectContaining({ cursor: "retry-start" }),
       }),
     );
 
     fireEvent.click(retryBoundedContinuation);
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(4));
+    const finalContinuation = await screen.findByRole("option", {
+      name: "Retry loading values",
+    });
+    expect(mocks.get).toHaveBeenNthCalledWith(
+      4,
+      "/filter-values/",
+      expect.objectContaining({
+        params: expect.objectContaining({ cursor: "empty-1" }),
+      }),
+    );
+
+    fireEvent.click(finalContinuation);
     expect(
       await screen.findByRole("option", { name: "recovered" }),
     ).toBeVisible();
     expect(screen.getByRole("option", { name: "completed" })).toBeVisible();
-    expect(mocks.get).toHaveBeenCalledTimes(16);
+    expect(mocks.get).toHaveBeenCalledTimes(5);
     expect(mocks.get).toHaveBeenNthCalledWith(
-      16,
+      5,
       "/filter-values/",
       expect.objectContaining({
-        params: expect.objectContaining({ cursor: "empty-13" }),
+        params: expect.objectContaining({ cursor: "empty-2" }),
       }),
     );
   });
@@ -713,6 +741,10 @@ describe("AutocompleteTextValueSelector", () => {
     );
 
     fireEvent.mouseDown(screen.getByRole("combobox"));
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledOnce());
+    fireEvent.click(
+      await screen.findByRole("option", { name: "Retry loading values" }),
+    );
     await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
     await waitFor(() =>
       expect(screen.queryByRole("progressbar")).not.toBeInTheDocument(),

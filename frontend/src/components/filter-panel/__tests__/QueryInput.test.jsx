@@ -164,6 +164,68 @@ describe("QueryInput explicit values", () => {
     ]);
   });
 
+  it("keeps an annotation choice value distinct from its display label", async () => {
+    const field = {
+      value: "annotation-label",
+      label: "Annotation",
+      type: "categorical",
+      choices: [
+        { value: "customer_refund", label: "Customer refund requested" },
+      ],
+      allowCustomValue: true,
+    };
+    const { onApply, utils } = renderQueryInput({ field });
+
+    await selectPhaseOption(utils, "Annotation", "pick operator...");
+    const input = utils.getByRole("combobox");
+    fireEvent.change(input, { target: { value: "equals" } });
+    fireEvent.click(await utils.findByRole("option", { name: /^equals$/i }));
+    await waitFor(() =>
+      expect(input).toHaveAttribute("placeholder", "type or pick value..."),
+    );
+    fireEvent.change(input, { target: { value: "customer_refund" } });
+    fireEvent.click(await utils.findByText("Customer refund requested"));
+
+    await waitFor(() => expect(onApply).toHaveBeenCalledTimes(1));
+    expect(onApply).toHaveBeenLastCalledWith([
+      {
+        field: "annotation-label",
+        operator: "equals",
+        value: "customer_refund",
+      },
+    ]);
+  });
+
+  it("allows an exact stored-only annotation value beside configured choices", async () => {
+    const field = {
+      value: "annotation-label",
+      label: "Annotation",
+      type: "categorical",
+      choices: [{ value: "configured", label: "Configured" }],
+      allowCustomValue: true,
+    };
+    const { onApply, utils } = renderQueryInput({ field });
+
+    await selectPhaseOption(utils, "Annotation", "pick operator...");
+    const input = utils.getByRole("combobox");
+    fireEvent.change(input, { target: { value: "equals" } });
+    fireEvent.click(await utils.findByRole("option", { name: /^equals$/i }));
+    await waitFor(() =>
+      expect(input).toHaveAttribute("placeholder", "type or pick value..."),
+    );
+    fireEvent.change(input, { target: { value: "historical-only" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(onApply).toHaveBeenCalledTimes(1));
+    expect(onApply).toHaveBeenLastCalledWith([
+      {
+        field: "annotation-label",
+        operator: "equals",
+        value: "historical-only",
+      },
+    ]);
+  });
+
   it("requests server search and the next value page", async () => {
     const field = {
       value: "custom_value",
@@ -195,14 +257,63 @@ describe("QueryInput explicit values", () => {
     );
 
     const listbox = await utils.findByRole("listbox");
+    let scrollTop = 180;
     Object.defineProperties(listbox, {
-      scrollTop: { configurable: true, value: 180 },
+      scrollTop: { configurable: true, get: () => scrollTop },
       clientHeight: { configurable: true, value: 220 },
       scrollHeight: { configurable: true, value: 400 },
     });
     fireEvent.scroll(listbox);
+    fireEvent.scroll(listbox);
+    fireEvent.scroll(listbox);
     expect(onLoadMoreValues).toHaveBeenCalledOnce();
+
+    scrollTop = 80;
+    fireEvent.scroll(listbox);
+    scrollTop = 180;
+    fireEvent.scroll(listbox);
+    expect(onLoadMoreValues).toHaveBeenCalledTimes(2);
   });
+
+  it.each([
+    [false, "Load more values"],
+    [true, "Retry loading values"],
+  ])(
+    "keeps an explicit %s value continuation reachable without scrolling",
+    async (valueLoadError, actionLabel) => {
+      const field = {
+        value: "custom_value",
+        label: "Custom value",
+        type: "string",
+      };
+      const onLoadMoreValues = vi.fn();
+      const { utils } = renderQueryInput({
+        field,
+        valueOptions: [
+          { value: "already-loaded", label: "already-loaded", type: "string" },
+        ],
+        onLoadMoreValues,
+        hasMoreValues: true,
+        valueLoadError,
+      });
+
+      await selectPhaseOption(utils, "Custom value", "pick operator...");
+      await selectPhaseOption(utils, "Contains", "type or pick value...");
+
+      const input = utils.getByRole("combobox");
+      fireEvent.click(await utils.findByText(actionLabel));
+
+      expect(onLoadMoreValues).toHaveBeenCalledOnce();
+      expect(input).toHaveAttribute("placeholder", "type or pick value...");
+      if (valueLoadError) {
+        expect(
+          utils.getByText(
+            "More values could not be loaded. Loaded matches remain available.",
+          ),
+        ).toHaveAttribute("role", "status");
+      }
+    },
+  );
 
   it("requests exact field search and advances field discovery explicitly", async () => {
     const field = {

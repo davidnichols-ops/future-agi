@@ -17598,7 +17598,7 @@ export type apiTracesSpanAttributeKeysListResponseError = (apiTracesSpanAttribut
 
 export type apiTracesSpanAttributeKeysListResponse = (apiTracesSpanAttributeKeysListResponseSuccess | apiTracesSpanAttributeKeysListResponseError)
 
-export const getApiTracesSpanAttributeKeysListUrl = (params: ApiTracesSpanAttributeKeysListParams,) => {
+export const getApiTracesSpanAttributeKeysListUrl = (params?: ApiTracesSpanAttributeKeysListParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -17628,7 +17628,7 @@ The no-page-size form is retained for older clients.
 GET /api/traces/span-attribute-keys/?project_id=<uuid>&page_size=10
  * @summary Discover span attribute keys for a project.
  */
-export const apiTracesSpanAttributeKeysList = async (params: ApiTracesSpanAttributeKeysListParams, options?: RequestInit): Promise<apiTracesSpanAttributeKeysListResponse> => {
+export const apiTracesSpanAttributeKeysList = async (params?: ApiTracesSpanAttributeKeysListParams, options?: RequestInit): Promise<apiTracesSpanAttributeKeysListResponse> => {
 
   return apiMutator<apiTracesSpanAttributeKeysListResponse>(getApiTracesSpanAttributeKeysListUrl(params),
   {

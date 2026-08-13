@@ -8795,10 +8795,17 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "requestBody": null,
         "queryParameters": {
           "project_id": {
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string",
               "format": "uuid"
+            }
+          },
+          "workspace_scope": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
             }
           },
           "discovery_mode": {
@@ -96443,6 +96450,14 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string"
         },
         "choices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "x-json-value": true,
+            "description": "Any valid JSON value."
+          }
+        },
+        "choice_options": {
           "type": "array",
           "items": {
             "type": "object",

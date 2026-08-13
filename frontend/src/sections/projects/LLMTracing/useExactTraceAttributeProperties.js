@@ -5,6 +5,7 @@ import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
 import {
   ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+  compactAttributeKeyRetryPage,
   getAttributeKeyCursorStopSignature,
   getNextAttributeKeyPageParam,
   isAttributeKeyCursorChainStopped,
@@ -66,6 +67,8 @@ export function useExactTraceAttributeProperties({
     retained: null,
     exact: null,
   });
+  const freshChainRequestRef = useRef(null);
+  const [freshChainRecoveryLane, setFreshChainRecoveryLane] = useState(null);
   const exactSearchGestureStateRef = useRef({
     scope: null,
     previous: null,
@@ -114,6 +117,9 @@ export function useExactTraceAttributeProperties({
     retry: false,
     staleTime: 60_000,
     gcTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
     // The picker owns a concise retry state; never let the global handler
     // display backend exception text to the customer.
     meta: { errorHandled: true },
@@ -154,6 +160,9 @@ export function useExactTraceAttributeProperties({
     retry: false,
     staleTime: 60_000,
     gcTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
     meta: { errorHandled: true },
   });
 
@@ -177,36 +186,6 @@ export function useExactTraceAttributeProperties({
     // without issuing a second request.
     state.pendingRetry = identity;
   }, [enabled, normalizedSearch, projectId, source]);
-
-  useEffect(() => {
-    const identity = JSON.stringify([projectId, source, normalizedSearch]);
-    const state = exactSearchGestureStateRef.current;
-    if (
-      state.pendingRetry !== identity ||
-      !normalizedSearch ||
-      debouncedSearch !== normalizedSearch
-    ) {
-      return;
-    }
-    if (exactQuery.isFetching) {
-      state.pendingRetry = null;
-      return;
-    }
-    const continuationFailed =
-      exactQuery.isFetchNextPageError && exactQuery.hasNextPage;
-    const cachedReadFailed = exactQuery.isError || exactQuery.isRefetchError;
-    if (!continuationFailed && !cachedReadFailed) {
-      state.pendingRetry = null;
-      return;
-    }
-
-    // Consume the re-entry before starting I/O. Query state changes cannot
-    // trigger another automatic request; another retry requires another raw
-    // search gesture or the explicit picker action.
-    state.pendingRetry = null;
-    if (continuationFailed) void exactQuery.fetchNextPage();
-    else void exactQuery.refetch();
-  }, [debouncedSearch, exactQuery, normalizedSearch, projectId, source]);
 
   const retainedPages = retainedQuery.data?.pages || [];
   const exactPages = exactQuery.data?.pages || [];
@@ -295,7 +274,11 @@ export function useExactTraceAttributeProperties({
   const browseStatus = retainedLastPage?.browse_status;
   const retainedHasNextPage =
     retainedQuery.hasNextPage || retainedStoppedRetryAvailable;
-  const shouldAdvanceExact = Boolean(debouncedSearch) && !exactSearchMatched;
+  const exactContinuationFailed = Boolean(
+    debouncedSearch && exactQuery.isFetchNextPageError,
+  );
+  const exactSearchActive = Boolean(debouncedSearch) && !exactSearchMatched;
+  const shouldAdvanceExact = exactSearchActive && !exactContinuationFailed;
   // A failed page-one exact probe has no pageParam to retry through
   // `fetchNextPage`; refetching the same query key correctly starts from a
   // cursorless page one. A failed later page keeps `hasNextPage` and retries
@@ -320,60 +303,161 @@ export function useExactTraceAttributeProperties({
   const shouldAdvanceRetained = !debouncedSearch || !exactHasNextPage;
   const hasNextPage =
     exactHasNextPage || (shouldAdvanceRetained && retainedHasNextPage);
+
+  const fetchFreshChainPage = ({ lane, queryKey, exact }) => {
+    if (freshChainRequestRef.current) return freshChainRequestRef.current;
+
+    setFreshChainRecoveryLane(lane);
+    const request = readAttributeKeyPage({
+      pageParam: null,
+      pageSize: 10,
+      publishedData: undefined,
+      requestPage: (cursor, signal) =>
+        axios
+          .get(endpoints.project.spanAttributeKeys(), {
+            signal,
+            timeout: ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+            params: {
+              project_id: projectId,
+              page_size: 10,
+              ...(exact ? { q: debouncedSearch } : {}),
+              ...(cursor ? { cursor } : {}),
+            },
+          })
+          .then(({ data }) => data || {}),
+    }).then((page) => {
+      // An infinite-query refetch replays every cached page. Cursor recovery
+      // is one explicit interaction and therefore replaces the stopped chain
+      // only after one bounded cursorless request completes.
+      const compactedPage = compactAttributeKeyRetryPage(
+        queryClient.getQueryData(queryKey),
+        page,
+      );
+      queryClient.setQueryData(queryKey, {
+        pages: [compactedPage],
+        pageParams: [null],
+      });
+      setCursorRetryState((current) => ({
+        ...current,
+        [lane]: {
+          identity:
+            lane === "exact" ? exactRetryIdentity : retainedRetryIdentity,
+          signature:
+            lane === "exact" ? exactStopSignature : retainedStopSignature,
+        },
+      }));
+      return compactedPage;
+    });
+    const settledRequest = request.finally(() => {
+      if (freshChainRequestRef.current === settledRequest) {
+        freshChainRequestRef.current = null;
+        setFreshChainRecoveryLane(null);
+      }
+    });
+    freshChainRequestRef.current = settledRequest;
+    return settledRequest;
+  };
+
+  useEffect(() => {
+    const identity = JSON.stringify([projectId, source, normalizedSearch]);
+    const state = exactSearchGestureStateRef.current;
+    if (
+      state.pendingRetry !== identity ||
+      !normalizedSearch ||
+      debouncedSearch !== normalizedSearch
+    ) {
+      return;
+    }
+    if (exactQuery.isFetching) {
+      state.pendingRetry = null;
+      return;
+    }
+    const continuationFailed =
+      exactQuery.isFetchNextPageError && exactQuery.hasNextPage;
+    const cachedReadFailed = exactQuery.isError || exactQuery.isRefetchError;
+    if (!continuationFailed && !cachedReadFailed) {
+      state.pendingRetry = null;
+      return;
+    }
+
+    // Consume the re-entry before starting I/O. A failed continuation retries
+    // only that signed page. A cached page-one/refetch failure starts one
+    // cursorless compacting read instead of replaying every retained page.
+    state.pendingRetry = null;
+    if (continuationFailed) void exactQuery.fetchNextPage();
+    else {
+      void fetchFreshChainPage({
+        lane: "exact",
+        queryKey: exactQueryKey,
+        exact: true,
+      }).catch(() => undefined);
+    }
+  }, [debouncedSearch, exactQuery, normalizedSearch, projectId, source]);
+
   const fetchNextPage = (...args) => {
     const reads = [];
     if (shouldAdvanceRetained && retainedStoppedRetryAvailable) {
-      setCursorRetryState((current) => ({
-        ...current,
-        retained: {
-          identity: retainedRetryIdentity,
-          signature: retainedStopSignature,
-        },
-      }));
-      reads.push(retainedQuery.refetch(...args));
+      reads.push(
+        fetchFreshChainPage({
+          lane: "retained",
+          queryKey: retainedQueryKey,
+          exact: false,
+        }),
+      );
     } else if (shouldAdvanceRetained && retainedQuery.hasNextPage) {
       reads.push(retainedQuery.fetchNextPage(...args));
     }
     if (shouldAdvanceExact && exactStoppedRetryAvailable) {
-      setCursorRetryState((current) => ({
-        ...current,
-        exact: {
-          identity: exactRetryIdentity,
-          signature: exactStopSignature,
-        },
-      }));
-      reads.push(exactQuery.refetch(...args));
+      reads.push(
+        fetchFreshChainPage({
+          lane: "exact",
+          queryKey: exactQueryKey,
+          exact: true,
+        }),
+      );
     } else if (shouldAdvanceExact && exactQuery.hasNextPage) {
       reads.push(exactQuery.fetchNextPage(...args));
-    } else if (exactInitialError) {
-      reads.push(exactQuery.refetch(...args));
-    } else if (exactRefetchError) {
-      reads.push(exactQuery.refetch(...args));
+    } else if (exactInitialError || exactRefetchError) {
+      reads.push(
+        fetchFreshChainPage({
+          lane: "exact",
+          queryKey: exactQueryKey,
+          exact: true,
+        }),
+      );
     }
     return reads.length === 1 ? reads[0] : Promise.allSettled(reads);
   };
   const fetchNextExactPage = (...args) => {
-    if (!shouldAdvanceExact) return Promise.resolve();
+    if (!exactSearchActive) return Promise.resolve();
     if (exactStoppedRetryAvailable) {
-      setCursorRetryState((current) => ({
-        ...current,
-        exact: {
-          identity: exactRetryIdentity,
-          signature: exactStopSignature,
-        },
-      }));
-      return exactQuery.refetch(...args);
+      return fetchFreshChainPage({
+        lane: "exact",
+        queryKey: exactQueryKey,
+        exact: true,
+      });
     }
-    if (exactQuery.hasNextPage) return exactQuery.fetchNextPage(...args);
-    if (exactInitialError) return exactQuery.refetch(...args);
-    if (exactRefetchError) return exactQuery.refetch(...args);
+    if (exactQuery.hasNextPage || exactContinuationFailed) {
+      return exactQuery.fetchNextPage(...args);
+    }
+    if (exactInitialError || exactRefetchError) {
+      return fetchFreshChainPage({
+        lane: "exact",
+        queryKey: exactQueryKey,
+        exact: true,
+      });
+    }
     return Promise.resolve();
   };
-  const refetch = (...args) => {
-    const reads = [retainedQuery.refetch(...args)];
-    if (debouncedSearch) reads.push(exactQuery.refetch(...args));
-    return Promise.allSettled(reads);
-  };
+  // The generic picker Retry belongs to the authoritative retained catalog.
+  // Refresh exactly one cursorless page and compact the old visible rows into
+  // it; never fan out to the supplemental exact lane or replay cached pages.
+  const refetch = () =>
+    fetchFreshChainPage({
+      lane: "retained",
+      queryKey: retainedQueryKey,
+      exact: false,
+    }).catch(() => undefined);
 
   return {
     data: properties,
@@ -388,7 +472,8 @@ export function useExactTraceAttributeProperties({
     debouncedSearch,
     isFetching:
       retainedQuery.isFetching ||
-      (Boolean(debouncedSearch) && exactQuery.isFetching),
+      (Boolean(debouncedSearch) && exactQuery.isFetching) ||
+      freshChainRecoveryLane !== null,
     isLoading: retainedQuery.isLoading,
     isError: retainedQuery.isError,
     isSuccess: retainedQuery.isSuccess,
@@ -406,6 +491,7 @@ export function useExactTraceAttributeProperties({
     isFetchingExactSearch: Boolean(debouncedSearch) && exactQuery.isFetching,
     isFetchingNextExactPage:
       (shouldAdvanceExact && exactQuery.isFetchingNextPage) ||
+      freshChainRecoveryLane === "exact" ||
       (shouldAdvanceExact &&
         (exactCursorStopped || exactInitialError) &&
         exactQuery.isFetching),
@@ -417,13 +503,14 @@ export function useExactTraceAttributeProperties({
     isFetchingNextPage:
       (shouldAdvanceRetained && retainedQuery.isFetchingNextPage) ||
       (shouldAdvanceExact && exactQuery.isFetchingNextPage) ||
+      freshChainRecoveryLane !== null ||
       (shouldAdvanceRetained &&
         retainedCursorStopped &&
         retainedQuery.isFetching) ||
       (shouldAdvanceExact && exactCursorStopped && exactQuery.isFetching),
     isFetchNextPageError:
       (shouldAdvanceRetained && retainedQuery.isFetchNextPageError) ||
-      (shouldAdvanceExact && exactQuery.isFetchNextPageError) ||
+      exactContinuationFailed ||
       exactInitialError ||
       exactRefetchError ||
       (shouldAdvanceRetained && retainedStoppedRetryAvailable) ||

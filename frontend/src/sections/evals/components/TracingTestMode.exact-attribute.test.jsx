@@ -2,7 +2,10 @@ import React from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, userEvent, waitFor } from "src/utils/test-utils";
-import { QUERY_FAILED_RETRY_MESSAGE } from "src/utils/queryReadState";
+import {
+  ATTRIBUTE_LOOKUP_UNAVAILABLE_MESSAGE,
+  QUERY_FAILED_RETRY_MESSAGE,
+} from "src/utils/queryReadState";
 
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
@@ -158,6 +161,22 @@ describe("TracingTestMode exact task attribute mapping", () => {
       }
       throw new Error(`Unexpected GET ${url}`);
     });
+  });
+
+  it("shows a sanitized retry for an initial retained attribute error", async () => {
+    mocks.exactReadState = "error";
+    mocks.hasNextAttributePage = true;
+    mocks.isNextAttributePageError = true;
+    renderTaskMapping(vi.fn());
+
+    expect(
+      await screen.findByText(ATTRIBUTE_LOOKUP_UNAVAILABLE_MESSAGE),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Retry loading attributes" }),
+    );
+
+    expect(mocks.fetchNextAttributePage).toHaveBeenCalledOnce();
   });
 
   it("lists and selects final_status even when the preview row omits it", async () => {

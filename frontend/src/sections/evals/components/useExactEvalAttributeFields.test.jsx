@@ -107,7 +107,7 @@ describe("useExactEvalAttributeFields", () => {
         "/api/traces/span-attribute-keys/",
         expect.objectContaining({
           signal: expect.any(AbortSignal),
-          timeout: 9_800,
+          timeout: 4_800,
           params: {
             project_id: "00000000-0000-4000-8000-000000000901",
             page_size: 10,
@@ -119,7 +119,7 @@ describe("useExactEvalAttributeFields", () => {
         "/api/traces/span-attribute-keys/",
         expect.objectContaining({
           signal: expect.any(AbortSignal),
-          timeout: 9_800,
+          timeout: 4_800,
           params: {
             project_id: "00000000-0000-4000-8000-000000000901",
             page_size: 10,
@@ -173,6 +173,34 @@ describe("useExactEvalAttributeFields", () => {
       "spans.0.duplicate",
       "spans.0.older",
     ]);
+  });
+
+  it("offers one cursorless retry after an initial retained inventory error", async () => {
+    mocks.get
+      .mockRejectedValueOnce(new Error("private retained failure"))
+      .mockResolvedValueOnce(retainedPage(["recovered.attribute"]));
+
+    const { result } = renderHook(
+      () =>
+        useExactEvalAttributeFields({
+          projectId: "project-eval-retry",
+          rowType: "spans",
+          search: "",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.hasNextPage).toBe(true);
+    expect(result.current.isFetchNextPageError).toBe(true);
+
+    await act(async () => result.current.fetchNextPage());
+
+    await waitFor(() =>
+      expect(result.current.data).toContain("recovered.attribute"),
+    );
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(mocks.get.mock.calls.at(-1)[1].params).not.toHaveProperty("cursor");
   });
 
   it("continues eval-field discovery after a resumable limit_reached batch", async () => {
@@ -240,13 +268,21 @@ describe("useExactEvalAttributeFields", () => {
 
     await waitFor(() => expect(result.current.hasNextPage).toBe(true));
     await act(async () => result.current.fetchNextPage());
-    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(14));
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
 
     expect(result.current.hasNextPage).toBe(true);
     expect(result.current.isFetchingNextPage).toBe(false);
     expect(result.current.data).toEqual(["spans.0.recent"]);
 
-    await act(async () => result.current.fetchNextPage());
+    // Every explicit gesture advances one physical checkpoint only. This
+    // preserves the complete signed chain without letting 15 four-second
+    // requests accumulate behind a single user action.
+    for (let requestCount = 3; requestCount <= 16; requestCount += 1) {
+      await act(async () => result.current.fetchNextPage());
+      await waitFor(() =>
+        expect(mocks.get).toHaveBeenCalledTimes(requestCount),
+      );
+    }
     await waitFor(() => expect(result.current.hasNextPage).toBe(false));
 
     expect(mocks.get).toHaveBeenCalledTimes(16);
@@ -305,6 +341,14 @@ describe("useExactEvalAttributeFields", () => {
     expect(result.current.hasNextPage).toBe(true);
     expect(result.current.isFetchNextPageError).toBe(true);
 
+    // One retry gesture fetches only a fresh page one. It must not replay the
+    // cached continuation automatically, because that would turn one click
+    // into an unbounded multi-page refetch on long inventories.
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(3));
+    expect(result.current.cursorRetryExhausted).toBe(false);
+    expect(result.current.hasNextPage).toBe(true);
+
     await act(async () => result.current.fetchNextPage());
     await waitFor(() => expect(result.current.cursorRetryExhausted).toBe(true));
 
@@ -315,6 +359,61 @@ describe("useExactEvalAttributeFields", () => {
 
     await act(async () => result.current.fetchNextPage());
     expect(mocks.get).toHaveBeenCalledTimes(4);
+  });
+
+  it("resets the one-shot cursor retry after leaving and re-entering a project", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (params.project_id === "project-other") {
+        return Promise.resolve(retainedPage(["other"]));
+      }
+      if (params.cursor === "same-cursor") {
+        return Promise.resolve(
+          retainedPage([], {
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: "same-cursor",
+          }),
+        );
+      }
+      return Promise.resolve(
+        retainedPage(["recent"], {
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "same-cursor",
+        }),
+      );
+    });
+
+    const { result, rerender } = renderHook(
+      ({ projectId }) =>
+        useExactEvalAttributeFields({
+          projectId,
+          rowType: "traces",
+          search: "",
+        }),
+      {
+        initialProps: { projectId: "project-synthetic" },
+        wrapper: createWrapper(),
+      },
+    );
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.queryReadState).toBe("degraded"));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.queryReadState).toBe("complete"));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.cursorRetryExhausted).toBe(true));
+
+    rerender({ projectId: "project-other" });
+    await waitFor(() => expect(result.current.data).toEqual(["spans.0.other"]));
+    rerender({ projectId: "project-synthetic" });
+
+    await waitFor(() =>
+      expect(result.current.cursorRetryExhausted).toBe(false),
+    );
+    expect(result.current.data).toEqual(["spans.0.recent"]);
+    expect(result.current.hasNextPage).toBe(true);
   });
 
   it("continues exact search to an older key and stops at the terminal page", async () => {
@@ -358,6 +457,9 @@ describe("useExactEvalAttributeFields", () => {
       { wrapper: createWrapper() },
     );
 
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    expect(result.current.data).toEqual(["recent_catalog"]);
+    await act(async () => result.current.fetchNextPage());
     await waitFor(() =>
       expect(result.current.data).toEqual([
         "recent_catalog",
@@ -379,21 +481,21 @@ describe("useExactEvalAttributeFields", () => {
     expect(mocks.get).toHaveBeenCalledTimes(completedRequestCount);
   });
 
-  it("does not advance the unrelated retained catalog after an exact key is found", async () => {
+  it("keeps exact-match siblings on later retained pages explicitly reachable", async () => {
     mocks.get.mockImplementation((_url, { params }) => {
       if (params.q) {
         return Promise.resolve(
-          retainedPage(["final_status"], {
+          retainedPage(["foo"], {
             lookup_mode: "exact",
             exact_match: true,
           }),
         );
       }
       if (params.cursor === "retained-page-2") {
-        return Promise.resolve(retainedPage(["unrelated_older_key"]));
+        return Promise.resolve(retainedPage(["foo.bar"]));
       }
       return Promise.resolve(
-        retainedPage(["recent_catalog"], {
+        retainedPage(["foo_archive"], {
           browse_status: "continuation",
           has_more: true,
           next_cursor: "retained-page-2",
@@ -406,23 +508,156 @@ describe("useExactEvalAttributeFields", () => {
         useExactEvalAttributeFields({
           projectId: "project-synthetic",
           rowType: "spans",
-          search: "final_status",
+          search: "foo",
         }),
       { wrapper: createWrapper() },
     );
 
     await waitFor(() =>
-      expect(result.current.data).toEqual(["recent_catalog", "final_status"]),
+      expect(result.current.data).toEqual(["foo_archive", "foo"]),
     );
-    expect(result.current.hasNextPage).toBe(false);
+    expect(result.current.hasNextPage).toBe(true);
     const completedRequestCount = mocks.get.mock.calls.length;
-    await act(async () => result.current.fetchNextPage());
-    expect(mocks.get).toHaveBeenCalledTimes(completedRequestCount);
     expect(
       mocks.get.mock.calls.some(
         ([, options]) => options.params.cursor === "retained-page-2",
       ),
     ).toBe(false);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() =>
+      expect(mocks.get).toHaveBeenCalledTimes(completedRequestCount + 1),
+    );
+    expect(
+      mocks.get.mock.calls.filter(
+        ([, options]) => options.params.cursor === "retained-page-2",
+      ),
+    ).toHaveLength(1);
+    expect(result.current.data).toEqual(["foo_archive", "foo.bar", "foo"]);
+    expect(result.current.hasNextPage).toBe(false);
+  });
+
+  it("keeps partial matches on retained page N reachable after exact absence", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (params.q) {
+        return Promise.resolve(
+          retainedPage([], {
+            lookup_mode: "exact",
+            exact_match: false,
+          }),
+        );
+      }
+      if (params.cursor === "retained-page-2") {
+        return Promise.resolve(retainedPage(["foo.bar"]));
+      }
+      return Promise.resolve(
+        retainedPage(["foo_archive"], {
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "retained-page-2",
+        }),
+      );
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactEvalAttributeFields({
+          projectId: "project-synthetic",
+          rowType: "spans",
+          search: "foo",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.data).toEqual(["foo_archive"]));
+    expect(result.current.hasNextPage).toBe(true);
+    expect(
+      mocks.get.mock.calls.some(
+        ([, options]) => options.params.cursor === "retained-page-2",
+      ),
+    ).toBe(false);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() =>
+      expect(result.current.data).toEqual(["foo_archive", "foo.bar"]),
+    );
+    expect(result.current.hasNextPage).toBe(false);
+  });
+
+  it("demotes a failed exact continuation and advances the retained cursor once", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (params.q && params.cursor === "exact-page-2") {
+        return Promise.reject(new Error("private exact lookup failure"));
+      }
+      if (params.q) {
+        return Promise.resolve(
+          retainedPage(["foo_exact_candidate"], {
+            lookup_mode: "exact",
+            exact_match: false,
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: "exact-page-2",
+          }),
+        );
+      }
+      if (params.cursor === "retained-page-2") {
+        return Promise.resolve(retainedPage(["foo.bar"]));
+      }
+      return Promise.resolve(
+        retainedPage(["foo_archive"], {
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "retained-page-2",
+        }),
+      );
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactEvalAttributeFields({
+          projectId: "project-synthetic",
+          rowType: "spans",
+          search: "foo",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() =>
+      expect(result.current.data).toEqual([
+        "foo_archive",
+        "foo_exact_candidate",
+      ]),
+    );
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() =>
+      expect(
+        mocks.get.mock.calls.filter(
+          ([, options]) => options.params.cursor === "exact-page-2",
+        ),
+      ).toHaveLength(1),
+    );
+    expect(result.current.data).toEqual(["foo_archive", "foo_exact_candidate"]);
+    expect(result.current.hasNextPage).toBe(true);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() =>
+      expect(result.current.data).toEqual([
+        "foo_archive",
+        "foo.bar",
+        "foo_exact_candidate",
+      ]),
+    );
+    expect(
+      mocks.get.mock.calls.filter(
+        ([, options]) => options.params.cursor === "exact-page-2",
+      ),
+    ).toHaveLength(1);
+    expect(
+      mocks.get.mock.calls.filter(
+        ([, options]) => options.params.cursor === "retained-page-2",
+      ),
+    ).toHaveLength(1);
   });
 
   it("reuses retained pages while exact search changes", async () => {

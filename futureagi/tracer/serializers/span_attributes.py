@@ -11,7 +11,8 @@ SPAN_ATTRIBUTE_KEY_TYPES = SPAN_ATTRIBUTE_TYPES
 
 
 class SpanAttributeProjectQuerySerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
+    project_id = serializers.UUIDField(required=False)
+    workspace_scope = serializers.BooleanField(required=False, default=False)
     discovery_mode = serializers.ChoiceField(
         choices=["filter", "eval_mapping"],
         required=False,
@@ -35,6 +36,16 @@ class SpanAttributeProjectQuerySerializer(serializers.Serializer):
     )
 
     def validate(self, attrs):
+        workspace_scope = attrs.get("workspace_scope", False)
+        has_project_id = attrs.get("project_id") is not None
+        if workspace_scope == has_project_id:
+            raise serializers.ValidationError(
+                "Provide exactly one of project_id or workspace_scope=true."
+            )
+        if workspace_scope and "page_size" not in attrs:
+            raise serializers.ValidationError(
+                {"page_size": "page_size is required with workspace_scope"}
+            )
         if attrs.get("cursor") and "page_size" not in attrs:
             raise serializers.ValidationError(
                 {"page_size": "page_size is required with cursor"}

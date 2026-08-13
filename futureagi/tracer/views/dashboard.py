@@ -1,7 +1,11 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from hashlib import blake2b
 from math import isfinite
 from numbers import Real
 from time import monotonic
@@ -10,6 +14,7 @@ from uuid import UUID
 
 import structlog
 from django.conf import settings
+from django.db import DatabaseError, connection, transaction
 from django.http import Http404
 from django.utils import timezone
 from rest_framework import serializers, status
@@ -50,6 +55,7 @@ from tracer.services.clickhouse.attribute_cursor_state import (
 )
 from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
+    ATTRIBUTE_READ_MAX_PROJECTS,
     AttributeReadSelector,
     InvalidAttributeKey,
 )
@@ -102,7 +108,10 @@ from tracer.services.dashboard_metrics_catalog import get_cached_metrics_catalog
 from tracer.services.exact_aggregation_cache import (
     read_or_schedule_exact_snapshot,
 )
-from tracer.utils.workspace_scope import project_queryset_for_request
+from tracer.utils.workspace_scope import (
+    project_queryset_for_request,
+    project_workspace_scope_q,
+)
 from tracer.views.span_attributes import (
     is_attribute_api_read_unavailable_error,
     retained_attribute_window_start,
@@ -234,11 +243,728 @@ _DASHBOARD_TRACE_READ_SETTINGS = {
 _DASHBOARD_TRACE_MAX_CONCURRENT_METRICS = 2
 _DASHBOARD_EXACT_QUERY_TIMEOUT_MS = 9_500
 
-# Begin this wall before project/cursor preparation and leave four seconds of
-# the public ten-second SLA for response construction, transport, and scheduler
-# jitter. Exhaustion returns an advancing cursor over the same unconsumed
-# interval, so the smaller wall changes latency/page density, never exactness.
-_FILTER_VALUES_INTERACTIVE_TIMEOUT_MS = 6_000
+# Property/value pickers have a stricter five-second interaction contract than
+# the general analytics surface. Begin the request-owned wall before project
+# and cursor preparation, leaving one second for response construction and
+# transport. Exhaustion returns an advancing cursor over the same unconsumed
+# interval, so the smaller wall changes page density, never exactness or
+# retained-history reachability.
+_FILTER_VALUES_INTERACTIVE_TIMEOUT_MS = 4_000
+_FILTER_VALUE_BATCH_CURSOR_RESOURCE = "dashboard_filter_value_project_batches"
+_FILTER_VALUE_BATCH_CURSOR_MARKER = "project_batches_v1"
+_FILTER_VALUE_RETAINED_START = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _run_filter_value_pg_read(deadline, read):
+    """Materialize one picker metadata read inside the request-owned wall.
+
+    The process-wide middleware allows PostgreSQL statements to run for thirty
+    seconds, which is longer than the entire property-picker interaction SLA.
+    Each authoritative ORM phase therefore consumes the same four-second wall
+    as ClickHouse. The transaction is explicitly read-only and never retries;
+    expiry fails closed at the public boundary instead of publishing an empty
+    vocabulary.
+    """
+
+    timeout_ms = deadline.remaining_ms(_FILTER_VALUES_INTERACTIVE_TIMEOUT_MS)
+    if connection.vendor != "postgresql":
+        return read()
+    already_in_atomic_block = connection.in_atomic_block
+    try:
+        # A SELECT-only production qualifier and a normal request can both
+        # already own the outer transaction.  Opening another atomic block in
+        # that case emits SAVEPOINT/RELEASE statements and does not buy an
+        # additional timeout boundary, so run directly inside the proven outer
+        # transaction.  Only create a read-only transaction when this helper
+        # owns the boundary.
+        transaction_context = (
+            nullcontext() if already_in_atomic_block else transaction.atomic()
+        )
+        with transaction_context:
+            with connection.cursor() as cursor:
+                # A direct SELECT harness may already own a read-only outer
+                # transaction. PostgreSQL rejects SET TRANSACTION after a
+                # savepoint/prior statement, so only declare read-only when
+                # this helper owns the outer transaction.
+                if not already_in_atomic_block:
+                    cursor.execute("SET TRANSACTION READ ONLY")
+                cursor.execute(
+                    "SET LOCAL statement_timeout = %s",
+                    [f"{timeout_ms}ms"],
+                )
+            return read()
+    except DatabaseError as exc:
+        raise ReadDeadlineExceeded(
+            "Filter-value PostgreSQL read exceeded its request deadline"
+        ) from exc
+
+
+def _filter_value_digest(value: str) -> str:
+    """Match the exact string-value digest used by the CH value selectors."""
+
+    return blake2b(str(value).encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _valid_filter_value_project_ids(raw_project_ids) -> tuple[str, ...]:
+    """Canonicalize request-owned project ids without consulting tenancy data."""
+
+    valid: set[str] = set()
+    for raw_project_id in raw_project_ids or ():
+        try:
+            valid.add(str(UUID(str(raw_project_id))))
+        except (AttributeError, TypeError, ValueError):
+            # Preserve the historical endpoint behavior: malformed and foreign
+            # ids contribute no data. They also must not become a physical
+            # project boundary in a signed continuation.
+            continue
+    return tuple(sorted(valid))
+
+
+def _bounded_authorized_filter_value_projects(
+    request,
+    project_ids: tuple[str, ...],
+    *,
+    deadline,
+) -> tuple[str, ...]:
+    """Authorize at most one selector-sized project batch under the request wall."""
+
+    if len(project_ids) > ATTRIBUTE_READ_MAX_PROJECTS:
+        raise ValueError("filter-value project authorization batch is too large")
+    if not project_ids:
+        return ()
+    rows = _run_filter_value_pg_read(
+        deadline,
+        lambda: list(
+            project_queryset_for_request(request)
+            .filter(id__in=project_ids)
+            .order_by("id")
+            .values_list("id", flat=True)[: ATTRIBUTE_READ_MAX_PROJECTS + 1]
+        ),
+    )
+    return tuple(str(project_id) for project_id in rows)
+
+
+@dataclass(frozen=True)
+class _FilterValueProjectScope:
+    """One authorized physical project batch and its resumable logical scope."""
+
+    mode: str
+    requested_project_ids: tuple[str, ...]
+    project_ids: tuple[str, ...] = ()
+    batch_end_project_id: str = ""
+    explicit_scan_offset: int = 0
+    has_later_projects: bool = False
+
+    @property
+    def batched(self) -> bool:
+        return self.mode != "fixed"
+
+    def cursor_identity(self) -> dict:
+        return {
+            "mode": self.mode,
+            **(
+                {"requested_project_ids": self.requested_project_ids}
+                if self.mode == "explicit"
+                else {}
+            ),
+        }
+
+
+def _next_filter_value_project_batch(
+    request,
+    scope: _FilterValueProjectScope,
+    *,
+    deadline,
+) -> _FilterValueProjectScope:
+    """Resolve one bounded next batch without materializing a workspace scope."""
+
+    if scope.mode == "workspace":
+        projects = project_queryset_for_request(request).order_by("id")
+        if scope.batch_end_project_id:
+            projects = projects.filter(id__gt=scope.batch_end_project_id)
+        rows = _run_filter_value_pg_read(
+            deadline,
+            lambda: list(
+                projects.values_list("id", flat=True)[: ATTRIBUTE_READ_MAX_PROJECTS + 1]
+            ),
+        )
+        project_ids = tuple(
+            str(project_id) for project_id in rows[:ATTRIBUTE_READ_MAX_PROJECTS]
+        )
+        return replace(
+            scope,
+            project_ids=project_ids,
+            batch_end_project_id=(
+                project_ids[-1] if project_ids else scope.batch_end_project_id
+            ),
+            has_later_projects=len(rows) > ATTRIBUTE_READ_MAX_PROJECTS,
+        )
+
+    if scope.mode != "explicit":
+        return scope
+
+    offset = int(scope.explicit_scan_offset)
+    candidates = scope.requested_project_ids
+    # Process exactly one finite candidate chunk per gesture. A foreign-heavy
+    # explicit list must not issue O(N/64) PostgreSQL statements while trying
+    # to fill one authorized batch; an empty authorized chunk is itself signed
+    # progress and the next gesture resumes at this candidate offset.
+    candidate_chunk = candidates[offset : offset + ATTRIBUTE_READ_MAX_PROJECTS]
+    offset += len(candidate_chunk)
+    authorized = _bounded_authorized_filter_value_projects(
+        request,
+        candidate_chunk,
+        deadline=deadline,
+    )
+    project_ids = tuple(authorized)
+    return replace(
+        scope,
+        project_ids=project_ids,
+        batch_end_project_id=(
+            project_ids[-1] if project_ids else scope.batch_end_project_id
+        ),
+        explicit_scan_offset=offset,
+        has_later_projects=offset < len(candidates),
+    )
+
+
+def _prepare_filter_value_project_scope(
+    request,
+    raw_project_ids,
+    *,
+    deadline,
+    cursor_token: str | None,
+) -> _FilterValueProjectScope:
+    """Choose the compatibility or bounded-batch project-scope contract."""
+
+    requested = _valid_filter_value_project_ids(raw_project_ids)
+    if raw_project_ids:
+        if len(requested) <= ATTRIBUTE_READ_MAX_PROJECTS:
+            authorized = _bounded_authorized_filter_value_projects(
+                request,
+                requested,
+                deadline=deadline,
+            )
+            return _FilterValueProjectScope(
+                mode="fixed",
+                requested_project_ids=requested,
+                project_ids=authorized,
+                batch_end_project_id=authorized[-1] if authorized else "",
+            )
+        scope = _FilterValueProjectScope(
+            mode="explicit",
+            requested_project_ids=requested,
+            has_later_projects=True,
+        )
+    else:
+        scope = _FilterValueProjectScope(
+            mode="workspace",
+            requested_project_ids=(),
+            has_later_projects=True,
+        )
+    # A resumed batch cursor carries (and re-authorizes) its own finite batch.
+    # Avoid querying the first workspace page merely to throw it away.
+    if cursor_token:
+        return scope
+    return _next_filter_value_project_batch(request, scope, deadline=deadline)
+
+
+def _reauthorize_filter_value_cursor_batch(
+    request,
+    project_ids: tuple[str, ...],
+    *,
+    deadline,
+) -> None:
+    authorized = _bounded_authorized_filter_value_projects(
+        request,
+        project_ids,
+        deadline=deadline,
+    )
+    if authorized != project_ids:
+        raise ListCursorError(
+            "cursor_mismatch",
+            "The continuation cursor no longer matches this workspace.",
+        )
+
+
+@dataclass(frozen=True)
+class _BatchedFilterValueCursor:
+    scope: _FilterValueProjectScope
+    cursor_scope: dict
+    cursor_query: dict
+    cursor_state: object | None
+    physical_order: tuple
+    seen_reference: tuple
+    new_project_batch: bool
+
+
+def _batched_filter_value_cursor(
+    request,
+    scope: _FilterValueProjectScope,
+    *,
+    deadline,
+    cursor_token: str | None,
+    page_size: int,
+    lane: str,
+    query: dict,
+) -> _BatchedFilterValueCursor:
+    """Decode one tenant-bound cursor and re-authorize its finite project batch."""
+
+    cursor_scope = cursor_scope_for_request(request, project_ids=[])
+    cursor_query = {
+        **query,
+        "project_scope": scope.cursor_identity(),
+    }
+    if not cursor_token:
+        return _BatchedFilterValueCursor(
+            scope,
+            cursor_scope,
+            cursor_query,
+            None,
+            (),
+            (),
+            True,
+        )
+
+    cursor_state = decode_list_cursor(
+        cursor_token,
+        resource=_FILTER_VALUE_BATCH_CURSOR_RESOURCE,
+        scope=cursor_scope,
+        query=cursor_query,
+        page_size=page_size,
+    )
+    if len(cursor_state.order) != 8:
+        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+    (
+        marker,
+        batch_end_project_id,
+        raw_project_ids,
+        has_later_projects,
+        explicit_scan_offset,
+        stored_lane,
+        physical_order,
+        seen_reference,
+    ) = cursor_state.order
+    if (
+        marker != _FILTER_VALUE_BATCH_CURSOR_MARKER
+        or stored_lane != lane
+        or not isinstance(batch_end_project_id, str)
+        or not isinstance(raw_project_ids, tuple)
+        or len(raw_project_ids) > ATTRIBUTE_READ_MAX_PROJECTS
+        or tuple(sorted(set(raw_project_ids))) != raw_project_ids
+        or any(not isinstance(project_id, str) for project_id in raw_project_ids)
+        or not isinstance(has_later_projects, bool)
+        or not isinstance(explicit_scan_offset, int)
+        or explicit_scan_offset < 0
+        or not isinstance(physical_order, tuple)
+        or not isinstance(seen_reference, tuple)
+        or (
+            scope.mode == "explicit"
+            and explicit_scan_offset > len(scope.requested_project_ids)
+        )
+        or (scope.mode == "workspace" and explicit_scan_offset != 0)
+        or (raw_project_ids and batch_end_project_id != raw_project_ids[-1])
+        or (
+            scope.mode == "explicit"
+            and any(
+                project_id
+                not in scope.requested_project_ids[
+                    max(
+                        0, explicit_scan_offset - ATTRIBUTE_READ_MAX_PROJECTS
+                    ) : explicit_scan_offset
+                ]
+                for project_id in raw_project_ids
+            )
+        )
+        or (not raw_project_ids and not has_later_projects)
+    ):
+        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+
+    resumed_scope = replace(
+        scope,
+        project_ids=raw_project_ids,
+        batch_end_project_id=batch_end_project_id,
+        explicit_scan_offset=explicit_scan_offset,
+        has_later_projects=has_later_projects,
+    )
+    new_project_batch = not raw_project_ids
+    if raw_project_ids:
+        _reauthorize_filter_value_cursor_batch(
+            request,
+            raw_project_ids,
+            deadline=deadline,
+        )
+    else:
+        resumed_scope = _next_filter_value_project_batch(
+            request,
+            resumed_scope,
+            deadline=deadline,
+        )
+    return _BatchedFilterValueCursor(
+        resumed_scope,
+        cursor_scope,
+        cursor_query,
+        cursor_state,
+        physical_order,
+        seen_reference,
+        new_project_batch,
+    )
+
+
+def _load_batched_filter_value_seen_state(
+    cursor: _BatchedFilterValueCursor,
+    *,
+    page_size: int,
+    window_start: datetime,
+    window_end: datetime,
+):
+    binding = {
+        "scope": cursor.cursor_scope,
+        "query": cursor.cursor_query,
+        "page_size": page_size,
+        "window_start": window_start,
+        "window_end": window_end,
+    }
+    seen_state = load_attribute_cursor_seen_state(
+        cursor.seen_reference,
+        resource=_FILTER_VALUE_BATCH_CURSOR_RESOURCE,
+        binding=binding,
+        validate_digest=lambda value: (
+            len(value) == 32
+            and all(character in "0123456789abcdef" for character in value)
+        ),
+    )
+    if cursor.cursor_state is not None and (
+        cursor.cursor_state.seen_rows != seen_state.seen_count
+    ):
+        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+    return seen_state, binding
+
+
+def _encode_batched_filter_value_cursor(
+    cursor: _BatchedFilterValueCursor,
+    *,
+    page_size: int,
+    window_start: datetime,
+    window_end: datetime,
+    seen_state,
+    state_binding: dict,
+    appended_digests,
+    lane: str,
+    physical_order: tuple,
+    physical_has_more: bool,
+) -> tuple[bool, str, str | None]:
+    """Persist global de-duplication and encode the next physical/batch step."""
+
+    advance_project_batch = not physical_has_more and cursor.scope.has_later_projects
+    has_more = physical_has_more or advance_project_batch
+    if not has_more:
+        return False, "exhausted", None
+    appended = tuple(appended_digests)
+    seen_reference = persist_attribute_cursor_seen_state(
+        seen_state,
+        appended,
+        resource=_FILTER_VALUE_BATCH_CURSOR_RESOURCE,
+        binding=state_binding,
+        validate_digest=lambda value: (
+            len(value) == 32
+            and all(character in "0123456789abcdef" for character in value)
+        ),
+    )
+    next_order = (
+        _FILTER_VALUE_BATCH_CURSOR_MARKER,
+        cursor.scope.batch_end_project_id,
+        () if advance_project_batch else cursor.scope.project_ids,
+        cursor.scope.has_later_projects,
+        cursor.scope.explicit_scan_offset,
+        lane,
+        physical_order,
+        seen_reference,
+    )
+    next_cursor = encode_list_cursor(
+        resource=_FILTER_VALUE_BATCH_CURSOR_RESOURCE,
+        scope=cursor.cursor_scope,
+        query=cursor.cursor_query,
+        page_size=page_size,
+        window_start=window_start,
+        window_end=window_end,
+        order=next_order,
+        seen_rows=seen_state.seen_count + len(appended),
+    )
+    return True, "continuation", next_cursor
+
+
+def _empty_batched_filter_value_payload(
+    cursor: _BatchedFilterValueCursor,
+    *,
+    page_size: int,
+    lane: str,
+    window_start: datetime,
+    window_end: datetime,
+    extra: dict | None = None,
+) -> dict:
+    """Return an exact no-read batch transition or a terminal empty result."""
+
+    seen_state, state_binding = _load_batched_filter_value_seen_state(
+        cursor,
+        page_size=page_size,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    has_more, browse_status, next_cursor = _encode_batched_filter_value_cursor(
+        cursor,
+        page_size=page_size,
+        window_start=window_start,
+        window_end=window_end,
+        seen_state=seen_state,
+        state_binding=state_binding,
+        appended_digests=(),
+        lane=lane,
+        physical_order=(),
+        physical_has_more=False,
+    )
+    return {
+        "values": [],
+        "query_complete": True,
+        "query_status": "complete",
+        "query_window_start": window_start,
+        "query_window_end": window_end,
+        "has_more": has_more,
+        "browse_status": browse_status,
+        "next_cursor": next_cursor,
+        **(extra or {}),
+    }
+
+
+def _batched_configured_filter_value_page(
+    cursor: _BatchedFilterValueCursor,
+    *,
+    page_size: int,
+    lane: str,
+    window_start: datetime,
+    window_end: datetime,
+    values: list[dict],
+    search: str,
+) -> dict:
+    """Page one stable configured vocabulary after batched target authorization."""
+
+    filtered_values = _filter_value_options_for_search(values, search)
+    physical_order = cursor.physical_order
+    if cursor.new_project_batch:
+        offset = 0
+    elif (
+        len(physical_order) != 1
+        or not isinstance(physical_order[0], int)
+        or physical_order[0] < 0
+        or physical_order[0] > len(filtered_values)
+    ):
+        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+    else:
+        offset = physical_order[0]
+    page_values = filtered_values[offset : offset + page_size]
+    next_offset = offset + len(page_values)
+    physical_has_more = next_offset < len(filtered_values)
+    # Once any authorized config for this exact template has been found, every
+    # option comes from that one stable template. Scanning later projects would
+    # only rediscover the same vocabulary, so terminate the project walk after
+    # the configured ordinal page finishes.
+    found_cursor = replace(
+        cursor,
+        scope=replace(cursor.scope, has_later_projects=False),
+    )
+    seen_state, state_binding = _load_batched_filter_value_seen_state(
+        found_cursor,
+        page_size=page_size,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    has_more, browse_status, next_cursor = _encode_batched_filter_value_cursor(
+        found_cursor,
+        page_size=page_size,
+        window_start=window_start,
+        window_end=window_end,
+        seen_state=seen_state,
+        state_binding=state_binding,
+        appended_digests=(),
+        lane=lane,
+        physical_order=(next_offset,),
+        physical_has_more=physical_has_more,
+    )
+    return {
+        "values": page_values,
+        "query_complete": True,
+        "query_status": "complete",
+        "has_more": has_more,
+        "browse_status": browse_status,
+        "next_cursor": next_cursor,
+    }
+
+
+def _legacy_filter_value_scope_metadata(
+    payload: dict,
+    scope: _FilterValueProjectScope,
+) -> dict:
+    """Label a no-cursor first-batch response truthfully when scope remains."""
+
+    if not scope.has_later_projects:
+        return payload
+    return {
+        **payload,
+        "query_complete": False,
+        "query_status": "sampled",
+        "query_error_code": "sample_limit",
+        "has_more": False,
+        "browse_status": "limit_reached",
+        "next_cursor": None,
+    }
+
+
+def _filter_value_options_for_search(values, search):
+    """Apply one Unicode-aware, case-insensitive picker search on the server."""
+
+    needle = str(search or "").strip().casefold()
+    if not needle:
+        return list(values)
+    searchable_fields = ("value", "label", "name", "email", "description")
+    return [
+        option
+        for option in values
+        if any(
+            needle
+            in str("" if option.get(field) is None else option.get(field)).casefold()
+            for field in searchable_fields
+        )
+    ]
+
+
+def _configured_filter_value_identity(value):
+    """Return a stable, type-aware identity for an arbitrary JSON value."""
+
+    return (
+        type(value).__name__,
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ),
+    )
+
+
+def _append_configured_filter_value_option(options, seen, choice):
+    """Append one configured option without coercing its JSON value."""
+
+    raw_value = choice
+    raw_label = choice
+    if isinstance(choice, dict):
+        raw_value = choice.get("value")
+        if raw_value is None or raw_value == "":
+            raw_value = choice.get("label")
+        if raw_value is None or raw_value == "":
+            raw_value = choice.get("name")
+
+        raw_label = choice.get("label")
+        if raw_label is None or raw_label == "":
+            raw_label = choice.get("name")
+        if raw_label is None or raw_label == "":
+            raw_label = raw_value
+
+    if raw_value is None or raw_value == "":
+        return
+    identity = _configured_filter_value_identity(raw_value)
+    if identity in seen:
+        return
+    seen.add(identity)
+    options.append({"value": raw_value, "label": str(raw_label)})
+
+
+def _finite_filter_value_cursor_page(
+    request,
+    *,
+    project_ids,
+    query,
+    values,
+    search,
+    page_size,
+    cursor_token,
+    query_complete=True,
+):
+    """Return an exact signed ordinal page over a finite server-held vocabulary.
+
+    The full finite vocabulary is bound into the cursor query identity.  This
+    helper must never receive a changing database sample: ordinal continuation
+    is safe only for configuration/static values with a stable order.
+    """
+
+    filtered_values = _filter_value_options_for_search(values, search)
+    cursor_scope = cursor_scope_for_request(request, project_ids=project_ids)
+    cursor_query = {
+        **query,
+        "search": search,
+        "content_identity": list(values),
+    }
+    cursor_resource = "dashboard_configured_filter_values"
+    if cursor_token:
+        cursor_state = decode_list_cursor(
+            cursor_token,
+            resource=cursor_resource,
+            scope=cursor_scope,
+            query=cursor_query,
+            page_size=page_size,
+        )
+        if (
+            len(cursor_state.order) != 1
+            or not isinstance(cursor_state.order[0], int)
+            or cursor_state.order[0] < 0
+            or cursor_state.order[0] > len(filtered_values)
+        ):
+            raise ListCursorError(
+                "invalid_cursor",
+                "The continuation cursor is invalid.",
+            )
+        offset = cursor_state.order[0]
+        window_start = cursor_state.window_start
+        window_end = cursor_state.window_end
+    else:
+        offset = 0
+        window_start = datetime(1970, 1, 1, tzinfo=UTC)
+        window_end = datetime.now(UTC)
+
+    page_values = filtered_values[offset : offset + page_size]
+    next_offset = offset + len(page_values)
+    has_more = next_offset < len(filtered_values)
+    next_cursor = None
+    if has_more:
+        next_cursor = encode_list_cursor(
+            resource=cursor_resource,
+            scope=cursor_scope,
+            query=cursor_query,
+            page_size=page_size,
+            window_start=window_start,
+            window_end=window_end,
+            order=(next_offset,),
+            seen_rows=next_offset,
+        )
+
+    payload = {
+        "values": page_values,
+        "query_complete": bool(query_complete),
+        "query_status": "complete" if query_complete else "sampled",
+        "has_more": has_more,
+        "browse_status": (
+            "continuation"
+            if has_more
+            else "exhausted"
+            if query_complete
+            else "limit_reached"
+        ),
+        "next_cursor": next_cursor,
+    }
+    if not query_complete:
+        payload["query_error_code"] = "sample_limit"
+    return payload
+
 
 # Public dashboard misses must return in the same wall budget as the rest of
 # the interactive analytics surface. The rollup route issues at most two
@@ -1543,6 +2269,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     request.query_params.get("agent_definition_id", "") or ""
                 ),
                 per_eval_config=(request.query_params.get("per_eval_config") == "true"),
+                include_custom_attributes=(
+                    request.query_params.get("exclude_custom_attributes") != "true"
+                ),
             )
 
             # --- Optional server-side filtering & pagination ---
@@ -1919,7 +2648,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         metric_name = query_params["metric_name"]
         metric_type = query_params["metric_type"]
         source = query_params["source"]
-        project_ids = query_params.get("project_ids", [])
+        raw_project_ids = query_params.get("project_ids", [])
         search = query_params.get("search", "").strip()
 
         # Route by source
@@ -1937,24 +2666,32 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         if source == "simulation":
             return self._filter_values_simulation(request, metric_name, metric_type)
 
-        system_filter_value_deadline = (
-            ReadDeadline.start(_FILTER_VALUES_INTERACTIVE_TIMEOUT_MS)
-            if metric_type == "system_metric"
-            else None
+        # One wall owns every PG/CH phase, including project authorization and
+        # post-query label hydration. Starting only inside the system selector
+        # let a slow metadata read consume the five-second interaction contract
+        # before the bounded ClickHouse statement even began.
+        filter_value_deadline = ReadDeadline.start(
+            _FILTER_VALUES_INTERACTIVE_TIMEOUT_MS
         )
 
-        # Traces source (default)
-        # Validate project_ids belong to this workspace
-        workspace_project_ids = {
-            str(pid)
-            for pid in project_queryset_for_request(request).values_list(
-                "id", flat=True
+        # Traces source (default). A fixed explicit scope keeps the existing
+        # cursor contract. Workspace and large explicit scopes resolve only one
+        # authorized selector-sized batch per physical request.
+        try:
+            project_scope = _prepare_filter_value_project_scope(
+                request,
+                raw_project_ids,
+                deadline=filter_value_deadline,
+                cursor_token=query_params.get("cursor"),
             )
-        }
-        if project_ids:
-            project_ids = [pid for pid in project_ids if pid in workspace_project_ids]
-        else:
-            project_ids = list(workspace_project_ids)
+        except ReadDeadlineExceeded:
+            logger.warning("filter_values_project_scope_deadline_exceeded")
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Filter values are temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        project_ids = list(project_scope.project_ids)
 
         try:
             if metric_type == "annotation_metric" and metric_name == "annotator":
@@ -1967,16 +2704,205 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 # this read to their denormalized tracer project key: the
                 # legacy CDC score table and direct-write CH25 spans are not
                 # co-located and cannot be joined safely after cutover.
-                annotator_ids = (
-                    AnnotationLabelScoresProjectPG().annotator_ids_for_projects(
-                        project_ids
+                page_size = query_params.get("page_size")
+                cursor_token = query_params.get("cursor")
+                source_reader = AnnotationLabelScoresProjectPG()
+                if not project_ids and not project_scope.batched:
+                    if page_size is None:
+                        return self._gm.success_response({"values": []})
+                    return self._gm.success_response(
+                        {
+                            "values": [],
+                            "query_complete": True,
+                            "query_status": "complete",
+                            "has_more": False,
+                            "browse_status": "exhausted",
+                            "next_cursor": None,
+                        }
                     )
-                )
-                users = (
-                    User.objects.filter(id__in=annotator_ids)
-                    .values("id", "name", "email")
-                    .order_by("name", "email")
-                )
+                if not project_ids and page_size is None:
+                    return self._gm.success_response(
+                        _legacy_filter_value_scope_metadata(
+                            {"values": []},
+                            project_scope,
+                        )
+                    )
+                if page_size is not None:
+                    page_size = int(page_size)
+                    if project_scope.batched:
+                        batch_lane = "annotation_annotators"
+                        batched_cursor = _batched_filter_value_cursor(
+                            request,
+                            project_scope,
+                            deadline=filter_value_deadline,
+                            cursor_token=cursor_token,
+                            page_size=page_size,
+                            lane=batch_lane,
+                            query={
+                                "metric_name": metric_name,
+                                "metric_type": metric_type,
+                                "source": source,
+                                "search": search,
+                            },
+                        )
+                        project_scope = batched_cursor.scope
+                        project_ids = list(project_scope.project_ids)
+                        cursor_state = batched_cursor.cursor_state
+                        window_start = (
+                            cursor_state.window_start
+                            if cursor_state is not None
+                            else _FILTER_VALUE_RETAINED_START
+                        )
+                        window_end = (
+                            cursor_state.window_end
+                            if cursor_state is not None
+                            else datetime.now(UTC)
+                        )
+                        if not project_ids:
+                            return self._gm.success_response(
+                                _empty_batched_filter_value_payload(
+                                    batched_cursor,
+                                    page_size=page_size,
+                                    lane=batch_lane,
+                                    window_start=window_start,
+                                    window_end=window_end,
+                                )
+                            )
+                        physical_order = batched_cursor.physical_order
+                        if batched_cursor.new_project_batch:
+                            annotator_after = None
+                        elif len(physical_order) != 1 or not isinstance(
+                            physical_order[0], str
+                        ):
+                            raise ListCursorError(
+                                "invalid_cursor",
+                                "The continuation cursor is invalid.",
+                            )
+                        else:
+                            try:
+                                annotator_after = (
+                                    UUID(physical_order[0])
+                                    if physical_order[0]
+                                    else None
+                                )
+                            except (TypeError, ValueError) as exc:
+                                raise ListCursorError(
+                                    "invalid_cursor",
+                                    "The continuation cursor is invalid.",
+                                ) from exc
+                        seen_state, state_binding = (
+                            _load_batched_filter_value_seen_state(
+                                batched_cursor,
+                                page_size=page_size,
+                                window_start=window_start,
+                                window_end=window_end,
+                            )
+                        )
+                        physical_users, physical_has_more = _run_filter_value_pg_read(
+                            filter_value_deadline,
+                            lambda: source_reader.annotator_page_for_projects(
+                                project_ids,
+                                page_size=page_size,
+                                search=search,
+                                after_id=annotator_after,
+                            ),
+                        )
+                        users = [
+                            user
+                            for user in physical_users
+                            if not seen_state.contains(
+                                _filter_value_digest(str(user["id"]))
+                            )
+                        ]
+                        appended_digests = tuple(
+                            _filter_value_digest(str(user["id"])) for user in users
+                        )
+                        has_more, browse_status, next_cursor = (
+                            _encode_batched_filter_value_cursor(
+                                batched_cursor,
+                                page_size=page_size,
+                                window_start=window_start,
+                                window_end=window_end,
+                                seen_state=seen_state,
+                                state_binding=state_binding,
+                                appended_digests=appended_digests,
+                                lane=batch_lane,
+                                physical_order=(
+                                    str(physical_users[-1]["id"])
+                                    if physical_has_more and physical_users
+                                    else str(annotator_after or ""),
+                                ),
+                                physical_has_more=physical_has_more,
+                            )
+                        )
+                    else:
+                        cursor_scope = cursor_scope_for_request(
+                            request,
+                            project_ids=project_ids,
+                        )
+                        cursor_query = {
+                            "metric_name": metric_name,
+                            "metric_type": metric_type,
+                            "source": source,
+                            "project_ids": sorted(str(value) for value in project_ids),
+                            "search": search,
+                        }
+                        cursor_resource = "dashboard_annotation_annotators"
+                        if cursor_token:
+                            cursor_state = decode_list_cursor(
+                                cursor_token,
+                                resource=cursor_resource,
+                                scope=cursor_scope,
+                                query=cursor_query,
+                                page_size=page_size,
+                            )
+                            if len(cursor_state.order) != 1 or not isinstance(
+                                cursor_state.order[0], str
+                            ):
+                                raise ListCursorError(
+                                    "invalid_cursor",
+                                    "The continuation cursor is invalid.",
+                                )
+                            try:
+                                annotator_after = UUID(cursor_state.order[0])
+                            except (TypeError, ValueError) as exc:
+                                raise ListCursorError(
+                                    "invalid_cursor",
+                                    "The continuation cursor is invalid.",
+                                ) from exc
+                            window_start = cursor_state.window_start
+                            window_end = cursor_state.window_end
+                            seen_rows = cursor_state.seen_rows
+                        else:
+                            annotator_after = None
+                            window_start = _FILTER_VALUE_RETAINED_START
+                            window_end = datetime.now(UTC)
+                            seen_rows = 0
+
+                        users, has_more = _run_filter_value_pg_read(
+                            filter_value_deadline,
+                            lambda: source_reader.annotator_page_for_projects(
+                                project_ids,
+                                page_size=page_size,
+                                search=search,
+                                after_id=annotator_after,
+                            ),
+                        )
+                else:
+                    annotator_ids = _run_filter_value_pg_read(
+                        filter_value_deadline,
+                        lambda: source_reader.annotator_ids_for_projects(project_ids),
+                    )
+                    users = _run_filter_value_pg_read(
+                        filter_value_deadline,
+                        lambda: list(
+                            User.objects.filter(id__in=annotator_ids)
+                            .values("id", "name", "email")
+                            .order_by("name", "email")
+                        ),
+                    )
+                    has_more = False
+
                 values = []
                 for u in users:
                     user_id = str(u["id"])
@@ -1991,7 +2917,52 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     if name and email and email != name:
                         option["description"] = email
                     values.append(option)
-                return self._gm.success_response({"values": values})
+                if page_size is None:
+                    return self._gm.success_response(
+                        _legacy_filter_value_scope_metadata(
+                            {
+                                "values": _filter_value_options_for_search(
+                                    values, search
+                                ),
+                            },
+                            project_scope,
+                        )
+                    )
+
+                if project_scope.batched:
+                    return self._gm.success_response(
+                        {
+                            "values": values,
+                            "query_complete": True,
+                            "query_status": "complete",
+                            "has_more": has_more,
+                            "browse_status": browse_status,
+                            "next_cursor": next_cursor,
+                        }
+                    )
+
+                next_cursor = None
+                if has_more:
+                    next_cursor = encode_list_cursor(
+                        resource=cursor_resource,
+                        scope=cursor_scope,
+                        query=cursor_query,
+                        page_size=page_size,
+                        window_start=window_start,
+                        window_end=window_end,
+                        order=(str(users[-1]["id"]),),
+                        seen_rows=seen_rows + len(users),
+                    )
+                return self._gm.success_response(
+                    {
+                        "values": values,
+                        "query_complete": True,
+                        "query_status": "complete",
+                        "has_more": has_more,
+                        "browse_status": "continuation" if has_more else "exhausted",
+                        "next_cursor": next_cursor,
+                    }
+                )
 
             # Filter-value reads are backed exclusively by the direct-write
             # CH25 tables.  Using the legacy service here silently targets the
@@ -2000,6 +2971,24 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
             analytics = V2AnalyticsQueryService()
 
             if metric_type == "system_metric":
+                if not project_ids and not project_scope.batched:
+                    return self._gm.success_response(
+                        {
+                            "values": [],
+                            "query_complete": True,
+                            "query_status": "complete",
+                            "has_more": False,
+                            "browse_status": "exhausted",
+                            "next_cursor": None,
+                        }
+                    )
+                if not project_ids and query_params.get("page_size") is None:
+                    return self._gm.success_response(
+                        _legacy_filter_value_scope_metadata(
+                            {"values": []},
+                            project_scope,
+                        )
+                    )
                 enduser_string_cols = {
                     "user": "user_id",
                     "user_id": "user_id",
@@ -2007,31 +2996,40 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 }
 
                 def system_value_options(raw_values):
-                    if metric_name == "session" and source == "sessions":
+                    if metric_name == "session":
                         from tracer.services.clickhouse.v2.trace_session_dict_reader import (
                             resolve_session_fields,
                         )
 
-                        session_fields = resolve_session_fields(raw_values)
-                        return [
-                            {
+                        session_fields = resolve_session_fields(
+                            raw_values,
+                            project_ids=project_ids,
+                            deadline=filter_value_deadline,
+                        )
+                        options = []
+                        for value in raw_values:
+                            fields = session_fields.get(value, {})
+                            display_name = fields.get("display_name")
+                            external_id = fields.get("external_session_id")
+                            option = {
                                 "value": value,
-                                "label": str(
-                                    session_fields.get(value, {}).get("display_name")
-                                    or session_fields.get(value, {}).get(
-                                        "external_session_id"
-                                    )
-                                    or value
-                                ),
+                                "label": str(display_name or external_id or value),
                             }
-                            for value in raw_values
-                        ]
+                            if display_name and external_id:
+                                option["description"] = str(external_id)
+                            options.append(option)
+                        return options
                     if metric_name == "project":
                         name_map = dict(
-                            Project.objects.filter(
-                                id__in=project_ids,
-                                workspace=request.workspace,
-                            ).values_list("id", "name")
+                            _run_filter_value_pg_read(
+                                filter_value_deadline,
+                                lambda: list(
+                                    Project.objects.filter(
+                                        id__in=project_ids,
+                                        workspace=request.workspace,
+                                    ).values_list("id", "name")
+                                ),
+                            )
                         )
                         normalized_names = {
                             str(key): value for key, value in name_map.items()
@@ -2045,10 +3043,218 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         ]
                     return [{"value": value, "label": value} for value in raw_values]
 
+                label_backed_system_metric = metric_name in {"project", "session"}
+
+                def search_hydrated_system_options(options):
+                    return (
+                        _filter_value_options_for_search(options, search)
+                        if label_backed_system_metric
+                        else options
+                    )
+
+                # Session/project labels are hydrated after their raw ids are
+                # read. Searching the ids in CH would make a displayed-name
+                # match permanently unreachable.
+                storage_search = "" if label_backed_system_metric else search
+
                 page_size = query_params.get("page_size")
                 cursor_token = query_params.get("cursor")
                 if page_size is not None:
                     page_size = int(page_size)
+                    if project_scope.batched:
+                        batch_query = {
+                            "metric_name": metric_name,
+                            "metric_type": metric_type,
+                            "source": source,
+                            "search": search,
+                        }
+                        batch_lane = (
+                            "end_user"
+                            if metric_name in enduser_string_cols
+                            else "span_system"
+                        )
+                        batched_cursor = _batched_filter_value_cursor(
+                            request,
+                            project_scope,
+                            deadline=filter_value_deadline,
+                            cursor_token=cursor_token,
+                            page_size=page_size,
+                            lane=batch_lane,
+                            query=batch_query,
+                        )
+                        project_scope = batched_cursor.scope
+                        project_ids = list(project_scope.project_ids)
+                        cursor_state = batched_cursor.cursor_state
+                        window_start = (
+                            cursor_state.window_start
+                            if cursor_state is not None
+                            else _FILTER_VALUE_RETAINED_START
+                        )
+                        window_end = (
+                            cursor_state.window_end
+                            if cursor_state is not None
+                            else datetime.now(UTC)
+                        )
+                        if not project_ids:
+                            return self._gm.success_response(
+                                _empty_batched_filter_value_payload(
+                                    batched_cursor,
+                                    page_size=page_size,
+                                    lane=batch_lane,
+                                    window_start=window_start,
+                                    window_end=window_end,
+                                )
+                            )
+                        seen_state, state_binding = (
+                            _load_batched_filter_value_seen_state(
+                                batched_cursor,
+                                page_size=page_size,
+                                window_start=window_start,
+                                window_end=window_end,
+                            )
+                        )
+
+                        if metric_name in enduser_string_cols:
+                            physical_order = batched_cursor.physical_order
+                            if batched_cursor.new_project_batch:
+                                value_after = None
+                            elif len(physical_order) != 1 or not isinstance(
+                                physical_order[0], str
+                            ):
+                                raise ListCursorError(
+                                    "invalid_cursor",
+                                    "The continuation cursor is invalid.",
+                                )
+                            else:
+                                value_after = physical_order[0] or None
+                            page_read = read_end_user_filter_value_cursor_page(
+                                analytics,
+                                project_ids=project_ids,
+                                source_column=enduser_string_cols[metric_name],
+                                page_size=page_size,
+                                search=search,
+                                value_after=value_after,
+                                deadline=filter_value_deadline,
+                            )
+                            values = tuple(
+                                value
+                                for value in page_read.values
+                                if not seen_state.contains(_filter_value_digest(value))
+                            )
+                            appended_digests = tuple(
+                                _filter_value_digest(value) for value in values
+                            )
+                            has_more, browse_status, next_cursor = (
+                                _encode_batched_filter_value_cursor(
+                                    batched_cursor,
+                                    page_size=page_size,
+                                    window_start=window_start,
+                                    window_end=window_end,
+                                    seen_state=seen_state,
+                                    state_binding=state_binding,
+                                    appended_digests=appended_digests,
+                                    lane=batch_lane,
+                                    physical_order=(page_read.next_value_after or "",),
+                                    physical_has_more=page_read.has_more,
+                                )
+                            )
+                            return self._gm.success_response(
+                                {
+                                    "values": search_hydrated_system_options(
+                                        system_value_options(values)
+                                    ),
+                                    "query_complete": True,
+                                    "query_status": "complete",
+                                    "has_more": has_more,
+                                    "browse_status": browse_status,
+                                    "next_cursor": next_cursor,
+                                }
+                            )
+
+                        if metric_name not in SYSTEM_FILTER_VALUE_METRICS:
+                            return self._gm.success_response(
+                                {
+                                    "values": [],
+                                    "query_complete": True,
+                                    "query_status": "complete",
+                                    "has_more": False,
+                                    "browse_status": "exhausted",
+                                    "next_cursor": None,
+                                }
+                            )
+
+                        physical_order = batched_cursor.physical_order
+                        if batched_cursor.new_project_batch:
+                            segment_end = window_end
+                            segment_start = None
+                            value_after = None
+                        elif (
+                            len(physical_order) != 3
+                            or not isinstance(physical_order[0], datetime)
+                            or (
+                                physical_order[1] is not None
+                                and not isinstance(physical_order[1], datetime)
+                            )
+                            or not isinstance(physical_order[2], str)
+                        ):
+                            raise ListCursorError(
+                                "invalid_cursor",
+                                "The continuation cursor is invalid.",
+                            )
+                        else:
+                            segment_end = physical_order[0]
+                            segment_start = physical_order[1]
+                            value_after = physical_order[2] or None
+                        page_read = read_span_system_filter_value_cursor_page(
+                            analytics,
+                            project_ids=project_ids,
+                            metric_name=metric_name,
+                            page_size=page_size,
+                            window_start=window_start,
+                            window_end=window_end,
+                            search=storage_search,
+                            segment_end=segment_end,
+                            segment_start=segment_start,
+                            value_after=value_after,
+                            seen_value_digests=seen_state.digests,
+                            seen_value_contains=seen_state.contains,
+                            seen_value_count=seen_state.seen_count,
+                            deadline=filter_value_deadline,
+                        )
+                        appended_digests = (
+                            page_read.appended_value_digests
+                            or page_read.seen_value_digests[len(seen_state.digests) :]
+                        )
+                        has_more, browse_status, next_cursor = (
+                            _encode_batched_filter_value_cursor(
+                                batched_cursor,
+                                page_size=page_size,
+                                window_start=window_start,
+                                window_end=window_end,
+                                seen_state=seen_state,
+                                state_binding=state_binding,
+                                appended_digests=appended_digests,
+                                lane=batch_lane,
+                                physical_order=(
+                                    page_read.next_segment_end,
+                                    page_read.next_segment_start,
+                                    page_read.next_value_after or "",
+                                ),
+                                physical_has_more=page_read.has_more,
+                            )
+                        )
+                        return self._gm.success_response(
+                            {
+                                "values": search_hydrated_system_options(
+                                    system_value_options(page_read.values)
+                                ),
+                                **page_read.metadata(),
+                                "has_more": has_more,
+                                "browse_status": browse_status,
+                                "next_cursor": next_cursor,
+                            }
+                        )
+
                     cursor_scope = cursor_scope_for_request(
                         request,
                         project_ids=project_ids,
@@ -2061,7 +3267,6 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         "search": search,
                     }
                     cursor_resource = "dashboard_system_filter_values"
-
                     if metric_name in enduser_string_cols:
                         if cursor_token:
                             cursor_state = decode_list_cursor(
@@ -2094,6 +3299,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             page_size=page_size,
                             search=search,
                             value_after=value_after,
+                            deadline=filter_value_deadline,
                         )
                         next_cursor = None
                         if page_read.has_more:
@@ -2109,7 +3315,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             )
                         return self._gm.success_response(
                             {
-                                "values": system_value_options(page_read.values),
+                                "values": search_hydrated_system_options(
+                                    system_value_options(page_read.values)
+                                ),
                                 "query_complete": True,
                                 "query_status": "complete",
                                 "has_more": page_read.has_more,
@@ -2133,6 +3341,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     selector = AttributeReadSelector(
                         typed_only=True,
                         json_attribute_mode="arrays",
+                        wall_timeout_ms=filter_value_deadline.remaining_ms(
+                            ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS
+                        ),
                     )
                     if cursor_token:
                         cursor_state = decode_list_cursor(
@@ -2204,14 +3415,14 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         page_size=page_size,
                         window_start=window_start,
                         window_end=window_end,
-                        search=search,
+                        search=storage_search,
                         segment_end=segment_end,
                         segment_start=segment_start,
                         value_after=value_after,
                         seen_value_digests=seen_state.digests,
                         seen_value_contains=seen_state.contains,
                         seen_value_count=seen_state.seen_count,
-                        deadline=system_filter_value_deadline,
+                        deadline=filter_value_deadline,
                     )
                     next_cursor = None
                     if page_read.has_more:
@@ -2246,7 +3457,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         )
                     return self._gm.success_response(
                         {
-                            "values": system_value_options(page_read.values),
+                            "values": search_hydrated_system_options(
+                                system_value_options(page_read.values)
+                            ),
                             **page_read.metadata(),
                             "has_more": page_read.has_more,
                             "browse_status": page_read.browse_status,
@@ -2268,7 +3481,11 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             f"LIMIT 500"
                         )
                         result = analytics.execute_ch_query(
-                            sql, {"project_ids": project_ids}, timeout_ms=5000
+                            sql,
+                            {"project_ids": project_ids},
+                            timeout_ms=filter_value_deadline.remaining_ms(
+                                _FILTER_VALUES_INTERACTIVE_TIMEOUT_MS
+                            ),
                         )
                         values = [
                             {"value": row["val"], "label": row["val"]}
@@ -2296,7 +3513,12 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             "Filter values could not be loaded",
                             code="server_error",
                         )
-                    return self._gm.success_response({"values": values})
+                    return self._gm.success_response(
+                        _legacy_filter_value_scope_metadata(
+                            {"values": values},
+                            project_scope,
+                        )
+                    )
 
                 if metric_name not in SYSTEM_FILTER_VALUE_METRICS:
                     return self._gm.success_response({"values": []})
@@ -2306,6 +3528,12 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         analytics,
                         project_ids=project_ids,
                         metric_name=metric_name,
+                        # The legacy response has no continuation contract, so
+                        # it cannot exhaustively walk raw ids and then search
+                        # hydrated Project/Session labels. Preserve its bounded
+                        # raw-value search instead of filtering only the first
+                        # 20 unrelated ids. Cursor callers above own displayed-
+                        # label search.
                         search=search,
                         limit=20 if search else 500,
                         lookback_days=int(
@@ -2315,6 +3543,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 self.FILTER_VALUES_DEFAULT_LOOKBACK_DAYS,
                             )
                         ),
+                        deadline=filter_value_deadline,
                     )
                     values = list(value_read.values)
                 except Exception as exc:
@@ -2342,7 +3571,10 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
 
                 values = system_value_options(values)
                 return self._gm.success_response(
-                    {"values": values, **value_read.metadata()}
+                    _legacy_filter_value_scope_metadata(
+                        {"values": values, **value_read.metadata()},
+                        project_scope,
+                    )
                 )
 
             elif metric_type == "eval_metric":
@@ -2354,23 +3586,158 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 from django.core.exceptions import ValidationError
                 from django.db.models import Q
 
+                page_size = query_params.get("page_size")
+                cursor_token = query_params.get("cursor")
+                finite_query = {
+                    "metric_name": metric_name,
+                    "metric_type": metric_type,
+                    "source": source,
+                    **(
+                        {"project_scope": project_scope.cursor_identity()}
+                        if project_scope.batched
+                        else {
+                            "project_ids": sorted(str(value) for value in project_ids)
+                        }
+                    ),
+                }
+                finite_cursor_project_ids = [] if project_scope.batched else project_ids
+                batched_eval_cursor = None
+                batched_eval_lane = "configured_eval_template"
+                configured_window_start = _FILTER_VALUE_RETAINED_START
+                configured_window_end = datetime.now(UTC)
+
                 try:
-                    eval_config = (
-                        CustomEvalConfig.no_workspace_objects.filter(
-                            project_id__in=project_ids,
-                            project__workspace=request.workspace,
-                            project__organization=request.workspace.organization,
+
+                    def eval_config_queryset():
+                        return CustomEvalConfig.no_workspace_objects.filter(
+                            project_workspace_scope_q(request),
+                            project__deleted=False,
                             eval_template__deleted=False,
                         )
-                        .filter(Q(id=metric_name) | Q(eval_template_id=metric_name))
-                        .select_related("eval_template")
-                        .first()
+
+                    def read_eval_config():
+                        # Resolve the one requested config/template through its
+                        # project relation. This remains a constant-cardinality
+                        # indexed lookup even when the logical project scope is
+                        # a workspace with thousands of projects.
+                        config = (
+                            eval_config_queryset()
+                            .filter(id=metric_name)
+                            .select_related("eval_template")
+                            .first()
+                        )
+                        if config is None:
+                            return None
+                        if (
+                            project_scope.mode != "workspace"
+                            and str(config.project_id)
+                            not in project_scope.requested_project_ids
+                        ):
+                            return None
+                        return config
+
+                    eval_config = _run_filter_value_pg_read(
+                        filter_value_deadline,
+                        read_eval_config,
                     )
+                    if eval_config is None and project_scope.mode == "workspace":
+                        eval_config = _run_filter_value_pg_read(
+                            filter_value_deadline,
+                            lambda: (
+                                eval_config_queryset()
+                                .filter(eval_template_id=metric_name)
+                                .select_related("eval_template")
+                                .first()
+                            ),
+                        )
+                    elif eval_config is None and project_scope.mode == "fixed":
+                        eval_config = _run_filter_value_pg_read(
+                            filter_value_deadline,
+                            lambda: (
+                                eval_config_queryset()
+                                .filter(
+                                    eval_template_id=metric_name,
+                                    project_id__in=project_ids,
+                                )
+                                .select_related("eval_template")
+                                .first()
+                            ),
+                        )
+                    elif eval_config is None:
+                        batched_eval_cursor = _batched_filter_value_cursor(
+                            request,
+                            project_scope,
+                            deadline=filter_value_deadline,
+                            cursor_token=cursor_token,
+                            page_size=int(page_size or 1),
+                            lane=batched_eval_lane,
+                            query={
+                                "metric_name": metric_name,
+                                "metric_type": metric_type,
+                                "source": source,
+                                "search": search,
+                            },
+                        )
+                        project_scope = batched_eval_cursor.scope
+                        project_ids = list(project_scope.project_ids)
+                        cursor_state = batched_eval_cursor.cursor_state
+                        configured_window_start = (
+                            cursor_state.window_start
+                            if cursor_state is not None
+                            else _FILTER_VALUE_RETAINED_START
+                        )
+                        configured_window_end = (
+                            cursor_state.window_end
+                            if cursor_state is not None
+                            else configured_window_end
+                        )
+                        if project_ids:
+                            eval_config = _run_filter_value_pg_read(
+                                filter_value_deadline,
+                                lambda: (
+                                    eval_config_queryset()
+                                    .filter(
+                                        eval_template_id=metric_name,
+                                        project_id__in=project_ids,
+                                    )
+                                    .select_related("eval_template")
+                                    .first()
+                                ),
+                            )
                 except (TypeError, ValueError, ValidationError):
                     eval_config = None
 
                 if eval_config is None:
-                    return self._gm.success_response({"values": []})
+                    if batched_eval_cursor is not None:
+                        if page_size is None:
+                            return self._gm.success_response(
+                                _legacy_filter_value_scope_metadata(
+                                    {"values": []},
+                                    project_scope,
+                                )
+                            )
+                        return self._gm.success_response(
+                            _empty_batched_filter_value_payload(
+                                batched_eval_cursor,
+                                page_size=int(page_size),
+                                lane=batched_eval_lane,
+                                window_start=configured_window_start,
+                                window_end=configured_window_end,
+                            )
+                        )
+                    if page_size is None:
+                        return self._gm.success_response({"values": []})
+                    return self._gm.success_response(
+                        _finite_filter_value_cursor_page(
+                            request,
+                            project_ids=finite_cursor_project_ids,
+                            query=finite_query,
+                            values=[],
+                            search=search,
+                            page_size=int(page_size),
+                            cursor_token=cursor_token,
+                        )
+                    )
 
                 eval_template = eval_config.eval_template
                 template_config = eval_template.config or {}
@@ -2399,28 +3766,41 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     values = []
                     seen_values = set()
                     for choice in eval_template.choices or []:
-                        raw_value = choice
-                        raw_label = choice
-                        if isinstance(choice, dict):
-                            raw_value = (
-                                choice.get("value")
-                                or choice.get("label")
-                                or choice.get("name")
-                            )
-                            raw_label = (
-                                choice.get("label") or choice.get("name") or raw_value
-                            )
-                        if raw_value in (None, ""):
-                            continue
-                        value = str(raw_value)
-                        if value in seen_values:
-                            continue
-                        seen_values.add(value)
-                        values.append({"value": value, "label": str(raw_label)})
+                        _append_configured_filter_value_option(
+                            values,
+                            seen_values,
+                            choice,
+                        )
                 else:
                     # Score evals use numeric entry rather than a misleading
                     # categorical vocabulary.
                     values = []
+
+                if page_size is not None:
+                    if batched_eval_cursor is not None:
+                        return self._gm.success_response(
+                            _batched_configured_filter_value_page(
+                                batched_eval_cursor,
+                                page_size=int(page_size),
+                                lane=batched_eval_lane,
+                                window_start=configured_window_start,
+                                window_end=configured_window_end,
+                                values=values,
+                                search=search,
+                            )
+                        )
+                    return self._gm.success_response(
+                        _finite_filter_value_cursor_page(
+                            request,
+                            project_ids=finite_cursor_project_ids,
+                            query=finite_query,
+                            values=values,
+                            search=search,
+                            page_size=int(page_size),
+                            cursor_token=cursor_token,
+                        )
+                    )
+                values = _filter_value_options_for_search(values, search)
 
             elif metric_type == "annotation_metric":
                 # Annotation filter values are derived from the label
@@ -2434,57 +3814,109 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
 
                 from model_hub.models.develop_annotations import AnnotationsLabels
 
+                page_size = query_params.get("page_size")
+                cursor_token = query_params.get("cursor")
+                finite_query = {
+                    "metric_name": metric_name,
+                    "metric_type": metric_type,
+                    "source": source,
+                    **(
+                        {"project_scope": project_scope.cursor_identity()}
+                        if project_scope.batched
+                        else {
+                            "project_ids": sorted(str(value) for value in project_ids)
+                        }
+                    ),
+                }
+                finite_cursor_project_ids = [] if project_scope.batched else project_ids
+
                 try:
-                    label_queryset = AnnotationsLabels.no_workspace_objects.filter(
-                        pk=metric_name,
-                        organization=request.workspace.organization,
-                        deleted=False,
-                    ).filter(Q(workspace=request.workspace) | Q(workspace__isnull=True))
-                    if project_ids:
-                        label_queryset = label_queryset.filter(
-                            Q(project_id__in=project_ids) | Q(project__isnull=True)
+                    request_organization = getattr(request, "organization", None)
+                    if request_organization is None:
+                        request_organization = _run_filter_value_pg_read(
+                            filter_value_deadline,
+                            lambda: request.workspace.organization,
                         )
-                    else:
-                        label_queryset = label_queryset.filter(project__isnull=True)
-                    label = label_queryset.first()
+
+                    def read_annotation_label():
+                        label_queryset = AnnotationsLabels.no_workspace_objects.filter(
+                            pk=metric_name,
+                            organization=request_organization,
+                            deleted=False,
+                        ).filter(
+                            Q(workspace=request.workspace) | Q(workspace__isnull=True)
+                        )
+                        label_queryset = label_queryset.filter(
+                            Q(project__isnull=True)
+                            | (
+                                Q(project__deleted=False)
+                                & project_workspace_scope_q(request)
+                            )
+                        )
+                        label = label_queryset.first()
+                        if (
+                            label is not None
+                            and label.project_id is not None
+                            and project_scope.mode != "workspace"
+                            and str(label.project_id)
+                            not in project_scope.requested_project_ids
+                        ):
+                            return None
+                        return label
+
+                    label = _run_filter_value_pg_read(
+                        filter_value_deadline,
+                        read_annotation_label,
+                    )
                 except (TypeError, ValueError, ValidationError):
                     label = None
                 if label is None:
-                    return self._gm.success_response({"values": []})
+                    if page_size is None:
+                        return self._gm.success_response({"values": []})
+                    return self._gm.success_response(
+                        _finite_filter_value_cursor_page(
+                            request,
+                            project_ids=finite_cursor_project_ids,
+                            query=finite_query,
+                            values=[],
+                            search=search,
+                            page_size=int(page_size),
+                            cursor_token=cursor_token,
+                        )
+                    )
 
                 label_type = label.type
                 label_settings = label.settings or {}
 
-                def add_value_option(options, seen, raw_value, raw_label=None):
-                    if raw_value in (None, ""):
-                        return
-                    value = str(raw_value)
-                    if not value or value in seen:
-                        return
-                    seen.add(value)
-                    options.append(
-                        {
-                            "value": value,
-                            "label": str(raw_label or raw_value),
-                        }
-                    )
-
                 if label_type == "categorical":
                     values = []
-                    seen_values = set()
+                    configured_seen_values = set()
                     for opt in label_settings.get("options", []):
-                        if isinstance(opt, dict):
-                            option_value = (
-                                opt.get("value") or opt.get("label") or opt.get("name")
+                        _append_configured_filter_value_option(
+                            values,
+                            configured_seen_values,
+                            opt,
+                        )
+
+                    # The stored-Score vocabulary is a changing bounded sample,
+                    # not a snapshot. Never ordinal-page it: a Score write
+                    # between requests could otherwise move values around the
+                    # offset and cause a silent skip/repeat. Cursor callers get
+                    # every stable configured option plus explicit metadata that
+                    # historical stored-only discovery remains incomplete.
+                    if page_size is not None:
+                        return self._gm.success_response(
+                            _finite_filter_value_cursor_page(
+                                request,
+                                project_ids=finite_cursor_project_ids,
+                                query=finite_query,
+                                values=values,
+                                search=search,
+                                page_size=int(page_size),
+                                cursor_token=cursor_token,
+                                query_complete=False,
                             )
-                            option_label = (
-                                opt.get("label") or opt.get("name") or option_value
-                            )
-                            add_value_option(
-                                values, seen_values, option_value, option_label
-                            )
-                        else:
-                            add_value_option(values, seen_values, opt)
+                        )
 
                     # Stored categorical choices are read from authoritative
                     # Score rows via tracer_project_id.  This avoids a cross-
@@ -2495,11 +3927,26 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         AnnotationLabelScoresProjectPG,
                     )
 
-                    for (
-                        payload_value
-                    ) in AnnotationLabelScoresProjectPG().categorical_values_for_label(
-                        label.id, project_ids
-                    ):
+                    seen_stored_values = {str(option["value"]) for option in values}
+
+                    def add_stored_value_option(raw_value):
+                        if raw_value in (None, ""):
+                            return
+                        value = str(raw_value)
+                        if not value or value in seen_stored_values:
+                            return
+                        seen_stored_values.add(value)
+                        values.append({"value": value, "label": value})
+
+                    stored_values = _run_filter_value_pg_read(
+                        filter_value_deadline,
+                        lambda: (
+                            AnnotationLabelScoresProjectPG().categorical_values_for_label(
+                                label.id, project_ids
+                            )
+                        ),
+                    )
+                    for payload_value in stored_values:
                         try:
                             payload = json.loads(payload_value)
                         except (TypeError, ValueError):
@@ -2520,7 +3967,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         elif payload not in (None, ""):
                             raw_values.append(payload)
                         for raw_value in raw_values:
-                            add_value_option(values, seen_values, raw_value)
+                            add_stored_value_option(raw_value)
                 elif label_type == "star":
                     no_of_stars = label_settings.get("no_of_stars", 5)
                     values = [
@@ -2536,21 +3983,259 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     # text / numeric — no predefined values
                     values = []
 
+                if page_size is not None:
+                    return self._gm.success_response(
+                        _finite_filter_value_cursor_page(
+                            request,
+                            project_ids=finite_cursor_project_ids,
+                            query=finite_query,
+                            values=values,
+                            search=search,
+                            page_size=int(page_size),
+                            cursor_token=cursor_token,
+                        )
+                    )
+                values = _filter_value_options_for_search(values, search)
+                if label_type == "categorical":
+                    return self._gm.success_response(
+                        _legacy_filter_value_scope_metadata(
+                            {"values": values},
+                            project_scope,
+                        )
+                    )
+
             elif metric_type == "custom_attribute":
                 # metric_name is an exact key request. It must not depend on
                 # the bounded browse inventory, where any rare key can be
                 # outside the sample.
-                selector = AttributeReadSelector(
-                    typed_only=True,
-                    json_attribute_mode="arrays",
-                    wall_timeout_ms=ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS,
-                )
                 try:
                     page_size = query_params.get("page_size")
                     cursor_token = query_params.get("cursor")
                     attribute_type = query_params.get("attribute_type")
+                    if not project_ids and not project_scope.batched:
+                        return self._gm.success_response(
+                            {
+                                "values": [],
+                                "query_complete": True,
+                                "query_status": "complete",
+                                "has_more": False,
+                                "browse_status": "exhausted",
+                                "next_cursor": None,
+                                **(
+                                    {"attribute_type": attribute_type}
+                                    if attribute_type
+                                    else {}
+                                ),
+                            }
+                        )
+                    if not project_ids and page_size is None:
+                        return self._gm.success_response(
+                            _legacy_filter_value_scope_metadata(
+                                {"values": []},
+                                project_scope,
+                            )
+                        )
                     if page_size is not None:
                         page_size = int(page_size)
+                        if project_scope.batched:
+                            batch_lane = "custom_attribute"
+                            batched_cursor = _batched_filter_value_cursor(
+                                request,
+                                project_scope,
+                                deadline=filter_value_deadline,
+                                cursor_token=cursor_token,
+                                page_size=page_size,
+                                lane=batch_lane,
+                                query={
+                                    "metric_name": metric_name,
+                                    "metric_type": metric_type,
+                                    "source": source,
+                                    "search": search,
+                                    "attribute_type": attribute_type,
+                                },
+                            )
+                            project_scope = batched_cursor.scope
+                            project_ids = list(project_scope.project_ids)
+                            cursor_state = batched_cursor.cursor_state
+                            window_start = (
+                                cursor_state.window_start
+                                if cursor_state is not None
+                                else _FILTER_VALUE_RETAINED_START
+                            )
+                            window_end = (
+                                cursor_state.window_end
+                                if cursor_state is not None
+                                else datetime.now(UTC)
+                            )
+                            if not project_ids:
+                                return self._gm.success_response(
+                                    _empty_batched_filter_value_payload(
+                                        batched_cursor,
+                                        page_size=page_size,
+                                        lane=batch_lane,
+                                        window_start=window_start,
+                                        window_end=window_end,
+                                        extra=(
+                                            {"attribute_type": attribute_type}
+                                            if attribute_type
+                                            else None
+                                        ),
+                                    )
+                                )
+                            physical_order = batched_cursor.physical_order
+                            if batched_cursor.new_project_batch:
+                                segment_end = window_end
+                                before_identity = None
+                                resume_identity = None
+                                resume_member_offset = 0
+                                segment_start = None
+                            elif len(physical_order) != 5:
+                                raise ListCursorError(
+                                    "invalid_cursor",
+                                    "The continuation cursor is invalid.",
+                                )
+                            else:
+                                (
+                                    segment_end,
+                                    raw_before_identity,
+                                    raw_resume_identity,
+                                    resume_member_offset,
+                                    segment_start,
+                                ) = physical_order
+                                if (
+                                    not isinstance(segment_end, datetime)
+                                    or not isinstance(raw_before_identity, tuple)
+                                    or len(raw_before_identity) not in {0, 4}
+                                    or not isinstance(raw_resume_identity, tuple)
+                                    or len(raw_resume_identity) not in {0, 4}
+                                    or (raw_before_identity and raw_resume_identity)
+                                    or not isinstance(resume_member_offset, int)
+                                    or resume_member_offset < 0
+                                    or (
+                                        segment_start is not None
+                                        and not isinstance(segment_start, datetime)
+                                    )
+                                ):
+                                    raise ListCursorError(
+                                        "invalid_cursor",
+                                        "The continuation cursor is invalid.",
+                                    )
+                                before_identity = raw_before_identity or None
+                                resume_identity = raw_resume_identity or None
+                                for identity in (
+                                    before_identity,
+                                    resume_identity,
+                                ):
+                                    if identity is not None and (
+                                        not all(
+                                            isinstance(value, str)
+                                            for value in identity[:3]
+                                        )
+                                        or not isinstance(identity[3], datetime)
+                                    ):
+                                        raise ListCursorError(
+                                            "invalid_cursor",
+                                            "The continuation cursor is invalid.",
+                                        )
+
+                            seen_state, state_binding = (
+                                _load_batched_filter_value_seen_state(
+                                    batched_cursor,
+                                    page_size=page_size,
+                                    window_start=window_start,
+                                    window_end=window_end,
+                                )
+                            )
+                            selector = AttributeReadSelector(
+                                typed_only=True,
+                                json_attribute_mode="arrays",
+                                wall_timeout_ms=filter_value_deadline.remaining_ms(
+                                    ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS
+                                ),
+                            )
+                            page_read = selector.read_value_cursor_page(
+                                project_ids,
+                                metric_name,
+                                page_size=page_size,
+                                window_start=window_start,
+                                window_end=window_end,
+                                segment_end=segment_end,
+                                segment_start=segment_start,
+                                before_identity=before_identity,
+                                resume_identity=resume_identity,
+                                resume_member_offset=resume_member_offset,
+                                seen_value_digests=seen_state.digests,
+                                seen_value_contains=seen_state.contains,
+                                seen_value_count=seen_state.seen_count,
+                                search=search,
+                                attribute_type=attribute_type,
+                            )
+                            if not page_read.metadata.query_complete:
+                                logger.warning(
+                                    "filter_value_cursor_incomplete",
+                                    metric_name=metric_name,
+                                    error_code=(page_read.metadata.query_error_code),
+                                )
+                                return self._gm.custom_error_response(
+                                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                                    "Filter values are temporarily unavailable. Please retry.",
+                                    code="service_unavailable",
+                                )
+                            appended_digests = (
+                                page_read.appended_value_digests
+                                or page_read.seen_value_digests[
+                                    len(seen_state.digests) :
+                                ]
+                            )
+                            has_more, browse_status, next_cursor = (
+                                _encode_batched_filter_value_cursor(
+                                    batched_cursor,
+                                    page_size=page_size,
+                                    window_start=window_start,
+                                    window_end=window_end,
+                                    seen_state=seen_state,
+                                    state_binding=state_binding,
+                                    appended_digests=appended_digests,
+                                    lane=batch_lane,
+                                    physical_order=(
+                                        page_read.next_segment_end,
+                                        page_read.next_before_identity or (),
+                                        page_read.next_resume_identity or (),
+                                        page_read.next_resume_member_offset,
+                                        page_read.next_segment_start,
+                                    ),
+                                    physical_has_more=page_read.has_more,
+                                )
+                            )
+                            values = [
+                                {
+                                    "value": row.value,
+                                    "type": row.type,
+                                    "label": (
+                                        "true"
+                                        if row.value is True
+                                        else "false"
+                                        if row.value is False
+                                        else str(row.value)
+                                    ),
+                                }
+                                for row in page_read.rows
+                            ]
+                            return self._gm.success_response(
+                                {
+                                    "values": values,
+                                    **page_read.metadata.public_payload(),
+                                    "has_more": has_more,
+                                    "browse_status": browse_status,
+                                    "next_cursor": next_cursor,
+                                    **(
+                                        {"attribute_type": attribute_type}
+                                        if attribute_type
+                                        else {}
+                                    ),
+                                }
+                            )
+
                         cursor_scope = cursor_scope_for_request(
                             request,
                             project_ids=project_ids,
@@ -2563,6 +4248,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             "search": search,
                             "attribute_type": attribute_type,
                         }
+                        selector = None
                         if cursor_token:
                             cursor_state = decode_list_cursor(
                                 cursor_token,
@@ -2633,6 +4319,13 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                     "The continuation cursor is invalid.",
                                 )
                         else:
+                            selector = AttributeReadSelector(
+                                typed_only=True,
+                                json_attribute_mode="arrays",
+                                wall_timeout_ms=filter_value_deadline.remaining_ms(
+                                    ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS
+                                ),
+                            )
                             window_end = datetime.now(UTC)
                             retained_start = selector.retained_window_start(
                                 project_ids,
@@ -2673,6 +4366,20 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 "The continuation cursor is invalid.",
                             )
 
+                        # Cursor decode and server-held seen-state lookup are
+                        # part of the same public four-second wall.  A resumed
+                        # page must capture the *remaining* duration only after
+                        # those phases finish; otherwise read_value_cursor_page
+                        # would start the earlier duration anew and outlive the
+                        # interaction contract.
+                        if selector is None:
+                            selector = AttributeReadSelector(
+                                typed_only=True,
+                                json_attribute_mode="arrays",
+                                wall_timeout_ms=filter_value_deadline.remaining_ms(
+                                    ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS
+                                ),
+                            )
                         page_read = selector.read_value_cursor_page(
                             project_ids,
                             metric_name,
@@ -2777,6 +4484,13 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             }
                         )
 
+                    selector = AttributeReadSelector(
+                        typed_only=True,
+                        json_attribute_mode="arrays",
+                        wall_timeout_ms=filter_value_deadline.remaining_ms(
+                            ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS
+                        ),
+                    )
                     read = selector.read_values(
                         project_ids,
                         metric_name,
@@ -2819,10 +4533,13 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 code="service_unavailable",
                             )
                     return self._gm.success_response(
-                        {
-                            "values": values,
-                            **metadata,
-                        }
+                        _legacy_filter_value_scope_metadata(
+                            {
+                                "values": values,
+                                **metadata,
+                            },
+                            project_scope,
+                        )
                     )
                 except AttributeCursorStateError as exc:
                     if exc.code == "cursor_state_unavailable":

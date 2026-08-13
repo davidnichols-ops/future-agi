@@ -15,8 +15,7 @@ import { Helmet } from "react-helmet-async";
 import { formatDate } from "src/utils/report-utils";
 import { endOfToday, sub } from "date-fns";
 import { useUrlState } from "src/routes/hooks/use-url-state";
-import axios, { endpoints } from "src/utils/axios";
-import { useQuery } from "@tanstack/react-query";
+import { endpoints } from "src/utils/axios";
 import { useObserveHeader } from "src/sections/project/context/ObserveHeaderContext";
 import { hydrateStoredFilterList } from "src/api/contracts/filter-contract";
 import {
@@ -52,6 +51,7 @@ import { sanitizeUserColumnState } from "./userSortContract";
 import UsersEmptyScreen from "./UsersEmptyScreen";
 import { useShallow } from "zustand/react/shallow";
 import { filtersContentEqual } from "../saved-view-utils";
+import { useCursorAttributeInventory } from "../LLMTracing/useCursorAttributeInventory";
 
 // ---------------------------------------------------------------------------
 // User filter fields for TraceFilterPanel
@@ -190,19 +190,23 @@ const UsersView = ({
     }
   }, [gridApi, autoSizeAllCols]);
 
-  // --- Eval attributes for custom column dialog (mirrors LLMTracingView) ---
-  const { data: evalAttributes } = useQuery({
-    queryKey: ["eval-attributes", observeId],
-    queryFn: () =>
-      axios.get(endpoints.project.getEvalAttributeList(), {
-        params: {
-          filters: JSON.stringify({ project_id: observeId }),
-        },
-      }),
-    select: (data) => data.data?.result,
+  // --- Cursor-backed attributes for custom columns ---
+  const [customAttributeSearch, setCustomAttributeSearch] = useState("");
+  const preservedCustomAttributeKeys = useMemo(
+    () =>
+      (columns || [])
+        .filter((column) => column?.groupBy === "Custom Columns")
+        .map((column) => column.id)
+        .filter(Boolean),
+    [columns],
+  );
+  const { attributes, inventoryControlProps } = useCursorAttributeInventory({
+    projectId: observeId,
+    discoveryMode: "eval_mapping",
+    search: customAttributeSearch,
+    preservedKeys: preservedCustomAttributeKeys,
     enabled: Boolean(observeId),
   });
-  const attributes = useMemo(() => evalAttributes || [], [evalAttributes]);
 
   // --- Observe header refresh wiring (TH-4023) ---
   // Expose a refresh callback to the shared ObserveHeader so the refresh
@@ -971,6 +975,8 @@ const UsersView = ({
         existingColumns={columns}
         onAddColumns={addCustomColumns}
         onRemoveColumns={removeCustomColumns}
+        onAttributeSearchChange={setCustomAttributeSearch}
+        inventoryControlProps={inventoryControlProps}
       />
     </>
   );

@@ -2027,6 +2027,7 @@ function TraceSelector({
     metricType: "annotation_metric",
     projectIds: projectId ? [projectId] : [],
     source: "traces",
+    pageSize: 10,
     enabled: hasAnnotatorChip && !!projectId,
   });
   const filterChipLabelMap = useMemo(
@@ -2749,6 +2750,7 @@ function SpanSelector({ onSetSelection, onSelectAll }) {
     metricType: "annotation_metric",
     projectIds: projectId ? [projectId] : [],
     source: "traces",
+    pageSize: 10,
     enabled: hasAnnotatorChip && !!projectId,
   });
   const filterChipLabelMap = useMemo(
@@ -3371,6 +3373,7 @@ function SessionSelector({ onSetSelection, onSelectAll }) {
     metricType: "annotation_metric",
     projectIds: projectId ? [projectId] : [],
     source: "sessions",
+    pageSize: 10,
     enabled: hasAnnotatorChip && !!projectId,
   });
   const filterChipLabelMap = useMemo(

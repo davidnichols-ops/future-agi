@@ -287,6 +287,8 @@ const EvalPickerDrawer = ({
   sourceId = "",
   sourceRowType = null,
   sourceColumns = [],
+  onSourceColumnSearchChange,
+  sourceColumnInventoryControls,
   extraColumns = [],
   onEvalAdded,
   existingEvals = [],
@@ -358,6 +360,8 @@ const EvalPickerDrawer = ({
         sourceId={sourceId}
         sourceRowType={sourceRowType}
         sourceColumns={sourceColumns}
+        onSourceColumnSearchChange={onSourceColumnSearchChange}
+        sourceColumnInventoryControls={sourceColumnInventoryControls}
         extraColumns={extraColumns}
         sourcePreviewData={sourcePreviewData}
         existingEvals={existingEvals}
@@ -385,6 +389,8 @@ EvalPickerDrawer.propTypes = {
   sourceId: PropTypes.string,
   sourceRowType: PropTypes.string,
   sourceColumns: PropTypes.array,
+  onSourceColumnSearchChange: PropTypes.func,
+  sourceColumnInventoryControls: PropTypes.node,
   extraColumns: PropTypes.array,
   onEvalAdded: PropTypes.func,
   existingEvals: PropTypes.array,

@@ -1334,6 +1334,16 @@ describe("exact manual attribute fallback", () => {
       source: "traces",
     });
 
+    await waitFor(() =>
+      expect(getSpy).toHaveBeenCalledWith(endpoints.dashboard.metrics, {
+        params: expect.objectContaining({
+          project_ids: "project-whatfix",
+          per_eval_config: true,
+          exclude_custom_attributes: true,
+        }),
+      }),
+    );
+
     expect(
       screen.getByText(
         "Loading additional evaluation and annotation properties…",
@@ -2003,7 +2013,9 @@ describe("exact manual attribute fallback", () => {
       hasNextPage: true,
       isFetchingNextPage: false,
       fetchNextExactPage,
-      hasNextExactPage: true,
+      // A failed exact continuation is demoted from normal pagination. The
+      // dedicated sanitized Retry must still advance that exact lane once.
+      hasNextExactPage: false,
       isFetchingExactSearch: false,
       isFetchingNextExactPage: false,
       isFetchNextPageError: false,
@@ -2170,7 +2182,9 @@ describe("filter-value picker bounded-read UX", () => {
 
     expect(screen.getByText("completed")).toBeInTheDocument();
     expect(
-      screen.getByText("Recent values — search or enter an exact value."),
+      screen.getByText(
+        "Showing configured or recent suggestions only. Enter an exact value.",
+      ),
     ).toBeInTheDocument();
     expect(
       screen.queryByText(/results are incomplete/i),
@@ -2211,7 +2225,7 @@ describe("filter-value picker bounded-read UX", () => {
     document.body.removeChild(anchorEl);
   });
 
-  it("continues one empty prompt_slug value checkpoint and keeps later pages explicit", async () => {
+  it("keeps every empty prompt_slug value checkpoint behind an explicit gesture", async () => {
     const fetchNextPage = vi.fn(() => Promise.resolve());
     dashboardFilterValuesMock.mockReturnValue({
       ...defaultDashboardFilterValues(),
@@ -2250,9 +2264,14 @@ describe("filter-value picker bounded-read UX", () => {
       document.querySelector('[data-filter-value-trigger="prompt_slug"]'),
     );
 
-    await waitFor(() => expect(fetchNextPage).toHaveBeenCalledOnce());
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Continue searching values" }),
+      ).toBeInTheDocument(),
+    );
+    expect(fetchNextPage).not.toHaveBeenCalled();
     rerenderPanel();
-    expect(fetchNextPage).toHaveBeenCalledOnce();
+    expect(fetchNextPage).not.toHaveBeenCalled();
     expect(
       screen.queryByText(/No retained values found/i),
     ).not.toBeInTheDocument();
@@ -2264,7 +2283,7 @@ describe("filter-value picker bounded-read UX", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Continue searching values" }),
     );
-    expect(fetchNextPage).toHaveBeenCalledTimes(2);
+    expect(fetchNextPage).toHaveBeenCalledOnce();
 
     document.body.removeChild(anchorEl);
   });
@@ -2318,17 +2337,27 @@ describe("filter-value picker bounded-read UX", () => {
       );
       const searchInput = screen.getByPlaceholderText("Search values...");
       fireEvent.change(searchInput, { target: { value: "rejected" } });
-      await waitFor(() => expect(fetchRejectedPage).toHaveBeenCalledOnce(), {
-        timeout: 1_500,
-      });
+      const firstContinue = await screen.findByRole(
+        "button",
+        { name: "Continue searching values" },
+        { timeout: 1_500 },
+      );
+      expect(fetchRejectedPage).not.toHaveBeenCalled();
+      fireEvent.click(firstContinue);
+      await waitFor(() => expect(fetchRejectedPage).toHaveBeenCalledOnce());
 
       // Clear and re-enter immediately, before the 500 ms value-search
       // debounce can publish the intermediate empty query.
       fireEvent.change(searchInput, { target: { value: "" } });
       fireEvent.change(searchInput, { target: { value: "rejected" } });
-      await waitFor(() => expect(fetchRejectedPage).toHaveBeenCalledTimes(2), {
-        timeout: 1_500,
-      });
+      const secondContinue = await screen.findByRole(
+        "button",
+        { name: "Continue searching values" },
+        { timeout: 1_500 },
+      );
+      expect(fetchRejectedPage).toHaveBeenCalledOnce();
+      fireEvent.click(secondContinue);
+      await waitFor(() => expect(fetchRejectedPage).toHaveBeenCalledTimes(2));
 
       expect(fetchRejectedPage).toHaveBeenCalledTimes(2);
       expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
@@ -2338,6 +2367,163 @@ describe("filter-value picker bounded-read UX", () => {
           search: "rejected",
           source: "traces",
         }),
+      );
+      document.body.removeChild(anchorEl);
+    },
+  );
+
+  it.each([
+    ["tracing", undefined, "traces", "provider", "Provider", "provider"],
+    [
+      "voice",
+      "voiceCalls",
+      "traces",
+      "ended_reason",
+      "Ended Reason",
+      "ended_reason",
+    ],
+    ["session", undefined, "sessions", "session_id", "Session ID", "session"],
+  ])(
+    "sends %s Basic system-value search to the cursor backend",
+    async (
+      _surface,
+      tab,
+      source,
+      propertyId,
+      propertyName,
+      expectedMetricName,
+    ) => {
+      const property = {
+        id: propertyId,
+        name: propertyName,
+        category: "system",
+        type: "string",
+        apiColType: "SYSTEM_METRIC",
+      };
+      const { anchorEl } = renderPanel({
+        currentFilters: [
+          {
+            field: propertyId,
+            fieldName: propertyName,
+            fieldCategory: "system",
+            fieldType: "string",
+            apiColType: "SYSTEM_METRIC",
+            operator: "in",
+            value: [],
+          },
+        ],
+        properties: [property],
+        projectId: `project-system-${_surface}`,
+        source,
+        tab,
+      });
+
+      fireEvent.click(
+        document.querySelector(`[data-filter-value-trigger="${propertyId}"]`),
+      );
+      fireEvent.change(screen.getByPlaceholderText("Search values..."), {
+        target: { value: "needle" },
+      });
+
+      await waitFor(
+        () =>
+          expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+              metricName: expectedMetricName,
+              metricType: "system_metric",
+              pageSize: 10,
+              search: "needle",
+              searchGesture: "needle",
+              source,
+            }),
+          ),
+        { timeout: 1_500 },
+      );
+      document.body.removeChild(anchorEl);
+    },
+  );
+
+  it.each([
+    [
+      "tracing annotation",
+      undefined,
+      "annotation",
+      "annotation_metric",
+      "quality-label",
+      "Quality Label",
+    ],
+    [
+      "tracing dynamic eval",
+      undefined,
+      "eval",
+      "eval_metric",
+      "trace-quality-eval",
+      "Trace Quality Eval",
+    ],
+    [
+      "voice annotation",
+      "voiceCalls",
+      "annotation",
+      "annotation_metric",
+      "voice-quality-label",
+      "Voice Quality Label",
+    ],
+    [
+      "voice dynamic eval",
+      "voiceCalls",
+      "eval",
+      "eval_metric",
+      "voice-quality-eval",
+      "Voice Quality Eval",
+    ],
+  ])(
+    "sends %s Basic value search to the cursor backend",
+    async (_surface, tab, category, metricType, propertyId, propertyName) => {
+      const property = {
+        id: propertyId,
+        name: propertyName,
+        category,
+        type: "string",
+        apiColType: category === "annotation" ? "ANNOTATION" : "EVAL_METRIC",
+      };
+      const { anchorEl } = renderPanel({
+        currentFilters: [
+          {
+            field: propertyId,
+            fieldName: propertyName,
+            fieldCategory: category,
+            fieldType: "string",
+            apiColType: property.apiColType,
+            operator: "in",
+            value: [],
+          },
+        ],
+        properties: [property],
+        projectId: `project-${_surface}`,
+        source: "traces",
+        tab,
+      });
+
+      fireEvent.click(
+        document.querySelector(`[data-filter-value-trigger="${propertyId}"]`),
+      );
+      fireEvent.change(screen.getByPlaceholderText("Search values..."), {
+        target: { value: "needle" },
+      });
+
+      await waitFor(
+        () =>
+          expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+              metricName: propertyId,
+              metricType,
+              pageSize: 10,
+              search: "needle",
+              searchGesture: "needle",
+              source: "traces",
+            }),
+          ),
+        { timeout: 1_500 },
       );
       document.body.removeChild(anchorEl);
     },
@@ -2374,6 +2560,29 @@ describe("filter-value picker bounded-read UX", () => {
     );
     expect(fetchNextPage).toHaveBeenCalledOnce();
 
+    document.body.removeChild(anchorEl);
+  });
+
+  it("retries a stopped Query value cursor through one fresh-chain action", async () => {
+    const retryFreshPage = vi.fn(() => Promise.resolve());
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [{ value: "retained", label: "retained", type: "string" }],
+      queryReadState: "degraded",
+      cursorChainStopped: true,
+      retryFreshPage,
+    });
+    const { anchorEl } = renderPanel({
+      properties: [statusProperty],
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    await selectQueryPhaseOption("Status", "pick operator...");
+    await selectQueryPhaseOption("Contains", "type or pick value...");
+    fireEvent.click(await screen.findByText("Retry loading values"));
+
+    expect(retryFreshPage).toHaveBeenCalledOnce();
     document.body.removeChild(anchorEl);
   });
 
@@ -2931,6 +3140,138 @@ describe("filter-value picker bounded-read UX", () => {
     document.body.removeChild(anchorEl);
   });
 
+  it("keeps Query-tab system values on the signed cursor route", async () => {
+    const { anchorEl } = renderPanel({
+      properties: [
+        {
+          id: "ended_reason",
+          name: "Ended Reason",
+          category: "system",
+          type: "string",
+          apiColType: "SYSTEM_METRIC",
+        },
+      ],
+      projectId: "project-mudflap",
+      source: "traces",
+      tab: "voiceCalls",
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    const input = await selectQueryPhaseOption(
+      "Ended Reason",
+      "pick operator...",
+    );
+
+    await waitFor(() =>
+      expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metricName: "ended_reason",
+          metricType: "system_metric",
+          pageSize: 10,
+          source: "traces",
+          enabled: true,
+        }),
+      ),
+    );
+
+    await selectQueryPhaseOption("contains", "type or pick value...");
+    fireEvent.change(input, { target: { value: "customer" } });
+    await waitFor(
+      () =>
+        expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            metricName: "ended_reason",
+            metricType: "system_metric",
+            pageSize: 10,
+            search: "customer",
+            searchGesture: "customer",
+            source: "traces",
+          }),
+        ),
+      { timeout: 1_500 },
+    );
+    document.body.removeChild(anchorEl);
+  });
+
+  it.each([
+    [
+      "tracing annotation",
+      undefined,
+      "annotation",
+      "annotation_metric",
+      "query-quality-label",
+      "Query Quality Label",
+    ],
+    [
+      "tracing dynamic eval",
+      undefined,
+      "eval",
+      "eval_metric",
+      "query-trace-eval",
+      "Query Trace Eval",
+    ],
+    [
+      "voice annotation",
+      "voiceCalls",
+      "annotation",
+      "annotation_metric",
+      "query-voice-label",
+      "Query Voice Label",
+    ],
+    [
+      "voice dynamic eval",
+      "voiceCalls",
+      "eval",
+      "eval_metric",
+      "query-voice-eval",
+      "Query Voice Eval",
+    ],
+  ])(
+    "sends %s Query value search to the cursor backend",
+    async (_surface, tab, category, metricType, propertyId, propertyName) => {
+      const property = {
+        id: propertyId,
+        name: propertyName,
+        category,
+        type: "string",
+        apiColType: category === "annotation" ? "ANNOTATION" : "EVAL_METRIC",
+      };
+      const { anchorEl } = renderPanel({
+        properties: [property],
+        projectId: `project-query-${_surface}`,
+        source: "traces",
+        tab,
+        showQueryTab: true,
+      });
+
+      fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+      const input = await selectQueryPhaseOption(
+        propertyName,
+        "pick operator...",
+      );
+      await selectQueryPhaseOption("contains", "type or pick value...");
+      fireEvent.change(input, { target: { value: "needle" } });
+
+      await waitFor(
+        () =>
+          expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+              metricName: propertyId,
+              metricType,
+              pageSize: 10,
+              search: "needle",
+              searchGesture: "needle",
+              source: "traces",
+              enabled: true,
+            }),
+          ),
+        { timeout: 1_500 },
+      );
+      document.body.removeChild(anchorEl);
+    },
+  );
+
   it.each([
     ["tracing", undefined, "traces"],
     ["voice", "voiceCalls", "spans"],
@@ -3226,6 +3567,43 @@ describe("filter-value picker bounded-read UX", () => {
     fireEvent.click(screen.getByText("Retry loading fields"));
     expect(retryFieldSearch).toHaveBeenCalledOnce();
     expect(screen.queryByText("hidden backend detail")).not.toBeInTheDocument();
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("labels and retries an initial Query-value failure", async () => {
+    const refetch = vi.fn(() => Promise.resolve());
+    dashboardFilterValuesMock.mockImplementation((request) => ({
+      ...defaultDashboardFilterValues(),
+      isError: Boolean(request.enabled),
+      queryReadState: request.enabled ? "error" : "complete",
+      refetch,
+    }));
+    const property = {
+      id: "provider",
+      name: "Provider",
+      category: "system",
+      type: "string",
+      apiColType: "SYSTEM_METRIC",
+    };
+    const { anchorEl } = renderPanel({
+      properties: [property],
+      projectId: "project-query-retry",
+      source: "traces",
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    await selectQueryPhaseOption("Provider", "pick operator...");
+    await selectQueryPhaseOption("contains", "type or pick value...");
+
+    fireEvent.click(await screen.findByText("Retry loading values"));
+    expect(refetch).toHaveBeenCalledOnce();
+    expect(
+      screen.getByText(
+        "Suggestions are temporarily unavailable. Enter an exact value or retry.",
+      ),
+    ).toBeInTheDocument();
 
     document.body.removeChild(anchorEl);
   });

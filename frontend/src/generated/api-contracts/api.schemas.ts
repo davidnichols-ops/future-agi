@@ -19225,6 +19225,11 @@ export interface DashboardFilterValuesResponseApi {
  */
 export type DashboardMetricCatalogItemApiChoicesItem = { [key: string]: unknown };
 
+/**
+ * Any valid JSON value.
+ */
+export type DashboardMetricCatalogItemApiChoiceOptionsItem = { [key: string]: unknown };
+
 export interface DashboardMetricCatalogItemApi {
   /** @minLength 1 */
   name: string;
@@ -19236,6 +19241,7 @@ export interface DashboardMetricCatalogItemApi {
   unit?: string;
   output_type?: string;
   choices?: DashboardMetricCatalogItemApiChoicesItem[];
+  choice_options?: DashboardMetricCatalogItemApiChoiceOptionsItem[];
   allowed_aggregations?: string[];
   data_type?: string;
 }
@@ -26094,7 +26100,8 @@ refresh?: boolean;
 };
 
 export type ApiTracesSpanAttributeKeysListParams = {
-project_id: string;
+project_id?: string;
+workspace_scope?: boolean;
 /**
  * Attribute contract to browse. filter returns only keys supported by attribute filters; eval_mapping also returns JSON-only keys that an evaluation mapping can resolve.
  */

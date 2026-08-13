@@ -12,6 +12,7 @@ from tracer.selectors.trace_filter_reads import (
     bounded_numbered_page_depth_exceeded,
     read_bounded_filter_page,
 )
+from tracer.services.clickhouse.query_builders.filters import EvalFilterMetadata
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     supports_span_filters,
     supports_trace_filters,
@@ -621,9 +622,7 @@ def test_bounded_historical_voice_returns_canonical_root_span_ids(
     monkeypatch.setattr(
         row_resolver,
         "_eval_config_ids_for_filters",
-        lambda _project_id, _filters: (
-            "00000000-0000-4000-8000-000000000088",
-        ),
+        lambda _project_id, _filters: ("00000000-0000-4000-8000-000000000088",),
     )
 
     ids = row_resolver._resolve_bounded_historical_span_ids(
@@ -2659,6 +2658,17 @@ def test_eval_and_annotation_filters_use_candidate_scoped_bounded_reader(
     monkeypatch.setattr(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
     )
+    if col_type == "EVAL_METRIC":
+        monkeypatch.setattr(
+            row_resolver,
+            "_eval_filter_metadata_for_filters",
+            lambda _project_id, _filters: {
+                "00000000-0000-4000-8000-000000000099": EvalFilterMetadata(
+                    ("00000000-0000-4000-8000-000000000100",),
+                    "SCORE",
+                )
+            },
+        )
     filters = {
         "filters": [
             {

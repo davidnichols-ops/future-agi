@@ -99,6 +99,10 @@ describe("PrimaryGraph", () => {
 
     await waitFor(() => expect(axios.post).toHaveBeenCalled());
 
+    expect(axios.get).toHaveBeenCalledWith("/dashboard/metrics/", {
+      params: { exclude_custom_attributes: true },
+    });
+
     expect(axios.post).toHaveBeenCalledWith(
       "/tracer/trace/get_graph_methods/",
       expect.objectContaining({

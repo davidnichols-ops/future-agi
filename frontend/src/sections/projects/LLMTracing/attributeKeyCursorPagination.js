@@ -11,11 +11,63 @@ const CURSOR_STOPPED_KEY = "__attributeKeyCursorStopped";
 // The shared Axios client intentionally has no global timeout. Attribute-key
 // browsing is interactive, so one stalled proxy/backend response must not
 // leave a picker in an endless loading state. Keep this just above the
-// server-side 9.5-second ceiling so structured server timeouts still win.
-export const ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS = 9_800;
+// server-side four-second property wall so structured server timeouts still
+// win while a proxy stall also releases the UI below five seconds.
+export const ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS = 4_800;
 
 const attributeKey = (item) =>
   typeof item?.key === "string" && item.key.length > 0 ? item.key : null;
+
+const workspaceAttributeKeyTypeIdentity = (item) => {
+  const key = attributeKey(item);
+  if (!key) return null;
+  const types = [item?.type, ...(Array.isArray(item?.types) ? item.types : [])]
+    .filter(
+      (valueType, index, values) =>
+        valueType && values.indexOf(valueType) === index,
+    )
+    .sort();
+  return `${key}\0${types.join("\0")}`;
+};
+
+export const compactAttributeKeyRetryPage = (previousData, freshPage) => {
+  const rowsByKey = new Map();
+  const rows = [
+    ...(previousData?.pages || []).flatMap((page) => page?.result || []),
+    ...(freshPage?.result || []),
+  ];
+
+  for (const row of rows) {
+    const key = attributeKey(row);
+    if (!key) continue;
+    const existing = rowsByKey.get(key);
+    if (!existing) {
+      rowsByKey.set(key, row);
+      continue;
+    }
+    const types = [
+      existing.type,
+      ...(existing.types || []),
+      row.type,
+      ...(row.types || []),
+    ].filter(
+      (valueType, index, values) =>
+        valueType && values.indexOf(valueType) === index,
+    );
+    rowsByKey.set(key, {
+      ...existing,
+      ...row,
+      key,
+      type: existing.type || row.type || types[0],
+      types,
+      // A refreshed first page cannot prove that type families observed on
+      // older retained pages are exhaustive.
+      types_exact: existing.types_exact === true && row.types_exact === true,
+    });
+  }
+
+  return { ...freshPage, result: [...rowsByKey.values()] };
+};
 
 const normalizeAttributeKeyPage = (page = {}) =>
   TERMINAL_BROWSE_STATUSES.has(page?.browse_status)
@@ -46,11 +98,10 @@ export const getAttributeKeyNextCursor = (page) => {
  *
  * ClickHouse can advance a signed cursor after proving that a bounded physical
  * slice contains no new keys. Such a response is a transport checkpoint, not
- * an empty picker page. Follow advancing checkpoints until a new key arrives
- * or the server proves exhaustion. The shared follower bounds one browser
- * action. If that bound is reached, return the still-advancing checkpoint to
- * the picker so the user can continue with another bounded Load more action;
- * never start an unbounded background request chain.
+ * proof of exhaustion. Publish that checkpoint immediately so the next
+ * explicit Load more gesture can advance its signed cursor. One browser
+ * action performs exactly one physical request; it never starts a background
+ * continuation chain that can exceed the interaction deadline.
  */
 export const readAttributeKeyPage = async ({
   pageParam,
@@ -58,13 +109,17 @@ export const readAttributeKeyPage = async ({
   publishedData,
   requestPage,
   signal,
+  dedupeByType = false,
 }) => {
   const actionStartedAt = Date.now();
   const isFreshChainRead = pageParam == null;
   const publishedPages = isFreshChainRead ? [] : publishedData?.pages || [];
-  const knownKeys = publishedPages.flatMap((page) =>
+  const rowIdentity = dedupeByType
+    ? workspaceAttributeKeyTypeIdentity
+    : attributeKey;
+  const knownIdentities = publishedPages.flatMap((page) =>
     (Array.isArray(page?.result) ? page.result : [])
-      .map(attributeKey)
+      .map(rowIdentity)
       .filter(Boolean),
   );
   const knownCursors = new Set(
@@ -108,8 +163,8 @@ export const readAttributeKeyPage = async ({
     rowsFromResponse: (response) =>
       Array.isArray(response?.result) ? response.result : [],
     metadataFromResponse: continuationMetadata,
-    identityFromRow: attributeKey,
-    knownIdentities: knownKeys,
+    identityFromRow: rowIdentity,
+    knownIdentities,
     targetRowCount: isFreshChainRead ? 1 : pageSize,
     nextResponse: requestPage,
     onContinuation: (metadata) => {
@@ -119,6 +174,12 @@ export const readAttributeKeyPage = async ({
     isCurrent: () => !signal?.aborted,
     cancellationSignal: signal,
     startedAt: actionStartedAt,
+    // The backend already bounds each physical key read at four seconds. Do
+    // not silently open a second physical request in the same click: publish
+    // an empty advancing checkpoint and let the explicit signed-cursor action
+    // continue it, preserving both the <5s gesture SLA and full reachability.
+    maxContinuations: 0,
+    maxElapsedMs: ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
   });
   const normalized = checkedMetadata(page);
 

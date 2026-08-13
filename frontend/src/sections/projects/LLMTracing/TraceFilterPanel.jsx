@@ -884,7 +884,10 @@ function metricToTraceFilterProperty(m) {
   }
   // thumbs labels have two fixed choices — surface them so the value picker
   // renders a multi-select without needing a dashboard lookup.
-  const choices = type === "thumbs" ? ["Thumbs Up", "Thumbs Down"] : m.choices;
+  const choices =
+    type === "thumbs"
+      ? ["Thumbs Up", "Thumbs Down"]
+      : m.choiceOptions || m.choice_options || m.choices;
   const apiColType = isEval
     ? "EVAL_METRIC"
     : isAnnotation
@@ -989,6 +992,7 @@ export function useTraceFilterProperties(
       // table). Default behaviour at /tracer/dashboard/metrics/ is still
       // template-level — used by dashboards, PrimaryGraph, widget pickers.
       params.per_eval_config = true;
+      params.exclude_custom_attributes = true;
       const { data } = await axios.get(endpoints.dashboard.metrics, { params });
       return data?.result?.metrics || [];
     },
@@ -1232,7 +1236,7 @@ function PropertyPicker({
   const loadNextExactAttributePage = useSingleFlightPageRequest({
     identity: JSON.stringify(["exact", projectId, source, debouncedSearch]),
     enabled:
-      hasNextExactAttributePage &&
+      (hasNextExactAttributePage || hasSettledExactAttributeError) &&
       !isFetchingExactSearch &&
       !isFetchingNextExactPage,
     request: fetchNextExactAttributePage,
@@ -1757,13 +1761,11 @@ function PropertyPicker({
 // ---------------------------------------------------------------------------
 // ValuePicker — checkbox multi-select dropdown
 // ---------------------------------------------------------------------------
-// Session-specific fields that have their own value endpoint
-const SESSION_VALUE_FIELDS = new Set([
-  "session_id",
-  "user_id",
-  "first_message",
-  "last_message",
-]);
+// Session ids and users use the same retained dashboard cursor as every other
+// system dimension. First/last message vocabularies have no current-table
+// index that can prove an exhaustive interactive browse, so those fields stay
+// honest free-text inputs instead of calling the legacy capped 9.5s endpoint.
+const SESSION_FREE_TEXT_FIELDS = new Set(["first_message", "last_message"]);
 
 const FREE_TEXT_NO_OPTIONS_TEXT =
   "No retained values found — type to search, or add an exact value";
@@ -1789,24 +1791,18 @@ function ValuePicker({
   // while a fast continuation response appends the next page. Without a
   // per-open gate, the remaining inertial scroll events drain every cursor
   // page and leave a high-cardinality attribute looking permanently busy.
-  // Load one exact continuation automatically; the existing Load more button
-  // remains available for every subsequent page.
+  // The existing Load more button advances each exact continuation only after
+  // an explicit gesture.
   const autoScrollPageUsedRef = useRef(false);
-  const autoEmptyValueContinuationIdentityRef = useRef(null);
 
   useEffect(() => {
     if (!anchorEl) {
       autoScrollPageUsedRef.current = false;
-      autoEmptyValueContinuationIdentityRef.current = null;
     }
   }, [anchorEl]);
 
   useEffect(() => {
     autoScrollPageUsedRef.current = false;
-    // Repeating a prior value search in the same open popover is a new user
-    // gesture and may consume one bounded empty checkpoint again. Keep the
-    // one-shot guard per settled search identity, not per popover lifetime.
-    autoEmptyValueContinuationIdentityRef.current = null;
   }, [search, debouncedSearch, projectId, propertyId, source]);
 
   // If the property declares its own static choices (e.g. the Project filter
@@ -1827,18 +1823,26 @@ function ValuePicker({
     return "system_metric";
   })();
 
-  const isSessionField =
-    !hasStaticChoices && SESSION_VALUE_FIELDS.has(propertyId);
+  const isSessionFreeTextField =
+    !hasStaticChoices && SESSION_FREE_TEXT_FIELDS.has(propertyId);
+  const filterValueMetricName =
+    source === "sessions" && propertyId === "session_id"
+      ? "session"
+      : propertyId;
 
   const isIdOnlyField = !hasStaticChoices && ID_ONLY_FIELDS.has(propertyId);
 
-  // Backend search: ID fields (as before) plus custom attributes, whose
-  // BE path is now ngram-index-backed. Server-side search matters because
-  // the value list is capped and time-windowed — a value outside the first
-  // page can only be found by the backend. Other field types keep
-  // client-side filtering of the fetched page.
+  // Backend search: every non-static cursor-backed vocabulary. A real
+  // annotation, annotator, or dynamic eval value outside page one cannot be
+  // discovered by client-side filtering alone. Static choices stay local;
+  // unindexed session message fields deliberately remain exact free text.
   const usesBackendSearch =
-    !hasStaticChoices && (isIdOnlyField || metricType === "custom_attribute");
+    !hasStaticChoices &&
+    (isIdOnlyField ||
+      metricType === "custom_attribute" ||
+      metricType === "system_metric" ||
+      metricType === "annotation_metric" ||
+      metricType === "eval_metric");
 
   // Primary: dashboard API values
   const {
@@ -1852,9 +1856,11 @@ function ValuePicker({
     hasNextPage: hasNextDashboardPage,
     isFetchingNextPage: isFetchingNextDashboardPage,
     isFetchNextPageError: isNextDashboardPageError,
+    retryFreshPage: retryDashboardOptions,
+    isRetryingFreshPage: isRetryingDashboardOptions,
     refetch: refetchDashboardOptions,
   } = useDashboardFilterValues({
-    metricName: propertyId,
+    metricName: filterValueMetricName,
     metricType,
     projectIds: projectId ? [projectId] : [],
     source,
@@ -1877,6 +1883,7 @@ function ValuePicker({
         : undefined,
     enabled:
       !hasStaticChoices &&
+      !isSessionFreeTextField &&
       Boolean(anchorEl) &&
       (!isIdOnlyField || Boolean(debouncedSearch)),
   });
@@ -1894,82 +1901,12 @@ function ValuePicker({
     enabled: hasMoreDashboardValues && !isFetchingNextDashboardPage,
     request: fetchNextDashboardPage,
   });
-  useEffect(() => {
-    if (
-      !anchorEl ||
-      hasStaticChoices ||
-      isSessionField ||
-      debouncedSearch !== search.trim() ||
-      dashLoading ||
-      dashError ||
-      dashboardOptions.length > 0 ||
-      !hasMoreDashboardValues ||
-      isFetchingNextDashboardPage ||
-      isNextDashboardPageError
-    ) {
-      return;
-    }
-    const identity = JSON.stringify([
-      projectId,
-      source,
-      propertyId,
-      usesBackendSearch ? debouncedSearch : "",
-    ]);
-    if (autoEmptyValueContinuationIdentityRef.current === identity) return;
-    autoEmptyValueContinuationIdentityRef.current = identity;
-    // Resume one empty-but-advancing checkpoint automatically. If another
-    // bounded chunk is needed the picker leaves a truthful manual action.
-    void loadNextDashboardValues();
-  }, [
-    anchorEl,
-    dashLoading,
-    dashError,
-    dashboardOptions.length,
-    debouncedSearch,
-    hasMoreDashboardValues,
-    hasStaticChoices,
-    isFetchingNextDashboardPage,
-    isNextDashboardPageError,
-    isSessionField,
-    loadNextDashboardValues,
-    projectId,
-    propertyId,
-    search,
-    source,
-    usesBackendSearch,
-  ]);
-
-  // Fallback: session filter values endpoint (for session-specific fields)
-  const {
-    data: sessionOptions = [],
-    isLoading: sessionLoading,
-    isError: sessionError,
-    refetch: refetchSessionOptions,
-  } = useQuery({
-    queryKey: ["session-filter-values", projectId, propertyId, debouncedSearch],
-    queryFn: () =>
-      axios.get(endpoints.project.getSessionFilterValues(), {
-        params: {
-          project_id: projectId,
-          column: propertyId,
-          search: debouncedSearch || undefined,
-          page: 0,
-          page_size: 100,
-        },
-      }),
-    select: (res) => res.data?.result?.values || [],
-    enabled:
-      !hasStaticChoices && isSessionField && !!projectId && Boolean(anchorEl),
-    staleTime: 30_000,
-    retry: false,
-    meta: { errorHandled: true },
-  });
-
-  // Source: static choices > session endpoint > dashboard API
+  // Source: static choices or the cursor-backed dashboard API. Message fields
+  // intentionally publish no suggestions and accept an exact typed value.
   const rawOptions = hasStaticChoices
     ? property.choices
-    : isSessionField
-      ? sessionOptions
+    : isSessionFreeTextField
+      ? []
       : dashboardOptions;
   const isCanonicalVoiceStatus =
     propertyId === "call_status" && property?.apiColType === "SYSTEM_METRIC";
@@ -1991,22 +1928,18 @@ function ValuePicker({
   }, [isCanonicalVoiceStatus, rawOptions]);
   const isLoading = hasStaticChoices
     ? false
-    : isSessionField
-      ? sessionLoading
+    : isSessionFreeTextField
+      ? false
       : dashLoading;
   const readState = hasStaticChoices
     ? "complete"
-    : isSessionField
-      ? sessionError
-        ? "error"
-        : "complete"
+    : isSessionFreeTextField
+      ? "complete"
       : dashError
         ? "error"
         : dashboardReadState;
   const readMessage = getFilterValueReadMessage(readState);
-  const refetchOptions = isSessionField
-    ? refetchSessionOptions
-    : refetchDashboardOptions;
+  const refetchOptions = retryDashboardOptions || refetchDashboardOptions;
 
   const handleOptionsScroll = useCallback(
     (event) => {
@@ -2037,12 +1970,12 @@ function ValuePicker({
   );
 
   const filtered = useMemo(() => {
-    if (!search || isSessionField || isIdOnlyField) return options;
+    if (!search || isSessionFreeTextField || isIdOnlyField) return options;
     const q = search.toLowerCase();
     return options.filter((o) =>
       getPickerOptionSearchText(o).toLowerCase().includes(q),
     );
-  }, [options, search, isSessionField, isIdOnlyField]);
+  }, [options, search, isSessionFreeTextField, isIdOnlyField]);
 
   const selectedValues = useMemo(() => {
     const normalized = normalizePickerValues(value);
@@ -2338,10 +2271,13 @@ function ValuePicker({
               {(readState === "error" || readState === "degraded") && (
                 <Button
                   size="small"
-                  onClick={() => refetchOptions()}
+                  disabled={isRetryingDashboardOptions}
+                  onClick={() =>
+                    void Promise.resolve(refetchOptions?.()).catch(() => {})
+                  }
                   sx={{ minWidth: "auto", fontSize: 11, flexShrink: 0 }}
                 >
-                  Retry
+                  {isRetryingDashboardOptions ? "Retrying…" : "Retry"}
                 </Button>
               )}
             </Box>
@@ -3326,6 +3262,9 @@ const TraceFilterPanel = ({
       label: p.name,
       type: p.type || "string",
       choices: p.choices,
+      allowCustomValue:
+        p.allowCustomValue === true ||
+        (p.category === "annotation" && p.type === "categorical"),
       panelType: p.type || "string",
       category: p.category, // system, eval, annotation, attribute
       rawCategory: p.rawCategory,
@@ -3380,7 +3319,9 @@ const TraceFilterPanel = ({
     open &&
       activeTab === "query" &&
       queryField &&
-      !queryFieldProp?.choices?.length,
+      (!queryFieldProp?.choices?.length ||
+        (queryFieldProp?.category === "annotation" &&
+          queryFieldProp?.type === "categorical")),
   );
   const effectiveQueryValueSearch =
     debouncedQueryValueSearch?.field === queryField
@@ -3396,18 +3337,36 @@ const TraceFilterPanel = ({
     fetchNextPage: fetchNextQueryValuesPage,
     hasNextPage: hasNextQueryValuesPage,
     isFetchingNextPage: isFetchingNextQueryValuesPage,
+    isFetchNextPageError: isNextQueryValuesPageError,
+    cursorChainStopped: queryValueCursorStopped,
+    retryFreshPage: retryQueryValues,
+    isRetryingFreshPage: isRetryingQueryValues,
+    refetch: refetchQueryValues,
   } = useDashboardFilterValues({
     metricName: queryFieldProp?.id || queryField || "",
     metricType: queryMetricType,
     projectIds: observeId ? [observeId] : [],
     source,
-    search:
-      queryMetricType === "custom_attribute" ? effectiveQueryValueSearch : "",
-    searchGesture:
-      queryMetricType === "custom_attribute"
-        ? effectiveQueryValueSearchGesture
-        : "",
-    pageSize: queryMetricType === "custom_attribute" ? 10 : undefined,
+    search: [
+      "custom_attribute",
+      "system_metric",
+      "annotation_metric",
+      "eval_metric",
+    ].includes(queryMetricType)
+      ? effectiveQueryValueSearch
+      : "",
+    searchGesture: [
+      "custom_attribute",
+      "system_metric",
+      "annotation_metric",
+      "eval_metric",
+    ].includes(queryMetricType)
+      ? effectiveQueryValueSearchGesture
+      : "",
+    // System, eval, and annotation values must use the same signed-cursor
+    // contract as custom attributes. A missing page_size enters the legacy
+    // non-pageable branch and can exceed the property picker's five-second SLA.
+    pageSize: 10,
     attributeType:
       queryMetricType === "custom_attribute"
         ? queryFieldProp?.attributeTypesExact === true &&
@@ -3428,11 +3387,21 @@ const TraceFilterPanel = ({
       queryField,
       effectiveQueryValueSearch,
     ]),
-    enabled: Boolean(hasNextQueryValuesPage) && !isFetchingNextQueryValuesPage,
-    request: fetchNextQueryValuesPage,
+    enabled:
+      Boolean(
+        hasNextQueryValuesPage || queryValuesError || queryValueCursorStopped,
+      ) &&
+      !isFetchingNextQueryValuesPage &&
+      !isRetryingQueryValues,
+    request: () =>
+      hasNextQueryValuesPage
+        ? fetchNextQueryValuesPage()
+        : (retryQueryValues || refetchQueryValues)?.(),
   });
-  const queryValuesMessage = getQueryReadMessage(
-    queryValuesError ? "error" : queryValuesReadState,
+  const queryValuesMessage = getFilterValueReadMessage(
+    queryValuesError || isNextQueryValuesPageError
+      ? "error"
+      : queryValuesReadState,
   );
 
   useEffect(() => {
@@ -3933,8 +3902,19 @@ const TraceFilterPanel = ({
               onLoadMoreFields={loadNextQueryAttributePage}
               onFieldSearchChange={setQueryFieldSearch}
               valueLoading={queryValuesLoading}
-              valueLoadingMore={isFetchingNextQueryValuesPage}
-              hasMoreValues={Boolean(hasNextQueryValuesPage)}
+              valueLoadingMore={
+                isFetchingNextQueryValuesPage || isRetryingQueryValues
+              }
+              valueLoadError={Boolean(
+                queryValuesError ||
+                  isNextQueryValuesPageError ||
+                  queryValueCursorStopped,
+              )}
+              hasMoreValues={Boolean(
+                hasNextQueryValuesPage ||
+                  queryValuesError ||
+                  queryValueCursorStopped,
+              )}
               onLoadMoreValues={loadNextQueryValuesPage}
               onValueSearchChange={(value, field) =>
                 setQueryValueSearch({ field: field ?? queryField, value })

@@ -3,7 +3,9 @@ import PropTypes from "prop-types";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import {
+  focusManager,
   MutationCache,
+  onlineManager,
   QueryClient,
   QueryClientProvider,
 } from "@tanstack/react-query";
@@ -21,6 +23,7 @@ vi.mock("src/utils/axios", () => ({
     dashboard: {
       list: "/tracer/dashboard/",
       query: "/tracer/dashboard/query/",
+      metrics: "/tracer/dashboard/metrics/",
       filterValues: "/tracer/dashboard/filter_values/",
       widgets: (dashboardId) => `/tracer/dashboard/${dashboardId}/widgets/`,
       widgetDetail: (dashboardId, widgetId) =>
@@ -44,6 +47,7 @@ import {
   useReorderWidgets,
   useDuplicateWidget,
   useDashboardQuery,
+  useDashboardMetricsPaginated,
   useWidgetQuery,
   usePreviewQuery,
   useDashboardFilterValues,
@@ -193,8 +197,58 @@ describe("useDashboards widget mutations", () => {
   });
 });
 
+describe("useDashboardMetricsPaginated", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.get.mockReset();
+  });
+
+  it("requests the finite catalog without capped custom attributes", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: {
+          metrics: [{ name: "latency", category: "system_metric" }],
+          total: 1,
+          page: 1,
+          page_size: 50,
+          has_more: false,
+        },
+      },
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    const { result } = renderHook(
+      () =>
+        useDashboardMetricsPaginated({
+          search: "latency",
+          excludeCustomAttributes: true,
+        }),
+      { wrapper: createQueryWrapper(queryClient) },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+    expect(mocks.get).toHaveBeenCalledWith("/tracer/dashboard/metrics/", {
+      params: {
+        search: "latency",
+        exclude_custom_attributes: true,
+        page: 1,
+        page_size: 50,
+      },
+    });
+  });
+});
+
 describe("useDashboardFilterValues bounded-read state", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // A bounded gesture deliberately leaves later cursor fixtures unused.
+    // Reset queued one-shot implementations so they cannot leak into the next
+    // test now that one interaction no longer drains an entire cursor chain.
+    mocks.get.mockReset();
+  });
 
   const renderValues = (overrides = {}) => {
     const queryClient = new QueryClient({
@@ -252,6 +306,54 @@ describe("useDashboardFilterValues bounded-read state", () => {
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.data).toEqual([]);
     expect(result.current.queryReadState).toBe("error");
+  });
+
+  it("does not replay cached cursor pages on mount, focus, or reconnect", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: {
+          values: [{ value: "retained", type: "string" }],
+          query_complete: true,
+          query_status: "complete",
+          browse_status: "exhausted",
+          has_more: false,
+          next_cursor: null,
+        },
+      },
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const renderCursorHook = () =>
+      renderHook(
+        () =>
+          useDashboardFilterValues({
+            metricName: "final_status",
+            metricType: "custom_attribute",
+            projectIds: ["project-synthetic"],
+            source: "traces",
+            search: "Rejected",
+            pageSize: 10,
+          }),
+        { wrapper: createQueryWrapper(queryClient) },
+      );
+
+    const first = renderCursorHook();
+    await waitFor(() => expect(first.result.current.isSuccess).toBe(true));
+    first.unmount();
+    const cachedQuery = queryClient.getQueryCache().getAll()[0];
+    cachedQuery.setState({ ...cachedQuery.state, dataUpdatedAt: 0 });
+
+    focusManager.setFocused(false);
+    onlineManager.setOnline(false);
+    const remounted = renderCursorHook();
+    await act(async () => Promise.resolve());
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+
+    await act(async () => focusManager.setFocused(true));
+    await act(async () => onlineManager.setOnline(true));
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+    remounted.unmount();
   });
 
   it("paginates with an opaque cursor and deduplicates values across pages", async () => {
@@ -345,7 +447,7 @@ describe("useDashboardFilterValues bounded-read state", () => {
     expect(mocks.get.mock.calls[1][1].params.cursor).toBe("terminal-page");
   });
 
-  it("follows a duplicate-only continuation until a new value arrives", async () => {
+  it("keeps a duplicate-only continuation behind an explicit next action", async () => {
     mocks.get
       .mockResolvedValueOnce({
         data: {
@@ -384,6 +486,13 @@ describe("useDashboardFilterValues bounded-read state", () => {
     const { result } = renderValues({ pageSize: 10 });
 
     await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+    expect(result.current.hasNextPage).toBe(true);
+    expect(result.current.data).toEqual([
+      { value: "CONVERSATION", type: "string" },
+    ]);
+
     await act(async () => result.current.fetchNextPage());
     await waitFor(() => expect(result.current.hasNextPage).toBe(false));
 
@@ -424,11 +533,22 @@ describe("useDashboardFilterValues bounded-read state", () => {
     const { result } = renderValues({ pageSize: 10 });
 
     await waitFor(() => expect(result.current.hasNextPage).toBe(true));
-    await act(async () => result.current.fetchNextPage());
+    for (
+      let expectedRequests = 2;
+      expectedRequests <= 7;
+      expectedRequests += 1
+    ) {
+      await act(async () => result.current.fetchNextPage());
+      await waitFor(() =>
+        expect(mocks.get).toHaveBeenCalledTimes(expectedRequests),
+      );
+      expect(result.current.hasNextPage).toBe(expectedRequests < 7);
+    }
     await waitFor(() => expect(result.current.hasNextPage).toBe(false));
 
-    // One explicit Load more action fills across all advancing physical pages.
-    // Pages 4-6 add no exact value, so it continues through terminal page 7.
+    // Each explicit Load more action owns exactly one physical page. The full
+    // signed chain remains reachable without one browser gesture silently
+    // draining every sparse page.
     expect(mocks.get).toHaveBeenCalledTimes(7);
     expect(result.current.data).toHaveLength(7);
     expect(mocks.get.mock.calls[3][1].params.cursor).toBe("page-4");
@@ -471,6 +591,71 @@ describe("useDashboardFilterValues bounded-read state", () => {
     expect(result.current.isError).toBe(false);
     expect(result.current.queryReadState).toBe("degraded");
     expect(mocks.get).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a long stopped cache with one fresh request and retains rows", async () => {
+    for (let index = 0; index < 4; index += 1) {
+      mocks.get.mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: `older-${index + 1}`, type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: `page-${index + 2}`,
+          },
+        },
+      });
+    }
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "older-5", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "fresh", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
+          },
+        },
+      });
+
+    const { result } = renderValues({ pageSize: 10 });
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    for (
+      let expectedRequests = 2;
+      expectedRequests <= 5;
+      expectedRequests += 1
+    ) {
+      await act(async () => result.current.fetchNextPage());
+      await waitFor(() =>
+        expect(mocks.get).toHaveBeenCalledTimes(expectedRequests),
+      );
+    }
+    expect(result.current.cursorChainStopped).toBe(true);
+
+    await act(async () => result.current.retryFreshPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(6));
+    expect(mocks.get.mock.calls[5][1].params).not.toHaveProperty("cursor");
+    expect(result.current.data.map(({ value }) => value)).toEqual([
+      "older-1",
+      "older-2",
+      "older-3",
+      "older-4",
+      "older-5",
+      "fresh",
+    ]);
   });
 
   it.each([
@@ -540,7 +725,10 @@ describe("useDashboardFilterValues bounded-read state", () => {
     const { result } = renderValues({ pageSize: 10 });
 
     await waitFor(() => expect(result.current.hasNextPage).toBe(true));
-    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+    expect(result.current.hasNextPage).toBe(true);
     await act(async () => result.current.fetchNextPage());
     await waitFor(() => expect(result.current.hasNextPage).toBe(false));
 
@@ -617,7 +805,7 @@ describe("useDashboardFilterValues bounded-read state", () => {
     mocks.get.mockImplementation(async () => {
       const current = responseIndex;
       responseIndex += 1;
-      if (current >= 48) {
+      if (current >= 4) {
         return {
           data: {
             result: {
@@ -646,27 +834,28 @@ describe("useDashboardFilterValues bounded-read state", () => {
     const { result } = renderValues({ pageSize: 10 });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(mocks.get).toHaveBeenCalledTimes(13);
+    expect(mocks.get).toHaveBeenCalledTimes(1);
     expect(result.current.data).toEqual([]);
     expect(result.current.hasNextPage).toBe(true);
 
-    for (const expectedRequestCount of [26, 39]) {
+    for (
+      let expectedRequests = 2;
+      expectedRequests <= 5;
+      expectedRequests += 1
+    ) {
       await act(async () => result.current.fetchNextPage());
       await waitFor(() =>
-        expect(mocks.get).toHaveBeenCalledTimes(expectedRequestCount),
+        expect(mocks.get).toHaveBeenCalledTimes(expectedRequests),
       );
-      expect(result.current.hasNextPage).toBe(true);
+      expect(result.current.hasNextPage).toBe(expectedRequests < 5);
     }
-
-    await act(async () => result.current.fetchNextPage());
     await waitFor(() => expect(result.current.hasNextPage).toBe(false));
-    expect(mocks.get).toHaveBeenCalledTimes(49);
+    expect(mocks.get).toHaveBeenCalledTimes(5);
     expect(result.current.data).toEqual([
       { value: "eventually-found", type: "string" },
     ]);
-    expect(mocks.get.mock.calls[13][1].params.cursor).toBe("cursor-13");
-    expect(mocks.get.mock.calls[26][1].params.cursor).toBe("cursor-26");
-    expect(mocks.get.mock.calls[39][1].params.cursor).toBe("cursor-39");
+    expect(mocks.get.mock.calls[1][1].params.cursor).toBe("cursor-1");
+    expect(mocks.get.mock.calls[4][1].params.cursor).toBe("cursor-4");
   });
 
   it("starts a searched result set without reusing the previous cursor", async () => {

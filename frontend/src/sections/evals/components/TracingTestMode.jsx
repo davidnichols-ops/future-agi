@@ -2051,7 +2051,7 @@ const TracingTestMode = React.forwardRef(
                 >
                   Variable Mapping
                 </Typography>
-                {mappingSearch && exactAttributeReadMessage && (
+                {exactAttributeReadMessage && (
                   <Box
                     role="status"
                     sx={(theme) => ({
@@ -2075,7 +2075,9 @@ const TracingTestMode = React.forwardRef(
                       size="small"
                       variant="text"
                       disabled={isFetchingNextAttributePage}
-                      onClick={() => fetchNextAttributePage?.()}
+                      onClick={() =>
+                        fetchNextAttributePage?.()?.catch?.(() => undefined)
+                      }
                       sx={{ px: 0, minWidth: 0, fontSize: 11 }}
                     >
                       {isFetchingNextAttributePage

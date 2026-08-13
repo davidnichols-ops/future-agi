@@ -207,6 +207,48 @@ def _eval_config_ids_for_filters(
         raise EvalTaskReadBudgetExceeded(_SAFE_EVAL_METADATA_MESSAGE) from None
 
 
+def _eval_filter_metadata_for_filters(
+    project_id: str,
+    ui_filters: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Freeze eval-value metadata once for every classifier in one proof.
+
+    ``None`` means no EVAL_METRIC leaf is present and retains the public
+    builders' compatibility fallback. An explicit mapping is authoritative;
+    each malformed or project-external identifier is represented by a known
+    empty config set and therefore remains a deterministic no-match.
+    """
+
+    eval_ids_in_order: list[str] = []
+    for item in ui_filters:
+        if not isinstance(item, dict):
+            continue
+        config = item.get("filter_config") or item.get("filterConfig") or {}
+        if not isinstance(config, dict):
+            continue
+        col_type = str(config.get("col_type") or config.get("colType") or "").upper()
+        column_id = item.get("column_id") or item.get("columnId")
+        if col_type == "EVAL_METRIC" and column_id:
+            eval_ids_in_order.append(str(column_id))
+    eval_ids = tuple(dict.fromkeys(eval_ids_in_order))
+    if not eval_ids:
+        return None
+
+    from django.db import DatabaseError
+
+    from tracer.services.clickhouse.query_builders.filters import (
+        resolve_eval_filter_metadata,
+    )
+
+    try:
+        return {
+            eval_id: resolve_eval_filter_metadata(eval_id, [str(project_id)])
+            for eval_id in eval_ids
+        }
+    except DatabaseError:
+        raise EvalTaskReadBudgetExceeded(_SAFE_EVAL_METADATA_MESSAGE) from None
+
+
 @dataclass(frozen=True)
 class TraceFilterWitness:
     """Latest-state child identity that proved one trace filter leaf."""
@@ -740,12 +782,21 @@ def _resolve_continuous_rows(
             "filters": ui_filters,
             "bounded_internal_scan": True,
         }
-        eval_config_ids = _eval_config_ids_for_filters(
+        annotation_label_ids = _annotation_label_ids_for_filters(
             str(task.project_id), ui_filters
         )
+        # Continuous reconciliation can classify up to 1,000 finite batches.
+        # Resolve annotation completeness once for the operation and preserve
+        # an explicit empty project label set as authoritative.  Otherwise
+        # span/session builders collapse ``[]`` into unknown metadata and
+        # ``has_annotation`` silently degrades to a simple Score-existence
+        # check instead of matching the public all-configured-label contract.
+        builder_kwargs["annotation_label_ids"] = list(annotation_label_ids)
+        eval_config_ids = _eval_config_ids_for_filters(str(task.project_id), ui_filters)
         if eval_config_ids is not None and task.row_type in {
             RowType.SPANS,
             RowType.TRACES,
+            RowType.SESSIONS,
             RowType.VOICE_CALLS,
         }:
             # Continuous reconciliation may classify hundreds of finite
@@ -753,6 +804,11 @@ def _resolve_continuous_rows(
             # reuse it instead of falling back to PostgreSQL during every SQL
             # compilation. An explicit empty list remains authoritative.
             builder_kwargs["eval_config_ids"] = list(eval_config_ids)
+        eval_filter_metadata = _eval_filter_metadata_for_filters(
+            str(task.project_id), ui_filters
+        )
+        if eval_filter_metadata is not None:
+            builder_kwargs["eval_filter_metadata"] = eval_filter_metadata
         if task.row_type in (RowType.SPANS, RowType.TRACES):
             builder_kwargs["bounded_identity_only"] = True
         if task.row_type == RowType.TRACES:
@@ -947,6 +1003,9 @@ def _resolve_bounded_historical_span_ids(
         str(project_id), ui_filters
     )
     eval_config_ids = _eval_config_ids_for_filters(str(project_id), ui_filters)
+    eval_filter_metadata = _eval_filter_metadata_for_filters(
+        str(project_id), ui_filters
+    )
     # Exactly 10k already exceeds the interactive 128-query proof for the
     # shape-specific classifiers (and for trace witness replay). Route the
     # boundary value through the background-workflow contract as well.
@@ -978,9 +1037,12 @@ def _resolve_bounded_historical_span_ids(
     if eval_config_ids is not None and row_type in {
         RowType.SPANS,
         RowType.TRACES,
+        RowType.SESSIONS,
         RowType.VOICE_CALLS,
     }:
         builder_kwargs["eval_config_ids"] = list(eval_config_ids)
+    if eval_filter_metadata is not None:
+        builder_kwargs["eval_filter_metadata"] = eval_filter_metadata
     if row_type == RowType.TRACES:
         # Interactive trace tasks first prove membership/order without the
         # expensive child-witness projection, then replay only their selected

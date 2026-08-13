@@ -110,6 +110,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         eval_config_ids: list[str] | None = None,
         remove_simulation_calls: bool = False,
         annotation_label_ids: list[str] | None = None,
+        eval_filter_metadata: dict[str, Any] | None = None,
         bounded_internal_scan: bool = False,
         bounded_identity_only: bool = False,
         bounded_sampling_salt: str | None = None,
@@ -125,6 +126,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         self.remove_simulation_calls = remove_simulation_calls
         self._annotation_label_set_known = annotation_label_ids is not None
         self.annotation_label_ids = annotation_label_ids or []
+        self.eval_filter_metadata = eval_filter_metadata
         self._bounded_internal_scan = bool(bounded_internal_scan)
         self._bounded_identity_only = bool(bounded_identity_only)
         if (bounded_sampling_salt is None) != (bounded_sampling_rate is None):
@@ -203,6 +205,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
             annotation_label_ids=(
                 self.annotation_label_ids if self._annotation_label_set_known else None
             ),
+            eval_filter_metadata=self.eval_filter_metadata,
             bounded_internal_scan=True,
             bounded_identity_only=self._bounded_identity_only,
         )

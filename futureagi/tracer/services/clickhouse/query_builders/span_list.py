@@ -177,6 +177,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         eval_config_ids: list[str] | None = None,
         annotation_label_ids: list[str] | None = None,
         annotation_label_ids_by_project: dict[str, list[str]] | None = None,
+        eval_filter_metadata: dict[str, Any] | None = None,
         end_user_id: str | None = None,
         project_version_id: str | None = None,
         bounded_internal_scan: bool = False,
@@ -191,7 +192,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         self.page_size = page_size
         self.filters = filters or []
         self.sort_params = sort_params or []
+        self._eval_config_ids_known = eval_config_ids is not None
         self.eval_config_ids = eval_config_ids or []
+        self._annotation_label_set_known = annotation_label_ids is not None
         self.annotation_label_ids = annotation_label_ids or []
         self.annotation_label_ids_by_project = (
             {
@@ -203,6 +206,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             if annotation_label_ids_by_project is not None
             else None
         )
+        self.eval_filter_metadata = eval_filter_metadata
         self.end_user_id = end_user_id
         self.project_version_id = project_version_id
         self._bounded_internal_scan = bool(bounded_internal_scan)
@@ -1253,7 +1257,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                         )
                     )
                     branch_label_ids = self.annotation_label_ids
-                    branch_label_set_known = False
+                    branch_label_set_known = self._annotation_label_set_known
                     if self.annotation_label_ids_by_project is not None:
                         if (
                             candidate_project_id
@@ -1322,6 +1326,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                     )
                 residual_predicate = " OR ".join(residual_branches) or "0 = 1"
             else:
+                has_eval_residual = any(
+                    (item.get("column_id") or item.get("columnId")) == "has_eval"
+                    for item in residual_filters
+                )
                 residual_builder = self._FILTER_BUILDER_CLS(
                     table=self.TABLE,
                     query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_SPAN,
@@ -1332,6 +1340,12 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                     span_date_scope=scope_to_request_window,
                     candidate_ids_param="candidate_span_ids",
                     candidate_entities_param=candidate_entities_param,
+                    strict_trace_project_correlation=has_eval_residual,
+                    trace_project_eval_config_ids=(
+                        self.eval_config_ids if self._eval_config_ids_known else None
+                    ),
+                    annotation_label_set_known=self._annotation_label_set_known,
+                    eval_filter_metadata=self.eval_filter_metadata,
                 )
                 residual_predicate, residual_params = residual_builder.translate(
                     residual_filters

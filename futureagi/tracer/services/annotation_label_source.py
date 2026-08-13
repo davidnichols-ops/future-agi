@@ -174,10 +174,88 @@ class AnnotationLabelScoresProjectPG:
         )
         return [str(annotator_id) for annotator_id in rows if annotator_id]
 
+    def annotator_page_for_projects(
+        self,
+        project_ids: list[str],
+        *,
+        page_size: int,
+        search: str = "",
+        after_id=None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Return one exact annotator page using the User primary-key order.
+
+        The outer keyset is backed by ``accounts_user_pkey``.  Its correlated
+        existence check is backed by Django's implicit ``Score.annotator`` FK
+        index and retains the authoritative tracer-project predicate.  This is
+        deliberately driven from the much smaller User relation: driving from
+        project Scores would require an unindexed ``(project, annotator)``
+        distinct/order scan.
+        """
+
+        finite_page_size = int(page_size)
+        if finite_page_size < 1 or finite_page_size > 50:
+            raise ValueError("page_size must be between 1 and 50")
+        if not project_ids:
+            return [], False
+
+        users = self._annotator_queryset_for_projects(
+            project_ids,
+            search=search,
+            after_id=after_id,
+        )
+        rows = _materialize_score_rows(
+            users.values("id", "name", "email")[: finite_page_size + 1]
+        )
+        has_more = len(rows) > finite_page_size
+        return rows[:finite_page_size], has_more
+
+    def _annotator_queryset_for_projects(
+        self,
+        project_ids: list[str],
+        *,
+        search: str = "",
+        after_id=None,
+    ):
+        """Build the index-keyed annotator query without evaluating it."""
+
+        from django.db.models import Exists, OuterRef, Q
+
+        from accounts.models.user import User
+        from model_hub.models.score import Score
+
+        matching_score = Score.no_workspace_objects.filter(
+            self._trace_span_scope(),
+            tracer_project_id__in=project_ids,
+            annotator_id=OuterRef("pk"),
+        )
+        users = User.objects.filter(Exists(matching_score))
+        if after_id is not None:
+            users = users.filter(id__gt=after_id)
+        normalized_search = str(search or "").strip()
+        if normalized_search:
+            search_filter = Q(name__icontains=normalized_search) | Q(
+                email__icontains=normalized_search
+            )
+            try:
+                from uuid import UUID
+
+                search_filter |= Q(pk=UUID(normalized_search))
+            except (TypeError, ValueError):
+                pass
+            users = users.filter(search_filter)
+        return users.order_by("id")
+
     def categorical_values_for_label(
         self, label_id, project_ids: list[str]
     ) -> list[Any]:
-        """Return a finite newest-first slice of stored Score JSON values."""
+        """Return the legacy bounded sample of stored Score JSON values.
+
+        This method is intentionally *not* an exhaustive cursor.  The deployed
+        Score index is ``(tracer_project_id, label_id)`` and has no stable row
+        key after the label, so exact keyset traversal would sort/rescan the
+        entire label history.  Callers must expose this fallback as sampled
+        until a later schema change adds the required composite key.
+        """
 
         if not project_ids:
             return []
@@ -185,8 +263,8 @@ class AnnotationLabelScoresProjectPG:
         from model_hub.models.score import Score
 
         # The picker deduplicates categorical choices, so ordering millions of
-        # Score rows by updated_at adds work without changing its response.
-        # The indexed project+label scan stops at the finite row cap.
+        # Score rows by updated_at adds work without changing this compatibility
+        # sample. The indexed project+label scan stops at the legacy row cap.
         rows = _materialize_score_rows(
             Score.no_workspace_objects.filter(
                 self._trace_span_scope(),
@@ -220,6 +298,7 @@ class AnnotationLabelScoresProjectPG:
 
         from django.db.models import CharField, Q, Value
         from django.db.models.functions import Cast, Concat
+
         from model_hub.models.score import Score
 
         unique_trace_ids = tuple(

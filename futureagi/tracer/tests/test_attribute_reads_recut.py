@@ -6,11 +6,13 @@ import base64
 import hashlib
 import json
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
+from unittest.mock import call as mock_call
 from urllib.parse import urlencode
 
 import pytest
@@ -32,6 +34,8 @@ from tracer.services.clickhouse.attribute_cursor_state import (
 )
 from tracer.services.clickhouse.attribute_reads import (
     _LATEST_CARDINALITY_SQL,
+    _LATEST_JSON_TARGET_SQL,
+    _LATEST_TARGET_SQL,
     _STRATIFIED_CANDIDATE_SQL,
     ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT,
     ATTRIBUTE_KEY_CURSOR_DENSE_RETRY_MIN_SEGMENT,
@@ -50,6 +54,7 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS,
     ATTRIBUTE_READ_MAX_PROJECTS,
     ATTRIBUTE_READ_MAX_QUERY_COUNT,
+    ATTRIBUTE_READ_MAX_VALUES,
     ATTRIBUTE_READ_METADATA_TIMEOUT_MS,
     ATTRIBUTE_READ_QUERY_TIMEOUT_MS,
     ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT,
@@ -92,12 +97,21 @@ from tracer.services.clickhouse.attribute_reads import (
     _unix_microseconds,
     adaptive_attribute_windows,
     attribute_key_cursor_digest,
+    attribute_key_type_cursor_digest,
     attribute_value_cursor_digest,
     merge_read_metadata,
     validate_attribute_key,
 )
-from tracer.services.clickhouse.list_cursor import encode_list_cursor
+from tracer.services.clickhouse.list_cursor import (
+    cursor_scope_for_request,
+    decode_list_cursor,
+    encode_list_cursor,
+)
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+from tracer.utils.filter_operators import (
+    JSON_ARRAY_FILTER_MAX_STRING_UTF8_BYTES,
+    JSON_ARRAY_FILTER_MAX_TOTAL_STRING_UTF8_BYTES,
+)
 
 NOW = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
 PROJECT_A = "c4de3065-12b5-488c-a814-aa1c8e3f856f"
@@ -266,6 +280,13 @@ def _target_row(
     legacy_raw: Any = None,
     latest_version: int = 1,
 ):
+    legacy_text = (
+        legacy_raw
+        if isinstance(legacy_raw, str)
+        else json.dumps(legacy_raw, ensure_ascii=False, separators=(",", ":"))
+        if legacy_raw is not None
+        else ""
+    )
     return {
         "project_id": project_id,
         "id": span_id,
@@ -283,7 +304,10 @@ def _target_row(
         "boolean_present": boolean is not None,
         "boolean_value": boolean or 0,
         "legacy_present": legacy_raw is not None,
-        "legacy_value_raw": legacy_raw or "",
+        "legacy_value_raw": legacy_text,
+        "legacy_value_fingerprint": hashlib.sha256(
+            legacy_text.encode("utf-8")
+        ).hexdigest(),
         "latest_version": latest_version,
     }
 
@@ -430,6 +454,10 @@ def _authenticated_get(path: str, data: dict[str, Any]):
     request = APIRequestFactory().get(path, data)
     force_authenticate(request, user=SimpleNamespace(is_authenticated=True))
     return request
+
+
+def _direct_pg_read(_deadline, read):
+    return read()
 
 
 def test_adaptive_windows_are_adjacent_half_open_7d_14d_30d_6mo_1yr_bands():
@@ -653,6 +681,16 @@ def test_latest_cardinality_replay_has_one_grouping_clause():
         _LATEST_CARDINALITY_SQL.count("GROUP BY project_id, trace_id, id, start_time")
         == 1
     )
+
+
+def test_latest_json_hydration_returns_clickhouse_sha256_fingerprint():
+    fingerprint_projection = (
+        "lower(hex(SHA256(tupleElement(latest_state, {index}))))\n"
+        "            AS legacy_value_fingerprint"
+    )
+
+    assert fingerprint_projection.format(index=13) in _LATEST_TARGET_SQL
+    assert fingerprint_projection.format(index=3) in _LATEST_JSON_TARGET_SQL
 
 
 def test_cardinality_uses_targeted_session_lane_when_dense_generic_sample_has_none():
@@ -3210,6 +3248,12 @@ def test_filter_value_cursor_unpinned_splits_mixed_typed_and_json_latest_state()
     assert read.metadata.query_complete is True
     assert read.browse_status == "exhausted"
     assert len(executor.calls) > 4
+    json_hydration_call = next(
+        call
+        for call in executor.calls
+        if "tupleElement(latest_state, 3) AS legacy_value_raw" in call.sql
+    )
+    assert "AS legacy_value_fingerprint" in json_hydration_call.sql
     assert all(
         "tupleElement(latest_state, 13) AS legacy_value_raw" not in call.sql
         for call in executor.calls
@@ -4100,7 +4144,7 @@ def test_filter_value_cursor_recovers_poisoned_resume_array_boundary():
     assert [row.value for row in first.rows] == ["remaining-first"]
     assert first.next_segment_end == checkpoint_time + ATTRIBUTE_READ_EXPLICIT_SEGMENT
     assert first.next_resume_identity == resume_identity
-    assert first.next_resume_member_offset == 2
+    assert first.next_resume_member_offset > ATTRIBUTE_READ_MAX_VALUES + 1
     assert first.next_before_identity is None
     assert [row.value for row in second.rows] == ["remaining-second"]
     assert second.next_resume_identity is None
@@ -5653,6 +5697,75 @@ def test_filter_value_cursor_temporal_distinct_array_overflow_falls_back_without
     assert read.rows == (AttributeValueRow("queued", "string", 1),)
 
 
+def test_filter_value_cursor_temporal_distinct_string_budget_falls_back_without_skip():
+    array_members = [
+        f"{index:02d}" + "x" * (JSON_ARRAY_FILTER_MAX_STRING_UTF8_BYTES - 2)
+        for index in range(17)
+    ]
+    candidate = _candidate(
+        PROJECT_A,
+        "typed-after-array-byte-boundary",
+        start_time=NOW - timedelta(minutes=1),
+    )
+    executor = _value_cursor_executor(
+        [candidate],
+        {str(candidate["id"]): "queued"},
+    )
+    executor.distinct_responder = lambda *_args: [
+        _distinct_value_group("json", json.dumps(array_members))
+    ]
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=10,
+        window_start=NOW - timedelta(hours=1),
+        window_end=NOW,
+        seen_value_digests=tuple(
+            attribute_value_cursor_digest("array", member)
+            for member in array_members[:16]
+        ),
+    )
+
+    candidate_call = next(
+        call for call in executor.calls if "segment_start" in call.params
+    )
+    assert candidate_call.params["segment_end"] == NOW
+    assert read.rows == (AttributeValueRow("queued", "string", 1),)
+
+
+def test_filter_value_cursor_temporal_distinct_huge_array_never_materializes_proof():
+    candidate = _candidate(
+        PROJECT_A,
+        "typed-after-huge-array-proof",
+        start_time=NOW - timedelta(minutes=1),
+    )
+    executor = _value_cursor_executor(
+        [candidate],
+        {str(candidate["id"]): "queued"},
+    )
+    huge_raw_array = '["' + ("x" * (300 * 1024)) + '"]'
+    executor.distinct_responder = lambda *_args: [
+        _distinct_value_group("json", huge_raw_array)
+    ]
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=10,
+        window_start=NOW - timedelta(hours=1),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("string", "completed"),),
+    )
+
+    assert any("segment_start" in call.params for call in executor.calls)
+    assert read.rows == (AttributeValueRow("queued", "string", 1),)
+
+
 def test_filter_value_cursor_temporal_distinct_programming_error_is_not_degraded():
     executor = RecordingExecutor(
         distinct_responder=lambda *_args: RuntimeError("invalid distinct SQL")
@@ -6863,7 +6976,7 @@ def test_filter_value_cursor_resumes_mid_array_without_skipping_members():
         "array-row",
         candidate["start_time"],
     )
-    assert first.next_resume_member_offset == 2
+    assert first.next_resume_member_offset > ATTRIBUTE_READ_MAX_VALUES + 1
 
     second = AttributeReadSelector(
         RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
@@ -6880,7 +6993,8 @@ def test_filter_value_cursor_resumes_mid_array_without_skipping_members():
         seen_value_digests=first.seen_value_digests,
     )
     assert [row.value for row in second.rows] == ["three", "four"]
-    assert second.next_resume_member_offset == 4
+    assert second.next_resume_member_offset > ATTRIBUTE_READ_MAX_VALUES + 1
+    assert second.next_resume_member_offset != first.next_resume_member_offset
 
     third = AttributeReadSelector(
         RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
@@ -6902,6 +7016,348 @@ def test_filter_value_cursor_resumes_mid_array_without_skipping_members():
     assert [row.value for page in (first, second, third) for row in page.rows] == list(
         members
     )
+
+
+def _json_array_cursor_executor(candidate, raw_value):
+    def respond(call, _call_number):
+        if "segment_start" in call.params:
+            rows = (
+                [candidate]
+                if call.params["segment_start"]
+                <= candidate["start_time"]
+                < call.params["segment_end"]
+                else []
+            )
+            return _keyset_candidate_page(rows, call)
+        resolved_raw = raw_value() if callable(raw_value) else raw_value
+        return [
+            _target_row(
+                PROJECT_A,
+                str(candidate["id"]),
+                trace_id=str(candidate["trace_id"]),
+                start_time=candidate["start_time"],
+                legacy_raw=resolved_raw,
+            )
+        ]
+
+    return RecordingExecutor(respond)
+
+
+def _read_json_array_cursor_pages(
+    executor,
+    *,
+    page_size,
+    search=None,
+    max_pages=100,
+):
+    cursor = {}
+    reads = []
+    for _ in range(max_pages):
+        read = AttributeReadSelector(
+            executor,
+            now=NOW,
+            json_attribute_mode="arrays",
+        ).read_value_cursor_page(
+            [PROJECT_A],
+            "json.array",
+            page_size=page_size,
+            window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+            window_end=NOW,
+            search=search,
+            attribute_type="array",
+            **cursor,
+        )
+        reads.append(read)
+        if not read.has_more:
+            break
+        cursor = {
+            "segment_end": read.next_segment_end,
+            "before_identity": read.next_before_identity,
+            "resume_identity": read.next_resume_identity,
+            "resume_member_offset": read.next_resume_member_offset,
+            "seen_value_digests": read.seen_value_digests,
+        }
+    else:
+        pytest.fail("JSON array cursor did not exhaust inside the test page bound")
+    return reads
+
+
+def test_filter_value_cursor_reaches_every_member_beyond_legacy_500_cap():
+    candidate = _candidate(
+        PROJECT_A,
+        "large-array",
+        start_time=NOW - timedelta(seconds=1),
+    )
+    members = [f"member-{index:04d}" for index in range(623)]
+    executor = _json_array_cursor_executor(candidate, json.dumps(members))
+    reads = _read_json_array_cursor_pages(
+        executor,
+        page_size=50,
+    )
+
+    assert [row.value for read in reads for row in read.rows] == members
+    assert len(reads) == 13
+    assert all(read.metadata.query_complete for read in reads)
+    assert reads[-1].has_more is False
+    assert reads[0].next_resume_member_offset > ATTRIBUTE_READ_MAX_VALUES + 1
+    assert any(
+        "tupleElement(latest_state, 13) AS legacy_value_raw" in call.sql
+        and "AS legacy_value_fingerprint" in call.sql
+        for call in executor.calls
+    )
+    # The packed fingerprint/checkpoint stays tiny inside the signed HTTP
+    # cursor even after replacing the old one-to-three digit member offset.
+    token = encode_list_cursor(
+        resource="dashboard_filter_values",
+        scope={"project_ids": [PROJECT_A]},
+        query={"metric_name": "json.array"},
+        page_size=50,
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+        window_end=NOW,
+        order=(
+            reads[0].next_segment_end,
+            (),
+            reads[0].next_resume_identity or (),
+            reads[0].next_resume_member_offset,
+            (),
+        ),
+        seen_rows=50,
+    )
+    assert len(token.encode("utf-8")) < 16 * 1024
+
+
+def test_filter_value_cursor_pages_total_string_bytes_and_skips_only_oversized_member():
+    candidate = _candidate(
+        PROJECT_A,
+        "byte-bounded-array",
+        start_time=NOW - timedelta(seconds=1),
+    )
+    valid_members = [
+        f"{index:02d}" + "x" * (JSON_ARRAY_FILTER_MAX_STRING_UTF8_BYTES - 2)
+        for index in range(19)
+    ]
+    oversized = "z" * (JSON_ARRAY_FILTER_MAX_STRING_UTF8_BYTES + 1)
+    members = [*valid_members[:8], oversized, *valid_members[8:], "tail"]
+    reads = _read_json_array_cursor_pages(
+        _json_array_cursor_executor(candidate, json.dumps(members)),
+        page_size=50,
+    )
+
+    assert JSON_ARRAY_FILTER_MAX_TOTAL_STRING_UTF8_BYTES == (
+        16 * JSON_ARRAY_FILTER_MAX_STRING_UTF8_BYTES
+    )
+    assert [row.value for read in reads for row in read.rows] == [
+        *valid_members,
+        "tail",
+    ]
+    assert len(reads) >= 2
+    assert oversized not in [row.value for read in reads for row in read.rows]
+
+
+def test_filter_value_cursor_search_reaches_and_deduplicates_matches_after_500():
+    candidate = _candidate(
+        PROJECT_A,
+        "searched-large-array",
+        start_time=NOW - timedelta(seconds=1),
+    )
+    members = [f"noise-{index:04d}" for index in range(550)]
+    members.extend(["needle-first", "needle-first", "other", "needle-second"])
+    reads = _read_json_array_cursor_pages(
+        _json_array_cursor_executor(candidate, json.dumps(members)),
+        page_size=1,
+        search="NeEdLe",
+    )
+
+    assert [row.value for read in reads for row in read.rows] == [
+        "needle-first",
+        "needle-second",
+    ]
+
+
+def test_filter_value_cursor_search_checkpoints_deep_duplicate_free_prefix():
+    candidate = _candidate(
+        PROJECT_A,
+        "deep-searched-array",
+        start_time=NOW - timedelta(seconds=1),
+    )
+    members = [f"noise-{index:05d}" for index in range(5_000)]
+    members.append("deep-needle")
+    reads = _read_json_array_cursor_pages(
+        _json_array_cursor_executor(candidate, json.dumps(members)),
+        page_size=1,
+        search="needle",
+    )
+
+    assert [row.value for read in reads for row in read.rows] == ["deep-needle"]
+    assert len(reads) >= 3
+    assert all(
+        read.next_resume_member_offset > ATTRIBUTE_READ_MAX_VALUES + 1
+        for read in reads
+        if read.next_resume_identity is not None
+    )
+
+
+def test_filter_value_cursor_skips_huge_unfilterable_string_incrementally():
+    candidate = _candidate(
+        PROJECT_A,
+        "huge-string-array",
+        start_time=NOW - timedelta(seconds=1),
+    )
+    huge_unfilterable = "x" * (600 * 1024)
+    reads = _read_json_array_cursor_pages(
+        _json_array_cursor_executor(
+            candidate,
+            json.dumps([huge_unfilterable, "reachable-tail"]),
+        ),
+        page_size=1,
+    )
+
+    assert [row.value for read in reads for row in read.rows] == ["reachable-tail"]
+    assert len(reads) >= 4
+    assert all(
+        read.next_resume_member_offset > ATTRIBUTE_READ_MAX_VALUES + 1
+        for read in reads
+        if read.next_resume_identity is not None
+    )
+
+
+def test_filter_value_cursor_array_mutation_restarts_without_skip_or_repeat():
+    candidate = _candidate(
+        PROJECT_A,
+        "mutating-array",
+        start_time=NOW - timedelta(seconds=1),
+    )
+    raw = {"value": json.dumps(["one", "two", "three"])}
+    executor = _json_array_cursor_executor(candidate, lambda: raw["value"])
+    first = AttributeReadSelector(
+        executor,
+        now=NOW,
+        json_attribute_mode="arrays",
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "json.array",
+        page_size=1,
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+        window_end=NOW,
+        attribute_type="array",
+    )
+    raw["value"] = json.dumps(["new-head", "one", "two", "three"])
+    cursor = {
+        "segment_end": first.next_segment_end,
+        "before_identity": first.next_before_identity,
+        "resume_identity": first.next_resume_identity,
+        "resume_member_offset": first.next_resume_member_offset,
+        "seen_value_digests": first.seen_value_digests,
+    }
+    following = []
+    for _ in range(4):
+        read = AttributeReadSelector(
+            executor,
+            now=NOW,
+            json_attribute_mode="arrays",
+        ).read_value_cursor_page(
+            [PROJECT_A],
+            "json.array",
+            page_size=1,
+            window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+            window_end=NOW,
+            attribute_type="array",
+            **cursor,
+        )
+        following.append(read)
+        if not read.has_more:
+            break
+        cursor = {
+            "segment_end": read.next_segment_end,
+            "before_identity": read.next_before_identity,
+            "resume_identity": read.next_resume_identity,
+            "resume_member_offset": read.next_resume_member_offset,
+            "seen_value_digests": read.seen_value_digests,
+        }
+
+    assert [row.value for row in first.rows] == ["one"]
+    assert [row.value for read in following for row in read.rows] == [
+        "new-head",
+        "two",
+        "three",
+    ]
+    assert following[-1].has_more is False
+
+
+def test_filter_value_cursor_shorter_seen_array_mutation_exhausts_without_loop():
+    candidate = _candidate(
+        PROJECT_A,
+        "shortened-array",
+        start_time=NOW - timedelta(seconds=1),
+    )
+    raw = {"value": json.dumps(["one", "two", "three"])}
+    executor = _json_array_cursor_executor(candidate, lambda: raw["value"])
+    first = AttributeReadSelector(
+        executor,
+        now=NOW,
+        json_attribute_mode="arrays",
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "json.array",
+        page_size=1,
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+        window_end=NOW,
+        attribute_type="array",
+    )
+    raw["value"] = json.dumps(["one"])
+
+    second = AttributeReadSelector(
+        executor,
+        now=NOW,
+        json_attribute_mode="arrays",
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "json.array",
+        page_size=1,
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        before_identity=first.next_before_identity,
+        resume_identity=first.next_resume_identity,
+        resume_member_offset=first.next_resume_member_offset,
+        seen_value_digests=first.seen_value_digests,
+        attribute_type="array",
+    )
+
+    assert [row.value for row in first.rows] == ["one"]
+    assert second.rows == ()
+    assert second.has_more is False
+    assert second.browse_status == "exhausted"
+
+
+def test_filter_value_cursor_rejects_malformed_packed_array_offset():
+    candidate = _candidate(
+        PROJECT_A,
+        "malformed-array-offset",
+        start_time=NOW - timedelta(seconds=1),
+    )
+    identity = (
+        PROJECT_A,
+        str(candidate["trace_id"]),
+        str(candidate["id"]),
+        candidate["start_time"],
+    )
+
+    with pytest.raises(ValueError, match="invalid filter-value JSON member cursor"):
+        AttributeReadSelector(
+            _json_array_cursor_executor(candidate, json.dumps(["one", "two"])),
+            now=NOW,
+            json_attribute_mode="arrays",
+        ).read_value_cursor_page(
+            [PROJECT_A],
+            "json.array",
+            page_size=1,
+            window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+            window_end=NOW,
+            resume_identity=identity,
+            resume_member_offset=10**200,
+            attribute_type="array",
+        )
 
 
 def test_typed_value_version_certificate_narrows_hydration_to_current_live_rows():
@@ -8036,6 +8492,22 @@ def test_span_attribute_keys_contract_accepts_exact_probe_and_read_state():
     )
     assert eval_query.is_valid(), eval_query.errors
     assert eval_query.validated_data["discovery_mode"] == "eval_mapping"
+    workspace_query = SpanAttributeProjectQuerySerializer(
+        data={"workspace_scope": True, "page_size": 50}
+    )
+    assert workspace_query.is_valid(), workspace_query.errors
+    assert workspace_query.validated_data["workspace_scope"] is True
+    for invalid_scope in (
+        {},
+        {"workspace_scope": True},
+        {
+            "project_id": project_id,
+            "workspace_scope": True,
+            "page_size": 50,
+        },
+    ):
+        invalid_query = SpanAttributeProjectQuerySerializer(data=invalid_scope)
+        assert not invalid_query.is_valid()
     assert {
         "query_complete",
         "query_status",
@@ -8114,6 +8586,167 @@ def test_span_attribute_key_cursor_pages_resume_wide_rows_without_duplicates(
     assert first.metadata.query_status == "complete"
     assert first.metadata.query_error_code is None
     assert len(second.seen_key_digests) == 2
+
+
+def test_workspace_key_cursor_merges_new_types_and_dedupes_repeated_type_rows(
+    monkeypatch,
+):
+    identities = tuple(
+        (
+            PROJECT_A,
+            f"trace-workspace-type-{index}",
+            f"span-workspace-type-{index}",
+            NOW - timedelta(minutes=index + 1),
+        )
+        for index in range(3)
+    )
+    rows = {
+        identities[0]: {
+            "project_id": PROJECT_A,
+            "trace_id": identities[0][1],
+            "id": identities[0][2],
+            "start_time": identities[0][3],
+            "is_deleted": 0,
+            "string_keys": ["migrated.attribute"],
+            "number_keys": [],
+            "boolean_keys": [],
+            "attributes_extra": "{}",
+        },
+        identities[1]: {
+            "project_id": PROJECT_A,
+            "trace_id": identities[1][1],
+            "id": identities[1][2],
+            "start_time": identities[1][3],
+            "is_deleted": 0,
+            "string_keys": ["migrated.attribute"],
+            "number_keys": [],
+            "boolean_keys": [],
+            "attributes_extra": "{}",
+        },
+        identities[2]: {
+            "project_id": PROJECT_A,
+            "trace_id": identities[2][1],
+            "id": identities[2][2],
+            "start_time": identities[2][3],
+            "is_deleted": 0,
+            "string_keys": [],
+            "number_keys": ["migrated.attribute"],
+            "boolean_keys": [],
+            "attributes_extra": "{}",
+        },
+    }
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    monkeypatch.setattr(
+        selector,
+        "_candidate_ids",
+        lambda *_args, **_kwargs: (identities, False, {}),
+    )
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **kwargs: [
+            rows[identity] for identity in kwargs["candidate_ids"]
+        ],
+    )
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        dedupe_by_type=True,
+    )
+
+    assert [(row.key, row.types) for row in page.rows] == [
+        ("migrated.attribute", ("string", "number"))
+    ]
+    assert page.appended_key_digests == (
+        attribute_key_type_cursor_digest("migrated.attribute", "string"),
+        attribute_key_type_cursor_digest("migrated.attribute", "number"),
+    )
+    assert len(page.appended_key_digests) == len(set(page.appended_key_digests))
+    assert page.seen_key_count == 2
+    assert page.has_more is False
+
+
+def test_workspace_exact_key_cursor_exhausts_same_batch_type_families(monkeypatch):
+    identities = tuple(
+        (
+            PROJECT_A,
+            f"trace-workspace-exact-{index}",
+            f"span-workspace-exact-{index}",
+            NOW - timedelta(minutes=index + 1),
+        )
+        for index in range(3)
+    )
+    rows = {
+        identities[0]: _target_row(
+            PROJECT_A,
+            identities[0][2],
+            trace_id=identities[0][1],
+            start_time=identities[0][3],
+            string="first",
+        ),
+        identities[1]: _target_row(
+            PROJECT_A,
+            identities[1][2],
+            trace_id=identities[1][1],
+            start_time=identities[1][3],
+            string="second",
+        ),
+        identities[2]: _target_row(
+            PROJECT_A,
+            identities[2][2],
+            trace_id=identities[2][1],
+            start_time=identities[2][3],
+            number=7,
+        ),
+    }
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    monkeypatch.setattr(
+        selector,
+        "_candidate_ids",
+        lambda *_args, **_kwargs: (identities, False, {}),
+    )
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **kwargs: [
+            rows[identity] for identity in kwargs["candidate_ids"]
+        ],
+    )
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        exact_key="migrated.attribute",
+        dedupe_by_type=True,
+        exhaustive_exact_types=True,
+    )
+
+    assert [(row.key, row.types) for row in page.rows] == [
+        ("migrated.attribute", ("string", "number"))
+    ]
+    assert page.appended_key_digests == (
+        attribute_key_type_cursor_digest("migrated.attribute", "string"),
+        attribute_key_type_cursor_digest("migrated.attribute", "number"),
+    )
+    assert len(page.appended_key_digests) == len(set(page.appended_key_digests))
+    assert page.seen_key_count == 2
+    assert page.has_more is False
+    assert page.browse_status == "exhausted"
 
 
 def test_span_attribute_key_cursor_remains_pageable_below_state_capacity(monkeypatch):
@@ -10978,8 +11611,10 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     calls = []
 
     def read_page(self, project_ids, **kwargs):
-        assert self._wall_timeout_seconds == (
-            ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS / 1000
+        assert (
+            0
+            < self._wall_timeout_seconds
+            <= (ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS / 1000)
         )
         calls.append((project_ids, kwargs))
         if len(calls) == 1:
@@ -11039,6 +11674,25 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     assert contract.is_valid(), contract.errors
     cursor = first_response.data["next_cursor"]
     assert cursor
+    legacy_scope_request = SimpleNamespace(
+        user=SimpleNamespace(),
+        auth=None,
+        organization=None,
+        workspace=None,
+    )
+    legacy_state = decode_list_cursor(
+        cursor,
+        resource="span_attribute_keys",
+        scope=cursor_scope_for_request(
+            legacy_scope_request,
+            project_ids=[PROJECT_A],
+        ),
+        query={"project_id": PROJECT_A, "mode": "recent_attribute_keys"},
+        page_size=10,
+    )
+    assert len(legacy_state.order) == 6
+    assert legacy_state.order[0] == calls[0][1]["window_end"]
+    assert legacy_state.order[1] == identity
 
     second_request = _authenticated_get(
         "/api/traces/span-attribute-keys/",
@@ -11064,6 +11718,596 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     mismatched_response = SpanAttributeKeysView.as_view()(mismatched_request)
     assert mismatched_response.status_code == 400
     assert len(calls) == 2
+
+
+def test_span_attribute_key_workspace_cursor_advances_one_bounded_project_batch(
+    monkeypatch,
+):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    batch_calls = []
+    read_calls = []
+
+    def project_batch(_request, *, after_project_id=None):
+        batch_calls.append(after_project_id)
+        if after_project_id is None:
+            return (PROJECT_A,), True
+        assert after_project_id == PROJECT_A
+        return (PROJECT_B,), False
+
+    def read_page(_self, project_ids, **kwargs):
+        read_calls.append((tuple(project_ids), kwargs))
+        assert kwargs["dedupe_by_type"] is True
+        assert kwargs["exhaustive_exact_types"] is False
+        if tuple(project_ids) == (PROJECT_A,):
+            return AttributeKeyCursorPageRead(
+                (AttributeKeyRow("workspace.alpha", "string", 1),),
+                _metadata(),
+                False,
+                "exhausted",
+                kwargs["window_start"],
+                None,
+                None,
+                0,
+                (attribute_key_type_cursor_digest("workspace.alpha", "string"),),
+            )
+        assert tuple(project_ids) == (PROJECT_B,)
+        assert kwargs["seen_key_contains"](
+            attribute_key_type_cursor_digest("workspace.alpha", "string")
+        )
+        return AttributeKeyCursorPageRead(
+            (AttributeKeyRow("workspace.beta", "number", 1),),
+            _metadata(),
+            False,
+            "exhausted",
+            kwargs["window_start"],
+            None,
+            None,
+            0,
+            (
+                attribute_key_type_cursor_digest("workspace.alpha", "string"),
+                attribute_key_type_cursor_digest("workspace.beta", "number"),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._workspace_project_batch", project_batch
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._run_span_attribute_pg_read",
+        _direct_pg_read,
+    )
+    monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
+
+    first_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"workspace_scope": True, "page_size": 10},
+    )
+    first_response = SpanAttributeKeysView.as_view()(first_request)
+
+    assert first_response.status_code == 200
+    assert [row["key"] for row in first_response.data["result"]] == ["workspace.alpha"]
+    assert first_response.data["has_more"] is True
+    assert first_response.data["browse_status"] == "continuation"
+    assert len(read_calls) == 1
+    workspace_scope_request = SimpleNamespace(
+        user=SimpleNamespace(),
+        auth=None,
+        organization=None,
+        workspace=None,
+    )
+    workspace_state = decode_list_cursor(
+        first_response.data["next_cursor"],
+        resource="span_attribute_keys",
+        scope=cursor_scope_for_request(workspace_scope_request, project_ids=[]),
+        query={"workspace_scope": True, "mode": "recent_attribute_keys"},
+        page_size=10,
+    )
+    assert workspace_state.order[0] == PROJECT_A
+    assert isinstance(workspace_state.order[1], tuple)
+    assert workspace_state.order[1] == ()
+    assert workspace_state.order[2] is True
+
+    second_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "workspace_scope": True,
+            "page_size": 10,
+            "cursor": first_response.data["next_cursor"],
+        },
+    )
+    second_response = SpanAttributeKeysView.as_view()(second_request)
+
+    assert second_response.status_code == 200
+    assert [row["key"] for row in second_response.data["result"]] == ["workspace.beta"]
+    assert second_response.data["has_more"] is False
+    assert batch_calls == [None, PROJECT_A]
+    assert len(read_calls) == 2
+    assert read_calls[1][1]["seen_key_digests"] == (
+        attribute_key_type_cursor_digest("workspace.alpha", "string"),
+    )
+
+
+def test_workspace_key_cursor_reaches_new_type_for_same_key_in_later_batch(
+    monkeypatch,
+):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    def project_batch(_request, *, after_project_id=None):
+        return (
+            ((PROJECT_A,), True) if after_project_id is None else ((PROJECT_B,), False)
+        )
+
+    def read_page(_self, project_ids, **kwargs):
+        assert kwargs["dedupe_by_type"] is True
+        assert kwargs["exhaustive_exact_types"] is False
+        attr_type = "string" if tuple(project_ids) == (PROJECT_A,) else "number"
+        digest = attribute_key_type_cursor_digest(
+            "migrated.workspace.attribute", attr_type
+        )
+        if attr_type == "number":
+            assert kwargs["seen_key_contains"](
+                attribute_key_type_cursor_digest(
+                    "migrated.workspace.attribute", "string"
+                )
+            )
+            assert not kwargs["seen_key_contains"](digest)
+        seen_after = (*kwargs["seen_key_digests"], digest)
+        return AttributeKeyCursorPageRead(
+            (
+                AttributeKeyRow(
+                    "migrated.workspace.attribute",
+                    attr_type,
+                    1,
+                    (attr_type,),
+                ),
+            ),
+            _metadata(),
+            False,
+            "exhausted",
+            kwargs["window_start"],
+            None,
+            None,
+            0,
+            seen_after,
+            appended_key_digests=(digest,),
+            seen_key_count=kwargs["seen_key_count"] + 1,
+        )
+
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._workspace_project_batch", project_batch
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._run_span_attribute_pg_read",
+        _direct_pg_read,
+    )
+    monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
+
+    first_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"workspace_scope": True, "page_size": 10},
+    )
+    first_response = SpanAttributeKeysView.as_view()(first_request)
+    assert first_response.status_code == 200
+    assert first_response.data["result"][0]["key"] == ("migrated.workspace.attribute")
+    assert first_response.data["result"][0]["type"] == "string"
+    assert tuple(first_response.data["result"][0]["types"]) == ("string",)
+    assert first_response.data["has_more"] is True
+
+    second_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "workspace_scope": True,
+            "page_size": 10,
+            "cursor": first_response.data["next_cursor"],
+        },
+    )
+    second_response = SpanAttributeKeysView.as_view()(second_request)
+    assert second_response.status_code == 200
+    assert second_response.data["result"][0]["key"] == ("migrated.workspace.attribute")
+    assert second_response.data["result"][0]["type"] == "number"
+    assert tuple(second_response.data["result"][0]["types"]) == ("number",)
+    assert second_response.data["has_more"] is False
+
+
+def test_workspace_exact_key_cursor_continues_after_match_for_later_batch_type(
+    monkeypatch,
+):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    def project_batch(_request, *, after_project_id=None):
+        return (
+            ((PROJECT_A,), True) if after_project_id is None else ((PROJECT_B,), False)
+        )
+
+    read_calls = []
+
+    def read_page(_self, project_ids, **kwargs):
+        read_calls.append((tuple(project_ids), kwargs))
+        assert kwargs["dedupe_by_type"] is True
+        assert kwargs["exhaustive_exact_types"] is True
+        assert kwargs["exact_key"] == "migrated.workspace.attribute"
+        attr_type = "string" if tuple(project_ids) == (PROJECT_A,) else "number"
+        digest = attribute_key_type_cursor_digest(
+            "migrated.workspace.attribute", attr_type
+        )
+        seen_after = (*kwargs["seen_key_digests"], digest)
+        return AttributeKeyCursorPageRead(
+            (
+                AttributeKeyRow(
+                    "migrated.workspace.attribute",
+                    attr_type,
+                    1,
+                    (attr_type,),
+                ),
+            ),
+            _metadata(),
+            False,
+            "exhausted",
+            kwargs["window_start"],
+            None,
+            None,
+            0,
+            seen_after,
+            appended_key_digests=(digest,),
+            seen_key_count=kwargs["seen_key_count"] + 1,
+        )
+
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._workspace_project_batch", project_batch
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._run_span_attribute_pg_read",
+        _direct_pg_read,
+    )
+    monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
+
+    first_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "workspace_scope": True,
+            "page_size": 10,
+            "q": "migrated.workspace.attribute",
+        },
+    )
+    first_response = SpanAttributeKeysView.as_view()(first_request)
+    assert first_response.status_code == 200
+    assert first_response.data["exact_match"] is True
+    assert tuple(first_response.data["result"][0]["types"]) == ("string",)
+    assert first_response.data["has_more"] is True
+
+    second_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "workspace_scope": True,
+            "page_size": 10,
+            "q": "migrated.workspace.attribute",
+            "cursor": first_response.data["next_cursor"],
+        },
+    )
+    second_response = SpanAttributeKeysView.as_view()(second_request)
+    assert second_response.status_code == 200
+    assert second_response.data["exact_match"] is True
+    assert tuple(second_response.data["result"][0]["types"]) == ("number",)
+    assert second_response.data["has_more"] is False
+    assert read_calls[1][1]["seen_key_contains"](
+        attribute_key_type_cursor_digest("migrated.workspace.attribute", "string")
+    )
+
+
+def test_span_attribute_key_workspace_cursor_reauthorizes_active_project_batch(
+    monkeypatch,
+):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    calls = []
+
+    def read_page(_self, project_ids, **kwargs):
+        calls.append(tuple(project_ids))
+        return AttributeKeyCursorPageRead(
+            (),
+            _metadata(),
+            True,
+            "continuation",
+            kwargs["window_end"] - timedelta(hours=6),
+            None,
+            None,
+            0,
+            (),
+        )
+
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._workspace_project_batch",
+        lambda _request, *, after_project_id=None: ((PROJECT_A,), False),
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._run_span_attribute_pg_read",
+        _direct_pg_read,
+    )
+    monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._workspace_projects_are_in_request_scope",
+        lambda _request, _project_ids: False,
+    )
+    first_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"workspace_scope": True, "page_size": 10},
+    )
+    first_response = SpanAttributeKeysView.as_view()(first_request)
+    assert first_response.status_code == 200
+
+    second_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "workspace_scope": True,
+            "page_size": 10,
+            "cursor": first_response.data["next_cursor"],
+        },
+    )
+    second_response = SpanAttributeKeysView.as_view()(second_request)
+
+    assert second_response.status_code == 400
+    assert second_response.data["code"] == "cursor_mismatch"
+    assert calls == [(PROJECT_A,)]
+
+
+def test_span_attribute_key_workspace_exact_search_continues_across_batches(
+    monkeypatch,
+):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    batch_calls = []
+    read_calls = []
+
+    def project_batch(_request, *, after_project_id=None):
+        batch_calls.append(after_project_id)
+        return (
+            ((PROJECT_A,), True) if after_project_id is None else ((PROJECT_B,), False)
+        )
+
+    def read_page(_self, project_ids, **kwargs):
+        read_calls.append((tuple(project_ids), kwargs["exact_key"]))
+        rows = (
+            ()
+            if tuple(project_ids) == (PROJECT_A,)
+            else (AttributeKeyRow("historical.exact", "string", 1),)
+        )
+        return AttributeKeyCursorPageRead(
+            rows,
+            _metadata(),
+            False,
+            "exhausted",
+            kwargs["window_start"],
+            None,
+            None,
+            0,
+            tuple(attribute_key_cursor_digest(row.key) for row in rows),
+        )
+
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._workspace_project_batch", project_batch
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._run_span_attribute_pg_read",
+        _direct_pg_read,
+    )
+    monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
+    first_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "workspace_scope": True,
+            "page_size": 10,
+            "q": "historical.exact",
+        },
+    )
+    first_response = SpanAttributeKeysView.as_view()(first_request)
+
+    assert first_response.status_code == 200
+    assert first_response.data["exact_match"] is False
+    assert first_response.data["has_more"] is True
+    assert len(read_calls) == 1
+
+    second_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "workspace_scope": True,
+            "page_size": 10,
+            "q": "historical.exact",
+            "cursor": first_response.data["next_cursor"],
+        },
+    )
+    second_response = SpanAttributeKeysView.as_view()(second_request)
+
+    assert second_response.status_code == 200
+    assert second_response.data["exact_match"] is True
+    assert second_response.data["has_more"] is False
+    assert batch_calls == [None, PROJECT_A]
+    assert read_calls == [
+        ((PROJECT_A,), "historical.exact"),
+        ((PROJECT_B,), "historical.exact"),
+    ]
+
+
+def test_span_attribute_key_workspace_cursor_handles_an_empty_workspace(monkeypatch):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._workspace_project_batch",
+        lambda _request, *, after_project_id=None: ((), False),
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._run_span_attribute_pg_read",
+        _direct_pg_read,
+    )
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "read_key_cursor_page",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an empty workspace must not issue a ClickHouse attribute read"
+        ),
+    )
+    request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"workspace_scope": True, "page_size": 10},
+    )
+
+    response = SpanAttributeKeysView.as_view()(request)
+
+    assert response.status_code == 200
+    assert response.data["result"] == []
+    assert response.data["has_more"] is False
+    assert response.data["next_cursor"] is None
+
+
+def test_span_attribute_key_workspace_cursor_terminates_if_next_batch_was_deleted(
+    monkeypatch,
+):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    batch_calls = []
+    read_calls = []
+
+    def project_batch(_request, *, after_project_id=None):
+        batch_calls.append(after_project_id)
+        return ((PROJECT_A,), True) if after_project_id is None else ((), False)
+
+    def read_page(_self, project_ids, **kwargs):
+        read_calls.append(tuple(project_ids))
+        return AttributeKeyCursorPageRead(
+            (AttributeKeyRow("surviving.attribute", "string", 1),),
+            _metadata(),
+            False,
+            "exhausted",
+            kwargs["window_start"],
+            None,
+            None,
+            0,
+            (attribute_key_cursor_digest("surviving.attribute"),),
+        )
+
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._workspace_project_batch", project_batch
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._run_span_attribute_pg_read",
+        _direct_pg_read,
+    )
+    monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
+    first_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"workspace_scope": True, "page_size": 10},
+    )
+    first_response = SpanAttributeKeysView.as_view()(first_request)
+    assert first_response.status_code == 200
+    assert first_response.data["has_more"] is True
+
+    second_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "workspace_scope": True,
+            "page_size": 10,
+            "cursor": first_response.data["next_cursor"],
+        },
+    )
+    second_response = SpanAttributeKeysView.as_view()(second_request)
+
+    assert second_response.status_code == 200
+    assert second_response.data["result"] == []
+    assert second_response.data["has_more"] is False
+    assert second_response.data["next_cursor"] is None
+    assert batch_calls == [None, PROJECT_A]
+    assert read_calls == [(PROJECT_A,)]
+
+
+def test_span_attribute_key_workspace_cursor_is_signed_to_workspace(monkeypatch):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    calls = []
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._workspace_project_batch",
+        lambda _request, *, after_project_id=None: ((PROJECT_A,), False),
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._run_span_attribute_pg_read",
+        _direct_pg_read,
+    )
+
+    def read_page(_self, project_ids, **kwargs):
+        calls.append(tuple(project_ids))
+        return AttributeKeyCursorPageRead(
+            (),
+            _metadata(),
+            True,
+            "continuation",
+            kwargs["window_end"] - timedelta(hours=6),
+            None,
+            None,
+            0,
+            (),
+        )
+
+    monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
+    first_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"workspace_scope": True, "page_size": 10},
+    )
+    first_request.workspace = SimpleNamespace(pk="workspace-a")
+    first_response = SpanAttributeKeysView.as_view()(first_request)
+    assert first_response.status_code == 200
+
+    second_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {
+            "workspace_scope": True,
+            "page_size": 10,
+            "cursor": first_response.data["next_cursor"],
+        },
+    )
+    second_request.workspace = SimpleNamespace(pk="workspace-b")
+    second_response = SpanAttributeKeysView.as_view()(second_request)
+
+    assert second_response.status_code == 400
+    assert second_response.data["code"] == "cursor_mismatch"
+    assert calls == [(PROJECT_A,)]
+
+
+def test_span_attribute_workspace_project_read_sets_remaining_pg_timeout(
+    monkeypatch,
+):
+    from tracer.views import span_attributes as span_attribute_view
+
+    cursor = MagicMock()
+    cursor_context = MagicMock()
+    cursor_context.__enter__.return_value = cursor
+    cursor_context.__exit__.return_value = False
+    connection = SimpleNamespace(
+        vendor="postgresql",
+        in_atomic_block=False,
+        cursor=lambda: cursor_context,
+    )
+    deadline = MagicMock()
+    deadline.remaining_ms.side_effect = [1_234, 900]
+    monkeypatch.setattr(span_attribute_view, "connection", connection)
+    monkeypatch.setattr(
+        span_attribute_view,
+        "transaction",
+        SimpleNamespace(atomic=lambda: nullcontext()),
+    )
+
+    result = span_attribute_view._run_span_attribute_pg_read(
+        deadline,
+        lambda: (PROJECT_A,),
+    )
+
+    assert result == (PROJECT_A,)
+    assert deadline.remaining_ms.call_args_list == [
+        mock_call(ATTRIBUTE_PROPERTY_PICKER_WALL_TIMEOUT_MS),
+        mock_call(floor_ms=1),
+    ]
+    assert cursor.execute.call_args_list == [
+        mock_call("SET TRANSACTION READ ONLY"),
+        mock_call("SET LOCAL statement_timeout = %s", ["1234ms"]),
+    ]
 
 
 def test_span_attribute_key_api_tracking_limit_is_terminal(monkeypatch):
@@ -11529,11 +12773,25 @@ def test_eval_attribute_picker_contract_accepts_general_exact_key_probe():
     } <= set(ObservationAttributeListResponseSerializer().fields)
 
 
+def _bypass_dashboard_filter_value_pg_read(monkeypatch):
+    """Keep selector/view contract tests isolated from PostgreSQL plumbing."""
+
+    monkeypatch.setattr(
+        "tracer.views.dashboard._run_filter_value_pg_read",
+        lambda _deadline, read: read(),
+    )
+    monkeypatch.setattr(
+        "tracer.views.dashboard._bounded_authorized_filter_value_projects",
+        lambda _request, project_ids, *, deadline: tuple(project_ids),
+    )
+
+
 def test_dashboard_final_status_picker_returns_rejected_from_selector(
     monkeypatch,
 ):
     from tracer.views.dashboard import DashboardViewSet
 
+    _bypass_dashboard_filter_value_pg_read(monkeypatch)
     captured: dict[str, Any] = {}
 
     def read_values(self, project_ids, key, **kwargs):
@@ -11586,6 +12844,8 @@ def test_dashboard_final_status_picker_returns_rejected_from_selector(
 def test_dashboard_json_array_value_picker_preserves_scalar_json_types(monkeypatch):
     from tracer.views.dashboard import DashboardViewSet
 
+    _bypass_dashboard_filter_value_pg_read(monkeypatch)
+
     def read_values(self, project_ids, key, **kwargs):
         assert self._json_attribute_mode == "arrays"
         return AttributeValueRead(
@@ -11626,6 +12886,8 @@ def test_dashboard_json_array_value_picker_preserves_scalar_json_types(monkeypat
 def test_dashboard_empty_sample_limit_is_an_explicit_200_sample(monkeypatch):
     from tracer.views.dashboard import DashboardViewSet
 
+    _bypass_dashboard_filter_value_pg_read(monkeypatch)
+
     monkeypatch.setattr(
         AttributeReadSelector,
         "read_values",
@@ -11660,6 +12922,8 @@ def test_dashboard_empty_sample_limit_is_an_explicit_200_sample(monkeypatch):
 
 def test_dashboard_empty_read_budget_remains_a_sanitized_503(monkeypatch):
     from tracer.views.dashboard import DashboardViewSet
+
+    _bypass_dashboard_filter_value_pg_read(monkeypatch)
 
     monkeypatch.setattr(
         AttributeReadSelector,
@@ -11698,6 +12962,7 @@ def test_dashboard_budget_errors_return_sanitized_503_and_are_not_retried(
 ):
     from tracer.views.dashboard import DashboardViewSet
 
+    _bypass_dashboard_filter_value_pg_read(monkeypatch)
     calls = 0
 
     def fail(self, query, params, *, timeout_ms, settings):
@@ -11746,6 +13011,7 @@ def test_dashboard_cursor_operational_failure_returns_503_without_values_or_curs
 ):
     from tracer.views.dashboard import DashboardViewSet
 
+    _bypass_dashboard_filter_value_pg_read(monkeypatch)
     calls = 0
 
     def fail(self, *args, **kwargs):
@@ -11791,6 +13057,8 @@ def test_dashboard_cursor_operational_failure_returns_503_without_values_or_curs
 
 def test_dashboard_cursor_incomplete_metadata_is_a_sanitized_503(monkeypatch):
     from tracer.views.dashboard import DashboardViewSet
+
+    _bypass_dashboard_filter_value_pg_read(monkeypatch)
 
     monkeypatch.setattr(
         AttributeReadSelector,
@@ -12876,6 +14144,11 @@ def test_span_attribute_views_sanitize_selector_construction_failures(
         raise failure
 
     monkeypatch.setattr(span_attributes, "AttributeReadSelector", fail_selector)
+    monkeypatch.setattr(
+        span_attributes,
+        "_project_is_in_request_scope",
+        lambda _request, _project_id: True,
+    )
     request = _authenticated_get(path, params)
 
     response = getattr(span_attributes, view_name).as_view()(request)

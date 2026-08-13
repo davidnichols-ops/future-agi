@@ -631,7 +631,10 @@ function SimulationRuleFilters({
     queryKey: ["automation-rule-simulation-eval-fields", agentDefinitionId],
     queryFn: () =>
       axios.get(endpoints.dashboard.metrics, {
-        params: { agent_definition_id: agentDefinitionId },
+        params: {
+          agent_definition_id: agentDefinitionId,
+          exclude_custom_attributes: true,
+        },
       }),
     enabled: Boolean(agentDefinitionId),
     select: (response) =>

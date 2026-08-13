@@ -18,7 +18,7 @@ import React, {
   useState,
 } from "react";
 import { useParams, useNavigate } from "react-router";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { enqueueSnackbar } from "notistack";
 import { Helmet } from "react-helmet-async";
 import { Events, trackEvent } from "src/utils/Mixpanel";
@@ -78,6 +78,7 @@ import {
 } from "../LLMTracing/savedViewColumns";
 import { filtersContentEqual } from "../saved-view-utils";
 import { getDefaultDateRangeForMode } from "../dateRangeDefaults";
+import { useCursorAttributeInventory } from "../LLMTracing/useCursorAttributeInventory";
 
 // ---------------------------------------------------------------------------
 // Base session filter fields (always available)
@@ -950,16 +951,22 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
   const [openCustomColumn, setOpenCustomColumn] = useState(false);
   const pendingCustomColumnsRef = useRef([]);
 
-  const { data: evalAttributes } = useQuery({
-    queryKey: ["eval-attributes", observeId],
-    queryFn: () =>
-      axios.get(endpoints.project.getEvalAttributeList(), {
-        params: { filters: JSON.stringify({ project_id: observeId }) },
-      }),
-    select: (data) => data.data?.result,
+  const [customAttributeSearch, setCustomAttributeSearch] = useState("");
+  const preservedCustomAttributeKeys = useMemo(
+    () =>
+      (sessionColumns || [])
+        .filter((column) => column?.groupBy === "Custom Columns")
+        .map((column) => column.id)
+        .filter(Boolean),
+    [sessionColumns],
+  );
+  const { attributes, inventoryControlProps } = useCursorAttributeInventory({
+    projectId: observeId,
+    discoveryMode: "eval_mapping",
+    search: customAttributeSearch,
+    preservedKeys: preservedCustomAttributeKeys,
     enabled: Boolean(observeId),
   });
-  const attributes = useMemo(() => evalAttributes || [], [evalAttributes]);
 
   const handleAddCustomColumns = useCallback((newCols) => {
     setSessionColumns((prev) => {
@@ -1211,6 +1218,8 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
         existingColumns={sessionColumns}
         onAddColumns={handleAddCustomColumns}
         onRemoveColumns={handleRemoveCustomColumns}
+        onAttributeSearchChange={setCustomAttributeSearch}
+        inventoryControlProps={inventoryControlProps}
       />
     </>
   );

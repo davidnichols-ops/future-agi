@@ -95,7 +95,7 @@ describe("useExactTraceAttributeProperties", () => {
       1,
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
-        timeout: 9_800,
+        timeout: 4_800,
         params: {
           project_id: "project-synthetic",
           page_size: 10,
@@ -108,7 +108,7 @@ describe("useExactTraceAttributeProperties", () => {
       2,
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
-        timeout: 9_800,
+        timeout: 4_800,
         params: {
           project_id: "project-synthetic",
           page_size: 10,
@@ -219,8 +219,13 @@ describe("useExactTraceAttributeProperties", () => {
     );
 
     await waitFor(() => expect(result.current.hasNextPage).toBe(true));
-    await act(async () => result.current.fetchNextPage());
-    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(14));
+    for (let expectedCalls = 2; expectedCalls <= 14; expectedCalls += 1) {
+      await act(async () => result.current.fetchNextPage());
+      await waitFor(() =>
+        expect(mocks.get).toHaveBeenCalledTimes(expectedCalls),
+      );
+      expect(result.current.hasNextPage).toBe(true);
+    }
 
     expect(result.current.hasNextPage).toBe(true);
     expect(result.current.isFetchingNextPage).toBe(false);
@@ -228,6 +233,9 @@ describe("useExactTraceAttributeProperties", () => {
       "recent.attribute",
     ]);
 
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(15));
+    expect(result.current.hasNextPage).toBe(true);
     await act(async () => result.current.fetchNextPage());
     await waitFor(() => expect(result.current.hasNextPage).toBe(false));
 
@@ -297,6 +305,11 @@ describe("useExactTraceAttributeProperties", () => {
     ]);
 
     await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(3));
+    expect(result.current.cursorRetryExhausted).toBe(false);
+    expect(result.current.hasNextPage).toBe(true);
+
+    await act(async () => result.current.fetchNextPage());
     await waitFor(() => expect(result.current.cursorRetryExhausted).toBe(true));
 
     expect(mocks.get).toHaveBeenCalledTimes(4);
@@ -343,6 +356,66 @@ describe("useExactTraceAttributeProperties", () => {
     expect(result.current.queryReadState).toBe("complete");
     expect(result.current.browseStatus).toBe("exhausted");
     expect(result.current.hasNextPage).toBe(false);
+  });
+
+  it("refreshes a long retained chain with one request and preserves older rows", async () => {
+    let freshReads = 0;
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (!params.cursor) {
+        freshReads += 1;
+        return Promise.resolve({
+          data: {
+            result: [
+              {
+                key: freshReads === 1 ? "recent.attribute" : "fresh.attribute",
+                type: "string",
+              },
+            ],
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: freshReads === 1 ? "page-2" : "fresh-page-2",
+          },
+        });
+      }
+      const pageNumber = Number(params.cursor.split("-").at(-1));
+      return Promise.resolve({
+        data: {
+          result: [{ key: `older.attribute.${pageNumber}`, type: "string" }],
+          browse_status: pageNumber === 5 ? "exhausted" : "continuation",
+          has_more: pageNumber < 5,
+          next_cursor: pageNumber < 5 ? `page-${pageNumber + 1}` : null,
+        },
+      });
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-long-chain",
+          search: "",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    for (let page = 2; page <= 5; page += 1) {
+      await act(async () => result.current.fetchNextPage());
+    }
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+    expect(mocks.get).toHaveBeenCalledTimes(5);
+
+    await act(async () => result.current.refetch());
+
+    expect(mocks.get).toHaveBeenCalledTimes(6);
+    expect(mocks.get.mock.calls.at(-1)[1].params).not.toHaveProperty("cursor");
+    expect(result.current.data.map(({ id }) => id)).toEqual(
+      expect.arrayContaining([
+        "recent.attribute",
+        "older.attribute.5",
+        "fresh.attribute",
+      ]),
+    );
   });
 
   it("uses endpoint-specific browse state instead of generic sampling state", () => {
@@ -749,6 +822,12 @@ describe("useExactTraceAttributeProperties", () => {
     await waitFor(() => expect(result.current.hasNextExactPage).toBe(true));
     expect(cursorlessFooCalls()).toBe(1);
     await act(async () => result.current.fetchNextExactPage());
+    await waitFor(() => expect(result.current.isFetchNextPageError).toBe(true));
+    expect(result.current.cursorRetryExhausted).toBe(false);
+    await act(async () => result.current.fetchNextExactPage());
+    await waitFor(() => expect(cursorlessFooCalls()).toBe(2));
+    expect(result.current.cursorRetryExhausted).toBe(false);
+    await act(async () => result.current.fetchNextExactPage());
     await waitFor(() => expect(result.current.cursorRetryExhausted).toBe(true));
     expect(cursorlessFooCalls()).toBe(2);
 
@@ -762,7 +841,9 @@ describe("useExactTraceAttributeProperties", () => {
 
     await act(async () => result.current.fetchNextExactPage());
     await waitFor(() => expect(cursorlessFooCalls()).toBe(3));
-    expect(result.current.cursorRetryExhausted).toBe(true);
+    expect(result.current.cursorRetryExhausted).toBe(false);
+    await act(async () => result.current.fetchNextExactPage());
+    await waitFor(() => expect(result.current.cursorRetryExhausted).toBe(true));
   });
 
   it("advances only the exact prompt_slug cursor after one sparse bounded search", async () => {
@@ -820,7 +901,26 @@ describe("useExactTraceAttributeProperties", () => {
     // The shared Load-more method is what Basic/Query picker gestures call.
     // With an active search it must advance exactly one logical cursor chain,
     // never the unrelated retained catalog.
-    await act(async () => result.current.fetchNextPage());
+    for (
+      let expectedExactPage = 1;
+      expectedExactPage <= 13;
+      expectedExactPage += 1
+    ) {
+      await act(async () => result.current.fetchNextPage());
+      await waitFor(() =>
+        expect(
+          mocks.get.mock.calls.some(
+            ([, options]) =>
+              options.params.cursor === `exact-${expectedExactPage}`,
+          ),
+        ).toBe(true),
+      );
+      expect(
+        mocks.get.mock.calls.some(
+          ([, options]) => options.params.cursor === "catalog-page-2",
+        ),
+      ).toBe(false);
+    }
     await waitFor(() => expect(result.current.exactSearchMatched).toBe(true));
 
     expect(

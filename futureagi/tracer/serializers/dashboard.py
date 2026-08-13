@@ -485,6 +485,9 @@ class DashboardMetricCatalogItemSerializer(serializers.Serializer):
     choices = serializers.ListField(
         child=JsonValueField(), required=False, allow_empty=True
     )
+    choice_options = serializers.ListField(
+        child=JsonValueField(), required=False, allow_empty=True
+    )
     allowed_aggregations = serializers.ListField(
         child=serializers.CharField(), required=False, allow_empty=True
     )

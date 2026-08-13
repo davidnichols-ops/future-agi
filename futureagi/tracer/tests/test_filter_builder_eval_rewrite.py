@@ -36,7 +36,11 @@ from tracer.services.clickhouse.eval_logger_table import (
     eval_logger_source,
     eval_logger_version_column,
 )
-from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.filters import (
+    ClickHouseFilterBuilder,
+    EvalFilterMetadata,
+    resolve_eval_filter_metadata,
+)
 from tracer.services.clickhouse.v2.query_builders.filters import (
     ClickHouseFilterBuilderV2,
     rewrite_v1_sql_to_v2,
@@ -513,6 +517,127 @@ class TestEvalChoiceCompilation:
 
 @pytest.mark.unit
 class TestEvalModeAndConfig:
+    @pytest.mark.parametrize(
+        ("output_type", "filter_op", "filter_value"),
+        [
+            ("SCORE", "greater_than", 50),
+            ("PASS_FAIL", "equals", "Passed"),
+            ("CHOICE", "in", ["a", "b"]),
+            ("CHOICES", "equals", "yes"),
+        ],
+    )
+    def test_authoritative_metadata_is_byte_identical_without_an_orm_fallback(
+        self,
+        monkeypatch,
+        output_type,
+        filter_op,
+        filter_value,
+    ):
+        eval_id, config_ids = _patch_eval(monkeypatch, output_type)
+        filters = _eval_filter(eval_id, filter_op, filter_value)
+        expected = _translate(ClickHouseFilterBuilder, filters)
+
+        monkeypatch.setattr(
+            "tracer.services.clickhouse.query_builders.filters.resolve_eval_filter_metadata",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("authoritative metadata must suppress ORM resolution")
+            ),
+        )
+        actual = _translate(
+            ClickHouseFilterBuilder,
+            filters,
+            eval_filter_metadata={
+                eval_id: EvalFilterMetadata(tuple(config_ids), output_type)
+            },
+        )
+
+        assert actual == expected
+
+    @pytest.mark.parametrize("metadata_present", [True, False])
+    def test_authoritative_empty_metadata_is_a_known_no_match(
+        self,
+        monkeypatch,
+        metadata_present,
+    ):
+        eval_id = str(uuid.uuid4())
+        monkeypatch.setattr(
+            "tracer.services.clickhouse.query_builders.filters.resolve_eval_filter_metadata",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("explicit metadata must not fall back to the ORM")
+            ),
+        )
+
+        where, params = _translate(
+            ClickHouseFilterBuilder,
+            _eval_filter(eval_id, "equals", 50),
+            eval_filter_metadata=(
+                {eval_id: EvalFilterMetadata((), "SCORE")} if metadata_present else {}
+            ),
+        )
+
+        assert where == (
+            "trace_id IN (SELECT toUUID('00000000-0000-0000-0000-000000000000'))"
+        )
+        assert params == {}
+
+    def test_authoritative_resolution_applies_project_fence_before_config_read(
+        self,
+        monkeypatch,
+    ):
+        from unittest import mock
+
+        from model_hub.models.evals_metric import EvalTemplate
+        from tracer.models.custom_eval_config import CustomEvalConfig
+
+        eval_id = str(uuid.uuid4())
+        project_id = str(uuid.uuid4())
+        template_id = str(uuid.uuid4())
+        config_id = str(uuid.uuid4())
+        unscoped = mock.Mock()
+        scoped = mock.Mock()
+        manager = mock.Mock()
+        manager.filter.return_value = unscoped
+        unscoped.exists.return_value = True
+        unscoped.filter.return_value = scoped
+        scoped.values_list.side_effect = lambda field, flat=False: _FakeValuesList(
+            [config_id] if field == "id" else [template_id]
+        )
+        monkeypatch.setattr(CustomEvalConfig, "objects", manager)
+        monkeypatch.setattr(
+            EvalTemplate,
+            "no_workspace_objects",
+            _FakeEvalTemplateManager("PASS_FAIL"),
+        )
+
+        metadata = resolve_eval_filter_metadata(eval_id, [project_id])
+
+        manager.filter.assert_called_once_with(id=eval_id, deleted=False)
+        unscoped.filter.assert_called_once_with(project_id__in=[project_id])
+        assert metadata == EvalFilterMetadata((config_id,), "PASS_FAIL")
+
+    def test_malformed_identifier_resolves_to_authoritative_no_match(
+        self,
+        monkeypatch,
+    ):
+        from django.core.exceptions import ValidationError
+
+        from tracer.models.custom_eval_config import CustomEvalConfig
+
+        class InvalidIdentifierManager:
+            @staticmethod
+            def filter(**_kwargs):
+                raise ValidationError("invalid UUID")
+
+        monkeypatch.setattr(
+            CustomEvalConfig,
+            "objects",
+            InvalidIdentifierManager(),
+        )
+
+        metadata = resolve_eval_filter_metadata("not-a-uuid", [str(uuid.uuid4())])
+
+        assert metadata == EvalFilterMetadata((), "SCORE")
+
     def test_trace_mode_matches_trace_id(self, monkeypatch):
         eval_id, _ = _patch_eval(monkeypatch, "SCORE")
         where, _ = _translate(

@@ -910,9 +910,11 @@ def test_session_has_eval_is_finite_latest_state_and_page_n_safe(
 ):
     now = datetime(2026, 7, 31, 12, 0)
     candidate_session_id = str(uuid.uuid4())
+    eval_config_id = str(uuid.uuid4())
     builder = SessionListQueryBuilderV2(
         project_id=str(uuid.uuid4()),
         filters=[*_window(now), _has_eval_filter(filter_value)],
+        eval_config_ids=[eval_config_id],
         bounded_internal_scan=True,
     )
 
@@ -935,6 +937,8 @@ def test_session_has_eval_is_finite_latest_state_and_page_n_safe(
     assert "WHERE isNotNull(trace_id)" in sql
     assert "toUUIDOrNull(trace_id)" not in sql
     assert "FROM tracer_eval_logger_v2 AS eval_scan" in sql
+    assert "eval_scan.custom_eval_config_id IN" in sql
+    assert params["session_project_eval_config_ids"] == (eval_config_id,)
     assert (
         "eval_scan.trace_id IN (\n                SELECT trace_id "
         "FROM candidate_eval_trace_ids" in sql
@@ -967,6 +971,7 @@ def test_session_has_eval_false_combines_before_exact_session_aggregation():
     candidate_session_id = str(uuid.uuid4())
     builder = SessionListQueryBuilderV2(
         project_id=str(uuid.uuid4()),
+        eval_config_ids=[str(uuid.uuid4())],
         filters=[
             *_window(now),
             {
@@ -1007,6 +1012,44 @@ def test_session_has_eval_false_combines_before_exact_session_aggregation():
     assert "eval_scan._version" not in sql
     assert "latest_eval._peerdb_is_deleted = 0" in sql
     assert "rejected" in params.values()
+
+
+@pytest.mark.unit
+def test_session_has_eval_unknown_configs_are_resolved_once_for_all_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy/public session callers cannot repeat one PG lookup per batch."""
+
+    from tracer.models.custom_eval_config import CustomEvalConfig
+
+    project_id = str(uuid.uuid4())
+    config_id = str(uuid.uuid4())
+    filter_calls = []
+
+    class _ConfigQuery:
+        @staticmethod
+        def values_list(*_args, **_kwargs):
+            return [config_id]
+
+    def config_filter(**kwargs):
+        filter_calls.append(kwargs)
+        return _ConfigQuery()
+
+    monkeypatch.setattr(CustomEvalConfig.objects, "filter", config_filter)
+    builder = SessionListQueryBuilderV2(
+        project_id=project_id,
+        filters=[_has_eval_filter(True)],
+        bounded_internal_scan=True,
+    )
+
+    for candidate_id in (str(uuid.uuid4()), str(uuid.uuid4())):
+        sql, params = builder.build_filter_match_query([candidate_id])
+        assert "eval_scan.custom_eval_config_id IN" in sql
+        assert params["session_project_eval_config_ids"] == (config_id,)
+
+    assert filter_calls == [
+        {"project_id__in": [project_id], "deleted": False},
+    ]
 
 
 @pytest.mark.unit

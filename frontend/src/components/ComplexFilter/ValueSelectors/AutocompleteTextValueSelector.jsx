@@ -23,9 +23,10 @@ const CURSOR_STOPPED_KEY = "filter_value_cursor_stopped";
 // The shared Axios client intentionally has no global timeout. Attribute
 // browsing is interactive, though, and an interrupted proxy/backend response
 // must not leave the picker in an endless "Loading more" state. This is just
-// above the server-side 9.5-second ceiling so ordinary server timeouts can
-// retain their structured response while transport stalls fail into Retry.
-const ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS = 9_800;
+// above the server-side four-second picker wall so ordinary server timeouts can
+// retain their structured response while transport stalls still fail below the
+// five-second interaction contract.
+const ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS = 4_800;
 
 const normalizeBrowseMetadata = (result = {}) =>
   TERMINAL_BROWSE_STATUSES.has(result?.browse_status)
@@ -160,10 +161,20 @@ const AutocompleteTextValueSelector = ({
     debouncedInput,
   ];
   const nextPageRequestRef = useRef(null);
+  const freshChainRetryRef = useRef(null);
+  const [freshChainRetrying, setFreshChainRetrying] = useState(false);
   const autoScrollPageUsedRef = useRef(false);
   const paginationIdentity = JSON.stringify(queryKey);
   useEffect(() => {
     autoScrollPageUsedRef.current = false;
+    setFreshChainRetrying(false);
+    return () => {
+      const activeRequest = freshChainRetryRef.current;
+      if (activeRequest?.identity === paginationIdentity) {
+        activeRequest.controller.abort();
+        freshChainRetryRef.current = null;
+      }
+    };
   }, [paginationIdentity]);
   const {
     data,
@@ -174,7 +185,6 @@ const AutocompleteTextValueSelector = ({
     fetchNextPage,
     isFetchingNextPage,
     isFetchNextPageError,
-    refetch,
   } = useInfiniteQuery({
     queryKey,
     queryFn: async ({ signal, pageParam }) => {
@@ -217,7 +227,7 @@ const AutocompleteTextValueSelector = ({
       const checkedResult = (response) =>
         validateBrowseCursor(response?.data?.result || {}, consumedCursors);
       // Every checkpoint shares the same action clock. The follower stops
-      // before a continuation can multiply the 9.5-second request wall.
+      // before a continuation can multiply the four-second server wall.
       const {
         response,
         rows: values,
@@ -241,6 +251,11 @@ const AutocompleteTextValueSelector = ({
         isCurrent: () => !signal.aborted,
         cancellationSignal: signal,
         startedAt: actionStartedAt,
+        // One interaction owns one physical HTTP request. Empty advancing
+        // checkpoints stay explicit through the signed cursor so a second
+        // four-second request cannot push the same click beyond five seconds.
+        maxContinuations: 0,
+        maxElapsedMs: ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS,
       });
       const accumulatedResponse = withBrowseResult(response, {
         ...response?.data?.result,
@@ -291,8 +306,95 @@ const AutocompleteTextValueSelector = ({
     enabled: Boolean(projectId) && Boolean(definition?.propertyId),
     staleTime: 30000,
     retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
     meta: { errorHandled: true },
   });
+  const retryFreshChain = useCallback(() => {
+    const activeRequest = freshChainRetryRef.current;
+    if (activeRequest?.identity === paginationIdentity) {
+      return activeRequest.promise;
+    }
+
+    const controller = new AbortController();
+    setFreshChainRetrying(true);
+    const request = (async () => {
+      await queryClient.cancelQueries({ queryKey, exact: true });
+      const previousData = queryClient.getQueryData(queryKey);
+      const response = await axios.get(endpoints.dashboard.filterValues, {
+        signal: controller.signal,
+        timeout: ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS,
+        params: {
+          project_ids: projectId,
+          metric_name: definition?.propertyId,
+          metric_type: "custom_attribute",
+          source: "traces",
+          search: debouncedInput,
+          page_size: 10,
+          ...(attributeType ? { attribute_type: attributeType } : {}),
+        },
+      });
+      const checkedResult = validateBrowseCursor(
+        response?.data?.result || {},
+        new Set(),
+      );
+      let freshResponse = withBrowseResult(response, {
+        ...checkedResult,
+        [FOLLOWED_CURSORS_KEY]: [],
+      });
+      if (hasEmptyContinuation(freshResponse)) {
+        freshResponse = markEmptyContinuationGuardExhausted(freshResponse);
+      }
+
+      const seenValues = new Set();
+      const retainedValues = [
+        ...(previousData?.pages || []).flatMap(
+          (page) => page?.data?.result?.values || [],
+        ),
+        ...(freshResponse?.data?.result?.values || []),
+      ].filter((option) => {
+        const identity = optionIdentity(option);
+        if (seenValues.has(identity)) return false;
+        seenValues.add(identity);
+        return true;
+      });
+      const compactedResponse = withBrowseResult(freshResponse, {
+        ...freshResponse?.data?.result,
+        values: retainedValues,
+      });
+      // Retain selectable rows, but publish only the newly fetched transport
+      // page. Calling TanStack's infinite-query refetch here would replay the
+      // whole cached cursor chain before the user regains control.
+      queryClient.setQueryData(queryKey, {
+        pages: [compactedResponse],
+        pageParams: [null],
+      });
+      return compactedResponse;
+    })();
+    const trackedRequest = {
+      identity: paginationIdentity,
+      controller,
+      promise: null,
+    };
+    const settledPromise = request.finally(() => {
+      if (freshChainRetryRef.current === trackedRequest) {
+        freshChainRetryRef.current = null;
+        setFreshChainRetrying(false);
+      }
+    });
+    trackedRequest.promise = settledPromise;
+    freshChainRetryRef.current = trackedRequest;
+    return settledPromise;
+  }, [
+    attributeType,
+    debouncedInput,
+    definition?.propertyId,
+    paginationIdentity,
+    projectId,
+    queryClient,
+    queryKey,
+  ]);
   const requestNextPage = useCallback(() => {
     const activeRequest = nextPageRequestRef.current;
     if (activeRequest?.identity === paginationIdentity) {
@@ -450,14 +552,16 @@ const AutocompleteTextValueSelector = ({
               event.preventDefault();
               event.stopPropagation();
               if (option === RETRY_OPTION) {
-                if (!isFetching) refetch();
+                if (!isFetching && !freshChainRetrying) {
+                  void retryFreshChain().catch(() => {});
+                }
               } else {
                 requestNextPage();
               }
             }}
           >
             {option === RETRY_OPTION
-              ? isFetching
+              ? isFetching || freshChainRetrying
                 ? "Retrying values…"
                 : "Retry loading values"
               : isFetchingNextPage
@@ -516,7 +620,9 @@ const AutocompleteTextValueSelector = ({
       onChange={(_, newValue) => {
         freeTextDirtyRef.current = false;
         if (newValue === RETRY_OPTION) {
-          if (!isFetching) refetch();
+          if (!isFetching && !freshChainRetrying) {
+            void retryFreshChain().catch(() => {});
+          }
           return;
         }
         if (newValue === LOAD_MORE_OPTION) {
@@ -528,7 +634,9 @@ const AutocompleteTextValueSelector = ({
           newValue.some((option) => isPaginationOption(option))
         ) {
           if (newValue.includes(RETRY_OPTION)) {
-            if (!isFetching) refetch();
+            if (!isFetching && !freshChainRetrying) {
+              void retryFreshChain().catch(() => {});
+            }
           } else {
             requestNextPage();
           }
@@ -553,7 +661,7 @@ const AutocompleteTextValueSelector = ({
             ...params.InputProps,
             endAdornment: (
               <>
-                {isLoading || isFetching ? (
+                {isLoading || isFetching || freshChainRetrying ? (
                   <CircularProgress color="inherit" size={16} />
                 ) : null}
                 {params.InputProps.endAdornment}

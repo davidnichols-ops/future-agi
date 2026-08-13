@@ -25,6 +25,7 @@ const FilterRow = ({
   defaultFilter,
   propertyIdCount,
   projectId,
+  onAttributeSearchChange,
 }) => {
   const parentProperty = filter?._meta?.parentProperty || "";
   const filterRef = useRef(null);
@@ -94,6 +95,9 @@ const FilterRow = ({
               value: item?.propertyId || item?.propertyName,
             }))}
             value={filter?._meta?.[property] || ""}
+            onSearchChange={
+              property === "Attribute" ? onAttributeSearchChange : undefined
+            }
             sx={{ maxWidth: "280px", width: "280px" }}
             onChange={(e) => {
               const dependentOgDefinition = dependents.find(
@@ -467,6 +471,7 @@ FilterRow.propTypes = {
   defaultFilter: PropTypes.object.isRequired,
   propertyIdCount: PropTypes.object.isRequired,
   projectId: PropTypes.string,
+  onAttributeSearchChange: PropTypes.func,
 };
 
 export default FilterRow;

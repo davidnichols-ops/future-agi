@@ -652,6 +652,33 @@ describe("OpenAPI runtime contract", () => {
     ).toMatchObject({ ok: true });
   });
 
+  it("accepts either project or workspace scope for span-attribute keys", () => {
+    expect(
+      validateContractedRequestConfig({
+        url: "/api/traces/span-attribute-keys/",
+        method: "get",
+        params: { workspace_scope: true, page_size: 50 },
+      }),
+    ).toMatchObject({ ok: true });
+    expect(
+      validateContractedRequestConfig({
+        url: "/api/traces/span-attribute-keys/",
+        method: "get",
+        params: { project_id: "c4de3065-12b5-488c-a814-aa1c8e3f856f" },
+      }),
+    ).toMatchObject({ ok: true });
+
+    // The workspace widening belongs only to key inventory. The detail
+    // endpoint remains project-scoped and must keep its required project_id.
+    expect(
+      validateContractedRequestConfig({
+        url: "/api/traces/span-attribute-detail/",
+        method: "get",
+        params: { key: "historical.attribute" },
+      }),
+    ).toMatchObject({ ok: false });
+  });
+
   it("accepts every JSON value shape in dashboard filter-picker options", () => {
     expect(
       OPENAPI_CONTRACT.definitions.DashboardFilterValueOption.properties.value[

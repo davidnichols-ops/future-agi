@@ -22,12 +22,13 @@ import useReverseEvalFilters from "src/hooks/use-reverse-eval-filters";
 import NumberQuickFilterPopover from "src/components/ComplexFilter/QuickFilterComponents/NumberQuickFilterPopover/NumberQuickFilterPopover";
 import { getFilterExtraProperties } from "../../../utils/prototypeObserveUtils";
 import TotalRowsStatusBar from "src/sections/develop-detail/Common/TotalRowsStatusBar";
-import { useQuery } from "@tanstack/react-query";
 import { generateAnnotationColumnsForTracing } from "src/sections/projects/LLMTracing/common";
 import { useShallowToggleAnnotationsStore } from "src/sections/agents/store";
 import { getListTotalState } from "src/sections/projects/LLMTracing/listTotalMetadata";
 import { parsePrototypeSpanListResponse } from "src/api/project/telemetry-list-contract";
 import { getSpanPhysicalRowId } from "src/sections/projects/LLMTracing/spanPhysicalIdentity";
+import AttributeInventoryControls from "src/sections/projects/LLMTracing/AttributeInventoryControls";
+import { useCursorAttributeInventory } from "src/sections/projects/LLMTracing/useCursorAttributeInventory";
 
 const defaultFilter = {
   column_id: "",
@@ -81,56 +82,27 @@ const SpanTab = React.forwardRef(
     const [filters, setFilters] = useState([
       { ...defaultFilter, id: getRandomId() },
     ]);
-
-    const { data: evalAttributes } = useQuery({
-      queryKey: ["eval-attributes", projectId],
-      queryFn: () =>
-        axios.get(endpoints.project.getEvalAttributeList(), {
-          params: {
-            filters: JSON.stringify({ project_id: projectId }),
-          },
-        }),
-      select: (data) => data.data?.result,
-    });
-
-    const [filterDefinition, setFilterDefinition] = useState(() => {
-      return generateSpanFilterDefinition(columns, evalAttributes, filters);
-    });
-
-    // Memoized helper for preserving attribute definitions
-    const preserveAttributeDefinitions = useMemo(() => {
-      return (prevDefinition, newBaseDefinition) => {
-        const attributionIndex = prevDefinition?.findIndex(
-          (item) => item?.propertyName === "Attribute",
-        );
-
-        if (prevDefinition?.[attributionIndex]?.dependents?.length > 0) {
-          // Already has the Attribute block — preserve it
-          const copy = [...newBaseDefinition];
-          const copyAttributionIndex = copy?.findIndex(
-            (item) => item?.propertyName === "Attribute",
-          );
-          if (copyAttributionIndex >= 0) {
-            copy[copyAttributionIndex] = prevDefinition[attributionIndex];
-          }
-          return copy;
-        } else {
-          // Generate fresh with attributes
-          return newBaseDefinition;
-        }
-      };
-    }, []);
-
-    useEffect(() => {
-      setFilterDefinition((prevDefinition) => {
-        const newBaseDefinition = generateSpanFilterDefinition(
-          columns,
-          evalAttributes,
-          filters,
-        );
-        return preserveAttributeDefinitions(prevDefinition, newBaseDefinition);
+    const [attributeSearch, setAttributeSearch] = useState("");
+    const preservedAttributeKeys = useMemo(
+      () =>
+        filters.flatMap((filter) =>
+          filter?._meta?.parentProperty === "Attribute" && filter?.column_id
+            ? [filter.column_id]
+            : [],
+        ),
+      [filters],
+    );
+    const { attributes: evalAttributes, inventoryControlProps } =
+      useCursorAttributeInventory({
+        projectId,
+        discoveryMode: "filter",
+        search: attributeSearch,
+        preservedKeys: preservedAttributeKeys,
       });
-    }, [columns, evalAttributes, filters, preserveAttributeDefinitions]);
+    const filterDefinition = useMemo(
+      () => generateSpanFilterDefinition(columns, evalAttributes, filters),
+      [columns, evalAttributes, filters],
+    );
 
     const reversePrimaryEvalColumnIds = useMemo(() => {
       return columns.filter((c) => c?.reverseOutput).map((c) => c.id);
@@ -325,6 +297,12 @@ const SpanTab = React.forwardRef(
               filterDefinition={filterDefinition}
               onClose={() => setFilterOpen(false)}
               projectId={projectId}
+              onAttributeSearchChange={setAttributeSearch}
+            />
+            <AttributeInventoryControls
+              {...inventoryControlProps}
+              showSearch={false}
+              search={attributeSearch}
             />
           </Box>
         </Collapse>

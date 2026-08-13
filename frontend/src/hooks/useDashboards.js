@@ -4,7 +4,7 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import axios, { endpoints } from "src/utils/axios";
 import { getFilterValueReadState } from "src/utils/queryReadState";
 import { accumulateUniqueListContinuations } from "src/sections/projects/LLMTracing/listCursorPagination";
@@ -19,13 +19,14 @@ const DASHBOARD_KEYS = {
     projectIds,
     workflow,
   ],
-  metricsPaginated: (category, search, source) => [
+  metricsPaginated: (category, search, source, excludeCustomAttributes) => [
     ...DASHBOARD_KEYS.all,
     "metrics",
     "paginated",
     category,
     search,
     source,
+    excludeCustomAttributes,
   ],
 };
 
@@ -81,11 +82,11 @@ const validateFilterValueCursor = (page, consumedCursors = new Set()) => {
   return stopFilterValueCursor(normalized, "malformed_cursor");
 };
 
-// The shared Axios instance intentionally has no global timeout. Distinct
-// value browsing is interactive and the API has a 9.5-second read ceiling, so
-// release the picker shortly after that boundary instead of leaving Load more
-// in a permanent spinner when a proxy/request stalls.
-export const FILTER_VALUE_REQUEST_TIMEOUT_MS = 9_800;
+// The server owns a four-second request wall. Keep the whole browser gesture
+// below five seconds as well, including a stalled proxy. One gesture performs
+// one physical request; a signed cursor remains available for the next
+// explicit action, so this latency guard never becomes a vocabulary cap.
+export const FILTER_VALUE_REQUEST_TIMEOUT_MS = 4_800;
 
 const getFilterValueIdentity = (option) => {
   const value =
@@ -128,6 +129,24 @@ const isFilterValueCursorChainStopped = (data) => {
     }
   }
   return consumedCursors.has(nextCursor);
+};
+
+const compactFilterValueRetryPage = (previousData, freshPage) => {
+  const seen = new Set();
+  const values = [
+    ...(previousData?.pages || []).flatMap((page) => page?.values || []),
+    ...(freshPage?.values || []),
+  ].filter((option) => {
+    const identity = getFilterValueIdentity(option);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+
+  // Fresh response metadata owns the new cursor chain. Previously loaded rows
+  // remain selectable, but old cursor/page history is deliberately discarded
+  // so a Retry can never replay an arbitrarily long infinite-query cache.
+  return { ...freshPage, values };
 };
 
 export function useDashboardList() {
@@ -222,16 +241,25 @@ export function useDashboardMetricsPaginated({
   source = "",
   search = "",
   pageSize = 50,
+  excludeCustomAttributes = false,
   enabled = true,
 } = {}) {
   const query = useInfiniteQuery({
-    queryKey: DASHBOARD_KEYS.metricsPaginated(category, search, source),
+    queryKey: DASHBOARD_KEYS.metricsPaginated(
+      category,
+      search,
+      source,
+      excludeCustomAttributes,
+    ),
     queryFn: ({ pageParam = 1 }) =>
       axios.get(endpoints.dashboard.metrics, {
         params: {
           ...(category ? { category } : {}),
           ...(source ? { source } : {}),
           ...(search ? { search } : {}),
+          ...(excludeCustomAttributes
+            ? { exclude_custom_attributes: true }
+            : {}),
           page: pageParam,
           page_size: pageSize,
         },
@@ -404,6 +432,8 @@ export function useDashboardFilterValues({
     previous: null,
     pendingRetry: null,
   });
+  const freshChainRetryRef = useRef(null);
+  const [freshChainRetryIdentity, setFreshChainRetryIdentity] = useState(null);
   const queryKey = [
     ...DASHBOARD_KEYS.all,
     "filterValues",
@@ -416,85 +446,99 @@ export function useDashboardFilterValues({
     pageSize,
     attributeType,
   ];
+  const queryIdentity = JSON.stringify(queryKey);
+  const requestFilterValuePage = (cursor, signal) =>
+    axios
+      .get(endpoints.dashboard.filterValues, {
+        signal,
+        timeout: FILTER_VALUE_REQUEST_TIMEOUT_MS,
+        params: {
+          metric_name: metricName,
+          metric_type: metricType,
+          project_ids: (projectIds || []).join(","),
+          source,
+          ...(workflow ? { workflow } : {}),
+          ...(search ? { search } : {}),
+          ...(pageSize ? { page_size: pageSize } : {}),
+          ...(cursor ? { cursor } : {}),
+          ...(attributeType ? { attribute_type: attributeType } : {}),
+        },
+      })
+      .then((res) => res.data?.result || {});
+  const readFilterValuePage = async ({ signal, pageParam, publishedData }) => {
+    const actionStartedAt = Date.now();
+    const requestPage = (cursor, requestSignal = signal) =>
+      requestFilterValuePage(cursor, requestSignal);
+    const cachedPages = publishedData?.pages || [];
+    const isFreshChainRead = pageParam == null;
+    const knownValueIdentities = isFreshChainRead
+      ? []
+      : cachedPages.flatMap((page) =>
+          (page?.values || []).map(getFilterValueIdentity),
+        );
+    const consumedCursors = new Set(
+      [
+        ...(isFreshChainRead ? [] : publishedData?.pageParams || []),
+        ...(isFreshChainRead
+          ? []
+          : cachedPages.flatMap(
+              (page) => page?.[FILTER_VALUE_FOLLOWED_CURSORS_KEY] || [],
+            )),
+        pageParam,
+      ].filter((cursor) => typeof cursor === "string" && cursor.length > 0),
+    );
+    const initialPage = await requestPage(pageParam);
+    const checkedMetadata = (response) =>
+      validateFilterValueCursor(response, consumedCursors);
+    const {
+      response: page,
+      rows: values,
+      followedCursors,
+    } = await accumulateUniqueListContinuations({
+      initialResponse: initialPage,
+      rowsFromResponse: (response) => response?.values || [],
+      identityFromRow: getFilterValueIdentity,
+      knownIdentities: knownValueIdentities,
+      targetRowCount: isFreshChainRead ? 1 : pageSize || 10,
+      // A private marker records a protocol stop for the picker. Project it
+      // as terminal only for this bounded follower so no malformed/repeated
+      // cursor is requested and the published response remains retryable.
+      metadataFromResponse: (response) => {
+        const checked = checkedMetadata(response);
+        return isFilterValueCursorStopped(checked)
+          ? { ...checked, has_more: false, next_cursor: null }
+          : checked;
+      },
+      nextResponse: requestPage,
+      onContinuation: (metadata) => {
+        const nextCursor = getFilterValueNextCursor(metadata);
+        if (nextCursor) consumedCursors.add(nextCursor);
+      },
+      isCurrent: () => !signal?.aborted,
+      cancellationSignal: signal,
+      startedAt: actionStartedAt,
+      // One interaction owns one physical HTTP request. Empty advancing
+      // checkpoints stay explicit through the signed cursor so a second
+      // four-second request can never push the same click beyond five
+      // seconds.
+      maxContinuations: 0,
+      maxElapsedMs: FILTER_VALUE_REQUEST_TIMEOUT_MS,
+    });
+    const checkedPage = checkedMetadata(page);
+    return {
+      ...checkedPage,
+      values,
+      [FILTER_VALUE_FOLLOWED_CURSORS_KEY]: followedCursors,
+    };
+  };
   const query = useInfiniteQuery({
     queryKey,
-    queryFn: async ({ signal, pageParam }) => {
-      const actionStartedAt = Date.now();
-      const requestPage = (cursor, requestSignal = signal) =>
-        axios
-          .get(endpoints.dashboard.filterValues, {
-            signal: requestSignal,
-            timeout: FILTER_VALUE_REQUEST_TIMEOUT_MS,
-            params: {
-              metric_name: metricName,
-              metric_type: metricType,
-              project_ids: (projectIds || []).join(","),
-              source,
-              ...(workflow ? { workflow } : {}),
-              ...(search ? { search } : {}),
-              ...(pageSize ? { page_size: pageSize } : {}),
-              ...(cursor ? { cursor } : {}),
-              ...(attributeType ? { attribute_type: attributeType } : {}),
-            },
-          })
-          .then((res) => res.data?.result || {});
-      const cachedData = queryClient.getQueryData(queryKey);
-      const cachedPages = cachedData?.pages || [];
-      const isFreshChainRead = pageParam == null;
-      const knownValueIdentities = isFreshChainRead
-        ? []
-        : cachedPages.flatMap((page) =>
-            (page?.values || []).map(getFilterValueIdentity),
-          );
-      const consumedCursors = new Set(
-        [
-          ...(isFreshChainRead ? [] : cachedData?.pageParams || []),
-          ...(isFreshChainRead
-            ? []
-            : cachedPages.flatMap(
-                (page) => page?.[FILTER_VALUE_FOLLOWED_CURSORS_KEY] || [],
-              )),
-          pageParam,
-        ].filter((cursor) => typeof cursor === "string" && cursor.length > 0),
-      );
-      const initialPage = await requestPage(pageParam);
-      const checkedMetadata = (response) =>
-        validateFilterValueCursor(response, consumedCursors);
-      const {
-        response: page,
-        rows: values,
-        followedCursors,
-      } = await accumulateUniqueListContinuations({
-        initialResponse: initialPage,
-        rowsFromResponse: (response) => response?.values || [],
-        identityFromRow: getFilterValueIdentity,
-        knownIdentities: knownValueIdentities,
-        targetRowCount: isFreshChainRead ? 1 : pageSize || 10,
-        // A private marker records a protocol stop for the picker. Project it
-        // as terminal only for this bounded follower so no malformed/repeated
-        // cursor is requested and the published response remains retryable.
-        metadataFromResponse: (response) => {
-          const checked = checkedMetadata(response);
-          return isFilterValueCursorStopped(checked)
-            ? { ...checked, has_more: false, next_cursor: null }
-            : checked;
-        },
-        nextResponse: requestPage,
-        onContinuation: (metadata) => {
-          const nextCursor = getFilterValueNextCursor(metadata);
-          if (nextCursor) consumedCursors.add(nextCursor);
-        },
-        isCurrent: () => !signal.aborted,
-        cancellationSignal: signal,
-        startedAt: actionStartedAt,
-      });
-      const checkedPage = checkedMetadata(page);
-      return {
-        ...checkedPage,
-        values,
-        [FILTER_VALUE_FOLLOWED_CURSORS_KEY]: followedCursors,
-      };
-    },
+    queryFn: ({ signal, pageParam }) =>
+      readFilterValuePage({
+        signal,
+        pageParam,
+        publishedData: queryClient.getQueryData(queryKey),
+      }),
     initialPageParam: null,
     getNextPageParam: (lastPage, allPages, lastPageParam, allPageParams) => {
       const nextCursor = getFilterValueNextCursor(lastPage);
@@ -517,10 +561,64 @@ export function useDashboardFilterValues({
     retry: false,
     staleTime: 5 * 60 * 1000,
     gcTime: 15 * 60 * 1000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
     // This surface renders a deliberately generic retry state. Prevent the
     // global query handler from echoing a backend/ClickHouse error payload.
     meta: { errorHandled: true },
   });
+
+  useEffect(
+    () => () => {
+      const activeRequest = freshChainRetryRef.current;
+      if (activeRequest?.identity === queryIdentity) {
+        activeRequest.controller.abort();
+        freshChainRetryRef.current = null;
+      }
+    },
+    [queryIdentity],
+  );
+
+  const retryFreshPage = () => {
+    const activeRequest = freshChainRetryRef.current;
+    if (activeRequest?.identity === queryIdentity) return activeRequest.promise;
+
+    const controller = new AbortController();
+    setFreshChainRetryIdentity(queryIdentity);
+    const request = (async () => {
+      await queryClient.cancelQueries({ queryKey, exact: true });
+      const previousData = queryClient.getQueryData(queryKey);
+      const freshPage = await readFilterValuePage({
+        signal: controller.signal,
+        pageParam: null,
+        publishedData: undefined,
+      });
+      const compactedPage = compactFilterValueRetryPage(
+        previousData,
+        freshPage,
+      );
+      queryClient.setQueryData(queryKey, {
+        pages: [compactedPage],
+        pageParams: [null],
+      });
+      return compactedPage;
+    })();
+    const trackedRequest = {
+      identity: queryIdentity,
+      controller,
+      promise: null,
+    };
+    const settledPromise = request.finally(() => {
+      if (freshChainRetryRef.current === trackedRequest) {
+        freshChainRetryRef.current = null;
+        setFreshChainRetryIdentity(null);
+      }
+    });
+    trackedRequest.promise = settledPromise;
+    freshChainRetryRef.current = trackedRequest;
+    return settledPromise;
+  };
 
   useEffect(() => {
     const scope = JSON.stringify([
@@ -590,7 +688,7 @@ export function useDashboardFilterValues({
 
     state.pendingRetry = null;
     if (continuationFailed) void query.fetchNextPage();
-    else void query.refetch();
+    else void retryFreshPage().catch(() => {});
   }, [
     attributeType,
     metricName,
@@ -633,6 +731,13 @@ export function useDashboardFilterValues({
     browseStatus,
     browseLimitReached: browseStatus === "limit_reached" && !query.hasNextPage,
     attributeType: pages.find((page) => page?.attribute_type)?.attribute_type,
+    cursorChainStopped,
+    retryFreshPage,
+    // Keep the historical public name safe too. An infinite-query refetch
+    // replays every cached page; retrying this interactive picker must always
+    // be one fresh bounded request.
+    refetch: retryFreshPage,
+    isRetryingFreshPage: freshChainRetryIdentity === queryIdentity,
   };
 }
 

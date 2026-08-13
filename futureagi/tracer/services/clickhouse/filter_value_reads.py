@@ -269,6 +269,7 @@ def read_span_system_filter_values(
     limit: int = 500,
     lookback_days: int = 7,
     now: datetime | None = None,
+    deadline: ReadDeadline | None = None,
 ) -> FilterValueRead:
     """Return exact latest-state values within one finite partition window.
 
@@ -340,10 +341,15 @@ def read_span_system_filter_values(
     }
     if search:
         params["filter_value_search"] = search
+    query_timeout_ms = (
+        deadline.remaining_ms(FILTER_VALUE_READ_TIMEOUT_MS)
+        if deadline is not None
+        else FILTER_VALUE_READ_TIMEOUT_MS
+    )
     result = analytics.execute_ch_query(
         query,
         params,
-        timeout_ms=FILTER_VALUE_READ_TIMEOUT_MS,
+        timeout_ms=query_timeout_ms,
         settings={
             **FILTER_VALUE_READ_SETTINGS,
             "max_result_rows": int(limit) + 1,
@@ -369,6 +375,7 @@ def read_end_user_filter_value_cursor_page(
     page_size: int,
     search: str = "",
     value_after: str | None = None,
+    deadline: ReadDeadline | None = None,
 ) -> EndUserFilterValueCursorPageRead:
     """Read an exact keyset page from the latest curated end-user state.
 
@@ -422,10 +429,15 @@ def read_end_user_filter_value_cursor_page(
         params["filter_value_search"] = search
     if value_after is not None:
         params["value_after"] = value_after
+    query_timeout_ms = (
+        deadline.remaining_ms(FILTER_VALUE_READ_TIMEOUT_MS)
+        if deadline is not None
+        else FILTER_VALUE_READ_TIMEOUT_MS
+    )
     result = analytics.execute_ch_query(
         query,
         params,
-        timeout_ms=FILTER_VALUE_READ_TIMEOUT_MS,
+        timeout_ms=query_timeout_ms,
         settings={
             **FILTER_VALUE_READ_SETTINGS,
             "max_result_rows": int(page_size) + 1,

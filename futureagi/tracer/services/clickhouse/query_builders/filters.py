@@ -9,7 +9,7 @@ Django ORM querysets.
 
 import re
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from tracer.services.clickhouse.query_builders.voice_filter_expressions import (
     VOICE_NORMALIZED_ROOT_SYSTEM_METRIC_EXPRS,
@@ -30,6 +30,65 @@ _LEGACY_OP_ALIAS = {"is": "equals", "is_not": "not_equals"}
 _LITERAL_TEXT_MATCH_OPS = frozenset(
     {"contains", "not_contains", "starts_with", "ends_with"}
 )
+
+
+class EvalFilterMetadata(NamedTuple):
+    """Authoritative PostgreSQL metadata for one eval-value filter id."""
+
+    config_ids: tuple[str, ...]
+    output_type: str
+
+
+def resolve_eval_filter_metadata(
+    eval_id: str,
+    project_ids: list[str] | tuple[str, ...] | None,
+) -> EvalFilterMetadata:
+    """Resolve one eval-value filter exactly as the SQL compiler historically did.
+
+    Database failures deliberately propagate. A malformed legacy identifier is
+    a valid, authoritative no-match and is represented by an empty config set.
+    """
+
+    from django.core.exceptions import ValidationError
+
+    from model_hub.models.evals_metric import EvalTemplate
+    from tracer.models.custom_eval_config import CustomEvalConfig
+
+    config_ids: tuple[str, ...] = ()
+    output_type = "SCORE"
+    try:
+        cfg_qs = CustomEvalConfig.objects.filter(id=eval_id, deleted=False)
+        if not cfg_qs.exists():
+            cfg_qs = CustomEvalConfig.objects.filter(
+                eval_template_id=eval_id, deleted=False
+            )
+        if project_ids:
+            cfg_qs = cfg_qs.filter(project_id__in=project_ids)
+        config_ids = tuple(str(value) for value in cfg_qs.values_list("id", flat=True))
+
+        template_id = (
+            cfg_qs.values_list("eval_template_id", flat=True).first()
+            if config_ids
+            else eval_id
+        )
+        template = (
+            EvalTemplate.no_workspace_objects.filter(id=template_id, deleted=False)
+            .values("config")
+            .first()
+        )
+        if template and isinstance(template.get("config"), dict):
+            normalized_output = (
+                (template["config"].get("output") or "")
+                .upper()
+                .replace("/", "_")
+                .replace(" ", "_")
+            )
+            if normalized_output in ("PASS_FAIL", "CHOICE", "CHOICES", "SCORE"):
+                output_type = normalized_output
+    except (TypeError, ValueError, ValidationError):
+        config_ids = ()
+
+    return EvalFilterMetadata(config_ids=config_ids, output_type=output_type)
 
 
 def _voice_root_metric_expressions(
@@ -412,6 +471,7 @@ class ClickHouseFilterBuilder:
         trace_project_eval_config_ids: list[str] | tuple[str, ...] | None = None,
         strict_enduser_project_correlation: bool = False,
         annotation_label_set_known: bool = False,
+        eval_filter_metadata: dict[str, EvalFilterMetadata] | None = None,
     ) -> None:
         self.table = table
         self.annotation_label_ids = annotation_label_ids or []
@@ -498,6 +558,26 @@ class ClickHouseFilterBuilder:
         # configured labels is vacuously true and must never widen to scores
         # from an unrelated/legacy label.
         self.annotation_label_set_known = bool(annotation_label_set_known)
+        # Eval-task population proofs can compile hundreds of finite batches.
+        # ``None`` retains the legacy per-compiler ORM resolution for public
+        # callers. An explicit mapping (including an empty one) is authoritative
+        # and must never fall back to PostgreSQL during a classifier batch.
+        self.eval_filter_metadata = (
+            {
+                str(eval_id): EvalFilterMetadata(
+                    tuple(str(config_id) for config_id in metadata.config_ids),
+                    (
+                        metadata.output_type
+                        if metadata.output_type
+                        in {"PASS_FAIL", "CHOICE", "CHOICES", "SCORE"}
+                        else "SCORE"
+                    ),
+                )
+                for eval_id, metadata in eval_filter_metadata.items()
+            }
+            if eval_filter_metadata is not None
+            else None
+        )
         self._param_counter: int = 0
         self._params: dict[str, Any] = {}
 
@@ -1856,53 +1936,21 @@ class ClickHouseFilterBuilder:
         dispatches on the template's output type (SCORE / PASS_FAIL / CHOICE)
         to compare the correct column in ``tracer_eval_logger``.
         """
-        from django.core.exceptions import ValidationError
-
-        from model_hub.models.evals_metric import EvalTemplate
-        from tracer.models.custom_eval_config import CustomEvalConfig
-
         project_ids = getattr(self, "project_ids", None)
 
         # Resolve either custom_eval_config_id (what Observe metrics usually
         # emit) or eval_template_id (older saved filters) to config ids.
-        config_ids = []
-        output_type = "SCORE"
-        try:
-            cfg_qs = CustomEvalConfig.objects.filter(id=eval_id, deleted=False)
-            if not cfg_qs.exists():
-                cfg_qs = CustomEvalConfig.objects.filter(
-                    eval_template_id=eval_id, deleted=False
-                )
-            if project_ids:
-                cfg_qs = cfg_qs.filter(project_id__in=project_ids)
-            config_ids = [str(x) for x in cfg_qs.values_list("id", flat=True)]
-
-            template_id = (
-                cfg_qs.values_list("eval_template_id", flat=True).first()
-                if config_ids
-                else eval_id
+        if self.eval_filter_metadata is None:
+            metadata = resolve_eval_filter_metadata(eval_id, project_ids)
+        else:
+            # Missing from an explicitly supplied authoritative snapshot is a
+            # known no-match, never permission to issue an unbounded fallback
+            # metadata read from inside a classifier batch.
+            metadata = self.eval_filter_metadata.get(
+                str(eval_id), EvalFilterMetadata((), "SCORE")
             )
-            tmpl = (
-                EvalTemplate.no_workspace_objects.filter(id=template_id, deleted=False)
-                .values("config")
-                .first()
-            )
-            if tmpl and isinstance(tmpl.get("config"), dict):
-                ot = (
-                    (tmpl["config"].get("output") or "")
-                    .upper()
-                    .replace("/", "_")
-                    .replace(" ", "_")
-                )
-                if ot in ("PASS_FAIL", "CHOICE", "CHOICES", "SCORE"):
-                    output_type = ot
-        except (TypeError, ValueError, ValidationError):
-            # A malformed legacy/saved identifier is a valid no-match.  Do
-            # not catch database/infrastructure failures here: converting a
-            # transient metadata outage into ``0 = 1`` publishes a successful
-            # but false-empty list/graph, which is materially worse than a
-            # retryable sanitized API error.
-            config_ids = []
+        config_ids = metadata.config_ids
+        output_type = metadata.output_type
 
         if not config_ids:
             # No matching config — build a condition that matches nothing so

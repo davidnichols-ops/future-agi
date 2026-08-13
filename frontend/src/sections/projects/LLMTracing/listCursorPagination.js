@@ -984,7 +984,7 @@ export const accumulateUniqueListContinuations = async ({
   if (!Number.isInteger(targetRowCount) || targetRowCount < 1) {
     throw new Error("Invalid list continuation target row count");
   }
-  if (!Number.isInteger(maxContinuations) || maxContinuations < 1) {
+  if (!Number.isInteger(maxContinuations) || maxContinuations < 0) {
     throw new Error("Invalid list continuation limit");
   }
   if (!Number.isFinite(maxElapsedMs) || maxElapsedMs < 1) {

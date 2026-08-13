@@ -14,6 +14,7 @@ import {
 } from "@mui/material";
 import { enqueueSnackbar } from "notistack";
 import Iconify from "src/components/iconify";
+import AttributeInventoryControls from "./AttributeInventoryControls";
 
 // Normalize an attribute entry to a string key.
 // The API may return plain strings OR objects like {key, type}.
@@ -27,6 +28,11 @@ const CustomColumnDialog = ({
   existingColumns,
   onAddColumns,
   onRemoveColumns,
+  onAttributeSearchChange,
+  hasNextAttributePage,
+  fetchNextAttributePage,
+  isFetchingNextAttributePage,
+  inventoryControlProps,
 }) => {
   const [search, setSearch] = useState("");
 
@@ -49,8 +55,9 @@ const CustomColumnDialog = ({
     if (open) {
       setChecked(new Set(existingCustomIds));
       setSearch("");
+      onAttributeSearchChange?.("");
     }
-  }, [open, existingCustomIds]);
+  }, [open, existingCustomIds, onAttributeSearchChange]);
 
   const filteredAttributes = useMemo(() => {
     const allAttrs = attributes || [];
@@ -167,7 +174,10 @@ const CustomColumnDialog = ({
           size="small"
           placeholder="Search attributes..."
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e) => {
+            setSearch(e.target.value);
+            onAttributeSearchChange?.(e.target.value);
+          }}
           sx={{ mb: 1.5 }}
           InputProps={{
             startAdornment: (
@@ -227,6 +237,14 @@ const CustomColumnDialog = ({
             })
           )}
         </Box>
+        <AttributeInventoryControls
+          hasNextPage={hasNextAttributePage}
+          isFetchingNextPage={isFetchingNextAttributePage}
+          onLoadMore={fetchNextAttributePage}
+          {...inventoryControlProps}
+          showSearch={false}
+          search={search}
+        />
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2 }}>
         <Button onClick={onClose} size="small" color="inherit">
@@ -252,6 +270,11 @@ CustomColumnDialog.propTypes = {
   existingColumns: PropTypes.array,
   onAddColumns: PropTypes.func,
   onRemoveColumns: PropTypes.func,
+  onAttributeSearchChange: PropTypes.func,
+  hasNextAttributePage: PropTypes.bool,
+  fetchNextAttributePage: PropTypes.func,
+  isFetchingNextAttributePage: PropTypes.bool,
+  inventoryControlProps: PropTypes.object,
 };
 
 export default React.memo(CustomColumnDialog);

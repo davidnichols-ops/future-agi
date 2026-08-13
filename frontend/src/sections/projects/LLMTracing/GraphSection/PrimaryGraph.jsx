@@ -127,7 +127,9 @@ function useGraphMetrics() {
   return useQuery({
     queryKey: ["graph-metrics-all"],
     queryFn: async () => {
-      const { data } = await axios.get(endpoints.dashboard.metrics);
+      const { data } = await axios.get(endpoints.dashboard.metrics, {
+        params: { exclude_custom_attributes: true },
+      });
       return data?.result?.metrics || [];
     },
     select: (metrics) => {

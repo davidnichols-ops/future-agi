@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { act, screen, fireEvent } from "@testing-library/react";
 import { render as renderWithProviders } from "src/utils/test-utils";
 import CustomColumnDialog from "../CustomColumnDialog";
 
@@ -116,5 +116,67 @@ describe("CustomColumnDialog — TH-4139", () => {
     fireEvent.click(screen.getByRole("button", { name: /apply/i }));
     expect(onRemoveColumns).toHaveBeenCalledWith(["stale.attribute.id"]);
     expect(onAddColumns).not.toHaveBeenCalled();
+  });
+
+  it("forwards free-text search and advances only one cursor page per gesture", async () => {
+    const onAttributeSearchChange = vi.fn();
+    let resolvePage;
+    const fetchNextAttributePage = vi.fn(
+      () => new Promise((resolve) => (resolvePage = resolve)),
+    );
+    renderWithProviders(
+      <CustomColumnDialog
+        open
+        onClose={vi.fn()}
+        attributes={["recent.attribute"]}
+        existingColumns={[]}
+        onAddColumns={vi.fn()}
+        onRemoveColumns={vi.fn()}
+        onAttributeSearchChange={onAttributeSearchChange}
+        hasNextAttributePage
+        fetchNextAttributePage={fetchNextAttributePage}
+      />,
+    );
+
+    fireEvent.change(screen.getByPlaceholderText("Search attributes..."), {
+      target: { value: "older.attribute" },
+    });
+    expect(onAttributeSearchChange).toHaveBeenLastCalledWith("older.attribute");
+
+    const continueButton = screen.getByRole("button", {
+      name: "Continue searching",
+    });
+    fireEvent.click(continueButton);
+    fireEvent.click(continueButton);
+    expect(fetchNextAttributePage).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolvePage());
+  });
+
+  it("renders the shared inventory retry state inside the dialog", async () => {
+    const onRetry = vi.fn(() => Promise.resolve());
+    renderWithProviders(
+      <CustomColumnDialog
+        open
+        onClose={vi.fn()}
+        attributes={[]}
+        existingColumns={[]}
+        onAddColumns={vi.fn()}
+        onRemoveColumns={vi.fn()}
+        inventoryControlProps={{
+          isError: true,
+          canRetry: true,
+          onRetry,
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText("Properties could not be loaded. Retry this page."),
+    ).toBeInTheDocument();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Retry properties" })),
+    );
+    expect(onRetry).toHaveBeenCalledTimes(1);
   });
 });

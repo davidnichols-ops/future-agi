@@ -76,6 +76,35 @@ def test_system_filter_value_cap_produces_a_labelled_sample():
     assert read.metadata()["query_status"] == "sampled"
 
 
+def test_non_cursor_system_values_consume_the_request_owned_property_deadline():
+    class Deadline:
+        calls = []
+
+        def remaining_ms(self, per_query_cap_ms):
+            self.calls.append(per_query_cap_ms)
+            return 3_650
+
+    class Analytics:
+        call = None
+
+        def execute_ch_query(self, query, params, **kwargs):
+            self.call = (query, params, kwargs)
+            return SimpleNamespace(data=[])
+
+    deadline = Deadline()
+    analytics = Analytics()
+    read_span_system_filter_values(
+        analytics,
+        project_ids=[PROJECT_ID],
+        metric_name="ended_reason",
+        deadline=deadline,
+        now=NOW,
+    )
+
+    assert deadline.calls == [FILTER_VALUE_READ_TIMEOUT_MS]
+    assert analytics.call[2]["timeout_ms"] == 3_650
+
+
 @pytest.mark.parametrize(
     ("metric_name", "expected_value", "sql_markers"),
     [
@@ -184,6 +213,35 @@ def test_end_user_values_use_exact_latest_state_keyset_pages():
     assert "argMax(tuple(user_id), version).1 AS raw_value" in sql
     assert "FINAL" not in sql
     assert settings["settings"]["timeout_overflow_mode"] == "throw"
+
+
+def test_end_user_cursor_consumes_the_request_owned_property_deadline():
+    class Deadline:
+        calls = []
+
+        def remaining_ms(self, per_query_cap_ms):
+            self.calls.append(per_query_cap_ms)
+            return 3_750
+
+    class Analytics:
+        call = None
+
+        def execute_ch_query(self, query, params, **kwargs):
+            self.call = (query, params, kwargs)
+            return SimpleNamespace(data=[])
+
+    deadline = Deadline()
+    analytics = Analytics()
+    read_end_user_filter_value_cursor_page(
+        analytics,
+        project_ids=[PROJECT_ID],
+        source_column="user_id",
+        page_size=2,
+        deadline=deadline,
+    )
+
+    assert deadline.calls == [FILTER_VALUE_READ_TIMEOUT_MS]
+    assert analytics.call[2]["timeout_ms"] == 3_750
 
 
 def test_system_values_cursor_exhausts_dense_slice_without_duplicates():

@@ -167,6 +167,7 @@ def build_metrics_catalog(
     project_ids_param: str = "",
     agent_definition_id: str = "",
     per_eval_config: bool = False,
+    include_custom_attributes: bool = True,
 ):
     """Assemble the full unified metrics catalog for the workspace.
 
@@ -511,16 +512,28 @@ def build_metrics_catalog(
         pid.strip() for pid in req_project_ids_str.split(",") if pid.strip()
     ]
 
-    workspace_project_ids = {
-        str(pid)
-        for pid in Project.objects.filter(workspace=workspace).values_list(
-            "id", flat=True
-        )
-    }
     if req_project_ids:
+        workspace_project_ids = {
+            str(pid)
+            for pid in Project.objects.filter(
+                workspace=workspace,
+                id__in=req_project_ids,
+            ).values_list("id", flat=True)
+        }
         project_ids = [pid for pid in req_project_ids if pid in workspace_project_ids]
+    elif include_custom_attributes:
+        project_ids = [
+            str(pid)
+            for pid in Project.objects.filter(workspace=workspace).values_list(
+                "id", flat=True
+            )
+        ]
     else:
-        project_ids = list(workspace_project_ids)
+        # Workspace-wide evals, annotations, and dataset columns already use
+        # their native workspace predicates below. The cursor-backed editor
+        # obtains trace attributes separately, so do not materialize every
+        # project id merely to discard a capped ClickHouse attribute catalog.
+        project_ids = []
 
     filter_by_project = bool(req_project_ids and project_ids)
 
@@ -569,8 +582,11 @@ def build_metrics_catalog(
             )
         return attrs
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        f_attrs = pool.submit(_discover_span_attributes)
+    if include_custom_attributes:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            f_attrs = pool.submit(_discover_span_attributes)
+    else:
+        f_attrs = None
 
     # 3. Eval metrics (PG-heavy chain, runs in main thread)
     try:
@@ -711,11 +727,27 @@ def build_metrics_catalog(
 
             if label_type == "categorical":
                 options = settings.get("options", [])
-                metric_entry["choices"] = [
-                    opt.get("label", "")
-                    for opt in options
-                    if isinstance(opt, dict) and opt.get("label")
-                ]
+                legacy_choices = []
+                choice_options = []
+                for option in options:
+                    if not isinstance(option, dict):
+                        continue
+                    raw_value = option.get("value")
+                    if raw_value is None or raw_value == "":
+                        raw_value = option.get("label") or option.get("name")
+                    if raw_value is None or raw_value == "":
+                        continue
+                    raw_label = option.get("label") or option.get("name")
+                    label = str(raw_label if raw_label not in (None, "") else raw_value)
+                    if raw_label not in (None, ""):
+                        legacy_choices.append(label)
+                    choice_options.append({"value": raw_value, "label": label})
+                metric_entry["choices"] = legacy_choices
+                # Keep the legacy label-only list for older consumers, while
+                # exposing the real stored value separately. A category whose
+                # value differs from its display label must never serialize a
+                # filter using the label by accident.
+                metric_entry["choice_options"] = choice_options
             elif label_type == "thumbs_up_down":
                 metric_entry["choices"] = ["Thumbs Up", "Thumbs Down"]
 
@@ -724,7 +756,7 @@ def build_metrics_catalog(
         logger.exception("annotation_metrics_failed")
 
     # Collect span attributes from background thread
-    custom_attributes = f_attrs.result()
+    custom_attributes = f_attrs.result() if f_attrs is not None else []
     for attr in custom_attributes:
         k = attr["key"] if isinstance(attr, dict) else attr
         t = attr.get("type", "string") if isinstance(attr, dict) else "string"
@@ -1185,6 +1217,7 @@ def get_cached_metrics_catalog(
     project_ids_param: str = "",
     agent_definition_id: str = "",
     per_eval_config: bool = False,
+    include_custom_attributes: bool = True,
     ttl: int = 60,
 ):
     """Return the metrics catalog, using a short-TTL Django cache.
@@ -1201,7 +1234,8 @@ def get_cached_metrics_catalog(
     )
     cache_key = (
         f"dashboard:metrics_catalog:v2:{workspace.id}:"
-        f"{pids_key}:{agent_definition_id}:{int(per_eval_config)}"
+        f"{pids_key}:{agent_definition_id}:{int(per_eval_config)}:"
+        f"{int(include_custom_attributes)}"
     )
     try:
         metrics = cache.get(cache_key)
@@ -1214,6 +1248,7 @@ def get_cached_metrics_catalog(
             project_ids_param=project_ids_param,
             agent_definition_id=agent_definition_id,
             per_eval_config=per_eval_config,
+            include_custom_attributes=include_custom_attributes,
         )
         try:
             cache.set(cache_key, metrics, timeout=ttl)

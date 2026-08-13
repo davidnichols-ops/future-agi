@@ -496,6 +496,7 @@ const TaskFilterBar = ({
     metricType: "annotation_metric",
     projectIds: projectId ? [projectId] : [],
     source: "traces",
+    pageSize: 10,
     enabled: hasAnnotatorFilter,
   });
   const annotatorLabelById = useMemo(() => {

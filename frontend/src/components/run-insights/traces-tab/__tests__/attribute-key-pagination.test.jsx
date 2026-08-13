@@ -69,7 +69,7 @@ describe("useRunInsightAttributeKeys", () => {
       1,
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
-        timeout: 9_800,
+        timeout: 4_800,
         params: { project_id: "project-large", page_size: 50 },
       }),
     );
@@ -81,7 +81,7 @@ describe("useRunInsightAttributeKeys", () => {
       2,
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
-        timeout: 9_800,
+        timeout: 4_800,
         params: {
           project_id: "project-large",
           page_size: 50,
@@ -99,7 +99,7 @@ describe("useRunInsightAttributeKeys", () => {
     expect(result.current.attributeKeys).toBe(loadedAttributes);
   });
 
-  it("follows a bounded empty checkpoint before publishing keys", async () => {
+  it("publishes a bounded empty checkpoint for the next explicit request", async () => {
     mocks.get
       .mockResolvedValueOnce({
         data: {
@@ -123,11 +123,15 @@ describe("useRunInsightAttributeKeys", () => {
       { wrapper: createWrapper() },
     );
 
-    await waitFor(() =>
-      expect(result.current.attributeKeys.map(({ key }) => key)).toEqual([
-        "older.attribute",
-      ]),
-    );
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    expect(result.current.attributeKeys).toEqual([]);
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+    expect(result.current.attributeKeys.map(({ key }) => key)).toEqual([
+      "older.attribute",
+    ]);
     expect(mocks.get).toHaveBeenCalledTimes(2);
     expect(result.current.hasNextPage).toBe(false);
   });
@@ -149,6 +153,14 @@ describe("useRunInsightAttributeKeys", () => {
           next_cursor: "same-cursor",
           browse_status: "continuation",
         },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: [{ key: "refreshed.attribute", type: "number" }],
+          has_more: false,
+          next_cursor: null,
+          browse_status: "exhausted",
+        },
       });
 
     const { result } = renderHook(
@@ -166,6 +178,42 @@ describe("useRunInsightAttributeKeys", () => {
     ]);
     await act(async () => result.current.fetchNextPage());
     expect(mocks.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => result.current.retryCursorChain());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(3));
+    expect(result.current.attributeKeys.map(({ key }) => key)).toEqual([
+      "recent.attribute",
+      "refreshed.attribute",
+    ]);
+    expect(mocks.get.mock.calls[2][1].params).not.toHaveProperty("cursor");
+  });
+
+  it("offers a sanitized one-request fresh retry after an initial error", async () => {
+    mocks.get
+      .mockRejectedValueOnce(new Error("sensitive backend detail"))
+      .mockResolvedValueOnce({
+        data: {
+          result: [{ key: "recovered.attribute", type: "string" }],
+          has_more: false,
+          next_cursor: null,
+          browse_status: "exhausted",
+        },
+      });
+
+    const { result } = renderHook(
+      () => useRunInsightAttributeKeys("project-retry"),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    await act(async () => result.current.retryCursorChain());
+    await waitFor(() =>
+      expect(result.current.attributeKeys.map(({ key }) => key)).toEqual([
+        "recovered.attribute",
+      ]),
+    );
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(mocks.get.mock.calls[1][1].params).not.toHaveProperty("cursor");
   });
 
   it("retains a selected attribute and its editor type when a new page arrives", () => {

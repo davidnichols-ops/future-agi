@@ -121,6 +121,35 @@ ATTRIBUTE_READ_MAX_PROJECTS = 64
 # of consecutive ``completed`` calls) without allowing one request to become
 # an unbounded distinct scan.
 ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE = 50
+# A legacy JSON array is one physical value but can contain an arbitrarily
+# large selectable vocabulary. Cursor reads therefore scan only a finite slice
+# of its raw JSON text per request and carry an authenticated character
+# checkpoint. The limits below bound Python work, not retained results: hitting
+# either one publishes a continuation at the exact unconsumed member.
+ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCAN_CHARS = 256 * 1024
+ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCANNED_MEMBERS = 2_048
+# Any selectable string (at most 4 KiB decoded UTF-8) has a JSON token well
+# below this size even when every character is a ``\\uXXXX`` escape. A token
+# still open after this prefix is necessarily unselectable and can be skipped
+# incrementally without materializing it.
+ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SELECTABLE_TOKEN_CHARS = 32 * 1024
+# The opaque integer remains inside the signed list cursor. It packs a strong
+# raw-value fingerprint, an exact character position, and the small lexer state
+# needed to continue through an unselectable oversized/nested member. Older
+# cursors used a plain <=501 unique-member offset; those restart the same array
+# safely and rely on the exact seen-value set to suppress repeats.
+_JSON_ARRAY_CURSOR_PREFIX = 0xA771
+_JSON_ARRAY_CURSOR_VERSION = 1
+_JSON_ARRAY_CURSOR_POSITION_BITS = 64
+_JSON_ARRAY_CURSOR_AUX_BITS = 32
+_JSON_ARRAY_CURSOR_MODE_BITS = 2
+_JSON_ARRAY_CURSOR_FINGERPRINT_BITS = 256
+_JSON_ARRAY_CURSOR_MODE_BOUNDARY = 0
+_JSON_ARRAY_CURSOR_MODE_STRING = 1
+_JSON_ARRAY_CURSOR_MODE_NESTED = 2
+_JSON_ARRAY_CURSOR_MODE_PRIMITIVE = 3
+_JSON_ARRAY_CURSOR_NESTED_IN_STRING = 1 << 30
+_JSON_ARRAY_CURSOR_NESTED_ESCAPE = 1 << 31
 # Maximum SQL/result sentinel for a continuation proof. The server-held exact
 # de-duplication prefix can grow beyond this optimization ceiling; in that case
 # an overflowing proof simply falls back to the ordinary exact physical walk at
@@ -455,6 +484,15 @@ class AttributeValueCursorPageRead:
     next_segment_start: datetime | None = None
     appended_value_digests: tuple[str, ...] = ()
     seen_value_count: int = 0
+
+
+@dataclass(frozen=True)
+class _JsonArrayCursorState:
+    """Authenticated incremental position inside one raw JSON array value."""
+
+    position: int
+    mode: int = _JSON_ARRAY_CURSOR_MODE_BOUNDARY
+    auxiliary: int = 0
 
 
 @dataclass(frozen=True)
@@ -945,7 +983,9 @@ _LATEST_TARGET_SQL = """
         tupleElement(latest_state, 10) AS boolean_present,
         tupleElement(latest_state, 11) AS boolean_value,
         tupleElement(latest_state, 12) AS legacy_present,
-        tupleElement(latest_state, 13) AS legacy_value_raw
+        tupleElement(latest_state, 13) AS legacy_value_raw,
+        lower(hex(SHA256(tupleElement(latest_state, 13))))
+            AS legacy_value_fingerprint
     FROM
     (
         SELECT
@@ -1023,7 +1063,9 @@ _LATEST_JSON_TARGET_SQL = """
         start_time,
         tupleElement(latest_state, 1) AS is_deleted,
         tupleElement(latest_state, 2) AS legacy_present,
-        tupleElement(latest_state, 3) AS legacy_value_raw
+        tupleElement(latest_state, 3) AS legacy_value_raw,
+        lower(hex(SHA256(tupleElement(latest_state, 3))))
+            AS legacy_value_fingerprint
     FROM
     (
         SELECT
@@ -2001,6 +2043,7 @@ class AttributeReadSelector:
                 "is_deleted": json_row.get("is_deleted"),
                 "legacy_present": json_row.get("legacy_present"),
                 "legacy_value_raw": json_row.get("legacy_value_raw"),
+                "legacy_value_fingerprint": json_row.get("legacy_value_fingerprint"),
             }
         return [typed_by_identity[identity] for identity in candidate_ids]
 
@@ -2093,14 +2136,14 @@ class AttributeReadSelector:
         return None
 
     @classmethod
-    def _decode_json_attribute(
+    def _decode_json_attribute_bounded(
         cls,
         raw: Any,
         *,
         mode: JsonAttributeMode,
         json_encoded: bool = True,
-    ) -> tuple[AttributeType, Any] | None:
-        """Decode only JSON value families the caller can faithfully use.
+    ) -> tuple[tuple[AttributeType, Any] | None, bool]:
+        """Decode a compatibility sample and report whether it was complete.
 
         ``arrays`` is the value-picker contract. ``structured`` is the
         filter-key contract and adds finite flat JSON objects (``map``) while
@@ -2111,20 +2154,21 @@ class AttributeReadSelector:
         """
 
         if mode == "none" or raw == "" or (raw is None and json_encoded):
-            return None
+            return None, True
         try:
             value = json.loads(raw) if json_encoded and isinstance(raw, str) else raw
         except (TypeError, ValueError, json.JSONDecodeError):
-            return None
+            return None, True
 
         if mode in {"scalars", "all"}:
             scalar = cls._decode_legacy_scalar(value, json_encoded=False)
             if scalar is not None:
-                return scalar
+                return scalar, True
         if mode in {"arrays", "structured", "all"} and isinstance(value, list):
             members: list[JsonScalar] = []
             seen: set[tuple[str, str]] = set()
             total_string_bytes = 0
+            complete = True
             for member in value:
                 if member is None or member == "":
                     continue
@@ -2138,6 +2182,10 @@ class AttributeReadSelector:
                         total_string_bytes + member_bytes
                         > JSON_ARRAY_FILTER_MAX_TOTAL_STRING_UTF8_BYTES
                     ):
+                        # Compatibility reads remain intentionally finite, but
+                        # the cursor proof must not treat this omission as an
+                        # exact vocabulary. Cursor replay pages this boundary.
+                        complete = False
                         continue
                     total_string_bytes += member_bytes
                     canonical = (
@@ -2162,19 +2210,159 @@ class AttributeReadSelector:
                     seen.add(canonical)
                     members.append(member)
                     if len(members) > ATTRIBUTE_READ_MAX_VALUES:
+                        complete = False
                         break
-            return "array", tuple(members)
+            return ("array", tuple(members)), complete
         if mode == "structured" and isinstance(value, dict):
             # Key discovery consumes only the type.  Do not retain or copy the
             # object here: the filter serializer independently enforces the
             # finite, flat, scalar-only public map contract on user input.
-            return "map", None
+            return ("map", None), True
         if mode == "all":
             # Eval mapping only consumes the key/type, never this value.  A
             # single sentinel keeps null/object keys discoverable without
             # copying their potentially large structure into Python state.
-            return "json", None
-        return None
+            return ("json", None), True
+        return None, True
+
+    @classmethod
+    def _decode_json_attribute(
+        cls,
+        raw: Any,
+        *,
+        mode: JsonAttributeMode,
+        json_encoded: bool = True,
+    ) -> tuple[AttributeType, Any] | None:
+        """Decode only JSON value families the caller can faithfully use.
+
+        Non-cursor compatibility consumers preserve their historical finite
+        sample. Exact cursor callers use the incremental raw-array path below.
+        """
+
+        decoded, _complete = cls._decode_json_attribute_bounded(
+            raw,
+            mode=mode,
+            json_encoded=json_encoded,
+        )
+        return decoded
+
+    @staticmethod
+    def _json_array_cursor_text(raw: Any) -> tuple[str, int] | None:
+        """Return raw array text and the first member position without loading it."""
+
+        if isinstance(raw, str):
+            text = raw
+        elif isinstance(raw, (list, tuple)):
+            # Native ClickHouse reads return JSONExtractRaw strings. This
+            # compatibility arm keeps lightweight/mock executors exact.
+            text = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        else:
+            return None
+        position = 0
+        while position < len(text) and text[position] in " \t\r\n":
+            position += 1
+        if position >= len(text) or text[position] != "[":
+            return None
+        return text, position + 1
+
+    @staticmethod
+    def _json_array_cursor_fingerprint(row: dict[str, Any], text: str) -> str:
+        """Return the strong raw-value hash produced by the latest-state query."""
+
+        supplied = str(row.get("legacy_value_fingerprint") or "").lower()
+        if len(supplied) == 64 and all(
+            character in "0123456789abcdef" for character in supplied
+        ):
+            return supplied
+        # Production SQL always supplies SHA256 beside JSONExtractRaw. The
+        # fallback is for compatible custom/test executors only.
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _encode_json_array_member_cursor(
+        fingerprint: str,
+        state: _JsonArrayCursorState,
+    ) -> int:
+        """Pack one lexer checkpoint into the signed cursor's integer slot."""
+
+        if (
+            len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+            or not 0 < state.position < (1 << _JSON_ARRAY_CURSOR_POSITION_BITS)
+            or not 0 <= state.mode < (1 << _JSON_ARRAY_CURSOR_MODE_BITS)
+            or not 0 <= state.auxiliary < (1 << _JSON_ARRAY_CURSOR_AUX_BITS)
+        ):
+            raise ValueError("invalid filter-value JSON member cursor")
+        if state.mode == _JSON_ARRAY_CURSOR_MODE_BOUNDARY and state.auxiliary != 0:
+            raise ValueError("invalid filter-value JSON member cursor")
+        if state.mode == _JSON_ARRAY_CURSOR_MODE_STRING and state.auxiliary not in {
+            0,
+            1,
+        }:
+            raise ValueError("invalid filter-value JSON member cursor")
+        if state.mode == _JSON_ARRAY_CURSOR_MODE_NESTED:
+            depth = state.auxiliary & (_JSON_ARRAY_CURSOR_NESTED_IN_STRING - 1)
+            if depth < 1:
+                raise ValueError("invalid filter-value JSON member cursor")
+        if state.mode == _JSON_ARRAY_CURSOR_MODE_PRIMITIVE and state.auxiliary != 0:
+            raise ValueError("invalid filter-value JSON member cursor")
+
+        header = (_JSON_ARRAY_CURSOR_PREFIX << 4) | _JSON_ARRAY_CURSOR_VERSION
+        packed = header
+        packed = (packed << _JSON_ARRAY_CURSOR_FINGERPRINT_BITS) | int(fingerprint, 16)
+        packed = (packed << _JSON_ARRAY_CURSOR_MODE_BITS) | state.mode
+        packed = (packed << _JSON_ARRAY_CURSOR_AUX_BITS) | state.auxiliary
+        return (packed << _JSON_ARRAY_CURSOR_POSITION_BITS) | state.position
+
+    @staticmethod
+    def _decode_json_array_member_cursor(
+        offset: int,
+        *,
+        fingerprint: str,
+        initial_position: int,
+        text_length: int,
+    ) -> _JsonArrayCursorState:
+        """Validate a packed checkpoint; safely restart rolling legacy state."""
+
+        raw_offset = int(offset)
+        if raw_offset < 0:
+            raise ValueError("invalid filter-value JSON member cursor")
+        if raw_offset <= ATTRIBUTE_READ_MAX_VALUES + 1:
+            # Old cursors counted members in the bounded decoded tuple. A raw
+            # character checkpoint cannot reconstruct that position without an
+            # unbounded prefix replay, so restart the same latest array. The
+            # authenticated exact seen set suppresses every published member.
+            return _JsonArrayCursorState(initial_position)
+
+        position_mask = (1 << _JSON_ARRAY_CURSOR_POSITION_BITS) - 1
+        auxiliary_mask = (1 << _JSON_ARRAY_CURSOR_AUX_BITS) - 1
+        fingerprint_mask = (1 << _JSON_ARRAY_CURSOR_FINGERPRINT_BITS) - 1
+        position = raw_offset & position_mask
+        packed = raw_offset >> _JSON_ARRAY_CURSOR_POSITION_BITS
+        auxiliary = packed & auxiliary_mask
+        packed >>= _JSON_ARRAY_CURSOR_AUX_BITS
+        mode = packed & ((1 << _JSON_ARRAY_CURSOR_MODE_BITS) - 1)
+        packed >>= _JSON_ARRAY_CURSOR_MODE_BITS
+        encoded_fingerprint = packed & fingerprint_mask
+        header = packed >> _JSON_ARRAY_CURSOR_FINGERPRINT_BITS
+        expected_header = (_JSON_ARRAY_CURSOR_PREFIX << 4) | _JSON_ARRAY_CURSOR_VERSION
+        if header != expected_header:
+            raise ValueError("invalid filter-value JSON member cursor")
+
+        state = _JsonArrayCursorState(position, mode, auxiliary)
+        # Reuse the encoder's state-shape validation without trusting the
+        # caller-provided integer merely because its header happens to match.
+        AttributeReadSelector._encode_json_array_member_cursor(
+            f"{encoded_fingerprint:064x}", state
+        )
+        if encoded_fingerprint != int(fingerprint, 16):
+            # Latest state changed between pages. Restarting can repeat work but
+            # can never skip a newly inserted/reordered member; exact seen-state
+            # membership removes already published values.
+            return _JsonArrayCursorState(initial_position)
+        if not initial_position <= position < text_length:
+            raise ValueError("invalid filter-value JSON member cursor")
+        return state
 
     @classmethod
     def _decode_target_value(
@@ -2213,7 +2401,7 @@ class AttributeReadSelector:
         row: dict[str, Any],
         *,
         json_attribute_mode: JsonAttributeMode,
-    ) -> tuple[AttributeType, Any] | None:
+    ) -> tuple[tuple[AttributeType, Any] | None, bool]:
         """Decode one tagged group from the temporal distinct proof."""
 
         value_type = str(row.get("value_type") or "")
@@ -2231,18 +2419,42 @@ class AttributeReadSelector:
             raise IncompleteLatestStateReplay(
                 "Attribute distinct proof returned an invalid value count"
             )
-        return cls._decode_target_value(
-            {
-                "string_present": value_type == "string",
-                "string_value": row.get("value_string"),
-                "number_present": value_type == "number",
-                "number_value": row.get("value_number"),
-                "boolean_present": value_type == "boolean",
-                "boolean_value": row.get("value_boolean"),
-                "legacy_present": value_type == "json",
-                "legacy_value_raw": row.get("value_json_raw"),
-            },
-            json_attribute_mode=json_attribute_mode,
+        if value_type == "json":
+            raw_json = row.get("value_json_raw")
+            if json_attribute_mode == "arrays" and isinstance(raw_json, str):
+                position = 0
+                while position < len(raw_json) and raw_json[position] in " \t\r\n":
+                    position += 1
+                if position >= len(raw_json) or raw_json[position] != "[":
+                    # JSON scalars/objects are not selectable in array-filter
+                    # mode. Avoid materializing a potentially large object just
+                    # to rediscover that type fact.
+                    return None, True
+                if len(raw_json) - position > (
+                    ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCAN_CHARS
+                ):
+                    # A proof may only advance when it names the complete raw
+                    # vocabulary. Defer a large array to incremental latest-row
+                    # replay instead of json.loads materializing it here.
+                    return ("array", ()), False
+            return cls._decode_json_attribute_bounded(
+                raw_json,
+                mode=json_attribute_mode,
+            )
+        return (
+            cls._decode_target_value(
+                {
+                    "string_present": value_type == "string",
+                    "string_value": row.get("value_string"),
+                    "number_present": value_type == "number",
+                    "number_value": row.get("value_number"),
+                    "boolean_present": value_type == "boolean",
+                    "boolean_value": row.get("value_boolean"),
+                    "legacy_present": False,
+                },
+                json_attribute_mode=json_attribute_mode,
+            ),
+            True,
         )
 
     @classmethod
@@ -3441,6 +3653,8 @@ class AttributeReadSelector:
         seen_key_contains: Callable[[str], bool] | None = None,
         seen_key_count: int | None = None,
         exact_key: str | None = None,
+        dedupe_by_type: bool = False,
+        exhaustive_exact_types: bool = False,
         continue_operation: bool = False,
     ) -> AttributeKeyCursorPageRead:
         """Return a bounded newest-first page of verified unique keys.
@@ -3460,6 +3674,10 @@ class AttributeReadSelector:
         projects = self._project_ids(project_ids)
         if exact_key is not None:
             exact_key = validate_attribute_key(exact_key)
+        if exhaustive_exact_types and (exact_key is None or not dedupe_by_type):
+            raise ValueError(
+                "exhaustive exact types require an exact key and type-aware dedupe"
+            )
         page_size = int(page_size)
         if not 1 <= page_size <= ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE:
             raise ValueError("attribute-key page_size is out of range")
@@ -3575,7 +3793,13 @@ class AttributeReadSelector:
         # separate exact-coverage read certifies otherwise.
         effective_page_size = 1 if exact_key is not None else page_size
         emitted_digests: list[str] = []
+        emitted_seen_digests: set[str] = set()
+        emitted_order: list[str] = []
         emitted: dict[str, AttributeKeyRow] = {}
+
+        def page_is_full() -> bool:
+            return not exhaustive_exact_types and len(emitted) >= effective_page_size
+
         candidate_pages = 0
         is_initial_generic_page = (
             exact_key is None
@@ -3755,26 +3979,38 @@ class AttributeReadSelector:
                 raise ValueError("invalid attribute-key resume offset")
             for index in range(key_offset, len(keys)):
                 key, attr_type = keys[index]
-                digest = attribute_key_cursor_digest(key)
-                if key_was_seen(digest):
+                logical_digest = attribute_key_cursor_digest(key)
+                seen_digest = (
+                    attribute_key_type_cursor_digest(key, attr_type)
+                    if dedupe_by_type
+                    else logical_digest
+                )
+                if key_was_seen(seen_digest):
                     continue
-                prior = emitted.get(digest)
+                prior = emitted.get(logical_digest)
                 if prior is not None:
                     observed_types = set(prior.types or (prior.type,))
                     observed_types.add(attr_type)
                     ordered_types = tuple(
                         sorted(observed_types, key=lambda value: _TYPE_PRIORITY[value])
                     )
-                    emitted[digest] = AttributeKeyRow(
+                    emitted[logical_digest] = AttributeKeyRow(
                         prior.key,
                         ordered_types[0],
                         prior.count + 1,
                         ordered_types,
                     )
+                    if seen_digest not in emitted_seen_digests:
+                        emitted_seen_digests.add(seen_digest)
+                        emitted_digests.append(seen_digest)
                     continue
-                emitted[digest] = AttributeKeyRow(key, attr_type, 1, (attr_type,))
-                emitted_digests.append(digest)
-                if len(emitted) >= effective_page_size:
+                emitted[logical_digest] = AttributeKeyRow(
+                    key, attr_type, 1, (attr_type,)
+                )
+                emitted_order.append(logical_digest)
+                emitted_seen_digests.add(seen_digest)
+                emitted_digests.append(seen_digest)
+                if page_is_full():
                     next_offset = index + 1
                     return next_offset >= len(keys), next_offset
             return True, len(keys)
@@ -3842,7 +4078,7 @@ class AttributeReadSelector:
 
         while (
             current_segment_end > start
-            and len(emitted) < effective_page_size
+            and not page_is_full()
             and next_resume_identity is None
             and candidate_pages < candidate_page_ceiling
             # Generic browsing needs a candidate/replay pair. An exact search
@@ -3946,7 +4182,7 @@ class AttributeReadSelector:
                         ):
                             continue
                         consume_keys(row_keys(row))
-                        if emitted:
+                        if emitted and not exhaustive_exact_types:
                             break
                     exact_probe_segment_end = current_segment_end
                 except Exception as exc:
@@ -3956,7 +4192,7 @@ class AttributeReadSelector:
                     # accelerator times out, do not retry it after fallback
                     # backoff; the physical exact walk remains authoritative.
                     exact_probe_segment_end = current_segment_end
-                if emitted:
+                if emitted and not exhaustive_exact_types:
                     break
 
             try:
@@ -4277,11 +4513,11 @@ class AttributeReadSelector:
                     next_resume_key_offset = next_offset
                     break
                 fully_processed_identity = identity
-                if len(emitted) >= effective_page_size:
+                if page_is_full():
                     break
 
             cursor_before = fully_processed_identity
-            if next_resume_identity is not None or len(emitted) >= effective_page_size:
+            if next_resume_identity is not None or page_is_full():
                 active_segment_start = current_segment_start
                 break
             if segment_truncated and candidate_ids:
@@ -4362,7 +4598,7 @@ class AttributeReadSelector:
         # key exists, and consumers deliberately do not treat its observed type
         # set as complete tenant-wide coverage.
         exhausted = (
-            (exact_key is not None and bool(emitted))
+            (exact_key is not None and bool(emitted) and not exhaustive_exact_types)
             or current_segment_end <= start
             and next_resume_identity is None
         )
@@ -4423,7 +4659,7 @@ class AttributeReadSelector:
             query_count=self._query_count,
         )
         return AttributeKeyCursorPageRead(
-            tuple(emitted[digest] for digest in emitted_digests),
+            tuple(emitted[digest] for digest in emitted_order),
             metadata,
             has_more,
             browse_status,
@@ -4846,6 +5082,372 @@ class AttributeReadSelector:
                     return next_offset >= len(candidates), next_offset
             return True, len(candidates)
 
+        def consume_json_array(
+            row: dict[str, Any],
+            text: str,
+            initial_position: int,
+            *,
+            member_offset: int,
+        ) -> tuple[bool, int]:
+            """Consume a bounded raw-array slice without capping its vocabulary."""
+
+            fingerprint = self._json_array_cursor_fingerprint(row, text)
+            state = self._decode_json_array_member_cursor(
+                member_offset,
+                fingerprint=fingerprint,
+                initial_position=initial_position,
+                text_length=len(text),
+            )
+            scan_chars = 0
+            scanned_members = 0
+            total_string_bytes = 0
+            row_member_digests: set[str] = set()
+
+            def continuation(next_state: _JsonArrayCursorState) -> tuple[bool, int]:
+                return False, self._encode_json_array_member_cursor(
+                    fingerprint,
+                    next_state,
+                )
+
+            def add_member(value: JsonScalar) -> bool:
+                """Publish one locally unique member; return whether page filled."""
+
+                digest = attribute_value_cursor_digest("array", value)
+                if digest in row_member_digests:
+                    return False
+                row_member_digests.add(digest)
+                if needle and needle not in _value_search_text(value).casefold():
+                    return False
+                if value_was_seen(digest):
+                    return False
+                prior = emitted.get(digest)
+                if prior is not None:
+                    emitted[digest] = AttributeValueRow(
+                        prior.value,
+                        prior.type,
+                        prior.count + 1,
+                    )
+                    return False
+                emitted[digest] = AttributeValueRow(value, "array", 1)
+                emitted_digests.append(digest)
+                return len(emitted) >= effective_page_size
+
+            def decoded_scalar(token: str) -> JsonScalar | None:
+                try:
+                    member = json.loads(token)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise ValueError("invalid filter-value JSON array") from None
+                if member is None or member == "":
+                    return None
+                if isinstance(member, bool):
+                    return member
+                if isinstance(member, str):
+                    return member
+                if isinstance(member, int):
+                    return member if -(1 << 63) <= member <= (1 << 64) - 1 else None
+                if isinstance(member, float) and math.isfinite(member):
+                    return member
+                return None
+
+            def advance_after_member(
+                position: int,
+            ) -> tuple[_JsonArrayCursorState | None, bool]:
+                """Reach the next member boundary or exact array exhaustion."""
+
+                nonlocal scan_chars
+                while position < len(text) and text[position] in " \t\r\n":
+                    if scan_chars >= ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCAN_CHARS:
+                        return (
+                            _JsonArrayCursorState(
+                                position,
+                                _JSON_ARRAY_CURSOR_MODE_PRIMITIVE,
+                            ),
+                            False,
+                        )
+                    position += 1
+                    scan_chars += 1
+                if position >= len(text):
+                    raise ValueError("invalid filter-value JSON array")
+                delimiter = text[position]
+                scan_chars += 1
+                if delimiter == ",":
+                    return _JsonArrayCursorState(position + 1), False
+                if delimiter == "]":
+                    return None, True
+                raise ValueError("invalid filter-value JSON array")
+
+            while True:
+                if state.mode == _JSON_ARRAY_CURSOR_MODE_BOUNDARY:
+                    position = state.position
+                    while position < len(text) and text[position] in " \t\r\n":
+                        if scan_chars >= ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCAN_CHARS:
+                            return continuation(_JsonArrayCursorState(position))
+                        position += 1
+                        scan_chars += 1
+                    if position >= len(text):
+                        raise ValueError("invalid filter-value JSON array")
+                    if text[position] == "]":
+                        return True, 0
+                    if (
+                        scanned_members
+                        >= ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCANNED_MEMBERS
+                    ):
+                        return continuation(_JsonArrayCursorState(position))
+                    member_start = position
+                    leading = text[position]
+
+                    if leading == '"':
+                        position += 1
+                        scan_chars += 1
+                        escaped = False
+                        closed = False
+                        while position < len(text):
+                            if scan_chars >= ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCAN_CHARS:
+                                # A potentially selectable token must restart
+                                # intact. This can occur only after prior proven
+                                # progress because a fresh request has >32 KiB.
+                                return continuation(_JsonArrayCursorState(member_start))
+                            character = text[position]
+                            position += 1
+                            scan_chars += 1
+                            if escaped:
+                                escaped = False
+                            elif character == "\\":
+                                escaped = True
+                            elif character == '"':
+                                closed = True
+                                break
+                            if (
+                                position - member_start
+                                >= ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SELECTABLE_TOKEN_CHARS
+                            ):
+                                # This token cannot decode below the public
+                                # 4-KiB per-string contract. Continue skipping
+                                # it incrementally, retaining escape state.
+                                return continuation(
+                                    _JsonArrayCursorState(
+                                        position,
+                                        _JSON_ARRAY_CURSOR_MODE_STRING,
+                                        int(escaped),
+                                    )
+                                )
+                        if not closed:
+                            raise ValueError("invalid filter-value JSON array")
+                        member = decoded_scalar(text[member_start:position])
+                        scanned_members += 1
+                        page_filled = False
+                        if isinstance(member, str):
+                            member_bytes = len(member.encode("utf-8"))
+                            if member_bytes <= JSON_ARRAY_FILTER_MAX_STRING_UTF8_BYTES:
+                                if (
+                                    total_string_bytes + member_bytes
+                                    > JSON_ARRAY_FILTER_MAX_TOTAL_STRING_UTF8_BYTES
+                                ):
+                                    # Do not consume the member. A fresh request
+                                    # gets a fresh byte allowance and publishes
+                                    # it from this exact character boundary.
+                                    return continuation(
+                                        _JsonArrayCursorState(member_start)
+                                    )
+                                total_string_bytes += member_bytes
+                                page_filled = add_member(member)
+                            # Oversized strings are intentionally unfilterable,
+                            # but consuming them does not hide later members.
+                        elif member is not None:
+                            page_filled = add_member(member)
+                        state, exhausted = advance_after_member(position)
+                        if exhausted:
+                            return True, 0
+                        assert state is not None
+                        if page_filled:
+                            return continuation(state)
+                        continue
+
+                    if leading in "[{":
+                        scan_chars += 1
+                        scanned_members += 1
+                        state = _JsonArrayCursorState(
+                            position + 1,
+                            _JSON_ARRAY_CURSOR_MODE_NESTED,
+                            1,
+                        )
+                        continue
+
+                    token_end = position
+                    while token_end < len(text) and text[token_end] not in " \t\r\n,]":
+                        if (
+                            token_end - member_start >= 128
+                            or scan_chars >= ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCAN_CHARS
+                        ):
+                            # Every supported JSON number/literal fits in this
+                            # prefix; a longer primitive is unfilterable.
+                            return continuation(
+                                _JsonArrayCursorState(
+                                    token_end,
+                                    _JSON_ARRAY_CURSOR_MODE_PRIMITIVE,
+                                )
+                            )
+                        token_end += 1
+                        scan_chars += 1
+                    if token_end == member_start:
+                        raise ValueError("invalid filter-value JSON array")
+                    member = decoded_scalar(text[member_start:token_end])
+                    scanned_members += 1
+                    page_filled = member is not None and add_member(member)
+                    state, exhausted = advance_after_member(token_end)
+                    if exhausted:
+                        return True, 0
+                    assert state is not None
+                    if page_filled:
+                        return continuation(state)
+                    continue
+
+                if state.mode == _JSON_ARRAY_CURSOR_MODE_STRING:
+                    position = state.position
+                    escaped = bool(state.auxiliary)
+                    while position < len(text):
+                        if scan_chars >= ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCAN_CHARS:
+                            return continuation(
+                                _JsonArrayCursorState(
+                                    position,
+                                    _JSON_ARRAY_CURSOR_MODE_STRING,
+                                    int(escaped),
+                                )
+                            )
+                        character = text[position]
+                        position += 1
+                        scan_chars += 1
+                        if escaped:
+                            escaped = False
+                        elif character == "\\":
+                            escaped = True
+                        elif character == '"':
+                            scanned_members += 1
+                            state, exhausted = advance_after_member(position)
+                            if exhausted:
+                                return True, 0
+                            assert state is not None
+                            break
+                    else:
+                        raise ValueError("invalid filter-value JSON array")
+                    continue
+
+                if state.mode == _JSON_ARRAY_CURSOR_MODE_NESTED:
+                    position = state.position
+                    depth = state.auxiliary & (_JSON_ARRAY_CURSOR_NESTED_IN_STRING - 1)
+                    in_string = bool(
+                        state.auxiliary & _JSON_ARRAY_CURSOR_NESTED_IN_STRING
+                    )
+                    escaped = bool(state.auxiliary & _JSON_ARRAY_CURSOR_NESTED_ESCAPE)
+                    while position < len(text):
+                        if scan_chars >= ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCAN_CHARS:
+                            auxiliary = depth
+                            if in_string:
+                                auxiliary |= _JSON_ARRAY_CURSOR_NESTED_IN_STRING
+                            if escaped:
+                                auxiliary |= _JSON_ARRAY_CURSOR_NESTED_ESCAPE
+                            return continuation(
+                                _JsonArrayCursorState(
+                                    position,
+                                    _JSON_ARRAY_CURSOR_MODE_NESTED,
+                                    auxiliary,
+                                )
+                            )
+                        character = text[position]
+                        position += 1
+                        scan_chars += 1
+                        if in_string:
+                            if escaped:
+                                escaped = False
+                            elif character == "\\":
+                                escaped = True
+                            elif character == '"':
+                                in_string = False
+                            continue
+                        if character == '"':
+                            in_string = True
+                        elif character in "[{":
+                            depth += 1
+                            if depth >= _JSON_ARRAY_CURSOR_NESTED_IN_STRING:
+                                raise ValueError("invalid filter-value JSON array")
+                        elif character in "]}":
+                            depth -= 1
+                            if depth < 0:
+                                raise ValueError("invalid filter-value JSON array")
+                            if depth == 0:
+                                state, exhausted = advance_after_member(position)
+                                if exhausted:
+                                    return True, 0
+                                assert state is not None
+                                break
+                    else:
+                        raise ValueError("invalid filter-value JSON array")
+                    continue
+
+                # Oversized primitive or post-member whitespace. Both are
+                # already intentionally consumed; walk only to the delimiter.
+                position = state.position
+                while position < len(text):
+                    if scan_chars >= ATTRIBUTE_VALUE_CURSOR_JSON_MAX_SCAN_CHARS:
+                        return continuation(
+                            _JsonArrayCursorState(
+                                position,
+                                _JSON_ARRAY_CURSOR_MODE_PRIMITIVE,
+                            )
+                        )
+                    character = text[position]
+                    position += 1
+                    scan_chars += 1
+                    if character == ",":
+                        state = _JsonArrayCursorState(position)
+                        break
+                    if character == "]":
+                        return True, 0
+                else:
+                    raise ValueError("invalid filter-value JSON array")
+
+        def consume_cursor_row(
+            row: dict[str, Any],
+            *,
+            member_offset: int = 0,
+        ) -> tuple[bool, int]:
+            """Consume one latest row, streaming actionable JSON arrays."""
+
+            typed_value_present = any(
+                bool(row.get(field))
+                for field in (
+                    "string_present",
+                    "number_present",
+                    "boolean_present",
+                )
+            )
+            if (
+                not typed_value_present
+                and bool(row.get("legacy_present"))
+                and self._json_attribute_mode in {"arrays", "structured", "all"}
+            ):
+                array_source = self._json_array_cursor_text(row.get("legacy_value_raw"))
+                if array_source is not None:
+                    if attribute_type is not None and attribute_type != "array":
+                        return True, 0
+                    text, initial_position = array_source
+                    return consume_json_array(
+                        row,
+                        text,
+                        initial_position,
+                        member_offset=member_offset,
+                    )
+            decoded = self._decode_target_value(
+                row,
+                json_attribute_mode=self._json_attribute_mode,
+            )
+            if decoded is None:
+                return True, 0
+            # Latest state may change from an array to a scalar between cursor
+            # pages. Re-evaluate the scalar from its beginning; the exact seen
+            # set prevents repeats and no replacement value can be skipped.
+            return consume_decoded(decoded)
+
         if resume_identity is not None:
             resume_rows = (
                 self._hydrate_latest_unpinned_values(
@@ -4870,18 +5472,11 @@ class AttributeReadSelector:
                 )
             )
             resume_row = resume_rows[0] if resume_rows else None
-            decoded = (
-                self._decode_target_value(
+            if resume_row is not None and self._row_is_active_in_window(
+                resume_row, start, end
+            ):
+                fully_consumed, next_offset = consume_cursor_row(
                     resume_row,
-                    json_attribute_mode=self._json_attribute_mode,
-                )
-                if resume_row is not None
-                and self._row_is_active_in_window(resume_row, start, end)
-                else None
-            )
-            if decoded is not None:
-                fully_consumed, next_offset = consume_decoded(
-                    decoded,
                     member_offset=int(resume_member_offset),
                 )
                 if not fully_consumed:
@@ -5049,22 +5644,18 @@ class AttributeReadSelector:
                 proof_is_complete = len(distinct_rows) < distinct_limit
                 if proof_is_complete:
                     for distinct_row in distinct_rows:
-                        decoded = self._decode_seen_value_slice_group(
+                        decoded, decoded_complete = self._decode_seen_value_slice_group(
                             distinct_row,
                             json_attribute_mode=self._json_attribute_mode,
                         )
+                        if not decoded_complete:
+                            proof_is_complete = False
+                            break
                         if decoded is None:
                             continue
                         attr_type, raw_value = decoded
                         if attribute_type is not None and attr_type != attribute_type:
                             continue
-                        if (
-                            attr_type == "array"
-                            and isinstance(raw_value, tuple)
-                            and len(raw_value) > ATTRIBUTE_READ_MAX_VALUES
-                        ):
-                            proof_is_complete = False
-                            break
                         relevant_candidates = (
                             candidate
                             for candidate in candidates_for(decoded)
@@ -5435,14 +6026,7 @@ class AttributeReadSelector:
                 if row is None or not self._row_is_active_in_window(row, start, end):
                     fully_processed_identity = identity
                     continue
-                decoded = self._decode_target_value(
-                    row,
-                    json_attribute_mode=self._json_attribute_mode,
-                )
-                if decoded is None:
-                    fully_processed_identity = identity
-                    continue
-                fully_consumed, next_offset = consume_decoded(decoded)
+                fully_consumed, next_offset = consume_cursor_row(row)
                 if not fully_consumed:
                     next_resume_identity = identity
                     next_resume_member_offset = next_offset
@@ -5863,6 +6447,22 @@ def attribute_key_cursor_digest(key: str) -> str:
     ).hexdigest()
 
 
+def attribute_key_type_cursor_digest(key: str, attr_type: AttributeType) -> str:
+    """Return a workspace cursor identity for one key storage family.
+
+    Single-project cursors deliberately keep using ``attribute_key_cursor_digest``
+    for byte-compatible key de-duplication. A workspace walk spans independent
+    project batches, so its seen set must allow a later project to contribute a
+    newly observed type for a key that an earlier project already published.
+    """
+
+    canonical = f"workspace-key-type\0{attr_type}\0{key}".encode()
+    return hashlib.blake2s(
+        canonical,
+        digest_size=ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES,
+    ).hexdigest()
+
+
 def _value_search_text(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -5935,6 +6535,7 @@ __all__ = [
     "V2AttributeQueryExecutor",
     "adaptive_attribute_windows",
     "attribute_key_cursor_digest",
+    "attribute_key_type_cursor_digest",
     "attribute_value_cursor_digest",
     "merge_read_metadata",
     "validate_attribute_key",

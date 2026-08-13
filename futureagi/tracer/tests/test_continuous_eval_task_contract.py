@@ -30,6 +30,7 @@ from tracer.models.observation_span import (
 )
 from tracer.models.trace import Trace
 from tracer.selectors.eval_tasks import continuous_candidates
+from tracer.services.clickhouse.query_builders.filters import EvalFilterMetadata
 from tracer.services.clickhouse.v2.query_builders.session_list import (
     SessionListQueryBuilderV2,
 )
@@ -91,6 +92,50 @@ def _structured_attribute_filter() -> dict:
             "filter_type": "array",
             "filter_op": "contains",
             "filter_value": ["vip"],
+        },
+    }
+
+
+def _has_annotation_filter(value: bool = True) -> dict:
+    return {
+        "column_id": "has_annotation",
+        "filter_config": {
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": value,
+        },
+    }
+
+
+def _has_eval_filter(value: bool = True) -> dict:
+    return {
+        "column_id": "has_eval",
+        "filter_config": {
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": value,
+        },
+    }
+
+
+def _eval_metric_filter(
+    eval_id: str,
+    *,
+    output_type: str = "SCORE",
+) -> dict:
+    filter_op, filter_value = {
+        "SCORE": ("greater_than", 50),
+        "PASS_FAIL": ("equals", "Passed"),
+        "CHOICE": ("equals", "yes"),
+        "CHOICES": ("equals", "yes"),
+    }[output_type]
+    return {
+        "column_id": eval_id,
+        "filter_config": {
+            "col_type": "EVAL_METRIC",
+            "filter_type": "number" if output_type == "SCORE" else "text",
+            "filter_op": filter_op,
+            "filter_value": filter_value,
         },
     }
 
@@ -575,7 +620,10 @@ def _continuous_trace_task_for_filter(filter_item: dict) -> SimpleNamespace:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("row_type", [RowType.TRACES, RowType.VOICE_CALLS])
+@pytest.mark.parametrize(
+    "row_type",
+    [RowType.SPANS, RowType.TRACES, RowType.SESSIONS, RowType.VOICE_CALLS],
+)
 @pytest.mark.parametrize(
     "config_ids",
     [
@@ -599,11 +647,9 @@ def test_continuous_eval_filter_resolves_project_configs_once_for_all_batches(
     }
     task = _continuous_trace_task_for_filter(has_eval_filter)
     task.row_type = row_type
-    classifier_ids = ("trace-a", "trace-b")
+    classifier_ids = ("candidate-a", "candidate-b")
     public_ids = (
-        ("root-a", "root-b")
-        if row_type == RowType.VOICE_CALLS
-        else classifier_ids
+        ("root-a", "root-b") if row_type == RowType.VOICE_CALLS else classifier_ids
     )
     candidates = continuous_candidates.ContinuousCandidates(
         classifier_ids,
@@ -638,10 +684,19 @@ def test_continuous_eval_filter_resolves_project_configs_once_for_all_batches(
     class Analytics:
         def execute_ch_query(self, query, params, *, timeout_ms, settings):
             assert query == "continuous_eval_classifier"
-            trace_id = params["candidate_ids"][0]
-            row = {"trace_id": trace_id}
-            if row_type == RowType.VOICE_CALLS:
-                row["root_span_id"] = trace_id.replace("trace-", "root-")
+            candidate_id = params["candidate_ids"][0]
+            result_key = {
+                RowType.SPANS: "id",
+                RowType.TRACES: "trace_id",
+                RowType.SESSIONS: "session_id",
+                RowType.VOICE_CALLS: "root_span_id",
+            }[row_type]
+            public_id = (
+                candidate_id.replace("candidate-", "root-")
+                if row_type == RowType.VOICE_CALLS
+                else candidate_id
+            )
+            row = {result_key: public_id}
             return _FakeQueryResult([row])
 
     def resolve_configs(project_id, filters):
@@ -680,9 +735,498 @@ def test_continuous_eval_filter_resolves_project_configs_once_for_all_batches(
 
     assert len(config_reads) == 1
     assert builder_kwargs["eval_config_ids"] == list(config_ids)
-    assert classified_batches == [("trace-a",), ("trace-b",)]
+    assert classified_batches == [("candidate-a",), ("candidate-b",)]
     assert resolved.candidate_ids == public_ids
     assert resolved.matched_ids == public_ids
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "builder_class", [SpanListQueryBuilderV2, SessionListQueryBuilderV2]
+)
+@pytest.mark.parametrize("config_ids", [(str(uuid.uuid4()),), ()])
+def test_span_and_session_has_eval_use_authoritative_project_configs(
+    monkeypatch: pytest.MonkeyPatch,
+    builder_class,
+    config_ids: tuple[str, ...],
+) -> None:
+    """Finite task classifiers cannot borrow a colliding foreign trace eval."""
+
+    from tracer.models.custom_eval_config import CustomEvalConfig
+
+    project_id = str(uuid.uuid4())
+    candidate_id = str(uuid.uuid4())
+
+    def unexpected_config_read(**_kwargs):
+        raise AssertionError("the frozen project config set must avoid ORM fallback")
+
+    monkeypatch.setattr(CustomEvalConfig.objects, "filter", unexpected_config_read)
+    builder = builder_class(
+        project_id=project_id,
+        filters=[_has_eval_filter(True)],
+        eval_config_ids=list(config_ids),
+        bounded_internal_scan=True,
+    )
+
+    sql, params = builder.build_filter_match_query(
+        [candidate_id], candidate_full_state=True
+    )
+
+    if config_ids:
+        assert "eval_scan.custom_eval_config_id" in sql
+        if builder_class is SpanListQueryBuilderV2:
+            assert "sp.project_id" in sql
+        assert "eval_scan.custom_eval_config_id IN" in sql
+        assert config_ids in params.values()
+    else:
+        assert "00000000-0000-0000-0000-000000000000" in sql
+        assert not any(key.startswith("project_eval_cfg") for key in params)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "row_type",
+    [RowType.SPANS, RowType.TRACES, RowType.SESSIONS, RowType.VOICE_CALLS],
+)
+def test_continuous_eval_value_metadata_is_frozen_once_for_all_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    row_type: str,
+) -> None:
+    eval_id = "00000000-0000-4000-8000-000000000089"
+    config_id = "00000000-0000-4000-8000-000000000090"
+    task = _continuous_trace_task_for_filter(_eval_metric_filter(eval_id))
+    task.row_type = row_type
+    classifier_ids = ("candidate-a", "candidate-b")
+    public_ids = (
+        ("root-a", "root-b") if row_type == RowType.VOICE_CALLS else classifier_ids
+    )
+    candidates = continuous_candidates.ContinuousCandidates(
+        classifier_ids,
+        public_ids,
+    )
+    metadata = EvalFilterMetadata((config_id,), "SCORE")
+    metadata_reads: list[tuple[str, tuple[str, ...]]] = []
+    builder_kwargs: dict[str, object] = {}
+    classified_batches: list[tuple[str, ...]] = []
+    result_key = {
+        RowType.SPANS: "id",
+        RowType.TRACES: "trace_id",
+        RowType.SESSIONS: "session_id",
+        RowType.VOICE_CALLS: "root_span_id",
+    }[row_type]
+
+    class Builder:
+        def __init__(self, **kwargs):
+            builder_kwargs.update(kwargs)
+
+        @staticmethod
+        def supports_bounded_filter_scan() -> bool:
+            return True
+
+        @staticmethod
+        def recommended_filter_classify_batch_size() -> int:
+            return 1
+
+        @staticmethod
+        def recommended_filter_classify_read_settings():
+            return None
+
+        @staticmethod
+        def build_filter_match_query(batch, *, candidate_full_state):
+            assert candidate_full_state is True
+            classified_batches.append(tuple(batch))
+            return "continuous_eval_value_classifier", {"candidate_ids": tuple(batch)}
+
+    class Analytics:
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            assert query == "continuous_eval_value_classifier"
+            candidate_id = params["candidate_ids"][0]
+            public_id = (
+                candidate_id.replace("candidate-", "root-")
+                if row_type == RowType.VOICE_CALLS
+                else candidate_id
+            )
+            return _FakeQueryResult([{result_key: public_id}])
+
+    def resolve_metadata(filter_eval_id, project_ids):
+        metadata_reads.append((filter_eval_id, tuple(project_ids or ())))
+        return metadata
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        Analytics,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.dispatch.get_v2_class",
+        lambda _query_type: Builder,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.query_builders.filters.resolve_eval_filter_metadata",
+        resolve_metadata,
+    )
+    monkeypatch.setattr(
+        continuous_candidates,
+        "sample_public_ids",
+        lambda _analytics, ids, **_kwargs: tuple(ids),
+    )
+
+    resolved = row_resolver._resolve_continuous_rows(
+        task,
+        ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        sampling_rate=100.0,
+    )
+
+    assert metadata_reads == [(eval_id, (str(task.project_id),))]
+    assert builder_kwargs["eval_filter_metadata"] == {eval_id: metadata}
+    assert classified_batches == [("candidate-a",), ("candidate-b",)]
+    assert resolved.candidate_ids == public_ids
+    assert resolved.matched_ids == public_ids
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "builder_class",
+    [
+        SpanListQueryBuilderV2,
+        TraceListQueryBuilderV2,
+        SessionListQueryBuilderV2,
+        VoiceCallListQueryBuilderV2,
+    ],
+)
+@pytest.mark.parametrize(
+    ("output_type", "expected_sql"),
+    [
+        ("SCORE", "output_float >"),
+        ("PASS_FAIL", "output_bool IN"),
+        ("CHOICE", "JSONExtract(output_str_list, 'Array(String)')"),
+    ],
+)
+def test_eval_value_metadata_reaches_every_bounded_builder_without_orm_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    builder_class,
+    output_type: str,
+    expected_sql: str,
+) -> None:
+    project_id = "00000000-0000-4000-8000-000000000097"
+    eval_id = "00000000-0000-4000-8000-000000000098"
+    config_id = "00000000-0000-4000-8000-000000000099"
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.query_builders.filters.resolve_eval_filter_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("bounded classifiers must use the frozen metadata")
+        ),
+    )
+    kwargs = {
+        "project_id": project_id,
+        "filters": [_eval_metric_filter(eval_id, output_type=output_type)],
+        "eval_filter_metadata": {
+            eval_id: EvalFilterMetadata((config_id,), output_type)
+        },
+        "bounded_internal_scan": True,
+    }
+    if builder_class is TraceListQueryBuilderV2:
+        kwargs.update(bounded_identity_only=True, bounded_bulk_scan=True)
+    builder = builder_class(**kwargs)
+    candidate_id = (
+        "candidate-session"
+        if builder_class is SessionListQueryBuilderV2
+        else "candidate"
+    )
+
+    for _ in range(2):
+        sql, params = builder.build_filter_match_query(
+            [candidate_id],
+            candidate_full_state=True,
+        )
+        assert expected_sql in sql
+        assert (config_id,) in params.values()
+
+
+@pytest.mark.unit
+def test_continuous_eval_value_metadata_failure_stops_before_classifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from django.db import DatabaseError
+
+    from tracer.models.custom_eval_config import CustomEvalConfig
+
+    class UnavailableConfigManager:
+        @staticmethod
+        def filter(**_kwargs):
+            raise DatabaseError("metadata backend unavailable")
+
+    eval_id = "00000000-0000-4000-8000-000000000100"
+    candidates = continuous_candidates.ContinuousCandidates(
+        ("trace-a",),
+        ("trace-a",),
+    )
+    monkeypatch.setattr(CustomEvalConfig, "objects", UnavailableConfigManager())
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.dispatch.get_v2_class",
+        lambda _query_type: (_ for _ in ()).throw(
+            AssertionError("classifier must not be constructed")
+        ),
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="evaluation metadata is temporarily unavailable",
+    ):
+        row_resolver._resolve_continuous_rows(
+            _continuous_trace_task_for_filter(_eval_metric_filter(eval_id)),
+            ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+            sampling_rate=100.0,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "row_type",
+    [RowType.SPANS, RowType.TRACES, RowType.SESSIONS, RowType.VOICE_CALLS],
+)
+@pytest.mark.parametrize(
+    "label_ids",
+    [
+        (
+            "00000000-0000-4000-8000-000000000091",
+            "00000000-0000-4000-8000-000000000092",
+        ),
+        (),
+    ],
+    ids=["configured", "known-empty"],
+)
+def test_continuous_annotation_filter_resolves_project_labels_once_for_all_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    row_type: str,
+    label_ids: tuple[str, ...],
+) -> None:
+    task = _continuous_trace_task_for_filter(_has_annotation_filter())
+    task.row_type = row_type
+    classifier_ids = ("candidate-a", "candidate-b")
+    public_ids = (
+        ("root-a", "root-b") if row_type == RowType.VOICE_CALLS else classifier_ids
+    )
+    candidates = continuous_candidates.ContinuousCandidates(
+        classifier_ids,
+        public_ids,
+    )
+    builder_kwargs: dict[str, object] = {}
+    label_reads: list[tuple[str, tuple[dict, ...]]] = []
+    classified_batches: list[tuple[str, ...]] = []
+    result_key = {
+        RowType.SPANS: "id",
+        RowType.TRACES: "trace_id",
+        RowType.SESSIONS: "session_id",
+        RowType.VOICE_CALLS: "root_span_id",
+    }[row_type]
+
+    class Builder:
+        def __init__(self, **kwargs):
+            builder_kwargs.update(kwargs)
+
+        @staticmethod
+        def supports_bounded_filter_scan() -> bool:
+            return True
+
+        @staticmethod
+        def recommended_filter_classify_batch_size() -> int:
+            return 1
+
+        @staticmethod
+        def recommended_filter_classify_read_settings():
+            return None
+
+        @staticmethod
+        def build_filter_match_query(batch, *, candidate_full_state):
+            assert candidate_full_state is True
+            classified_batches.append(tuple(batch))
+            return "continuous_annotation_classifier", {"candidate_ids": tuple(batch)}
+
+    class Analytics:
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            assert query == "continuous_annotation_classifier"
+            candidate_id = params["candidate_ids"][0]
+            if row_type == RowType.VOICE_CALLS:
+                public_id = candidate_id.replace("candidate-", "root-")
+            else:
+                public_id = candidate_id
+            return _FakeQueryResult([{result_key: public_id}])
+
+    def resolve_labels(project_id, filters):
+        label_reads.append((project_id, tuple(filters)))
+        return label_ids
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        Analytics,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.dispatch.get_v2_class",
+        lambda _query_type: Builder,
+    )
+    monkeypatch.setattr(
+        row_resolver,
+        "_annotation_label_ids_for_filters",
+        resolve_labels,
+    )
+    monkeypatch.setattr(
+        continuous_candidates,
+        "sample_public_ids",
+        lambda _analytics, ids, **_kwargs: tuple(ids),
+    )
+
+    resolved = row_resolver._resolve_continuous_rows(
+        task,
+        ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        sampling_rate=100.0,
+    )
+
+    assert len(label_reads) == 1
+    assert builder_kwargs["annotation_label_ids"] == list(label_ids)
+    assert classified_batches == [("candidate-a",), ("candidate-b",)]
+    assert resolved.candidate_ids == public_ids
+    assert resolved.matched_ids == public_ids
+
+
+@pytest.mark.unit
+def test_continuous_annotation_metadata_failure_stops_before_classifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidates = continuous_candidates.ContinuousCandidates(
+        ("trace-a",),
+        ("trace-a",),
+    )
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        row_resolver,
+        "_annotation_label_ids_for_filters",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            row_resolver.EvalTaskReadBudgetExceeded(
+                row_resolver._SAFE_ANNOTATION_METADATA_MESSAGE
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.dispatch.get_v2_class",
+        lambda _query_type: (_ for _ in ()).throw(
+            AssertionError("classifier must not be constructed")
+        ),
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="annotation metadata is temporarily unavailable",
+    ):
+        row_resolver._resolve_continuous_rows(
+            _continuous_trace_task_for_filter(_has_annotation_filter()),
+            ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+            sampling_rate=100.0,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "builder_class",
+    [
+        SpanListQueryBuilderV2,
+        TraceListQueryBuilderV2,
+        SessionListQueryBuilderV2,
+        VoiceCallListQueryBuilderV2,
+    ],
+)
+@pytest.mark.parametrize(
+    ("wants_annotation", "expected_predicate"),
+    [(True, "1 = 1"), (False, "0 = 1")],
+)
+def test_continuous_builder_preserves_known_empty_annotation_label_semantics(
+    builder_class,
+    wants_annotation: bool,
+    expected_predicate: str,
+) -> None:
+    kwargs = {
+        "project_id": "00000000-0000-4000-8000-000000000093",
+        "filters": [_has_annotation_filter(wants_annotation)],
+        "annotation_label_ids": [],
+        "bounded_internal_scan": True,
+    }
+    if builder_class is TraceListQueryBuilderV2:
+        kwargs.update(bounded_identity_only=True, bounded_bulk_scan=True)
+    builder = builder_class(**kwargs)
+    candidate_id = (
+        "candidate-session"
+        if builder_class is SessionListQueryBuilderV2
+        else "candidate"
+    )
+
+    sql, _ = builder.build_filter_match_query(
+        [candidate_id],
+        candidate_full_state=True,
+    )
+
+    assert builder._annotation_label_set_known is True
+    assert "from model_hub_score" not in sql.lower()
+    assert expected_predicate in sql
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "builder_class",
+    [
+        SpanListQueryBuilderV2,
+        TraceListQueryBuilderV2,
+        SessionListQueryBuilderV2,
+        VoiceCallListQueryBuilderV2,
+    ],
+)
+def test_continuous_builder_requires_every_configured_annotation_label(
+    builder_class,
+) -> None:
+    label_ids = [
+        "00000000-0000-4000-8000-000000000094",
+        "00000000-0000-4000-8000-000000000095",
+    ]
+    kwargs = {
+        "project_id": "00000000-0000-4000-8000-000000000096",
+        "filters": [_has_annotation_filter()],
+        "annotation_label_ids": label_ids,
+        "bounded_internal_scan": True,
+    }
+    if builder_class is TraceListQueryBuilderV2:
+        kwargs.update(bounded_identity_only=True, bounded_bulk_scan=True)
+    builder = builder_class(**kwargs)
+    candidate_id = (
+        "candidate-session"
+        if builder_class is SessionListQueryBuilderV2
+        else "candidate"
+    )
+
+    sql, params = builder.build_filter_match_query(
+        [candidate_id],
+        candidate_full_state=True,
+    )
+
+    assert builder._annotation_label_set_known is True
+    assert "uniqExact(s.label_id) >= 2" in sql
+    assert all(label_id in params.values() for label_id in label_ids)
 
 
 @pytest.mark.unit

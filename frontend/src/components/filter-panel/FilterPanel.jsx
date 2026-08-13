@@ -600,6 +600,7 @@ const isCompleteNumericInput = (v) => {
 };
 
 const QUERY_FIELD_LOAD_MORE_OPTION = "__query_field_load_more__";
+const QUERY_VALUE_LOAD_MORE_OPTION = "__query_value_load_more__";
 
 const QueryInput = forwardRef(function QueryInput(
   {
@@ -610,6 +611,7 @@ const QueryInput = forwardRef(function QueryInput(
     valueOptions = [],
     valueLoading = false,
     valueLoadingMore = false,
+    valueLoadError = false,
     fieldLoading = false,
     fieldLoadingMore = false,
     fieldLoadError = false,
@@ -635,6 +637,7 @@ const QueryInput = forwardRef(function QueryInput(
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [focused, setFocused] = useState(false);
   const inputRef = useRef(null);
+  const bottomEdgeLatchedRef = useRef(false);
   const initialTokensKey = useMemo(
     () => JSON.stringify(initialTokens || []),
     [initialTokens],
@@ -659,6 +662,18 @@ const QueryInput = forwardRef(function QueryInput(
   }, [initialTokensKey]);
 
   const phase = !partialField ? "field" : !partialOp ? "operator" : "value";
+
+  useEffect(() => {
+    // A field/operator/search transition is a new list and may start a new
+    // explicit scroll gesture. Page arrivals alone do not touch this latch:
+    // browsers often emit more momentum/resize events while still pinned to
+    // the bottom, and those events must not drain the remaining cursor chain.
+    bottomEdgeLatchedRef.current = false;
+  }, [phase, partialField, inputValue]);
+
+  useEffect(() => {
+    if (!dropdownOpen) bottomEdgeLatchedRef.current = false;
+  }, [dropdownOpen]);
 
   // Resolve the picked operator's definition (so we can read `range: true`).
   const currentOpDef = useMemo(() => {
@@ -686,6 +701,11 @@ const QueryInput = forwardRef(function QueryInput(
   const hasStaticValueChoices = Boolean(
     phase === "value" && fieldMap[partialField]?.choices?.length,
   );
+  const allowsFreeTextValue = Boolean(
+    phase === "value" &&
+      (!hasStaticValueChoices ||
+        fieldMap[partialField]?.allowCustomValue === true),
+  );
 
   const options = useMemo(() => {
     if (phase === "field")
@@ -709,9 +729,6 @@ const QueryInput = forwardRef(function QueryInput(
       const fd = fieldMap[partialField];
       // Static choices: gate on choices presence so categorical / thumbs /
       // annotator fields (which carry their real type tag) also pick up.
-      if (fd?.choices?.length) {
-        return fd.choices.map((c) => ({ id: c, label: c, type: "value" }));
-      }
       // Dynamic values from parent (fetched from CH)
       if (valueOptions.length > 0) {
         return valueOptions.map((o) => {
@@ -723,6 +740,15 @@ const QueryInput = forwardRef(function QueryInput(
             type: "value",
             storageType: typeof o === "object" ? o.type : undefined,
           };
+        });
+      }
+      if (fd?.choices?.length) {
+        return fd.choices.map((choice) => {
+          const value =
+            typeof choice === "object" ? choice.value ?? choice.label : choice;
+          const label =
+            typeof choice === "object" ? choice.label ?? choice.value : choice;
+          return { id: value, label: String(label ?? ""), type: "value" };
         });
       }
     }
@@ -738,30 +764,56 @@ const QueryInput = forwardRef(function QueryInput(
 
   const filtered = useMemo(() => {
     const matchingOptions = inputValue
-      ? options.filter((option) =>
-          option.label.toLowerCase().includes(inputValue.toLowerCase()),
-        )
+      ? options.filter((option) => {
+          const query = inputValue.toLowerCase();
+          const candidates =
+            phase === "value" ? [option.id, option.label] : [option.label];
+          return candidates.some((candidate) =>
+            String(candidate ?? "")
+              .toLowerCase()
+              .includes(query),
+          );
+        })
       : options;
-    if (phase !== "field" || !hasMoreFields) return matchingOptions;
-    return [
-      ...matchingOptions,
-      {
-        id: QUERY_FIELD_LOAD_MORE_OPTION,
-        label: fieldLoadingMore
-          ? "Loading more fields..."
-          : fieldLoadError
-            ? "Retry loading fields"
-            : "Load more fields",
-        type: "field_load_more",
-      },
-    ];
+    if (phase === "field" && hasMoreFields) {
+      return [
+        ...matchingOptions,
+        {
+          id: QUERY_FIELD_LOAD_MORE_OPTION,
+          label: fieldLoadingMore
+            ? "Loading more fields..."
+            : fieldLoadError
+              ? "Retry loading fields"
+              : "Load more fields",
+          type: "field_load_more",
+        },
+      ];
+    }
+    if (phase === "value" && hasMoreValues) {
+      return [
+        ...matchingOptions,
+        {
+          id: QUERY_VALUE_LOAD_MORE_OPTION,
+          label: valueLoadingMore
+            ? "Loading more values..."
+            : valueLoadError
+              ? "Retry loading values"
+              : "Load more values",
+          type: "value_load_more",
+        },
+      ];
+    }
+    return matchingOptions;
   }, [
     fieldLoadError,
     fieldLoadingMore,
     hasMoreFields,
+    hasMoreValues,
     inputValue,
     options,
     phase,
+    valueLoadError,
+    valueLoadingMore,
   ]);
 
   const exactInputOption = useMemo(() => {
@@ -874,16 +926,14 @@ const QueryInput = forwardRef(function QueryInput(
         }
         const v = inputValue.trim();
         if (!v) return null;
-        if (hasStaticValueChoices && !exactInputOption) return null;
+        if (!allowsFreeTextValue && !exactInputOption) return null;
         // Don't commit a partial/invalid numeric on close (TH-5195).
         if (isNumericScalar && !isCompleteNumericInput(v)) return null;
-        const selectedValue = hasStaticValueChoices
+        const selectedValue = exactInputOption
           ? exactInputOption.id
-          : exactInputOption
-            ? exactInputOption.id
-            : originalInputUnchanged
-              ? partialOriginalValue
-              : v;
+          : originalInputUnchanged
+            ? partialOriginalValue
+            : v;
         const selectedValueTypes = exactInputOption?.storageType
           ? [exactInputOption.storageType]
           : originalInputUnchanged
@@ -923,6 +973,7 @@ const QueryInput = forwardRef(function QueryInput(
       isNumericScalar,
       inputValue,
       hasStaticValueChoices,
+      allowsFreeTextValue,
       exactInputOption,
       partialValueTypes,
       partialOriginalValue,
@@ -953,11 +1004,16 @@ const QueryInput = forwardRef(function QueryInput(
         reopenDropdown();
         return;
       }
+      if (option?.type === "value_load_more") {
+        if (!valueLoadingMore) onLoadMoreValues?.();
+        reopenDropdown();
+        return;
+      }
       if (typeof option === "string") {
         const explicitValue = option.trim();
         if (
           phase !== "value" ||
-          hasStaticValueChoices ||
+          !allowsFreeTextValue ||
           !explicitValue ||
           (isNumericScalar && !isCompleteNumericInput(explicitValue))
         ) {
@@ -1003,9 +1059,12 @@ const QueryInput = forwardRef(function QueryInput(
       onFieldChange,
       opDefFor,
       hasStaticValueChoices,
+      allowsFreeTextValue,
       isNumericScalar,
       fieldLoadingMore,
+      valueLoadingMore,
       onLoadMoreFields,
+      onLoadMoreValues,
     ],
   );
 
@@ -1075,7 +1134,7 @@ const QueryInput = forwardRef(function QueryInput(
         !isRangePhase &&
         e.key === "Enter" &&
         inputValue.trim() &&
-        !hasStaticValueChoices &&
+        allowsFreeTextValue &&
         (!isNumericScalar || isCompleteNumericInput(inputValue.trim()))
       ) {
         // MUI otherwise commits the first highlighted fuzzy suggestion after
@@ -1127,6 +1186,7 @@ const QueryInput = forwardRef(function QueryInput(
       commitFilter,
       editToken,
       hasStaticValueChoices,
+      allowsFreeTextValue,
       exactInputOption,
       partialValueTypes,
       partialOriginalValue,
@@ -1147,10 +1207,16 @@ const QueryInput = forwardRef(function QueryInput(
   const handleOptionsScroll = useCallback(
     (event) => {
       const { scrollTop, clientHeight, scrollHeight } = event.currentTarget;
-      if (scrollHeight - scrollTop - clientHeight > 40) return;
+      if (scrollHeight - scrollTop - clientHeight > 40) {
+        bottomEdgeLatchedRef.current = false;
+        return;
+      }
+      if (bottomEdgeLatchedRef.current) return;
       if (phase === "field" && hasMoreFields && !fieldLoadingMore) {
+        bottomEdgeLatchedRef.current = true;
         onLoadMoreFields?.();
       } else if (phase === "value" && hasMoreValues && !valueLoadingMore) {
+        bottomEdgeLatchedRef.current = true;
         onLoadMoreValues?.();
       }
     },
@@ -1193,9 +1259,9 @@ const QueryInput = forwardRef(function QueryInput(
         ? "pick operator..."
         : valueLoading
           ? "loading values..."
-          : fieldMap[partialField]?.choices?.length
-            ? "pick value..."
-            : "type or pick value...";
+          : allowsFreeTextValue
+            ? "type or pick value..."
+            : "pick value...";
 
   // Shared chip/prefix render — used by both the Autocomplete renderInput
   // startAdornment and the range-phase Box below.
@@ -1335,7 +1401,7 @@ const QueryInput = forwardRef(function QueryInput(
   return (
     <Autocomplete
       size="small"
-      freeSolo={phase === "value" && !isRangePhase && !hasStaticValueChoices}
+      freeSolo={phase === "value" && !isRangePhase && allowsFreeTextValue}
       options={filtered}
       filterOptions={(availableOptions) => availableOptions}
       getOptionLabel={(o) => (typeof o === "string" ? o : o.label)}
@@ -1385,6 +1451,7 @@ const QueryInput = forwardRef(function QueryInput(
         const { key, ...rest } = props;
         const isField = option.type === "field";
         const isFieldLoadMore = option.type === "field_load_more";
+        const isValueLoadMore = option.type === "value_load_more";
         const isOperator = option.type === "operator";
         const isValue = option.type === "value";
         const fieldDef = isField ? fieldMap[option.id] : null;
@@ -1428,7 +1495,8 @@ const QueryInput = forwardRef(function QueryInput(
                 sx={{ color: "text.disabled", flexShrink: 0 }}
               />
             )}
-            {isFieldLoadMore && fieldLoadingMore && (
+            {((isFieldLoadMore && fieldLoadingMore) ||
+              (isValueLoadMore && valueLoadingMore)) && (
               <CircularProgress size={14} sx={{ flexShrink: 0 }} />
             )}
             <Box
@@ -1465,10 +1533,15 @@ const QueryInput = forwardRef(function QueryInput(
           helperText={
             phase === "field" && fieldLoadError
               ? "More fields could not be loaded. Retained matches remain available."
-              : undefined
+              : phase === "value" && valueLoadError
+                ? "More values could not be loaded. Loaded matches remain available."
+                : undefined
           }
           FormHelperTextProps={
-            phase === "field" && fieldLoadError ? { role: "status" } : undefined
+            (phase === "field" && fieldLoadError) ||
+            (phase === "value" && valueLoadError)
+              ? { role: "status" }
+              : undefined
           }
           onFocus={() => {
             setFocused(true);
@@ -1513,6 +1586,7 @@ QueryInput.propTypes = {
   valueOptions: PropTypes.array,
   valueLoading: PropTypes.bool,
   valueLoadingMore: PropTypes.bool,
+  valueLoadError: PropTypes.bool,
   fieldLoading: PropTypes.bool,
   fieldLoadingMore: PropTypes.bool,
   fieldLoadError: PropTypes.bool,

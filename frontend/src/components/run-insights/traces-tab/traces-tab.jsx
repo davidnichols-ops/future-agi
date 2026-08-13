@@ -75,6 +75,11 @@ const TraceTab = React.forwardRef(
       hasNextPage: hasNextAttributePage,
       fetchNextPage: fetchNextAttributePage,
       isFetchingNextPage: isFetchingNextAttributePage,
+      isError: isAttributeLoadError,
+      isFetchNextPageError: isNextAttributePageError,
+      cursorChainStopped: attributeCursorStopped,
+      retryCursorChain: retryAttributeCursor,
+      isRetryingCursorChain: isRetryingAttributeCursor,
     } = useRunInsightAttributeKeys(projectId);
 
     const [filterDefinition, setFilterDefinition] = useState(() => {
@@ -293,6 +298,45 @@ const TraceTab = React.forwardRef(
               onClose={() => setFilterOpen(false)}
               projectId={projectId}
             />
+            {(attributeCursorStopped ||
+              isAttributeLoadError ||
+              isNextAttributePageError) && (
+              <Box
+                role="status"
+                sx={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 1,
+                  mt: 1,
+                }}
+              >
+                <Box sx={{ fontSize: 12, color: "warning.main" }}>
+                  {isAttributeLoadError
+                    ? "Attributes could not be loaded. Retry safely."
+                    : isNextAttributePageError
+                      ? "The next attribute page failed. Loaded attributes remain available."
+                      : "Attribute pagination stopped safely. Loaded attributes remain available."}
+                </Box>
+                <Button
+                  size="small"
+                  disabled={
+                    isRetryingAttributeCursor || isFetchingNextAttributePage
+                  }
+                  onClick={() =>
+                    void Promise.resolve(
+                      isNextAttributePageError && !attributeCursorStopped
+                        ? fetchNextAttributePage?.()
+                        : retryAttributeCursor?.(),
+                    ).catch(() => {})
+                  }
+                >
+                  {isRetryingAttributeCursor || isFetchingNextAttributePage
+                    ? "Retrying attributes…"
+                    : "Retry attributes"}
+                </Button>
+              </Box>
+            )}
             {hasNextAttributePage && (
               <Box sx={{ display: "flex", justifyContent: "flex-end", mt: 1 }}>
                 <Button

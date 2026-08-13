@@ -1258,9 +1258,7 @@ def test_known_empty_project_eval_configs_fail_positive_closed_and_negative_open
             ["shared-trace"]
         )
 
-    impossible_relation = (
-        "SELECT toUUID('00000000-0000-0000-0000-000000000000')"
-    )
+    impossible_relation = "SELECT toUUID('00000000-0000-0000-0000-000000000000')"
     assert config_manager.filter.call_count == 0
     assert f"trace_id IN ({impossible_relation})" in positive_sql
     assert f"trace_id NOT IN ({impossible_relation})" in negative_sql
@@ -3541,6 +3539,7 @@ def test_org_span_has_annotation_uses_each_projects_disjoint_labels() -> None:
 def test_has_eval_span_residual_matches_candidate_span_not_its_whole_trace() -> None:
     builder = SpanListQueryBuilder(
         project_id=PROJECT_ID,
+        eval_config_ids=["00000000-0000-4000-8000-000000000093"],
         filters=[
             _time_filter(),
             {
@@ -3589,6 +3588,7 @@ def test_has_eval_false_span_residual_is_exact_pair_scoped_on_page_n(
 ) -> None:
     builder = SpanListQueryBuilderV2(
         project_id=PROJECT_ID,
+        eval_config_ids=["00000000-0000-4000-8000-000000000094"],
         filters=[_time_filter(), _has_eval_filter(filter_value)],
     )
     started = END - timedelta(minutes=1)

@@ -131,8 +131,10 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         filters: list[dict] | None = None,
         sort_params: list[dict] | None = None,
         user_id: str | None = None,
+        eval_config_ids: list[str] | None = None,
         annotation_label_ids: list[str] | None = None,
         annotation_label_ids_by_project: dict[str, list[str]] | None = None,
+        eval_filter_metadata: dict[str, Any] | None = None,
         bounded_internal_scan: bool = False,
         bounded_sampling_salt: str | None = None,
         bounded_sampling_rate: float | None = None,
@@ -144,6 +146,9 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         self.filters = filters or []
         self.sort_params = sort_params or []
         self.user_id = user_id
+        self._eval_config_ids_known = eval_config_ids is not None
+        self.eval_config_ids = eval_config_ids or []
+        self._annotation_label_set_known = annotation_label_ids is not None
         self.annotation_label_ids = annotation_label_ids or []
         self.annotation_label_ids_by_project = (
             {
@@ -155,6 +160,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             if annotation_label_ids_by_project is not None
             else None
         )
+        self.eval_filter_metadata = eval_filter_metadata
         self._bounded_internal_scan = bool(bounded_internal_scan)
         if (bounded_sampling_salt is None) != (bounded_sampling_rate is None):
             raise ValueError(
@@ -363,7 +369,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             if not branch_project_id:
                 raise ValueError("relational session filter requires a project scope")
             branch_label_ids = self.annotation_label_ids
-            branch_label_set_known = False
+            branch_label_set_known = self._annotation_label_set_known
             if org_scope and self.annotation_label_ids_by_project is not None:
                 if branch_project_id not in self.annotation_label_ids_by_project:
                     raise ValueError(
@@ -384,8 +390,19 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                     score_date_scope=scope_to_request_window,
                     span_date_scope=scope_to_request_window,
                     candidate_ids_param=candidate_param,
-                    strict_trace_project_correlation=org_scope,
+                    strict_trace_project_correlation=(
+                        org_scope
+                        or (item.get("column_id") or item.get("columnId")) == "has_eval"
+                    ),
+                    trace_project_eval_config_ids=(
+                        self.eval_config_ids
+                        if self._eval_config_ids_known and not org_scope
+                        else None
+                    ),
                     annotation_label_set_known=branch_label_set_known,
+                    eval_filter_metadata=(
+                        self.eval_filter_metadata if not org_scope else None
+                    ),
                 )
                 predicate, leaf_params = filter_builder.translate([item])
                 if not predicate:
@@ -477,13 +494,12 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         )
         return ctes, (f"({combined_predicate})",), merged_params
 
-    @classmethod
     def _bounded_eval_membership_ctes(
-        cls,
+        self,
         *,
         has_eval_values: tuple[bool, ...],
         scope_to_request_window: bool,
-    ) -> tuple[str, tuple[str, ...]]:
+    ) -> tuple[str, tuple[str, ...], dict[str, Any]]:
         """Return finite latest-eval CTEs and root-trace membership predicates.
 
         The only eval-table read is keyed by trace IDs derived from the already
@@ -496,7 +512,42 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         """
 
         if not has_eval_values:
-            return "", ()
+            return "", (), {}
+        scoped_config_ids = (
+            tuple(self.eval_config_ids) if self._eval_config_ids_known else None
+        )
+        if scoped_config_ids is None:
+            from tracer.models.custom_eval_config import CustomEvalConfig
+
+            project_ids = self.project_ids or (
+                [self.project_id] if self.project_id else []
+            )
+            scoped_config_ids = tuple(
+                str(config_id)
+                for config_id in CustomEvalConfig.objects.filter(
+                    project_id__in=project_ids,
+                    deleted=False,
+                ).values_list("id", flat=True)
+            )
+            # The builder is reused across every finite classifier batch in
+            # one public session-page proof. Freeze the project-scoped lookup
+            # after its first compilation so a 1,000-batch walk cannot issue
+            # 1,000 identical PostgreSQL reads. Explicit empty remains a known
+            # empty set and therefore never falls back again.
+            self.eval_config_ids = list(scoped_config_ids)
+            self._eval_config_ids_known = True
+        eval_params: dict[str, Any] = {}
+        if scoped_config_ids:
+            eval_params["session_project_eval_config_ids"] = scoped_config_ids
+            eval_project_scope = (
+                "\n              AND eval_scan.custom_eval_config_id IN "
+                "%(session_project_eval_config_ids)s"
+            )
+        else:
+            # An explicit empty project config set is authoritative. Keep the
+            # finite CTE shape so positive/negative predicates retain their
+            # existing set semantics without reading unrelated eval rows.
+            eval_project_scope = "\n              AND 0 = 1"
         eval_table, _ = eval_logger_source()
         eval_version = eval_logger_version_column(eval_table)
         eval_live_columns = eval_logger_live_state_columns(eval_table)
@@ -526,7 +577,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             FROM {eval_table} AS eval_scan
             PREWHERE eval_scan.trace_id IN (
                 SELECT trace_id FROM candidate_eval_trace_ids
-            ){eval_date_scope}
+            ){eval_project_scope}{eval_date_scope}
             ORDER BY eval_scan.{eval_version} DESC
             LIMIT 1 BY eval_scan.id
         ),
@@ -542,7 +593,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             + " (SELECT trace_id FROM live_candidate_eval_trace_ids)"
             for value in has_eval_values
         )
-        return ctes, predicates
+        return ctes, predicates, eval_params
 
     @staticmethod
     def _bounded_root_witness_plan(plans: list[Any] | tuple[Any, ...]):
@@ -1961,10 +2012,11 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             for item in self.filters
         )
         scope_to_request_window = not candidate_full_state or has_explicit_time_filter
-        eval_ctes, eval_predicates = self._bounded_eval_membership_ctes(
+        eval_ctes, eval_predicates, eval_params = self._bounded_eval_membership_ctes(
             has_eval_values=has_eval_values,
             scope_to_request_window=scope_to_request_window,
         )
+        params.update(eval_params)
         relational_ctes, relational_predicates, relational_params = (
             self._bounded_relational_membership_plan(
                 relational_filters,

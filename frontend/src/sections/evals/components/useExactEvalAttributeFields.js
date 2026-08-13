@@ -1,10 +1,11 @@
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
 import {
   ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+  compactAttributeKeyRetryPage,
   getAttributeKeyCursorStopSignature,
   getNextAttributeKeyPageParam,
   isAttributeKeyCursorChainStopped,
@@ -63,7 +64,8 @@ export function useExactEvalAttributeFields({
 }) {
   const queryClient = useQueryClient();
   const normalizedRowType = normalizeExactAttributeRowType(rowType);
-  const debouncedSearch = useDebounce(String(search || "").trim(), 350);
+  const rawSearch = String(search || "").trim();
+  const debouncedSearch = useDebounce(rawSearch, 350);
   let exactSearch = debouncedSearch;
   if (normalizedRowType === "traces" && exactSearch.startsWith("spans.0.")) {
     exactSearch = exactSearch.slice("spans.0.".length);
@@ -90,10 +92,43 @@ export function useExactEvalAttributeFields({
     normalizedRowType,
     exactSearch,
   ]);
+  const exactRetryGestureIdentity = JSON.stringify([
+    projectId,
+    normalizedRowType,
+    rawSearch,
+  ]);
   const [cursorRetryState, setCursorRetryState] = useState({
     retained: null,
     exact: null,
   });
+  const previousRetryIdentity = useRef({
+    retained: retainedRetryIdentity,
+    exact: exactRetryIdentity,
+    exactGesture: exactRetryGestureIdentity,
+  });
+  const [freshRetryPending, setFreshRetryPending] = useState(false);
+
+  // A stopped-cursor retry is one-shot only within one settled query identity.
+  // Clear its marker when the project/row/search identity changes so returning
+  // to a formerly cached search starts a fresh, bounded retry contract instead
+  // of inheriting an exhausted marker from an earlier interaction.
+  useEffect(() => {
+    const retainedChanged =
+      previousRetryIdentity.current.retained !== retainedRetryIdentity;
+    const exactChanged =
+      previousRetryIdentity.current.exact !== exactRetryIdentity ||
+      previousRetryIdentity.current.exactGesture !== exactRetryGestureIdentity;
+    previousRetryIdentity.current = {
+      retained: retainedRetryIdentity,
+      exact: exactRetryIdentity,
+      exactGesture: exactRetryGestureIdentity,
+    };
+    if (!retainedChanged && !exactChanged) return;
+    setCursorRetryState((current) => ({
+      retained: retainedChanged ? null : current.retained,
+      exact: exactChanged ? null : current.exact,
+    }));
+  }, [retainedRetryIdentity, exactRetryGestureIdentity, exactRetryIdentity]);
 
   const retainedQuery = useInfiniteQuery({
     // The retained project schema is deliberately independent of the task's
@@ -126,6 +161,9 @@ export function useExactEvalAttributeFields({
     retry: false,
     staleTime: 60_000,
     gcTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
     meta: { errorHandled: true },
   });
 
@@ -166,6 +204,9 @@ export function useExactEvalAttributeFields({
     retry: false,
     staleTime: 60_000,
     gcTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
     // The mapping picker keeps free-text entry available on a failed read;
     // suppress the global backend-exception snackbar for this optional probe.
     meta: { errorHandled: true },
@@ -230,38 +271,112 @@ export function useExactEvalAttributeFields({
             page.result.some(({ key }) => key === exactSearch)),
       ),
   );
+  const retainedInitialError =
+    retainedQuery.isError && retainedPages.length === 0;
   const retainedHasNextPage =
-    retainedQuery.hasNextPage || retainedStoppedRetryAvailable;
-  const shouldAdvanceExact = Boolean(exactSearch) && !exactSearchMatched;
+    retainedQuery.hasNextPage ||
+    retainedStoppedRetryAvailable ||
+    retainedInitialError;
+  // A failed continuation belongs only to the optional exact-q accelerator.
+  // Do not make every later read-more gesture retry the same failed cursor:
+  // retain the exact rows already published and resume the authoritative
+  // no-q catalog on the next explicit gesture instead.
+  const exactContinuationFailed = Boolean(
+    exactSearch && exactQuery.isFetchNextPageError,
+  );
+  const shouldAdvanceExact =
+    Boolean(exactSearch) && !exactSearchMatched && !exactContinuationFailed;
   const exactHasNextPage =
     shouldAdvanceExact &&
     (exactQuery.hasNextPage || exactStoppedRetryAvailable);
-  const shouldAdvanceRetained = !exactSearchMatched;
+  // The exact-q cursor is only a supplemental accelerator. Give it first
+  // priority while it can still advance, then resume the independent retained
+  // catalog so an exact `foo` hit cannot hide later siblings such as
+  // `foo_archive` or `foo.bar`. The two predicates are mutually exclusive, so
+  // one explicit read-more gesture advances only one cursor chain.
+  const shouldAdvanceRetained = !exactSearch || !exactHasNextPage;
   const hasNextPage =
     exactHasNextPage || (shouldAdvanceRetained && retainedHasNextPage);
-  const fetchNextPage = (...args) => {
-    const reads = [];
-    if (shouldAdvanceRetained && retainedStoppedRetryAvailable) {
+
+  const fetchFreshPage = async ({ queryKey, exact, lane, retryState }) => {
+    if (freshRetryPending) return undefined;
+    setFreshRetryPending(true);
+    try {
+      const page = await readAttributeKeyPage({
+        pageParam: null,
+        pageSize: 10,
+        publishedData: undefined,
+        requestPage: (cursor, signal) =>
+          axios
+            .get(endpoints.project.spanAttributeKeys(), {
+              signal,
+              timeout: ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+              params: {
+                project_id: projectId,
+                page_size: 10,
+                discovery_mode: "eval_mapping",
+                ...(exact ? { q: exactSearch } : {}),
+                ...(cursor ? { cursor } : {}),
+              },
+            })
+            .then(({ data }) => data || {}),
+      });
+      const compactedPage = compactAttributeKeyRetryPage(
+        queryClient.getQueryData(queryKey),
+        page,
+      );
+      queryClient.setQueryData(queryKey, {
+        pages: [compactedPage],
+        pageParams: [null],
+      });
       setCursorRetryState((current) => ({
         ...current,
-        retained: {
-          identity: retainedRetryIdentity,
-          signature: retainedStopSignature,
-        },
+        [lane]: retryState,
       }));
-      reads.push(retainedQuery.refetch(...args));
+      return compactedPage;
+    } finally {
+      setFreshRetryPending(false);
+    }
+  };
+
+  const fetchNextPage = (...args) => {
+    const reads = [];
+    if (shouldAdvanceRetained && retainedInitialError) {
+      reads.push(
+        fetchFreshPage({
+          queryKey: retainedQueryKey,
+          exact: false,
+          lane: "retained",
+          retryState: cursorRetryState.retained,
+        }),
+      );
+    } else if (shouldAdvanceRetained && retainedStoppedRetryAvailable) {
+      reads.push(
+        fetchFreshPage({
+          queryKey: retainedQueryKey,
+          exact: false,
+          lane: "retained",
+          retryState: {
+            identity: retainedRetryIdentity,
+            signature: retainedStopSignature,
+          },
+        }),
+      );
     } else if (shouldAdvanceRetained && retainedQuery.hasNextPage) {
       reads.push(retainedQuery.fetchNextPage(...args));
     }
     if (shouldAdvanceExact && exactStoppedRetryAvailable) {
-      setCursorRetryState((current) => ({
-        ...current,
-        exact: {
-          identity: exactRetryIdentity,
-          signature: exactStopSignature,
-        },
-      }));
-      reads.push(exactQuery.refetch(...args));
+      reads.push(
+        fetchFreshPage({
+          queryKey: exactQueryKey,
+          exact: true,
+          lane: "exact",
+          retryState: {
+            identity: exactRetryIdentity,
+            signature: exactStopSignature,
+          },
+        }),
+      );
     } else if (shouldAdvanceExact && exactQuery.hasNextPage) {
       reads.push(exactQuery.fetchNextPage(...args));
     }
@@ -285,12 +400,14 @@ export function useExactEvalAttributeFields({
     isFetchingNextPage:
       (shouldAdvanceRetained && retainedQuery.isFetchingNextPage) ||
       (shouldAdvanceExact && exactQuery.isFetchingNextPage) ||
+      freshRetryPending ||
       (shouldAdvanceRetained &&
         retainedCursorStopped &&
         retainedQuery.isFetching) ||
       (shouldAdvanceExact && exactCursorStopped && exactQuery.isFetching),
     isFetchNextPageError:
-      (shouldAdvanceRetained && retainedQuery.isFetchNextPageError) ||
+      (shouldAdvanceRetained &&
+        (retainedInitialError || retainedQuery.isFetchNextPageError)) ||
       (shouldAdvanceExact && exactQuery.isFetchNextPageError) ||
       (shouldAdvanceRetained && retainedStoppedRetryAvailable) ||
       (shouldAdvanceExact && exactStoppedRetryAvailable),
