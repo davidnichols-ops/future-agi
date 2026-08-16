@@ -20338,9 +20338,14 @@ export interface AddObservationSpanAnnotationsApi {
   notes?: string;
 }
 
+/**
+ * String or JSON object.
+ */
+export type ObservationAttributeListResponseApiResultItem = string | { [key: string]: unknown };
+
 export interface ObservationAttributeListResponseApi {
   status?: boolean;
-  result: string[];
+  result: ObservationAttributeListResponseApiResultItem[];
 }
 
 export type ObserveGraphDataRequestApiFiltersItemFilterConfig = {
@@ -26554,6 +26559,7 @@ limit?: number;
  */
 filters: string;
 row_type?: TracerObservationSpanGetEvalAttributesListRowType;
+include_types?: boolean;
 };
 
 export type TracerObservationSpanGetEvalAttributesListRowType = typeof TracerObservationSpanGetEvalAttributesListRowType[keyof typeof TracerObservationSpanGetEvalAttributesListRowType];
@@ -26616,6 +26622,7 @@ limit?: number;
  */
 filters: string;
 row_type?: TracerObservationSpanGetSpanAttributesListRowType;
+include_types?: boolean;
 };
 
 export type TracerObservationSpanGetSpanAttributesListRowType = typeof TracerObservationSpanGetSpanAttributesListRowType[keyof typeof TracerObservationSpanGetSpanAttributesListRowType];

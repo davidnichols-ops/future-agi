@@ -32519,6 +32519,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
               ],
               "default": "spans"
             }
+          },
+          "include_types": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         },
         "responses": {
@@ -32697,6 +32704,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
                 "voiceCalls"
               ],
               "default": "spans"
+            }
+          },
+          "include_types": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
             }
           }
         },
@@ -61479,8 +61493,9 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "result": {
           "type": "array",
           "items": {
-            "type": "string",
-            "minLength": 1
+            "type": "object",
+            "x-string-or-object": true,
+            "description": "String or JSON object."
           }
         }
       }

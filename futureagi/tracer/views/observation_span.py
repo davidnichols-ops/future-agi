@@ -2183,13 +2183,20 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
         Query params:
             filters: JSON {"project_id": "<uuid>"} (required)
+            include_types: when true, return ``{"key", "type"}`` objects so
+                the caller can pick an operator set without asking the user.
 
         Returns:
-            List of attribute key strings.
+            List of attribute key strings, or ``{"key", "type"}`` objects
+            when ``include_types`` is set.
         """
         try:
             project_id = request.validated_query_data["filters"]["project_id"]
 
+            if request.validated_query_data.get("include_types"):
+                return self._gm.success_response(
+                    self._get_span_attribute_rows(project_id)
+                )
             result = self._get_span_attribute_keys(project_id)
             return self._gm.success_response(result)
 
@@ -2211,6 +2218,8 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             filters: JSON {"project_id": "<uuid>"} (required)
             row_type: spans | traces | sessions (default spans;
                       voiceCalls aliases to spans)
+            include_types: spans/voiceCalls only — traces and sessions
+                      return interpolated paths, which are always strings.
 
         Returns:
             spans/voiceCalls: distinct span_attributes keys
@@ -2275,6 +2284,24 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
     # sample keeps the path enumeration query cheap.
     _OBSERVED_MAX_SAMPLE_SIZE = 100
 
+    def _get_span_attribute_rows(self, project_id: str) -> list:
+        """Project's span attribute keys with the type CH resolved for each.
+
+        CH decides the type from which typed map the key lives in
+        (``attrs_string`` / ``attrs_number`` / ``attrs_bool``), so callers
+        that need to pick an operator set never have to ask the user.
+        """
+        analytics = AnalyticsQueryService()
+        rows = []
+        for item in analytics.get_span_attribute_keys_ch(str(project_id)) or []:
+            if isinstance(item, dict):
+                key = item.get("key")
+                if key:
+                    rows.append({"key": key, "type": item.get("type", "string")})
+            elif isinstance(item, str) and item:
+                rows.append({"key": item, "type": "string"})
+        return rows
+
     def _get_span_attribute_keys(self, project_id: str) -> list:
         """Project's distinct span_attributes keys, sourced from CH.
 
@@ -2291,18 +2318,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         routing toggle. Span attribute keys come from the CH ``attrs_*``
         typed-Map indexes (the authoritative inventory).
         """
-        analytics = AnalyticsQueryService()
-        raw = analytics.get_span_attribute_keys_ch(str(project_id))
-
-        keys = []
-        for item in raw or []:
-            if isinstance(item, dict):
-                k = item.get("key")
-                if k:
-                    keys.append(k)
-            elif isinstance(item, str) and item:
-                keys.append(item)
-        return keys
+        return [row["key"] for row in self._get_span_attribute_rows(project_id)]
 
     def _max_spans_per_trace(self, project_id: str) -> int:
         """Max span count observed across the project's most recent traces.
