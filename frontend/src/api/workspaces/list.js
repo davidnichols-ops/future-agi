@@ -11,7 +11,7 @@ const flattenPages = (data) =>
   data.pages.flatMap((page) => page?.data?.results || []);
 
 export function useWorkspacesList({ enabled = true } = {}) {
-  const { currentOrganizationId } = useOrganization();
+  const { currentOrganizationId, isReady: orgReady } = useOrganization();
 
   const query = useInfiniteQuery({
     // A cached list must never be served to a different org.
@@ -29,21 +29,29 @@ export function useWorkspacesList({ enabled = true } = {}) {
     enabled: enabled && !!currentOrganizationId,
   });
 
+  // Org resolution can finish without producing an id: seedFromMembership sets
+  // isReady in its catch and on an empty membership while leaving the id null.
+  // `enabled` then keeps the query off for good, so it can never report success
+  // or failure on its own — every state below has to come from the org context.
+  const orgResolving = enabled && !orgReady && !currentOrganizationId;
+  const orgUnavailable = enabled && orgReady && !currentOrganizationId;
+
   // Spreading the result would read every property, marking them all tracked
   // and re-rendering consumers on transitions none of them use. Adding a
   // property here is the price of a consumer needing one.
   return {
     data: query.data,
     fetchNextPage: query.fetchNextPage,
-    // A disabled query is still pending, which is what the switcher renders on.
-    isPending: query.isPending,
+    // A disabled query is still pending, which is what the switcher renders on
+    // — it would skeleton forever once the org is known to be unavailable.
+    isPending: query.isPending && !orgUnavailable,
     isFetchingNextPage: query.isFetchingNextPage,
-    isError: query.isError,
-    // A disabled query is not "loading", but callers have nothing to render.
-    // Gate on the same value as `enabled`: org resolution can finish without
-    // producing an id — a failed org list still sets isReady — which would
-    // otherwise leave this "not loading, no error, no data" forever.
-    isLoading: query.isLoading || (enabled && !currentOrganizationId),
+    // Scope could not be established, which is terminal: without this the role
+    // guard has no exit, since its only one is isError.
+    isError: query.isError || orgUnavailable,
+    // A disabled query is not "loading", but callers have nothing to render
+    // while the org is still being resolved.
+    isLoading: query.isLoading || orgResolving,
   };
 }
 

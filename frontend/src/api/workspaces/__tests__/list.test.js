@@ -89,7 +89,13 @@ describe("useWorkspacesList — returns an explicit set, not the whole query", (
 describe("useWorkspacesList — loading state tracks the same value as enabled", () => {
   beforeEach(() => {
     h.org = { currentOrganizationId: null, isReady: false };
-    h.queryResult = { isLoading: false, isError: false, data: undefined };
+    // What v5 reports for a disabled query: pending, never loading.
+    h.queryResult = {
+      isLoading: false,
+      isError: false,
+      isPending: true,
+      data: undefined,
+    };
     h.lastOptions = null;
   });
 
@@ -97,16 +103,23 @@ describe("useWorkspacesList — loading state tracks the same value as enabled",
     const { result } = renderHook(() => useWorkspacesList());
     expect(h.lastOptions.enabled).toBe(false);
     expect(result.current.isLoading).toBe(true);
+    expect(result.current.isError).toBe(false);
   });
 
-  it("reports loading when the org resolved to nothing, not an empty result", () => {
+  it("reports an error once the org resolved to nothing, rather than hanging", () => {
     // seedFromMembership sets isReady(true) in its catch and in the no-orgs
-    // case while leaving the id null. The query is then disabled forever, so
-    // "not loading, no error, no data" would render an empty editable form.
+    // case while leaving the id null. `enabled` keeps the query off, so it can
+    // never report success or failure itself — reporting loading here would
+    // leave the role guard on a LoadingScreen and the switcher on skeletons
+    // for good.
     h.org = { currentOrganizationId: null, isReady: true };
     const { result } = renderHook(() => useWorkspacesList());
     expect(h.lastOptions.enabled).toBe(false);
-    expect(result.current.isLoading).toBe(true);
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.isError).toBe(true);
+    // The switcher renders skeletons on isPending, which a disabled query
+    // reports forever.
+    expect(result.current.isPending).toBe(false);
   });
 
   it("defers to the query once an org id exists", () => {
