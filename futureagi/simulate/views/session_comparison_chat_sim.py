@@ -7,6 +7,7 @@ from rest_framework.views import APIView
 
 from model_hub.models.develop_dataset import Row
 from simulate.models import CallExecution
+from simulate.utils.baseline import resolve_baseline_id
 from simulate.serializers.response.call_execution import (
     CallExecutionErrorResponseSerializer,
     SessionComparisonResponseSerializer,
@@ -74,7 +75,11 @@ class SessionComparisonChatSimView(APIView):
 
         if is_voice:
             # Voice replay: look for baseline trace ID
-            trace_id = metadata.get("trace_id") or metadata.get("intent_id")
+            trace_id = resolve_baseline_id(
+                metadata,
+                is_replay=True,
+                simulation_call_type=CallExecution.SimulationCallType.VOICE,
+            )
             if trace_id:
                 return trace_id, "trace"
 
@@ -95,8 +100,15 @@ class SessionComparisonChatSimView(APIView):
 
             raise ValidationError("Comparison is only available for replay sessions")
 
-        # Chat replay: look for session_id
-        session_id = metadata.get("session_id")
+        # Chat replay: only a real session_id is usable here. The chat pipeline
+        # resolves the baseline into Postgres Trace rows by session, so a
+        # voice-shaped trace_id would match nothing and render an empty
+        # baseline as a successful comparison — fail loudly instead.
+        session_id = resolve_baseline_id(
+            metadata,
+            is_replay=True,
+            simulation_call_type=CallExecution.SimulationCallType.TEXT,
+        )
         if not session_id:
             raise ValidationError("No session ID found for comparison")
         return session_id, "session"

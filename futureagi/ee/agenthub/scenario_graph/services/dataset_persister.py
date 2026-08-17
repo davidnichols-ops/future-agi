@@ -22,6 +22,14 @@ from simulate.models import Scenarios
 logger = structlog.get_logger(__name__)
 
 
+def _is_uuid(value: Any) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
 def create_scenario_dataset(
     scenario_id: str,
     cases: List[Dict[str, Any]],
@@ -163,11 +171,24 @@ def create_scenario_dataset(
 
             # Create rows and cells for each case
             for i, case in enumerate(cases):
+                row_metadata = {"intent_id": case.get("intent_id")}
                 row: Row = Row.objects.create(
                     id=uuid.uuid4(),
                     dataset=dataset,
                     order=i,
-                    metadata={"intent_id": case.get("intent_id")},
+                    metadata=row_metadata,
+                )
+                intent_id = row_metadata["intent_id"]
+                logger.info(
+                    "scenario_row_metadata_stored",
+                    row_id=str(row.id),
+                    dataset_id=str(dataset.id),
+                    scenario_id=str(scenario_id),
+                    order=i,
+                    intent_id=intent_id,
+                    intent_id_type=type(intent_id).__name__,
+                    intent_id_is_uuid=_is_uuid(intent_id),
+                    metadata=row_metadata,
                 )
 
                 conversation_flow = case.get("nodes", [])
