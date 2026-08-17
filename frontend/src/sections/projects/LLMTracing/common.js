@@ -218,6 +218,9 @@ export const applyQuickFilters =
         value,
         filter: {
           column_id: col.id,
+          // The popover renders "Where <display_name> is"; without it the
+          // heading reads "Where value is".
+          display_name: col.name,
           filter_config: {
             filter_type: "number",
             filter_op: "equals",
@@ -349,6 +352,10 @@ export const applyQuickFilters =
     } else if (col?.groupBy === "Annotation Metrics") {
       filter = {
         column_id: col.id,
+        // Annotation ids are UUIDs, so both the chip and the number popover
+        // have nothing to show without this. On the base filter rather than the
+        // NUMERIC branch so every label type gets it.
+        display_name: col.name,
         _meta: {
           parentProperty: "Annotation Metrics",
           "Annotation Metrics": col.id,
@@ -423,9 +430,13 @@ export const applyQuickFilters =
       // Quick filters skip the toolbar normalization, so attach the col_type
       // the backend needs — without it the list 400s on a NORMAL col_type.
       let field = filter.column_id;
-      // Eval ids are UUIDs, so the chip has no readable label without this.
+      // Eval and annotation ids are both UUIDs, so the chip has no readable
+      // label without this.
       let fieldName =
-        col?.groupBy === "Evaluation Metrics" ? col?.name : undefined;
+        col?.groupBy === "Evaluation Metrics" ||
+        col?.groupBy === "Annotation Metrics"
+          ? col?.name
+          : undefined;
       const apiColType =
         col?.groupBy === "Annotation Metrics"
           ? "ANNOTATION"
