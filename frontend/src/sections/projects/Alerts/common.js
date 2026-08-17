@@ -536,18 +536,30 @@ const STATUS_COLORS = {
   INSUFFICIENT_DATA: "#9E9E9E",
 };
 
-export function getCompareChartConfig(apiData, customOptions = {}) {
-  if (!apiData?.result?.graph_data || !apiData?.result?.alert_bar_data) {
+export function getCompareChartConfig(
+  apiData,
+  customOptions = {},
+  { isDark = false } = {},
+) {
+  const graphData = apiData?.result?.graph_data;
+  const alertBarData = apiData?.result?.alert_bar_data;
+  // Empty arrays are truthy, so a `{graph_data: [], alert_bar_data: []}`
+  // response (new/quiet monitor) must be caught here — otherwise
+  // graphData[graphData.length - 1] dereferences undefined.
+  if (
+    !Array.isArray(graphData) ||
+    !Array.isArray(alertBarData) ||
+    graphData.length === 0
+  ) {
     throw new Error("Invalid API data structure");
   }
 
-  const { graph_data: graphData, alert_bar_data: alertBarData } =
-    apiData.result;
-
-  const totalTimeSpan =
-    new Date(graphData[graphData.length - 1].timestamp).getTime() -
-    new Date(graphData[0].timestamp).getTime();
   const startTime = new Date(graphData[0].timestamp).getTime();
+  // A single-bucket series has zero span; avoid divide-by-zero (Infinity/NaN
+  // offsets) below.
+  const totalTimeSpan =
+    new Date(graphData[graphData.length - 1].timestamp).getTime() - startTime ||
+    1;
 
   const colorStops = [];
   alertBarData.forEach((period) => {
@@ -657,6 +669,7 @@ export function getCompareChartConfig(apiData, customOptions = {}) {
       },
     },
     tooltip: {
+      theme: isDark ? "dark" : "light",
       enabledOnSeries: [1],
       marker: {
         show: true,
@@ -792,6 +805,7 @@ export function getSimpleLineChartConfig(
       },
     },
     tooltip: {
+      theme: isDark ? "dark" : "light",
       y: {
         formatter: (value) => `${value}`,
       },

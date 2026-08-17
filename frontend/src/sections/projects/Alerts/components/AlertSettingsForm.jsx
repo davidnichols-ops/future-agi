@@ -165,11 +165,17 @@ export default function AlertSettingsForm({
     const payload = {
       name: debouncedName,
       project: observeId,
+      // The backend stamps the authenticated org, but the request contract
+      // requires the field — mirror the submit payload.
+      ...(currentOrganizationId && { organization: currentOrganizationId }),
       metric_type: debouncedMetricType,
       threshold_operator: debouncedOperator,
       threshold_type: debouncedType,
       critical_threshold_value: debouncedCritical,
-      warning_threshold_value: debouncedWarning,
+      warning_threshold_value:
+        debouncedWarning === "" || debouncedWarning === undefined
+          ? null
+          : debouncedWarning,
       alert_frequency: debouncedFrequency,
       filters: {
         ...(observation_type.length > 0 && { observation_type }),
@@ -189,6 +195,7 @@ export default function AlertSettingsForm({
     return payload;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
+    currentOrganizationId,
     observeId,
     debouncedMetricType,
     debouncedOperator,
@@ -214,23 +221,30 @@ export default function AlertSettingsForm({
     ];
     const hasErrors = relevantFields.some((field) => errors[field]);
 
+    // 0 is a legit threshold/frequency -> truthiness would wrongly disable
+    const hasValue = (v) => v !== null && v !== undefined && v !== "";
+
     const requiredFieldsValid =
       observeId &&
       debouncedMetricType &&
       debouncedOperator &&
       debouncedType &&
-      debouncedCritical &&
-      debouncedWarning &&
-      debouncedFrequency &&
+      hasValue(debouncedCritical) &&
+      hasValue(debouncedFrequency) &&
       !hasErrors &&
       (debouncedMetricType === "evaluation_metrics" ? debouncedMetric : true);
 
+    // Warning tier is optional (backend fires critical-only monitors fine);
+    // enforce ordering only when both are set, comparing as numbers.
     const isThresholdValid = (() => {
+      if (!hasValue(debouncedWarning)) return true;
+      const crit = Number(debouncedCritical);
+      const warn = Number(debouncedWarning);
       if (debouncedOperator === "less_than") {
-        return debouncedCritical < debouncedWarning;
+        return crit < warn;
       }
       if (debouncedOperator === "greater_than") {
-        return debouncedCritical > debouncedWarning;
+        return crit > warn;
       }
       return true;
     })();
