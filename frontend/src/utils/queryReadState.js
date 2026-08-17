@@ -280,11 +280,13 @@ export function getAggregationRefreshState(payload) {
 
 const AGGREGATION_POLL_DELAYS_MS = [1000, 2000, 4000, 8000];
 export const AGGREGATION_POLL_MAX_ATTEMPTS = 12;
-export const AGGREGATION_POLL_TIMEOUT_MS = 60_000;
+// One visible exact-read action must settle before the ten-second UX boundary.
+// A user-triggered Refresh/Retry resets the controller and begins a separate
+// action; background work may continue server-side without holding this UI.
+export const AGGREGATION_POLL_TIMEOUT_MS = 9_000;
 export const AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES = 3;
-// Background aggregation may run for a minute, but each cache-state poll is an
-// interactive HTTP read. Give the API's 9.5-second server wall a small transport
-// grace without letting one stalled poll hold the graph spinner for a minute.
+// Give the API's 9.5-second server wall a small transport grace while remaining
+// below the ten-second visible-action boundary.
 export const AGGREGATION_REQUEST_TIMEOUT_MS = 9_800;
 
 const aggregationRequestError = (code) => {
@@ -397,9 +399,9 @@ export function getAggregationPollDelay(attempt = 0) {
 }
 
 /**
- * Exact snapshot jobs are allowed to queue, but the browser must never poll a
- * stuck job forever. The elapsed limit covers slow/failing transports while
- * the attempt limit also bounds unexpectedly fast response loops.
+ * Exact snapshot jobs are allowed to queue, but one browser action must settle
+ * before the interactive deadline. The elapsed limit covers slow/failing
+ * transports while the attempt limit also bounds unexpectedly fast loops.
  */
 export function isAggregationPollBudgetExhausted({
   attempt = 0,
@@ -472,6 +474,17 @@ export function createAggregationPollController({
     return false;
   };
 
+  const remainingMs = (capMs = AGGREGATION_POLL_TIMEOUT_MS) => {
+    if (!active || startedAt === null || exhausted) return 0;
+    const elapsed = Math.max(now() - startedAt, 0);
+    const actionRemaining = Math.max(AGGREGATION_POLL_TIMEOUT_MS - elapsed, 0);
+    const numericCap = Number(capMs);
+    const finiteCap = Number.isFinite(numericCap)
+      ? Math.max(numericCap, 0)
+      : AGGREGATION_POLL_TIMEOUT_MS;
+    return Math.floor(Math.min(actionRemaining, finiteCap));
+  };
+
   const nextDelay = () => {
     if (!active) return false;
     const currentTime = now();
@@ -522,6 +535,7 @@ export function createAggregationPollController({
     stop,
     terminate: exhaust,
     nextDelay,
+    remainingMs,
     recordAttempt,
     recordSuccess,
     recordFailure,

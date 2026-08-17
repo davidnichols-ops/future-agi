@@ -1,6 +1,7 @@
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import axios, { endpoints } from "src/utils/axios";
+import { useCursorAttributeInventory } from "src/sections/projects/LLMTracing/useCursorAttributeInventory";
 import {
   ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
   compactAttributeKeyRetryPage,
@@ -9,7 +10,8 @@ import {
   readAttributeKeyPage,
 } from "src/sections/projects/LLMTracing/attributeKeyCursorPagination";
 
-export const useRunInsightAttributeKeys = (projectId) => {
+/** Rollout-only retained span-key adapter kept for compatibility coverage. */
+export const useLegacyRunInsightAttributeKeys = (projectId) => {
   const queryClient = useQueryClient();
   const queryKey = ["run-insights-span-attribute-keys", projectId];
   const queryIdentity = JSON.stringify(queryKey);
@@ -123,5 +125,23 @@ export const useRunInsightAttributeKeys = (projectId) => {
     cursorChainStopped,
     retryCursorChain,
     isRetryingCursorChain: freshChainRetrying,
+  };
+};
+
+export const useRunInsightAttributeKeys = (projectId) => {
+  const inventory = useCursorAttributeInventory({
+    projectId,
+    rowType: "spans",
+    discoveryMode: "filter",
+    enabled: Boolean(projectId),
+    pageSize: 50,
+  });
+
+  return {
+    ...inventory,
+    attributeKeys: inventory.rawAttributes,
+    cursorChainStopped: inventory.cursorRetryExhausted,
+    retryCursorChain: inventory.inventoryControlProps.onRetry,
+    isRetryingCursorChain: inventory.isFetchingNextPage,
   };
 };

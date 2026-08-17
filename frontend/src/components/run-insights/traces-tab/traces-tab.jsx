@@ -28,6 +28,8 @@ import { useShallowToggleAnnotationsStore } from "src/sections/agents/store";
 import { getListTotalState } from "src/sections/projects/LLMTracing/listTotalMetadata";
 import { parsePrototypeTraceListResponse } from "src/api/project/telemetry-list-contract";
 import { useRunInsightAttributeKeys } from "./useRunInsightAttributeKeys";
+import { QUERY_FAILED_RETRY_MESSAGE } from "src/utils/queryReadState";
+import { readRunInsightListPage } from "../runInsightListRead";
 
 const defaultFilter = {
   column_id: "",
@@ -65,6 +67,7 @@ const TraceTab = React.forwardRef(
     const agTheme = useAgThemeWith(AG_THEME_OVERRIDES.borderless);
     const { projectId, runId } = useParams();
     const [openQuickFilter, setOpenQuickFilter] = useState(null);
+    const [readError, setReadError] = useState(null);
 
     const [filters, setFilters] = useState([
       { ...defaultFilter, id: getRandomId() },
@@ -250,15 +253,20 @@ const TraceTab = React.forwardRef(
             // request has startRow and endRow get next page number and each page has 10 rows
             const pageNumber = Math.floor(request.startRow / 10);
 
-            const results = await axios.get(endpoints.project.getTraceList(), {
-              params: {
-                project_version_id: runId,
-                page_number: pageNumber,
-                trace_ids: selectedTraceIds.join(","),
-                page_size: 10,
-                filters: JSON.stringify(debouncedValidatedFilters),
-              },
-            });
+            const results = await readRunInsightListPage(
+              ({ signal, timeout }) =>
+                axios.get(endpoints.project.getTraceList(), {
+                  signal,
+                  timeout,
+                  params: {
+                    project_version_id: runId,
+                    page_number: pageNumber,
+                    trace_ids: selectedTraceIds.join(","),
+                    page_size: 10,
+                    filters: JSON.stringify(debouncedValidatedFilters),
+                  },
+                }),
+            );
             const res = normalizeTraceListPayload(results.data);
             const columns = res.columnConfig.map((o) => ({
               ...o,
@@ -274,8 +282,10 @@ const TraceTab = React.forwardRef(
             if (!res.totalRowCountIsLowerBound) {
               successPayload.totalRows = res.totalRows;
             }
+            setReadError(null);
             params.success(successPayload);
-          } catch (error) {
+          } catch {
+            setReadError(QUERY_FAILED_RETRY_MESSAGE);
             params.fail();
           }
         },
@@ -358,6 +368,31 @@ const TraceTab = React.forwardRef(
             flex: 1,
           }}
         >
+          {readError && (
+            <Box
+              role="alert"
+              sx={{
+                px: 1.5,
+                py: 0.75,
+                color: "warning.main",
+                bgcolor: "warning.lighter",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+              }}
+            >
+              {readError}
+              <Button
+                size="small"
+                onClick={() => {
+                  setReadError(null);
+                  gridApiRef?.current?.api?.refreshServerSide({ purge: false });
+                }}
+              >
+                Retry
+              </Button>
+            </Box>
+          )}
           <AgGridReact
             ref={gridApiRef}
             theme={agTheme}

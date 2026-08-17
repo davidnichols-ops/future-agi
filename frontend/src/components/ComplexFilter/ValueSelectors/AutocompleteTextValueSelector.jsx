@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import PropTypes from "prop-types";
 import { Autocomplete, TextField, CircularProgress } from "@mui/material";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
@@ -145,6 +145,9 @@ const AutocompleteTextValueSelector = ({
   const { observeId, id } = useParams();
   const projectId = projectIdProp || observeId || id;
   const definitionFilterType = definition?.filterType?.type || definition?.type;
+  const propertyRegistryId = definition?.propertyId
+    ? definition?.registryId || `custom_attribute:${definition.propertyId}`
+    : "";
   const attributeType =
     definitionFilterType &&
     definition?.attributeTypesExact === true &&
@@ -153,13 +156,16 @@ const AutocompleteTextValueSelector = ({
       ? normalizeAttributeType(definitionFilterType)
       : undefined;
 
-  const queryKey = [
-    "span-attribute-values",
-    projectId,
-    definition?.propertyId,
-    attributeType || "all-types",
-    debouncedInput,
-  ];
+  const queryKey = useMemo(
+    () => [
+      "span-attribute-values",
+      projectId,
+      propertyRegistryId,
+      attributeType || "all-types",
+      debouncedInput,
+    ],
+    [attributeType, debouncedInput, projectId, propertyRegistryId],
+  );
   const nextPageRequestRef = useRef(null);
   const freshChainRetryRef = useRef(null);
   const [freshChainRetrying, setFreshChainRetrying] = useState(false);
@@ -195,6 +201,7 @@ const AutocompleteTextValueSelector = ({
           timeout: ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS,
           params: {
             project_ids: projectId,
+            property_id: propertyRegistryId,
             metric_name: definition?.propertyId,
             metric_type: "custom_attribute",
             source: "traces",
@@ -303,7 +310,7 @@ const AutocompleteTextValueSelector = ({
         ? undefined
         : nextCursor;
     },
-    enabled: Boolean(projectId) && Boolean(definition?.propertyId),
+    enabled: Boolean(projectId) && Boolean(propertyRegistryId),
     staleTime: 30000,
     retry: false,
     refetchOnWindowFocus: false,
@@ -327,6 +334,7 @@ const AutocompleteTextValueSelector = ({
         timeout: ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS,
         params: {
           project_ids: projectId,
+          property_id: propertyRegistryId,
           metric_name: definition?.propertyId,
           metric_type: "custom_attribute",
           source: "traces",
@@ -390,6 +398,7 @@ const AutocompleteTextValueSelector = ({
     attributeType,
     debouncedInput,
     definition?.propertyId,
+    propertyRegistryId,
     paginationIdentity,
     projectId,
     queryClient,
@@ -678,6 +687,7 @@ const AutocompleteTextValueSelector = ({
 AutocompleteTextValueSelector.propTypes = {
   definition: PropTypes.shape({
     propertyId: PropTypes.string,
+    registryId: PropTypes.string,
     type: PropTypes.string,
     filterType: PropTypes.shape({ type: PropTypes.string }),
     attributeTypes: PropTypes.arrayOf(PropTypes.string),

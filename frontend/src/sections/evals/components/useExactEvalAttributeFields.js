@@ -4,6 +4,10 @@ import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
 import {
+  attributeInventoryKey,
+  useCursorAttributeInventory,
+} from "src/sections/projects/LLMTracing/useCursorAttributeInventory";
+import {
   ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
   compactAttributeKeyRetryPage,
   getAttributeKeyCursorStopSignature,
@@ -56,7 +60,8 @@ function combineQueryReadStates(...states) {
   return "complete";
 }
 
-export function useExactEvalAttributeFields({
+/** Rollout-only retained span-key adapter kept for compatibility coverage. */
+export function useLegacyExactEvalAttributeFields({
   projectId,
   rowType,
   search,
@@ -420,5 +425,57 @@ export function useExactEvalAttributeFields({
     browseStatus:
       (exactSearch ? exactPages.at(-1)?.browse_status : undefined) ||
       retainedPages.at(-1)?.browse_status,
+  };
+}
+
+export function useExactEvalAttributeFields({
+  projectId,
+  rowType,
+  search,
+  enabled = true,
+}) {
+  const normalizedRowType = normalizeExactAttributeRowType(rowType);
+  const inventory = useCursorAttributeInventory({
+    projectId,
+    rowType: normalizedRowType || "spans",
+    discoveryMode: "eval_mapping",
+    search,
+    enabled: enabled && Boolean(normalizedRowType),
+    pageSize: 10,
+  });
+  const data = mergeTracingFieldNames(
+    [],
+    inventory.rawAttributes
+      .map((attribute) =>
+        retainedAttributeFieldName(
+          attributeInventoryKey(attribute),
+          normalizedRowType,
+        ),
+      )
+      .filter(Boolean),
+  );
+  const queryReadState = inventory.isError
+    ? "error"
+    : inventory.cursorRetryExhausted
+      ? "degraded"
+      : "complete";
+
+  return {
+    data,
+    queryReadState,
+    debouncedSearch: inventory.debouncedSearch,
+    isSupportedRowType: Boolean(normalizedRowType),
+    isFetching: inventory.isFetching,
+    isLoading: inventory.isLoading,
+    isError: inventory.isError,
+    isSuccess: !inventory.isError && !inventory.isLoading,
+    error: inventory.error,
+    fetchNextPage: inventory.fetchNextPage,
+    hasNextPage: inventory.hasNextPage,
+    isFetchingNextPage: inventory.isFetchingNextPage,
+    isFetchNextPageError: inventory.isFetchNextPageError,
+    cursorRetryExhausted: inventory.cursorRetryExhausted,
+    pageCount: inventory.pageCount,
+    browseStatus: inventory.hasNextPage ? "continuation" : "exhausted",
   };
 }

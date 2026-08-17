@@ -701,16 +701,11 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
       activeViewConfig.extra_filters,
     );
     setExtraFilters((prev) => {
-      if (prev.length === 0 && nextExtraFilters.length === 0) return prev;
-      if (prev.length === nextExtraFilters.length) {
-        const allSame = prev.every(
-          (f, i) =>
-            f?.column_id === nextExtraFilters[i]?.column_id &&
-            JSON.stringify(f?.filter_config) ===
-              JSON.stringify(nextExtraFilters[i]?.filter_config),
-        );
-        if (allSame) return prev;
-      }
+      // Reuse the canonical saved-view comparator so property_id participates
+      // in hydration equality. Otherwise switching between same-name system
+      // and custom properties keeps the stale row because column_id/config
+      // happen to match.
+      if (filtersContentEqual(prev, nextExtraFilters)) return prev;
       return nextExtraFilters;
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -999,6 +994,7 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
       <ObserveToolbar
         mode="sessions"
         projectId={toolbarProjectId}
+        allowWorkspaceScope={isUserMode}
         // Date
         dateLabel={getDateLabel(dateFilter)}
         dateFilter={dateFilter}
