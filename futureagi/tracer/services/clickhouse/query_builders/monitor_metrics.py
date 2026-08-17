@@ -378,6 +378,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         metric_type: str,
         start_time: datetime,
         end_time: datetime,
+        interval_kind: Optional[str] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Build a query that returns mean and stddev for historical analysis.
 
@@ -483,9 +484,38 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         elif metric_type == EVALUATION_METRICS:
             query, params = self._build_eval_stats_query(params)
 
+        elif metric_type in (
+            COUNT_OF_ERRORS,
+            TOKEN_USAGE,
+            DAILY_TOKENS_SPENT,
+            MONTHLY_TOKENS_SPENT,
+        ):
+            # Stats over calendar-aligned buckets. Empty result collapses to
+            # (0, 0), a single bucket to (value, 0), and no-token buckets are
+            # skipped via nullIf (v2 total_tokens is non-Nullable) — matching
+            # the old Python path.
+            bucket_fn = self.time_bucket_expr(interval_kind or "hour")
+            agg = (
+                "countIf(status = 'ERROR')"
+                if metric_type == COUNT_OF_ERRORS
+                else "nullIf(sum(total_tokens), 0)"
+            )
+            query = f"""
+                SELECT
+                    coalesce(ifNotFinite(avg(bucket_value), 0), 0) AS mean,
+                    coalesce(ifNotFinite(stddevSamp(bucket_value), 0), 0) AS stddev
+                FROM (
+                    SELECT
+                        {bucket_fn}(created_at) AS bucket_ts,
+                        {agg} AS bucket_value
+                    FROM {SPANS_TABLE}
+                    {base_where}
+                      {time_win}
+                    GROUP BY bucket_ts
+                )
+            """
+
         else:
-            # For COUNT_OF_ERRORS, TOKEN_USAGE, DAILY/MONTHLY_TOKENS_SPENT
-            # these are handled via time-series aggregation in Python
             query = "SELECT NULL AS mean, NULL AS stddev"
 
         return query, params

@@ -545,18 +545,12 @@ def _get_historical_stats(monitor, start_time, end_time):
     try:
         metric_type = monitor.metric_type
 
-        # For time-aggregated metrics, compute stats from time-series buckets
-        if metric_type in (
-            MonitorMetricTypeChoices.COUNT_OF_ERRORS,
-            MonitorMetricTypeChoices.TOKEN_USAGE,
-            MonitorMetricTypeChoices.DAILY_TOKENS_SPENT,
-            MonitorMetricTypeChoices.MONTHLY_TOKENS_SPENT,
-        ):
-            return _get_stats_for_time_aggregated_metrics(monitor, start_time, end_time)
-
         builder = _build_monitor_ch_builder(monitor)
         query, params = builder.build_historical_stats_query(
-            metric_type, start_time, end_time
+            metric_type,
+            start_time,
+            end_time,
+            interval_kind=_get_interval_kind(monitor),
         )
         result = analytics.execute_ch_query(query, params, timeout_ms=5000)
         if result.data:
