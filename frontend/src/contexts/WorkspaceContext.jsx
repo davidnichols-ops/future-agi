@@ -167,7 +167,11 @@ export function WorkspaceProvider({ children }) {
   useEffect(() => {
     if (!authenticated || !user) return;
 
-    const activeOrgId = currentOrganizationId || user.organization?.id || null;
+    // The resolved org first: effects run child-first and this provider sits
+    // inside OrganizationProvider, so currentOrganizationId is still the
+    // previous org on the render where `user` arrives. Preferring it adopts the
+    // old org's workspace row, and with it the old org's role and wsLevel.
+    const activeOrgId = user.organization?.id || currentOrganizationId || null;
 
     // Trust sessionStorage only while it belongs to the org we are in
     const stored = readSessionWorkspaceForOrg(activeOrgId);
