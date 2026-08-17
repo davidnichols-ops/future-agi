@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
+from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder, _parse_dt
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
 
@@ -46,7 +47,6 @@ MONTHLY_TOKENS_SPENT = "monthly_tokens_spent"
 EVALUATION_METRICS = "evaluation_metrics"
 
 SPANS_TABLE = "spans"
-EVAL_TABLE = "tracer_eval_logger"
 
 # Time-series bucket expressions: floor the time column to the frequency window.
 # Spans are partitioned/keyed on ``start_time``; the eval table has no
@@ -97,12 +97,8 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
 
     @staticmethod
     def _eval_choice_match_expr(param_name: str = "choice_val") -> str:
-        """Return exact choice membership against CH's JSON-string list column."""
-        choice_array = "JSONExtract(output_str_list, 'Array(String)')"
-        return (
-            f"(has({choice_array}, %({param_name})s) "
-            f"OR output_str = %({param_name})s)"
-        )
+        """Choice membership in the JSON list (choice evals only write output_str_list)."""
+        return f"has(JSONExtract(output_str_list, 'Array(String)'), %({param_name})s)"
 
     def _translate_filters(self) -> None:
         """Translate raw monitor filter JSON into CH WHERE clause fragments."""
@@ -331,31 +327,30 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
     def _build_eval_metric_value_query(
         self, params: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
-        """Build the eval metric value query against tracer_eval_logger."""
+        """Build the eval metric value query against the configured eval-logger table."""
         if not self.eval_config_id:
             return "SELECT NULL AS value", params
 
         params["eval_config_id"] = self.eval_config_id
 
-        eval_where = self._eval_base_where()
+        eval_table, eval_nd = eval_logger_source()
+        eval_where = self._eval_base_where(eval_nd)
 
         if self.eval_output_type == "SCORE":
             query = f"""
                 SELECT ifNotFinite(avg(output_float), NULL) AS value
-                FROM {EVAL_TABLE} FINAL
+                FROM {eval_table} FINAL
                 {eval_where}
-                  AND created_at BETWEEN %(start_time)s AND %(end_time)s
             """
         elif self.eval_output_type == "PASS_FAIL":
             output_bool_val = 1 if self.threshold_metric_value == "Passed" else 0
             params["output_bool_val"] = output_bool_val
             query = f"""
-                SELECT avg(
+                SELECT ifNotFinite(avg(
                     CASE WHEN output_bool = %(output_bool_val)s THEN 1.0 ELSE 0.0 END
-                ) AS value
-                FROM {EVAL_TABLE} FINAL
+                ), NULL) AS value
+                FROM {eval_table} FINAL
                 {eval_where}
-                  AND created_at BETWEEN %(start_time)s AND %(end_time)s
             """
         elif self.eval_output_type == "CHOICES":
             if not self.threshold_metric_value:
@@ -363,12 +358,11 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             params["choice_val"] = self.threshold_metric_value
             choice_match = self._eval_choice_match_expr()
             query = f"""
-                SELECT avg(
+                SELECT ifNotFinite(avg(
                     CASE WHEN {choice_match} THEN 1.0 ELSE 0.0 END
-                ) AS value
-                FROM {EVAL_TABLE} FINAL
+                ), NULL) AS value
+                FROM {eval_table} FINAL
                 {eval_where}
-                  AND created_at BETWEEN %(start_time)s AND %(end_time)s
             """
         else:
             query = "SELECT NULL AS value"
@@ -499,35 +493,37 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
     def _build_eval_stats_query(
         self, params: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
-        """Build eval metric stats (mean/stddev) query."""
+        """Build eval metric stats (mean/stddev) query.
+
+        ``stddevPop`` matches the pre-migration PG ``StdDev`` default.
+        """
         if not self.eval_config_id:
             return "SELECT NULL AS mean, NULL AS stddev", params
 
         params["eval_config_id"] = self.eval_config_id
-        eval_where = self._eval_base_where()
+        eval_table, eval_nd = eval_logger_source()
+        eval_where = self._eval_base_where(eval_nd)
 
         if self.eval_output_type == "SCORE":
             query = f"""
                 SELECT
                     ifNotFinite(avg(output_float), NULL) AS mean,
-                    ifNotFinite(stddevSamp(output_float), NULL) AS stddev
-                FROM {EVAL_TABLE} FINAL
+                    ifNotFinite(stddevPop(output_float), NULL) AS stddev
+                FROM {eval_table} FINAL
                 {eval_where}
-                  AND created_at BETWEEN %(start_time)s AND %(end_time)s
             """
         elif self.eval_output_type == "PASS_FAIL":
             output_bool_val = 1 if self.threshold_metric_value == "Passed" else 0
             params["output_bool_val"] = output_bool_val
             query = f"""
                 SELECT
-                    avg(pass_value) AS mean,
-                    stddevSamp(pass_value) AS stddev
+                    ifNotFinite(avg(pass_value), NULL) AS mean,
+                    ifNotFinite(stddevPop(pass_value), NULL) AS stddev
                 FROM (
                     SELECT
                         CASE WHEN output_bool = %(output_bool_val)s THEN 1.0 ELSE 0.0 END AS pass_value
-                    FROM {EVAL_TABLE} FINAL
+                    FROM {eval_table} FINAL
                     {eval_where}
-                      AND created_at BETWEEN %(start_time)s AND %(end_time)s
                 )
             """
         elif self.eval_output_type == "CHOICES":
@@ -537,14 +533,13 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             choice_match = self._eval_choice_match_expr()
             query = f"""
                 SELECT
-                    avg(choice_value) AS mean,
-                    stddevSamp(choice_value) AS stddev
+                    ifNotFinite(avg(choice_value), NULL) AS mean,
+                    ifNotFinite(stddevPop(choice_value), NULL) AS stddev
                 FROM (
                     SELECT
                         CASE WHEN {choice_match} THEN 1.0 ELSE 0.0 END AS choice_value
-                    FROM {EVAL_TABLE} FINAL
+                    FROM {eval_table} FINAL
                     {eval_where}
-                      AND created_at BETWEEN %(start_time)s AND %(end_time)s
                 )
             """
         else:
@@ -707,15 +702,19 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
     ) -> Tuple[str, Dict[str, Any]]:
         """Build eval metric time-series query.
 
-        Buckets on ``created_at``: the eval table has no ``start_time`` column.
+        Buckets on the eval row's ``created_at`` (the table has no span-time
+        column). Window membership comes from the span subquery, so a
+        late-computed eval for an in-window span lands in the bucket of its
+        computation time.
+        # TODO: bucket by span time (needs a spans join) for graph fidelity.
         """
         if not self.eval_config_id:
             return "SELECT NULL AS timestamp, NULL AS value WHERE 1 = 0", params
 
         params["eval_config_id"] = self.eval_config_id
-        eval_where = self._eval_base_where()
+        eval_table, eval_nd = eval_logger_source()
+        eval_where = self._eval_base_where(eval_nd)
         bucket_expr = _EVAL_BUCKET_EXPR
-        time_filter = "AND created_at BETWEEN %(start_time)s AND %(end_time)s"
 
         if self.eval_output_type == "SCORE":
             agg = "avg(output_float)"
@@ -738,9 +737,8 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             SELECT
                 {bucket_expr} AS timestamp,
                 ifNotFinite({agg}, NULL) AS value
-            FROM {EVAL_TABLE} FINAL
+            FROM {eval_table} FINAL
             {eval_where}
-              {time_filter}
             GROUP BY timestamp
             ORDER BY timestamp
         """
@@ -758,11 +756,27 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             clause += f" AND {self._filter_clause}"
         return clause
 
-    def _eval_base_where(self) -> str:
-        """Return the base WHERE clause for eval_logger table queries.
+    def _eval_base_where(self, not_deleted: str) -> str:
+        """Eval-config scope + span-time window via bounded span membership.
 
-        Scopes to the eval config and ensures the observation_span belongs
-        to the project via a subquery on spans.
+        ``not_deleted`` comes from the same ``eval_logger_source()`` call that
+        resolved the table, so the pair stays consistent.
+
+        The metric window is applied to the SPAN's ``created_at`` (when the
+        activity happened), NOT the eval row's ``created_at`` (when the score
+        was computed) — evals run asynchronously after their spans, so a
+        window on eval time measures the wrong thing. Windowing the span
+        subquery also keeps the IN-set a window's worth of ids instead of the
+        whole project (an unbounded set explodes on busy projects).
+
+        The eval-side ``created_at`` keeps only a loose lower bound: an eval
+        row is written after its span, so eval time >= span time >= window
+        start (1-day pad for skew). It is correctness-neutral (the span
+        subquery alone determines the result) but it is the eval table's ONLY
+        prune — the table is PARTITION BY toYYYYMM(created_at) with sort key
+        (trace_id, config_id, id), so without it every tick full-scans all
+        partitions + FINAL-merges them. Drop it only if evals are ever
+        backfilled with created_at stamps predating their spans by >1 day.
         """
         filter_extra = ""
         if self._filter_clause:
@@ -770,11 +784,15 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
 
         return (
             f"WHERE custom_eval_config_id = toUUID(%(eval_config_id)s) "
-            f"AND is_deleted = 0 "
+            f"AND {not_deleted} "
+            f"AND created_at >= %(start_time)s - INTERVAL 1 DAY "
             f"AND observation_span_id IN ("
             f"  SELECT id FROM {SPANS_TABLE} "
-            f"  WHERE project_id = %(project_id)s "
-            f"  AND is_deleted = 0"
+            f"  WHERE {self.project_filter_sql()} "
+            f"  AND is_deleted = 0 "
+            f"  AND created_at >= %(start_time)s AND created_at < %(end_time)s "
+            f"  AND start_time >= %(start_time)s - INTERVAL 1 DAY "
+            f"  AND start_time < %(end_time)s + INTERVAL 1 DAY"
             f"  {filter_extra}"
             f")"
         )

@@ -116,15 +116,20 @@ def test_session_and_date_range_filters_use_start_time():
 # --- Eval-table queries must stay on created_at (no start_time column) --------
 
 
-def test_eval_value_query_keeps_created_at():
+def test_eval_value_query_windows_span_time():
+    # The metric window lives on the SPAN membership subquery (evals run async
+    # after their spans); the eval table keeps only a loose created_at lower
+    # bound (its sole partition prune).
     sql, _ = _builder(eval_output_type="SCORE").build_metric_value_query(
         mm.EVALUATION_METRICS, START, END
     )
-    assert "created_at BETWEEN %(start_time)s AND %(end_time)s" in sql
-    # ``start_time`` is only ever a param name here, never a column reference —
-    # the eval table has no start_time column.
-    for col_use in ("start_time BETWEEN", "start_time >=", "toUInt32(start_time)"):
-        assert col_use not in sql, f"eval query references start_time column: {col_use}"
+    subq = sql.split("observation_span_id IN (", 1)[1]
+    assert "created_at >= %(start_time)s AND created_at < %(end_time)s" in subq
+    assert "start_time >= %(start_time)s - INTERVAL 1 DAY" in subq
+    head = sql.split("observation_span_id IN (", 1)[0]
+    assert "created_at >= %(start_time)s - INTERVAL 1 DAY" in head
+    # No spans-style bucket on the eval table itself.
+    assert "toUInt32(start_time)" not in sql
 
 
 def test_eval_time_series_buckets_created_at():
