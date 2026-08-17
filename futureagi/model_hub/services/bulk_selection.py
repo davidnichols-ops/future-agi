@@ -57,6 +57,7 @@ from simulate.utils.persona_filtering import (
 )
 from tracer.models.project import Project, ProjectSourceChoices
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
+from tracer.services.clickhouse.read_budget import ReadDeadline
 from tracer.services.clickhouse.v2.query_builders.filters import (
     ClickHouseFilterBuilderV2,
 )
@@ -130,6 +131,12 @@ class BulkSelectionAmbiguousIdentity(RuntimeError):
     """A bare queue-item ID maps to multiple matching physical entities."""
 
 
+def _optional_deadline_kwargs(deadline: ReadDeadline | None) -> dict:
+    """Preserve legacy internal call shapes when no request wall is supplied."""
+
+    return {"deadline": deadline} if deadline is not None else {}
+
+
 def _bounded_bulk_worst_case_query_count(raw_page_size: int) -> int:
     """Count per-seed classifier queries needed to prove a raw page prefix."""
 
@@ -201,6 +208,7 @@ def _read_bounded_bulk_page(
     cap,
     exclude_count=0,
     classify_batch_size=200,
+    deadline: ReadDeadline | None = None,
 ):
     """Resolve enough raw IDs to prove a cap+1 non-excluded prefix."""
 
@@ -215,6 +223,11 @@ def _read_bounded_bulk_page(
 
     from tracer.selectors.trace_filter_reads import read_bounded_filter_page
 
+    selector_deadline_ms = (
+        deadline.remaining_ms(floor_ms=1)
+        if deadline is not None
+        else _BULK_BOUNDED_DEADLINE_MS
+    )
     page = read_bounded_filter_page(
         builder=builder,
         analytics=analytics,
@@ -225,12 +238,14 @@ def _read_bounded_bulk_page(
         # cap+1+exclude_count therefore proves whether cap+1 non-excluded IDs
         # exist without incorrectly treating an excluded sentinel as overflow.
         page_size=cap + 1 + exclude_count,
-        deadline_ms=_BULK_BOUNDED_DEADLINE_MS,
+        deadline_ms=selector_deadline_ms,
         max_seed_attempts=_BULK_BOUNDED_MAX_SEED_ATTEMPTS,
         max_candidates=_BULK_BOUNDED_MAX_CANDIDATES,
         max_query_count=_BULK_BOUNDED_MAX_QUERY_COUNT,
         classify_batch_size=classify_batch_size,
     )
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
     if not page.complete:
         raise BulkSelectionReadIncomplete(page.error_code or "scan_budget_exceeded")
     return page
@@ -311,6 +326,7 @@ def _resolve_voice_call_ids_clickhouse(
     cap: int,
     remove_simulation_calls: bool,
     annotation_label_ids: list[str],
+    deadline: ReadDeadline | None = None,
 ) -> ResolveResult:
     """Resolve voice-call trace IDs via ClickHouse, mirroring ``list_voice_calls``.
 
@@ -369,6 +385,7 @@ def _resolve_voice_call_ids_clickhouse(
                 if remove_simulation_calls
                 else _BULK_BOUNDED_CLASSIFY_BATCH_SIZE
             ),
+            **_optional_deadline_kwargs(deadline),
         )
         rows = bounded_page.rows
         bounded_has_more = bounded_page.has_more
@@ -418,6 +435,7 @@ def _resolve_trace_ids_clickhouse(
     exclude_ids: set,
     cap: int,
     annotation_label_ids: list[str],
+    deadline: ReadDeadline | None = None,
 ) -> ResolveResult:
     """Resolve regular trace IDs via ClickHouse, mirroring ``list_traces_of_session``.
 
@@ -479,6 +497,7 @@ def _resolve_trace_ids_clickhouse(
             key_field="trace_id",
             cap=cap,
             exclude_count=len(excl),
+            **_optional_deadline_kwargs(deadline),
         )
         rows = bounded_page.rows
         bounded_has_more = bounded_page.has_more
@@ -530,6 +549,7 @@ def resolve_filtered_trace_ids(
     user=None,
     is_voice_call: bool = False,
     remove_simulation_calls: bool = False,
+    deadline: ReadDeadline | None = None,
 ) -> ResolveResult:
     """Return trace IDs matching ``filters`` in ``project_id``, minus ``exclude_ids``.
 
@@ -565,6 +585,8 @@ def resolve_filtered_trace_ids(
         ValueError: if filters reference user-scoped columns but user is None.
     """
     _validate_user_scoped_filters(filters or [], user)
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
 
     # Project + workspace scope are resolved in PG — the project / annotation-
     # label tables are NOT tracer tables and are not being dropped. Trace/voice
@@ -573,11 +595,15 @@ def resolve_filtered_trace_ids(
     # Verifying the project up front keeps the 404 contract consistent with the
     # enumerated path.
     project = Project.objects.get(id=project_id, organization=organization)
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
     if not _project_matches_workspace(project, workspace):
         return ResolveResult(ids=[], total_matching=0, truncated=False)
 
     annotation_labels = get_annotation_labels_for_project(project.id, organization)
     annotation_label_ids = [str(lbl.id) for lbl in annotation_labels]
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
 
     # The CH list builders default to a now-30d window when the payload sends no
     # time bound (a dashboard-perf default in parse_time_range), which would
@@ -600,6 +626,7 @@ def resolve_filtered_trace_ids(
             cap=cap,
             remove_simulation_calls=remove_simulation_calls,
             annotation_label_ids=annotation_label_ids,
+            **_optional_deadline_kwargs(deadline),
         )
     return _resolve_trace_ids_clickhouse(
         project_id=project_id,
@@ -607,6 +634,7 @@ def resolve_filtered_trace_ids(
         exclude_ids=set(exclude_ids or ()),
         cap=cap,
         annotation_label_ids=annotation_label_ids,
+        **_optional_deadline_kwargs(deadline),
     )
 
 
@@ -648,6 +676,7 @@ def _resolve_span_ids_clickhouse(
     exclude_ids: set,
     cap: int,
     annotation_label_ids: list[str],
+    deadline: ReadDeadline | None = None,
 ) -> ResolveResult:
     """Resolve span IDs from ClickHouse, mirroring ``list_spans_observe``.
 
@@ -697,6 +726,7 @@ def _resolve_span_ids_clickhouse(
             key_field="id",
             cap=cap,
             exclude_count=len(excl),
+            **_optional_deadline_kwargs(deadline),
         )
         rows = bounded_page.rows
         bounded_has_more = bounded_page.has_more
@@ -750,6 +780,7 @@ def resolve_filtered_span_ids(
     workspace=None,
     cap: int = 10_000,
     user=None,
+    deadline: ReadDeadline | None = None,
 ) -> ResolveResult:
     """Return span IDs matching ``filters`` in ``project_id``, minus ``exclude_ids``.
 
@@ -777,17 +808,23 @@ def resolve_filtered_span_ids(
         ValueError: if filters reference user-scoped columns but user is None.
     """
     _validate_user_scoped_filters(filters or [], user)
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
 
     # Project + workspace scope are resolved in PG — the project / annotation-label
     # tables are NOT tracer tables and are not being dropped. The span rows
     # themselves are read only from ClickHouse (no PG tracer-table access), so
     # filter-mode add stays working once the PG tracer tables are dropped.
     project = Project.objects.get(id=project_id, organization=organization)
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
     if not _project_matches_workspace(project, workspace):
         return ResolveResult(ids=[], total_matching=0, truncated=False)
 
     annotation_labels = get_annotation_labels_for_project(project.id, organization)
     annotation_label_ids = [str(lbl.id) for lbl in annotation_labels]
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
 
     return _resolve_span_ids_clickhouse(
         project_id=project_id,
@@ -795,6 +832,7 @@ def resolve_filtered_span_ids(
         exclude_ids=set(exclude_ids or ()),
         cap=cap,
         annotation_label_ids=annotation_label_ids,
+        **_optional_deadline_kwargs(deadline),
     )
 
 
@@ -843,6 +881,7 @@ def _prepare_session_ch_filters(
     *,
     project_id,
     organization,
+    deadline: ReadDeadline | None = None,
 ) -> list[dict]:
     """Translate a ``user_id`` session filter into the synthetic ``end_user_id``
     IN(...) filter the CH ``SessionListQueryBuilder`` understands, mirroring the
@@ -879,6 +918,9 @@ def _prepare_session_ch_filters(
             raw_user_id,
             organization_id=getattr(organization, "id", None),
             project_id=project_id,
+            timeout_ms=(
+                deadline.remaining_ms(floor_ms=1) if deadline is not None else None
+            ),
         )
         # Empty → match nothing (NIL_UUID sentinel), mirroring the live view.
         from tracer.services.clickhouse.query_builders.base import NIL_UUID
@@ -897,7 +939,10 @@ def _prepare_session_ch_filters(
 
 
 def _apply_session_score_filters_pg(
-    session_ids: list[str], score_filters: list[dict]
+    session_ids: list[str],
+    score_filters: list[dict],
+    *,
+    deadline: ReadDeadline | None = None,
 ) -> list[str]:
     """Intersect a CH-derived candidate session-id list with annotation
     ``Score``-based filters, preserving input order.
@@ -910,6 +955,8 @@ def _apply_session_score_filters_pg(
     """
     surviving = list(session_ids)
     for sf in score_filters:
+        if deadline is not None:
+            deadline.remaining_ms(floor_ms=1)
         if not surviving:
             break
         col_id = _filter_column_id(sf)
@@ -950,6 +997,8 @@ def _apply_session_score_filters_pg(
         matched = {
             str(sid) for sid in match_q.values_list("trace_session_id", flat=True)
         }
+        if deadline is not None:
+            deadline.remaining_ms(floor_ms=1)
         if negate:
             surviving = [s for s in surviving if s not in matched]
         else:
@@ -965,6 +1014,7 @@ def _resolve_session_ids_clickhouse(
     exclude_ids: set,
     organization,
     cap: int,
+    deadline: ReadDeadline | None = None,
 ) -> ResolveResult:
     """Re-derive the filter-matched session-id set from ClickHouse.
 
@@ -991,7 +1041,10 @@ def _resolve_session_ids_clickhouse(
     from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 
     ch_filters = _prepare_session_ch_filters(
-        non_score_filters, project_id=project_id, organization=organization
+        non_score_filters,
+        project_id=project_id,
+        organization=organization,
+        **_optional_deadline_kwargs(deadline),
     )
 
     # Preserve select-all's all-history contract, but only as the finite reader's
@@ -1027,6 +1080,7 @@ def _resolve_session_ids_clickhouse(
             key_field="session_id",
             cap=cap,
             exclude_count=len(excl),
+            **_optional_deadline_kwargs(deadline),
         )
         rows = bounded_page.rows
         bounded_has_more = bounded_page.has_more
@@ -1044,7 +1098,11 @@ def _resolve_session_ids_clickhouse(
     ids = [str(row.get("session_id", "")) for row in rows if row.get("session_id")]
 
     if score_filters:
-        ids = _apply_session_score_filters_pg(ids, score_filters)
+        ids = _apply_session_score_filters_pg(
+            ids,
+            score_filters,
+            **_optional_deadline_kwargs(deadline),
+        )
 
     if excl:
         ids = [i for i in ids if i not in excl]
@@ -1083,6 +1141,7 @@ def resolve_filtered_session_ids(
     workspace=None,
     cap: int = 10_000,
     user=None,
+    deadline: ReadDeadline | None = None,
 ) -> ResolveResult:
     """Return session IDs matching ``filters`` in ``project_id``.
 
@@ -1103,12 +1162,16 @@ def resolve_filtered_session_ids(
         ValueError: if filters reference user-scoped columns but user is None.
     """
     _validate_user_scoped_filters(filters or [], user)
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
 
     # Resolve + scope-check the project up front (the CH builder keys spans by
     # project_id but does NOT enforce org membership or the SIMULATOR carve-out).
     # Raising Project.DoesNotExist here preserves the caller's 404 mapping. These
     # are Project / annotation tables — not tracer tables — so they stay in PG.
     project = Project.objects.get(id=project_id, organization=organization)
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
     if project.source == ProjectSourceChoices.SIMULATOR.value:
         return ResolveResult(ids=[], total_matching=0, truncated=False)
     if workspace is not None and project.workspace_id != getattr(
@@ -1118,6 +1181,8 @@ def resolve_filtered_session_ids(
         return ResolveResult(ids=[], total_matching=0, truncated=False)
 
     score_label_ids = _session_score_label_ids(project_id)
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
     non_score_filters, score_filters = _split_session_score_filters(
         filters or [], score_label_ids
     )
@@ -1129,6 +1194,7 @@ def resolve_filtered_session_ids(
         exclude_ids=set(exclude_ids or set()),
         organization=organization,
         cap=cap,
+        **_optional_deadline_kwargs(deadline),
     )
 
 
@@ -1360,6 +1426,7 @@ def resolve_filtered_call_execution_ids(
     workspace=None,
     cap: int = 10_000,
     user=None,
+    deadline: ReadDeadline | None = None,
 ) -> ResolveResult:
     """Return CallExecution IDs under ``agent_definition_id=project_id``.
 
@@ -1374,6 +1441,8 @@ def resolve_filtered_call_execution_ids(
         ValueError: if filters reference user-scoped columns but user is None.
     """
     _validate_user_scoped_filters(filters or [], user)
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
 
     qs = CallExecution.objects.filter(
         test_execution__agent_definition_id=project_id,
@@ -1397,6 +1466,8 @@ def resolve_filtered_call_execution_ids(
                     deleted=False,
                 ).values_list("id", flat=True)
             )
+            if deadline is not None:
+                deadline.remaining_ms(floor_ms=1)
             qs, unsupported = _apply_call_execution_filters(
                 qs,
                 remaining,
@@ -1418,6 +1489,8 @@ def resolve_filtered_call_execution_ids(
 
     # See resolve_filtered_trace_ids — cap+1 fetch instead of COUNT(*).
     capped = list(qs.values_list("id", flat=True)[: cap + 1])
+    if deadline is not None:
+        deadline.remaining_ms(floor_ms=1)
     truncated = len(capped) > cap
     ids = capped[:cap]
     total_matching = len(ids) + (1 if truncated else 0)

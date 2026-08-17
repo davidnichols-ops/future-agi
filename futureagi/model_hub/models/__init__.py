@@ -11,6 +11,12 @@ from .annotation_queues import (
     QueueItemReviewComment,
     QueueItemReviewThread,
 )
+from .annotation_score_values import (
+    AnnotationScoreValueLabelState,
+    AnnotationScoreValueMarker,
+    AnnotationScoreValueProjectionStatus,
+    AnnotationScoreValueVocabulary,
+)
 from .column_config import ColumnConfig
 from .conversations import Conversation, Message, Node
 from .dataset_insight_meta import DatasetInsightMeta

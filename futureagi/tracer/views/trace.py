@@ -88,6 +88,14 @@ from tracer.serializers.trace import (
     UsersResponseSerializer,
 )
 from tracer.services.clickhouse.bounded_graph_reads import BoundedGraphReadError
+from tracer.services.clickhouse.graph_action_deadline import (
+    GraphActionUnavailable,
+    bounded_graph_action_request,
+    finish_graph_action_response,
+    graph_action_postgres_budget,
+    graph_action_remaining_ms,
+    start_graph_action_deadline,
+)
 from tracer.services.clickhouse.graph_dispatch import (
     enforce_exact_graph_data_contract,
     fetch_agent_graph_ch,
@@ -106,6 +114,7 @@ from tracer.services.clickhouse.list_cursor import (
     frozen_window_filter,
     snapshot_cursor_supported,
 )
+from tracer.services.clickhouse.list_request_deadline import bounded_list_request
 from tracer.services.clickhouse.page_dedup import paginate_deduped
 from tracer.services.clickhouse.query_builders.base import NIL_UUID
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
@@ -136,6 +145,11 @@ from tracer.services.clickhouse.v2.trace_detail_reads import (
     TraceDetailReadUnavailable,
     read_trace_detail,
 )
+from tracer.services.filter_attestation import (
+    applied_filter_attestation,
+    graph_execution_filters,
+    graph_query_evidence,
+)
 from tracer.services.filter_principal_context import (
     FilterPrincipalContextError,
     bind_request_my_annotations_principal,
@@ -162,6 +176,7 @@ from tracer.utils.helper import (
     update_span_column_config_based_on_annotations,
 )
 from tracer.utils.otel import CallAttributes, ConversationAttributes
+from tracer.utils.property_registry import validate_property_graph_namespace
 from tracer.views.observation_span import get_observation_spans
 
 logger = structlog.get_logger(__name__)
@@ -239,6 +254,15 @@ class AnnotationScoreReadBoundExceeded(ReadDeadlineExceeded):
 
 class VoiceContentHydrationIncomplete(RuntimeError):
     """Exact selected voice-root content could not be reconstructed."""
+
+
+def _format_trace_list_created_at(value: datetime) -> str:
+    """Serialize a ClickHouse datetime as canonical RFC 3339 UTC."""
+
+    normalized = (
+        value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    )
+    return normalized.isoformat().replace("+00:00", "Z")
 
 
 def _voice_content_identity(
@@ -2622,6 +2646,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 code="server_error",
             )
 
+    @bounded_list_request(
+        wall_ms=TRACE_LIST_WALL_DEADLINE_MS,
+        resource="prototype_traces",
+        unavailable_message="Trace data is temporarily unavailable. Please retry.",
+    )
     @validated_request(
         query_serializer=TraceListQuerySerializer,
         responses={
@@ -2660,7 +2689,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # never send authoritative telemetry reads to the legacy cluster.
             analytics = V2AnalyticsQueryService()
             return self._list_traces_clickhouse(
-                request, project_version_id, analytics, query_params
+                request,
+                project_version_id,
+                analytics,
+                query_params,
+                read_deadline=kwargs.get("read_deadline"),
             )
 
         except UnsupportedFilterShapeError:
@@ -2687,6 +2720,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
             return self._gm.bad_request("Trace data could not be loaded")
 
+    @bounded_graph_action_request(resource="trace_graph")
     @validated_request(
         query_serializer=ObserveGraphDataQuerySerializer,
         request_serializer=ObserveGraphDataRequestSerializer,
@@ -2702,20 +2736,29 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         """
         Fetch data for the observe graph with optimized queries
         """
+        deadline = kwargs.pop("_graph_action_deadline", None)
+        deadline = deadline or start_graph_action_deadline()
+
+        def finish(response):
+            return finish_graph_action_response(deadline, response)
+
         try:
             body = request.validated_data
             allow_sampled = request.validated_query_data["allow_sampled"]
             refresh = request.validated_query_data.get("refresh", False)
             project_id = str(body["project_id"])
-            project = (
-                _project_queryset_for_request(self.request)
-                .filter(id=project_id)
-                .first()
-            )
+            with graph_action_postgres_budget(deadline):
+                project = (
+                    _project_queryset_for_request(self.request)
+                    .filter(id=project_id)
+                    .first()
+                )
 
             if not project_id or not project or project.trace_type != "observe":
-                return self._gm.bad_request(
-                    "Project id is required and project should be of type observe"
+                return finish(
+                    self._gm.bad_request(
+                        "Project id is required and project should be of type observe"
+                    )
                 )
 
             # Get parameters
@@ -2723,26 +2766,40 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 request,
                 body["filters"],
             )
+            filters = graph_execution_filters(filters)
             interval = body["interval"]
             req_data_config = body["req_data_config"]
+            try:
+                validate_property_graph_namespace(
+                    req_data_config.get("property_id"),
+                    expected_definition_source="traces",
+                )
+            except ValueError:
+                return finish(
+                    self._gm.bad_request(
+                        "property_id is not valid for this graph endpoint"
+                    )
+                )
 
             metric_type = req_data_config.get("type", None)
             if metric_type not in ["EVAL", "ANNOTATION", "SYSTEM_METRIC"]:
-                return self._gm.bad_request("Filter property type is not valid")
+                return finish(self._gm.bad_request("Filter property type is not valid"))
             metric_id = req_data_config.get("id", "latency")
             # PostgreSQL remains authoritative for small config metadata and
             # authorization only. Telemetry still comes exclusively from CH25.
-            if (
-                metric_type == "EVAL"
-                and not CustomEvalConfig.objects.filter(
-                    id=metric_id,
-                    project_id=project_id,
-                    deleted=False,
-                ).exists()
-            ):
-                return self._gm.bad_request(
-                    "Evaluation config is not available for this project"
-                )
+            if metric_type == "EVAL":
+                with graph_action_postgres_budget(deadline):
+                    eval_config_available = CustomEvalConfig.objects.filter(
+                        id=metric_id,
+                        project_id=project_id,
+                        deleted=False,
+                    ).exists()
+                if not eval_config_available:
+                    return finish(
+                        self._gm.bad_request(
+                            "Evaluation config is not available for this project"
+                        )
+                    )
 
             # CH-only path post-migration. D-027: the previous PG fallback
             # (root_span_qs / all_span_qs Subquery annotations over Trace
@@ -2775,6 +2832,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                             else None
                         ),
                         workspace_id=str(workspace_id) if workspace_id else None,
+                        timeout_ms=graph_action_remaining_ms(deadline),
                     )
                 elif metric_type == "EVAL":
                     graph = fetch_eval_graph_ch(
@@ -2791,6 +2849,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                             else None
                         ),
                         workspace_id=str(workspace_id) if workspace_id else None,
+                        timeout_ms=graph_action_remaining_ms(deadline),
                     )
                 else:
                     graph = fetch_annotation_graph_ch(
@@ -2807,18 +2866,28 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                             else None
                         ),
                         workspace_id=str(workspace_id) if workspace_id else None,
+                        timeout_ms=graph_action_remaining_ms(deadline),
                     )
+                graph.update(
+                    graph_query_evidence(
+                        project_id=project_id,
+                        observe_type="trace",
+                        filters=filters,
+                    )
+                )
                 graph = enforce_exact_graph_data_contract(graph)
                 if not graph_payload_is_publishable(
                     graph,
                     allow_sampled=allow_sampled,
                 ):
-                    return self._gm.custom_error_response(
-                        status.HTTP_503_SERVICE_UNAVAILABLE,
-                        "Graph data is temporarily unavailable. Please retry.",
-                        code="service_unavailable",
+                    return finish(
+                        self._gm.custom_error_response(
+                            status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Graph data is temporarily unavailable. Please retry.",
+                            code="service_unavailable",
+                        )
                     )
-                return self._gm.success_response(graph)
+                return finish(self._gm.success_response(graph))
             except Exception as exc:
                 if not (
                     isinstance(exc, BoundedGraphReadError)
@@ -2835,12 +2904,26 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     metric_id=metric_id,
                     error_type=type(exc).__name__,
                 )
-                return self._gm.custom_error_response(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "Graph data is temporarily unavailable. Please retry.",
-                    code="service_unavailable",
+                return finish(
+                    self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Graph data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
                 )
 
+        except GraphActionUnavailable:
+            logger.warning(
+                "trace_graph_action_deadline_exceeded",
+                project_id=str(
+                    getattr(request, "validated_data", {}).get("project_id", "")
+                ),
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Graph data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         except UnsupportedFilterShapeError:
             return self._gm.bad_request("Graph filter configuration is invalid")
         except FilterPrincipalContextError as exc:
@@ -3464,6 +3547,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             logger.exception("trace_navigation_failed", error_type=type(exc).__name__)
             return self._gm.bad_request("Trace navigation could not be loaded")
 
+    @bounded_list_request(
+        wall_ms=TRACE_LIST_WALL_DEADLINE_MS,
+        resource="observe_traces",
+        unavailable_message="Trace data is temporarily unavailable. Please retry.",
+    )
     @validated_request(
         query_serializer=TraceObserveListQuerySerializer,
         responses={
@@ -3591,6 +3679,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 code="server_error",
             )
 
+    @bounded_list_request(
+        wall_ms=TRACE_LIST_WALL_DEADLINE_MS,
+        resource="voice_calls",
+        unavailable_message=(
+            "Voice call data is temporarily unavailable. Please retry."
+        ),
+    )
     @validated_request(
         query_serializer=TraceVoiceCallListQuerySerializer,
         responses={
@@ -4369,6 +4464,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         org_scope = bool(org_project_ids)
         filters = list(validated_data.get("filters", []) or [])
+        attested_filters = list(filters)
         filtered_attribute_keys = [
             str(item.get("column_id") or item.get("columnId") or "")
             for item in filters
@@ -5258,7 +5354,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "input": row.get("input", ""),
                 "output": row.get("output", ""),
                 "created_at": (
-                    row.get("start_time").isoformat() + "Z"
+                    _format_trace_list_created_at(row.get("start_time"))
                     if row.get("start_time")
                     else None
                 ),
@@ -5490,6 +5586,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "Trace data is temporarily unavailable. Please retry.",
                 code="service_unavailable",
             )
+        if project_id:
+            filter_evidence = applied_filter_attestation(
+                project_id=project_id,
+                observe_type="trace",
+                filters=attested_filters,
+            )
+            if filter_evidence["query_applied_filter_count"]:
+                metadata.update(filter_evidence)
         response = {
             "metadata": metadata,
             "table": _sanitize_nonfinite_floats(table_data),
@@ -5525,6 +5629,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         read_deadline = read_deadline or ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
 
         filters = list(validated_data.get("filters", []) or [])
+        attested_filters = list(filters)
         page = validated_data.get("page", 1)
         page_size = validated_data.get("page_size", 30)
         page_number = page - 1  # Convert 1-based to 0-based
@@ -6028,7 +6133,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         # Build column config
         column_config = update_column_config_based_on_eval_config(
-            [], eval_configs, is_simulator=True
+            [],
+            eval_configs,
+            is_simulator=True,
+            property_source="traces",
         )
         column_config = update_span_column_config_based_on_annotations(
             column_config, annotation_labels
@@ -6090,6 +6198,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 **processed_log,
                 "id": trace_id,
                 "trace_id": trace_id,
+                "project_id": str(row.get("project_id") or project_id),
                 "turn_count": voice_metrics.get("turn_count"),
                 "talk_ratio": voice_metrics.get("talk_ratio"),
                 "agent_talk_percentage": voice_metrics.get("agent_talk_percentage"),
@@ -6366,13 +6475,26 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             response_data["next"] = response_page + 1
         if response_page > 1:
             response_data["previous"] = response_page - 1
+        filter_evidence = applied_filter_attestation(
+            project_id=project_id,
+            observe_type="voice",
+            filters=attested_filters,
+        )
+        if filter_evidence["query_applied_filter_count"]:
+            response_data.update(filter_evidence)
 
         from rest_framework.response import Response
 
         return Response(response_data)
 
     def _list_traces_clickhouse(
-        self, request, project_version_id, analytics, query_params
+        self,
+        request,
+        project_version_id,
+        analytics,
+        query_params,
+        *,
+        read_deadline=None,
     ):
         """List traces using ClickHouse backend.
 
@@ -6383,7 +6505,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             TraceListQueryBuilderV2,
         )
 
-        read_deadline = ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
+        read_deadline = read_deadline or ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
 
         filters = query_params["filters"]
         sort_params = query_params["sort_params"]

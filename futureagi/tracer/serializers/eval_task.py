@@ -41,7 +41,7 @@ class EvalTaskUsageQuerySerializer(StrictInputSerializer):
 
     eval_task_id = serializers.UUIDField(required=True)
     period = serializers.ChoiceField(
-        choices=("30m", "6h", "1d", "7d", "30d", "90d", "180d", "365d"),
+        choices=("30m", "1h", "6h", "1d", "7d", "30d", "90d", "180d", "365d"),
         required=False,
         default="30d",
     )
@@ -217,13 +217,13 @@ class EvalTaskListQuerySerializer(StrictInputSerializer):
     sort_params = SortParamListQueryParamField(required=False, default=list)
     page_number = serializers.IntegerField(required=False, default=0, min_value=0)
     page_size = serializers.IntegerField(
-        required=False, default=30, min_value=1, max_value=500
+        required=False, default=30, min_value=1, max_value=100
     )
 
 
 class EvalTaskListWithProjectNameQuerySerializer(EvalTaskListQuerySerializer):
     page_size = serializers.IntegerField(
-        required=False, default=10, min_value=1, max_value=500
+        required=False, default=10, min_value=1, max_value=100
     )
 
 

@@ -5,12 +5,18 @@ from uuid import UUID, uuid4
 import pytest
 
 from model_hub.models.score import Score
-from tracer.services.annotation_label_source import AnnotationLabelScoresProjectPG
+from tracer.services.annotation_label_source import (
+    AnnotationLabelScoresProjectPG,
+    AnnotationScoreValuePage,
+    AnnotationScoreValueRow,
+    AnnotationScoreVocabularyChanged,
+)
 from tracer.services.clickhouse.list_cursor import ListCursorError
 from tracer.views.dashboard import (
     _append_configured_filter_value_option,
     _filter_value_options_for_search,
     _finite_filter_value_cursor_page,
+    _projected_annotation_filter_value_page,
 )
 
 FILTER_VALUES_URL = "/tracer/dashboard/filter_values/"
@@ -49,6 +55,130 @@ def _page(request, *, cursor=None, search="", complete=True):
         cursor_token=cursor,
         query_complete=complete,
     )
+
+
+@pytest.mark.unit
+def test_projected_annotation_values_keyset_after_configured_choices(monkeypatch):
+    request = _request()
+    first_row = AnnotationScoreValueRow("Stored A", "stored a", "a" * 64)
+    second_row = AnnotationScoreValueRow("Stored B", "stored b", "b" * 64)
+    observed = []
+
+    def read_page(_self, _label_id, project_ids, **kwargs):
+        observed.append((tuple(project_ids), kwargs))
+        if kwargs["after"] is None:
+            return AnnotationScoreValuePage((first_row,), "1:41", True)
+        return AnnotationScoreValuePage((second_row,), "1:41", False)
+
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_value_page_for_label",
+        read_page,
+    )
+    monkeypatch.setattr(
+        "tracer.views.dashboard._run_filter_value_pg_read",
+        lambda _deadline, read: read(),
+    )
+    kwargs = {
+        "request": request,
+        "project_ids": ["project-a"],
+        "query": {"metric_name": "label-a", "metric_type": "annotation_metric"},
+        "configured_values": [{"value": "Configured", "label": "Configured"}],
+        "label_id": "label-a",
+        "search": "",
+        "page_size": 2,
+        "deadline": object(),
+    }
+
+    first = _projected_annotation_filter_value_page(**kwargs, cursor_token=None)
+    second = _projected_annotation_filter_value_page(
+        **kwargs, cursor_token=first["next_cursor"]
+    )
+
+    assert [option["value"] for option in first["values"]] == [
+        "Configured",
+        "Stored A",
+    ]
+    assert [option["value"] for option in second["values"]] == ["Stored B"]
+    assert first["browse_status"] == "continuation"
+    assert second["browse_status"] == "exhausted"
+    assert observed[0][1]["excluded_values"] == ("Configured",)
+    assert observed[1][1]["after"] == first_row.order
+    assert observed[1][1]["expected_revision"] == "1:41"
+
+
+@pytest.mark.unit
+def test_projected_annotation_cursor_does_not_embed_permitted_large_value(monkeypatch):
+    request = _request()
+    value = "".join(f"{index:04x}" for index in range(4096))
+    row = AnnotationScoreValueRow(value, value[:384], "d" * 64)
+
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_value_page_for_label",
+        lambda *_args, **_kwargs: AnnotationScoreValuePage((row,), "1:1", True),
+    )
+    monkeypatch.setattr(
+        "tracer.views.dashboard._run_filter_value_pg_read",
+        lambda _deadline, read: read(),
+    )
+
+    page = _projected_annotation_filter_value_page(
+        request=request,
+        project_ids=["project-a"],
+        query={"metric_name": "label-a", "metric_type": "annotation_metric"},
+        configured_values=[],
+        label_id="label-a",
+        search="",
+        page_size=1,
+        cursor_token=None,
+        deadline=object(),
+    )
+
+    assert len(value.encode("utf-8")) == 16 * 1024
+    assert page["next_cursor"] is not None
+    assert len(page["next_cursor"]) < 16_384
+
+
+@pytest.mark.unit
+def test_projected_annotation_cursor_rejects_changed_label_revision(monkeypatch):
+    request = _request()
+    row = AnnotationScoreValueRow("Stored", "stored", "c" * 64)
+    calls = 0
+
+    def read_page(_self, _label_id, _project_ids, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AnnotationScoreValuePage((row,), "1:7", True)
+        raise AnnotationScoreVocabularyChanged("changed")
+
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_value_page_for_label",
+        read_page,
+    )
+    monkeypatch.setattr(
+        "tracer.views.dashboard._run_filter_value_pg_read",
+        lambda _deadline, read: read(),
+    )
+    kwargs = {
+        "request": request,
+        "project_ids": ["project-a"],
+        "query": {"metric_name": "label-a", "metric_type": "annotation_metric"},
+        "configured_values": [],
+        "label_id": "label-a",
+        "search": "",
+        "page_size": 1,
+        "deadline": object(),
+    }
+    first = _projected_annotation_filter_value_page(**kwargs, cursor_token=None)
+
+    with pytest.raises(ListCursorError, match="changed") as exc_info:
+        _projected_annotation_filter_value_page(
+            **kwargs, cursor_token=first["next_cursor"]
+        )
+    assert exc_info.value.code == "cursor_mismatch"
 
 
 @pytest.mark.unit
@@ -341,17 +471,22 @@ def test_annotation_choice_label_search_returns_the_stored_value(
         },
     )
 
-    response = auth_client.get(
-        FILTER_VALUES_URL,
-        {
-            "source": "traces",
-            "metric_type": "annotation_metric",
-            "metric_name": str(label.id),
-            "project_ids": str(project.id),
-            "page_size": 10,
-            "search": "rEfUnD rEqUeStEd",
-        },
-    )
+    with patch.object(
+        AnnotationLabelScoresProjectPG,
+        "categorical_value_page_for_label",
+        return_value=AnnotationScoreValuePage((), "1:0", False),
+    ):
+        response = auth_client.get(
+            FILTER_VALUES_URL,
+            {
+                "source": "traces",
+                "metric_type": "annotation_metric",
+                "metric_name": str(label.id),
+                "project_ids": str(project.id),
+                "page_size": 10,
+                "search": "rEfUnD rEqUeStEd",
+            },
+        )
 
     assert response.status_code == 200
     payload = response.json()["result"]
@@ -399,34 +534,39 @@ def test_annotation_configured_choices_preserve_json_values_and_search_them(
         "page_size": 20,
     }
 
-    payload = auth_client.get(FILTER_VALUES_URL, params).json()["result"]
-
-    assert payload["values"] == [
-        {"value": False, "label": "Disabled"},
-        {"value": 0, "label": "Zero code"},
-        {"value": "Null fallback", "label": "Null fallback"},
-        {"value": "Empty fallback", "label": "Empty fallback"},
-        {"value": "Plain string", "label": "Plain string"},
-    ]
-    assert payload["query_complete"] is True
-
-    for search, expected in (
-        ("false", [{"value": False, "label": "Disabled"}]),
-        ("0", [{"value": 0, "label": "Zero code"}]),
-        (
-            "fallback",
-            [
-                {"value": "Null fallback", "label": "Null fallback"},
-                {"value": "Empty fallback", "label": "Empty fallback"},
-            ],
-        ),
-        ("plain", [{"value": "Plain string", "label": "Plain string"}]),
+    with patch.object(
+        AnnotationLabelScoresProjectPG,
+        "categorical_value_page_for_label",
+        return_value=AnnotationScoreValuePage((), "1:0", False),
     ):
-        searched = auth_client.get(
-            FILTER_VALUES_URL,
-            {**params, "search": search},
-        ).json()["result"]
-        assert searched["values"] == expected
+        payload = auth_client.get(FILTER_VALUES_URL, params).json()["result"]
+
+        assert payload["values"] == [
+            {"value": False, "label": "Disabled"},
+            {"value": 0, "label": "Zero code"},
+            {"value": "Null fallback", "label": "Null fallback"},
+            {"value": "Empty fallback", "label": "Empty fallback"},
+            {"value": "Plain string", "label": "Plain string"},
+        ]
+        assert payload["query_complete"] is True
+
+        for search, expected in (
+            ("false", [{"value": False, "label": "Disabled"}]),
+            ("0", [{"value": 0, "label": "Zero code"}]),
+            (
+                "fallback",
+                [
+                    {"value": "Null fallback", "label": "Null fallback"},
+                    {"value": "Empty fallback", "label": "Empty fallback"},
+                ],
+            ),
+            ("plain", [{"value": "Plain string", "label": "Plain string"}]),
+        ):
+            searched = auth_client.get(
+                FILTER_VALUES_URL,
+                {**params, "search": search},
+            ).json()["result"]
+            assert searched["values"] == expected
     assert payload["query_status"] == "complete"
     assert "query_error_code" not in payload
     assert payload["browse_status"] == "exhausted"
@@ -462,8 +602,12 @@ def test_annotation_stored_categorical_values_are_included_in_exact_cursor_respo
     )
     with patch.object(
         AnnotationLabelScoresProjectPG,
-        "categorical_values_for_label",
-        return_value=[{"selected": ["Stored only"]}],
+        "categorical_value_page_for_label",
+        return_value=AnnotationScoreValuePage(
+            (AnnotationScoreValueRow("Stored only", "stored only", "d" * 64),),
+            "1:4",
+            False,
+        ),
     ) as stored_read:
         payload = auth_client.get(
             FILTER_VALUES_URL,
@@ -488,7 +632,8 @@ def test_annotation_stored_categorical_values_are_included_in_exact_cursor_respo
     assert payload["browse_status"] == "exhausted"
     assert payload["has_more"] is False
     assert payload["next_cursor"] is None
-    stored_read.assert_called_once_with(label.id, [str(project.id)])
+    stored_read.assert_called_once()
+    assert stored_read.call_args.args[1] == [str(project.id)]
 
 
 @pytest.mark.django_db

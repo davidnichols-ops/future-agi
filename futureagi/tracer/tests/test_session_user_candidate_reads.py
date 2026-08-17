@@ -1218,8 +1218,9 @@ def test_org_session_has_annotation_branches_by_project_and_disjoint_labels():
     assert "candidate_session_project_counts AS" in sql
     assert "uniqExact(project_id) AS project_count" in sql
     assert "max(project_count) AS project_count" in sql
+    assert "any(project_id) AS project_id" in sql
     assert "SELECT session_id, session_start AS start_time" in sql
-    assert ", project_count" in sql
+    assert ", project_id, project_count" in sql
     # The OR-ed project branches are one membership unit and cannot bypass
     # session/user predicates through SQL AND/OR precedence.
     assert "AND ((project_id =" in sql
@@ -1238,6 +1239,7 @@ def test_default_org_session_page_exposes_global_collision_guard():
 
     assert "candidate_session_project_counts AS" in page_sql
     assert "uniqExact(project_id) AS project_count" in page_sql
+    assert "any(project_id) AS project_id" in page_sql
     assert "max(project_count) OVER() AS max_project_count" in page_sql
     assert "max(project_count) AS max_project_count" in count_sql
 

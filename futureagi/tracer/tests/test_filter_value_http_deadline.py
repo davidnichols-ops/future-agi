@@ -100,7 +100,7 @@ def test_filter_value_pg_reads_use_the_remaining_request_wall(monkeypatch):
     ]
     assert statements == [
         ("SET TRANSACTION READ ONLY", None),
-        ("SET LOCAL statement_timeout = %s", ["3725ms"]),
+        ("SELECT set_config('statement_timeout', %s, true)", ["3725"]),
     ]
 
 
@@ -180,7 +180,9 @@ def test_filter_value_pg_read_inside_outer_transaction_only_sets_local(monkeypat
         SimpleNamespace(remaining_ms=lambda _cap: 3_250),
         lambda: ["project"],
     ) == ["project"]
-    assert statements == [("SET LOCAL statement_timeout = %s", ["3250ms"])]
+    assert statements == [
+        ("SELECT set_config('statement_timeout', %s, true)", ["3250"])
+    ]
 
 
 def test_resumed_custom_value_cursor_captures_wall_after_state_restore(monkeypatch):

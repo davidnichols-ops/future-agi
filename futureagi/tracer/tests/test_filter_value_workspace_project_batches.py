@@ -8,7 +8,13 @@ from uuid import UUID
 
 import pytest
 
-from tracer.services.annotation_label_source import AnnotationLabelScoresProjectPG
+from tracer.services.annotation_label_source import (
+    AnnotationLabelScoresProjectPG,
+    AnnotationScoreReadUnavailable,
+    AnnotationScoreValuePage,
+    AnnotationScoreValueRow,
+    AnnotationScoreVocabularyChanged,
+)
 from tracer.services.clickhouse.attribute_cursor_state import AttributeCursorSeenState
 from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_MAX_PROJECTS,
@@ -1013,7 +1019,7 @@ def test_workspace_configured_annotation_authorizes_target_beyond_first_batch(
 
 
 @pytest.mark.unit
-def test_workspace_legacy_categorical_annotation_reports_sampled_scope(monkeypatch):
+def test_workspace_legacy_categorical_annotation_requires_exact_pagination(monkeypatch):
     from model_hub.models.develop_annotations import AnnotationsLabels
 
     project_ids = [_uuid(index) for index in range(1, 66)]
@@ -1042,27 +1048,19 @@ def test_workspace_legacy_categorical_annotation_reports_sampled_scope(monkeypat
         "categorical_values_for_label",
         stored_values,
     )
-    result = _result(
-        _invoke(
-            {
-                "metric_name": str(label.id),
-                "metric_type": "annotation_metric",
-                "source": "traces",
-                "project_ids": [],
-                "search": "",
-            }
-        )
+    response = _invoke(
+        {
+            "metric_name": str(label.id),
+            "metric_type": "annotation_metric",
+            "source": "traces",
+            "project_ids": [],
+            "search": "",
+        }
     )
 
-    assert result["values"] == [
-        {"value": "Configured", "label": "Configured"},
-        {"value": "Stored", "label": "Stored"},
-    ]
-    assert result["query_complete"] is False
-    assert result["query_status"] == "sampled"
-    assert result["browse_status"] == "limit_reached"
-    assert result["next_cursor"] is None
-    assert [len(batch) for batch in observed_batches] == [64]
+    assert response.status_code == 400
+    assert response.data["code"] == "pagination_required"
+    assert observed_batches == []
 
 
 @pytest.mark.unit
@@ -1087,18 +1085,37 @@ def test_workspace_categorical_annotation_cursor_walks_exact_score_batches(
         _FirstQuery(label),
     )
     observed_batches = []
+    observed_revisions = []
 
-    def stored_values(_self, _label_id, batch):
+    def stored_values(_self, _label_id, batch, **kwargs):
         observed_batches.append(tuple(batch))
-        values = [{"selected": ["Shared"]}]
+        observed_revisions.append(kwargs["expected_revision"])
+        values = [
+            AnnotationScoreValueRow("Shared", "shared", "a" * 64),
+        ]
         if project_ids[-1] in batch:
-            values.append({"selected": ["Later only"]})
-        return values
+            values.append(AnnotationScoreValueRow("Later only", "later only", "b" * 64))
+        after = kwargs.get("after")
+        if after is not None:
+            values = [value for value in values if value.order > after]
+        page_size = kwargs["page_size"]
+        return AnnotationScoreValuePage(
+            tuple(values[:page_size]),
+            "1:9",
+            len(values) > page_size,
+        )
 
     monkeypatch.setattr(
         AnnotationLabelScoresProjectPG,
-        "categorical_values_for_label",
+        "categorical_value_page_for_label",
         stored_values,
+    )
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_values_for_label",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("page_size route must not scan Score rows")
+        ),
     )
     params = {
         "metric_name": str(label.id),
@@ -1120,4 +1137,263 @@ def test_workspace_categorical_annotation_cursor_walks_exact_score_batches(
     assert first["browse_status"] == "continuation"
     assert second["browse_status"] == "exhausted"
     assert [len(batch) for batch in observed_batches] == [64, 1]
+    assert observed_revisions == [None, "1:9"]
     assert all(limit <= ATTRIBUTE_READ_MAX_PROJECTS + 1 for limit in slice_limits)
+
+
+@pytest.mark.unit
+def test_workspace_annotation_cursor_rejects_change_across_project_batches(
+    monkeypatch,
+):
+    from model_hub.models.develop_annotations import AnnotationsLabels
+
+    project_ids = [_uuid(index) for index in range(1, 66)]
+    projects = _ProjectQuery(project_ids, [])
+    _install_scope_and_seen_state(monkeypatch, projects)
+    label = SimpleNamespace(
+        id=_uuid(34_101),
+        project_id=project_ids[-1],
+        type="categorical",
+        settings={"options": []},
+    )
+    monkeypatch.setattr(
+        AnnotationsLabels,
+        "no_workspace_objects",
+        _FirstQuery(label),
+    )
+    calls = 0
+
+    def stored_values(_self, _label_id, _batch, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert kwargs["expected_revision"] is None
+            return AnnotationScoreValuePage((), "1:22", False)
+        assert kwargs["expected_revision"] == "1:22"
+        raise AnnotationScoreVocabularyChanged("changed")
+
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_value_page_for_label",
+        stored_values,
+    )
+    params = {
+        "metric_name": str(label.id),
+        "metric_type": "annotation_metric",
+        "source": "traces",
+        "project_ids": [],
+        "search": "",
+        "page_size": 10,
+    }
+
+    first = _result(_invoke(params))
+    changed = _invoke({**params, "cursor": first["next_cursor"]})
+
+    assert first["values"] == []
+    assert first["has_more"] is True
+    assert changed.status_code == 400
+    assert changed.data["code"] == "cursor_mismatch"
+
+
+@pytest.mark.unit
+def test_explicit_annotation_cursor_retains_revision_through_empty_scope_chunk(
+    monkeypatch,
+):
+    from model_hub.models.develop_annotations import AnnotationsLabels
+
+    requested_ids = [_uuid(index) for index in range(1, 66)]
+    authorized_last = requested_ids[-1]
+    projects = _ProjectQuery([authorized_last], [])
+    _install_scope_and_seen_state(monkeypatch, projects)
+    label = SimpleNamespace(
+        id=_uuid(34_201),
+        project_id=authorized_last,
+        type="categorical",
+        settings={"options": []},
+    )
+    monkeypatch.setattr(
+        AnnotationsLabels,
+        "no_workspace_objects",
+        _FirstQuery(label),
+    )
+    reads = []
+
+    def stored_values(_self, _label_id, batch, **kwargs):
+        reads.append((tuple(batch), kwargs["expected_revision"]))
+        return AnnotationScoreValuePage((), "1:31", False)
+
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_value_page_for_label",
+        stored_values,
+    )
+    params = {
+        "metric_name": str(label.id),
+        "metric_type": "annotation_metric",
+        "source": "traces",
+        "project_ids": requested_ids,
+        "search": "",
+        "page_size": 10,
+    }
+
+    first = _result(_invoke(params))
+    second = _result(_invoke({**params, "cursor": first["next_cursor"]}))
+
+    assert first["values"] == []
+    assert first["has_more"] is True
+    assert second["has_more"] is False
+    assert reads == [((), None), ((authorized_last,), "1:31")]
+
+
+@pytest.mark.unit
+def test_fixed_categorical_annotation_page_uses_projection_not_score_scan(monkeypatch):
+    from model_hub.models.develop_annotations import AnnotationsLabels
+
+    project_id = _uuid(35_001)
+    label = SimpleNamespace(
+        id=_uuid(35_002),
+        project_id=project_id,
+        type="categorical",
+        settings={"options": []},
+    )
+    projects = _ProjectQuery([project_id], [])
+    _install_scope_and_seen_state(monkeypatch, projects)
+    monkeypatch.setattr(
+        AnnotationsLabels,
+        "no_workspace_objects",
+        _FirstQuery(label),
+    )
+    projected = AnnotationScoreValueRow("Projected", "projected", "c" * 64)
+    observed = []
+
+    def read_page(_self, _label_id, project_ids, **kwargs):
+        observed.append((tuple(project_ids), kwargs))
+        return AnnotationScoreValuePage((projected,), "1:12", False)
+
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_value_page_for_label",
+        read_page,
+    )
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_values_for_label",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("page_size route must not scan Score rows")
+        ),
+    )
+
+    result = _result(
+        _invoke(
+            {
+                "metric_name": str(label.id),
+                "metric_type": "annotation_metric",
+                "source": "traces",
+                "project_ids": [project_id],
+                "search": "project",
+                "page_size": 10,
+            }
+        )
+    )
+
+    assert result["values"] == [{"value": "Projected", "label": "Projected"}]
+    assert result["browse_status"] == "exhausted"
+    assert observed[0][0] == (project_id,)
+    assert observed[0][1]["search"] == "project"
+
+
+@pytest.mark.unit
+def test_projection_route_flag_off_preserves_bounded_exact_score_reader(monkeypatch):
+    from model_hub.models.develop_annotations import AnnotationsLabels
+
+    project_id = _uuid(35_051)
+    label = SimpleNamespace(
+        id=_uuid(35_052),
+        project_id=project_id,
+        type="categorical",
+        settings={"options": ["Configured"]},
+    )
+    _install_scope_and_seen_state(monkeypatch, _ProjectQuery([project_id], []))
+    monkeypatch.setattr(
+        AnnotationsLabels,
+        "no_workspace_objects",
+        _FirstQuery(label),
+    )
+    monkeypatch.setattr(
+        dashboard_view.settings,
+        "ANNOTATION_SCORE_VALUE_PROJECTION_READ_ENABLED",
+        False,
+    )
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_value_page_for_label",
+        lambda *_args, **_kwargs: pytest.fail("projection must stay off before gate"),
+    )
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_values_for_label",
+        lambda _self, _label_id, project_ids: (
+            ["Stored"] if project_ids == [project_id] else []
+        ),
+    )
+
+    result = _result(
+        _invoke(
+            {
+                "metric_name": str(label.id),
+                "metric_type": "annotation_metric",
+                "source": "traces",
+                "project_ids": [project_id],
+                "search": "",
+                "page_size": 10,
+            }
+        )
+    )
+
+    assert result["values"] == [
+        {"value": "Configured", "label": "Configured"},
+        {"value": "Stored", "label": "Stored"},
+    ]
+    assert result["query_complete"] is True
+    assert result["browse_status"] == "exhausted"
+
+
+@pytest.mark.unit
+def test_categorical_annotation_projection_unready_is_sanitized_503(monkeypatch):
+    from model_hub.models.develop_annotations import AnnotationsLabels
+
+    project_id = _uuid(35_101)
+    label = SimpleNamespace(
+        id=_uuid(35_102),
+        project_id=project_id,
+        type="categorical",
+        settings={"options": []},
+    )
+    _install_scope_and_seen_state(monkeypatch, _ProjectQuery([project_id], []))
+    monkeypatch.setattr(
+        AnnotationsLabels,
+        "no_workspace_objects",
+        _FirstQuery(label),
+    )
+    monkeypatch.setattr(
+        AnnotationLabelScoresProjectPG,
+        "categorical_value_page_for_label",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AnnotationScoreReadUnavailable("internal projection detail")
+        ),
+    )
+
+    response = _invoke(
+        {
+            "metric_name": str(label.id),
+            "metric_type": "annotation_metric",
+            "source": "traces",
+            "project_ids": [project_id],
+            "search": "",
+            "page_size": 10,
+        }
+    )
+
+    assert response.status_code == 503
+    assert response.data["code"] == "service_unavailable"
+    assert "internal projection detail" not in str(response.data)

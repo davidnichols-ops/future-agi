@@ -24,6 +24,7 @@ logger = structlog.get_logger(__name__)
 _TOO_MANY_SIMULTANEOUS_QUERIES_CODE = 202
 _READ_ADMISSION_RETRY_DELAYS_SECONDS = (0.025, 0.075, 0.150)
 _APPLICATION_READ_TIMEOUT_MS = 9_500
+_REVIEWED_READ_TIMEOUT_CEILING_MS = 30_000
 _APPLICATION_READ_MAX_MEMORY_USAGE = 36 * 1024 * 1024 * 1024
 _APPLICATION_READ_MAX_BYTES_TO_READ = 36 * 1024 * 1024 * 1024
 _APPLICATION_READ_DEFAULT_THREADS = 4
@@ -43,12 +44,20 @@ except ImportError:
     CLICKHOUSE_AVAILABLE = False
 
 
-def _bounded_read_timeout_ms(timeout_ms: int | None) -> int:
+def _bounded_read_timeout_ms(
+    timeout_ms: int | None,
+    *,
+    ceiling_ms: int = _APPLICATION_READ_TIMEOUT_MS,
+) -> int:
+    if type(ceiling_ms) is not int or not (
+        1 <= ceiling_ms <= _REVIEWED_READ_TIMEOUT_CEILING_MS
+    ):
+        raise ValueError("ClickHouse read timeout ceiling is outside [1, 30000] ms")
     return max(
         1,
         min(
-            int(_APPLICATION_READ_TIMEOUT_MS if timeout_ms is None else timeout_ms),
-            _APPLICATION_READ_TIMEOUT_MS,
+            int(ceiling_ms if timeout_ms is None else timeout_ms),
+            ceiling_ms,
         ),
     )
 
@@ -253,6 +262,7 @@ class ClickHouseClient:
         send_timeout: float | None = None,
         receive_timeout: float | None = None,
         pool_size: int | None = None,
+        read_timeout_ceiling_ms: int | None = None,
     ):
         """
         Initialize ClickHouse client with connection settings.
@@ -292,6 +302,11 @@ class ClickHouseClient:
             if receive_timeout is None
             else float(receive_timeout)
         )
+        self.read_timeout_ceiling_ms = (
+            _APPLICATION_READ_TIMEOUT_MS
+            if read_timeout_ceiling_ms is None
+            else read_timeout_ceiling_ms
+        )
 
         # Thread-safe connection pool
         self._pool_size = int(
@@ -304,6 +319,10 @@ class ClickHouseClient:
             or self._pool_size <= 0
         ):
             raise ValueError("ClickHouse transport bounds must be positive")
+        _bounded_read_timeout_ms(
+            self.read_timeout_ceiling_ms,
+            ceiling_ms=self.read_timeout_ceiling_ms,
+        )
         self._pool: queue.Queue = queue.Queue(maxsize=self._pool_size)
         self._pool_lock = threading.Lock()
         self._pool_initialized = False
@@ -535,7 +554,10 @@ class ClickHouseClient:
             Tuple of (rows, column_types, query_time_ms), optionally followed
             by native read_rows and read_bytes progress.
         """
-        timeout_ms = _bounded_read_timeout_ms(timeout_ms)
+        timeout_ms = _bounded_read_timeout_ms(
+            timeout_ms,
+            ceiling_ms=self.read_timeout_ceiling_ms,
+        )
         query_settings: dict[str, Any] | None
         if self.server_enforced_readonly:
             # A ClickHouse profile locked at readonly=1 rejects *all* client
@@ -806,7 +828,10 @@ class ClickHouseClient:
             self,
             query,
             params or {},
-            timeout_ms=_bounded_read_timeout_ms(timeout_ms),
+            timeout_ms=_bounded_read_timeout_ms(
+                timeout_ms,
+                ceiling_ms=self.read_timeout_ceiling_ms,
+            ),
             block_size=block_size,
         )
 

@@ -24,17 +24,49 @@ denormalized ``Score.tracer_project_id`` carries the ``tracer.Project`` id.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
+
+from django.db import DatabaseError, connection
+
+ANNOTATION_SUGGESTION_VALUE_MAX_BYTES = 16 * 1024
+ANNOTATION_SUGGESTION_PAYLOAD_MAX_BYTES = 64 * 1024
+ANNOTATION_SUGGESTION_VALUES_PER_SCORE_MAX = 256
+ANNOTATION_VALUE_PROJECT_BATCH_MAX = 64
 
 
 class AnnotationScoreReadUnavailable(RuntimeError):
     """Stable boundary error for authoritative annotation Score reads."""
 
 
+class AnnotationScoreVocabularyChanged(RuntimeError):
+    """The exact vocabulary changed after a continuation was issued."""
+
+
+@dataclass(frozen=True)
+class AnnotationScoreValueRow:
+    value: str
+    sort_prefix: str
+    digest: str
+
+    @property
+    def order(self) -> tuple[str, str]:
+        # The SHA-256 digest is the stable uniqueness tie-break.  Do not put
+        # the full (up to 16 KiB) value into signed URL cursors: an
+        # incompressible permitted value would exceed the API's cursor length
+        # limit and make its own exact continuation unusable.
+        return (self.sort_prefix, self.digest)
+
+
+@dataclass(frozen=True)
+class AnnotationScoreValuePage:
+    rows: tuple[AnnotationScoreValueRow, ...]
+    revision: str
+    has_more: bool
+
+
 def _materialize_score_rows(queryset):
     """Evaluate a Score queryset without exposing database diagnostics."""
-
-    from django.db import DatabaseError
 
     try:
         return list(queryset)
@@ -146,6 +178,33 @@ class AnnotationLabelScoresProjectPG:
             if project_key in grouped and label_id:
                 grouped[project_key].append(str(label_id))
         return grouped
+
+    def label_has_scores_for_projects(self, label_id, project_ids: list[str]) -> bool:
+        """Return whether one label is visible in any requested tracer project.
+
+        Workspace-level annotation labels are only project-visible after an
+        observability Score binds them to that project.  Keep the exact-value
+        endpoint aligned with the property catalog without materializing every
+        distinct label in a high-volume project: the existing
+        ``(tracer_project_id, label)`` index can stop after the first match.
+        """
+
+        normalized = tuple(dict.fromkeys(str(value) for value in project_ids if value))
+        if not normalized:
+            return False
+
+        from model_hub.models.score import Score
+
+        rows = _materialize_score_rows(
+            Score.no_workspace_objects.filter(
+                self._trace_span_scope(),
+                tracer_project_id__in=normalized,
+                label_id=label_id,
+            )
+            .order_by()
+            .values_list("id", flat=True)[:1]
+        )
+        return bool(rows)
 
     def annotator_ids_for_projects(self, project_ids: list[str]) -> list[str]:
         """Return distinct annotators for the requested tracer projects only."""
@@ -281,6 +340,201 @@ class AnnotationLabelScoresProjectPG:
                 "Annotation score vocabulary exceeds the bounded exact-read limit"
             )
         return [value for value in rows if value not in (None, "")]
+
+    def categorical_value_page_for_label(
+        self,
+        label_id,
+        project_ids: list[str],
+        *,
+        page_size: int,
+        search: str = "",
+        after: tuple[str, str] | None = None,
+        expected_revision: str | None = None,
+        excluded_values: tuple[str, ...] = (),
+    ) -> AnnotationScoreValuePage:
+        """Read one exact keyset page from the trigger-maintained projection.
+
+        The query touches the tiny readiness/label-state rows and at most one
+        indexed vocabulary page.  ``expected_revision`` binds every
+        continuation to the complete label vocabulary (including projects in
+        later authorization batches), so a concurrent Score change is rejected
+        instead of silently skipping or repeating a value.
+        """
+
+        finite_page_size = int(page_size)
+        if finite_page_size < 1 or finite_page_size > 50:
+            raise ValueError("page_size must be between 1 and 50")
+        if not project_ids:
+            # Still require projection readiness: returning a successful empty
+            # page while historical backfill is incomplete would make an empty
+            # authorized batch indistinguishable from an unready source.
+            normalized_projects: tuple[str, ...] = ()
+        else:
+            normalized_projects = tuple(
+                dict.fromkeys(str(value) for value in project_ids if value)
+            )
+        if len(normalized_projects) > ANNOTATION_VALUE_PROJECT_BATCH_MAX:
+            raise ValueError(
+                "annotation value project batch cannot exceed "
+                f"{ANNOTATION_VALUE_PROJECT_BATCH_MAX} projects"
+            )
+
+        normalized_after = None
+        if after is not None:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or any(not isinstance(value, str) for value in after)
+                or len(after[1]) != 64
+                or any(character not in "0123456789abcdef" for character in after[1])
+            ):
+                raise ValueError("invalid annotation value keyset")
+            normalized_after = after
+
+        predicates = [
+            "v.label_id = %s",
+            "v.ref_count > 0",
+        ]
+        parameters: list[Any] = [str(label_id)]
+
+        normalized_search = str(search or "").strip().lower()
+        if normalized_search:
+            escaped_search = (
+                normalized_search.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            predicates.append("v.value_search LIKE %s ESCAPE E'\\\\'")
+            parameters.append(f"%{escaped_search}%")
+
+        normalized_excluded = tuple(
+            dict.fromkeys(str(value) for value in excluded_values)
+        )
+        if normalized_excluded:
+            predicates.append("NOT (v.value_text = ANY(%s::text[]))")
+            parameters.append(list(normalized_excluded))
+
+        if normalized_after is not None:
+            predicates.append(
+                "(v.value_sort_prefix, v.value_digest) > (%s, decode(%s, 'hex'))"
+            )
+            parameters.extend(normalized_after)
+
+        query = f"""
+            WITH requested_projects AS (
+                SELECT unnest(%s::uuid[]) AS project_id
+            ), projection_state AS (
+                SELECT
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM requested_projects AS requested
+                        LEFT JOIN tracer_project AS project
+                          ON project.id = requested.project_id
+                         AND NOT project.deleted
+                        LEFT JOIN model_hub_annotation_value_status AS status
+                          ON status.organization_id = project.organization_id
+                        WHERE project.id IS NULL
+                           OR status.organization_id IS NULL
+                           OR NOT status.ready
+                           OR status.projection_version <> 1
+                    ) AS ready,
+                    1 AS projection_version,
+                    COALESCE(label_state.revision, 0) AS revision
+                FROM (SELECT 1) AS singleton
+                LEFT JOIN model_hub_annotation_value_label_state AS label_state
+                  ON label_state.label_id = %s
+            ), project_candidates AS (
+                SELECT
+                    requested.project_id,
+                    candidate.value_text,
+                    candidate.value_sort_prefix,
+                    candidate.value_digest
+                FROM requested_projects AS requested
+                CROSS JOIN LATERAL (
+                    SELECT
+                        v.value_text,
+                        v.value_sort_prefix,
+                        v.value_digest
+                    FROM model_hub_annotation_value_vocab AS v
+                    WHERE v.tracer_project_id = requested.project_id
+                      AND {" AND ".join(predicates)}
+                    ORDER BY v.value_sort_prefix, v.value_digest, v.value_text
+                    LIMIT %s
+                ) AS candidate
+            ), project_more AS (
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM project_candidates
+                    GROUP BY project_id
+                    HAVING count(*) > %s
+                ) AS has_more
+            ), page_values AS (
+                SELECT
+                    v.value_text,
+                    v.value_sort_prefix,
+                    encode(v.value_digest, 'hex') AS value_digest
+                FROM project_candidates AS v
+                GROUP BY v.value_text, v.value_sort_prefix, v.value_digest
+                ORDER BY v.value_sort_prefix, v.value_digest, v.value_text
+                LIMIT %s
+            )
+            SELECT
+                state.ready,
+                state.projection_version,
+                state.revision,
+                project_more.has_more,
+                page.value_text,
+                page.value_sort_prefix,
+                page.value_digest
+            FROM projection_state AS state
+            CROSS JOIN project_more
+            LEFT JOIN page_values AS page ON true
+            ORDER BY
+                page.value_sort_prefix NULLS LAST,
+                page.value_digest NULLS LAST,
+                page.value_text NULLS LAST
+        """
+
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    query,
+                    [
+                        list(normalized_projects),
+                        str(label_id),
+                        *parameters,
+                        finite_page_size + 1,
+                        finite_page_size,
+                        finite_page_size + 1,
+                    ],
+                )
+                result = list(cursor.fetchall())
+        except DatabaseError:
+            raise AnnotationScoreReadUnavailable(
+                "Annotation score vocabulary is temporarily unavailable"
+            ) from None
+
+        if not result or not bool(result[0][0]) or int(result[0][1]) != 1:
+            raise AnnotationScoreReadUnavailable(
+                "Annotation score vocabulary projection is not ready"
+            )
+        revision = f"{int(result[0][1])}:{int(result[0][2])}"
+        if expected_revision is not None and expected_revision != revision:
+            raise AnnotationScoreVocabularyChanged(
+                "The annotation values changed while this cursor was active"
+            )
+
+        value_rows = tuple(
+            AnnotationScoreValueRow(str(row[4]), str(row[5]), str(row[6]))
+            for row in result
+            if row[4] is not None
+        )
+        has_more = bool(result[0][3]) or len(value_rows) > finite_page_size
+        return AnnotationScoreValuePage(
+            value_rows[:finite_page_size],
+            revision,
+            has_more,
+        )
 
     def annotation_rows_for_candidates(
         self,

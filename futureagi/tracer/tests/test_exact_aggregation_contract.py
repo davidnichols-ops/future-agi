@@ -4443,14 +4443,17 @@ def test_exact_trace_membership_exhausts_5k_identity_classifier_boundary(monkeyp
     assert exact_module.EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE == 5_000
     assert exact_module.EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL == 1_001
     assert exact_module.EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE == 5_000
-    assert exact_module.EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS == 30_000
+    assert (
+        exact_module.EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS
+        == exact_module.EXACT_GRAPH_WALL_DEADLINE_MS
+    )
     assert exact_module.EXACT_GRAPH_READ_SETTINGS["max_threads"] == 1
     assert "max_rows_to_read" not in exact_module.EXACT_GRAPH_READ_SETTINGS
     assert exact_module.EXACT_GRAPH_READ_SETTINGS["max_bytes_to_read"] == (
         exact_module.EXACT_GRAPH_MAX_BYTES_TO_READ
     )
     assert exact_module.EXACT_GRAPH_MAX_BYTES_TO_READ == 36 * 1024 * 1024 * 1024
-    assert exact_module.EXACT_GRAPH_TRACE_CLASSIFIER_READ_SETTINGS["max_threads"] == 4
+    assert exact_module.EXACT_GRAPH_TRACE_CLASSIFIER_READ_SETTINGS["max_threads"] == 8
     assert trace_ids == ordered_ids
     assert [len(batch) for batch in classifier_batches] == [5_000, 5_000, 1]
     assert len(classifier_timeouts) == 3
@@ -4458,7 +4461,7 @@ def test_exact_trace_membership_exhausts_5k_identity_classifier_boundary(monkeyp
         0 < timeout <= exact_module.EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS
         for timeout in classifier_timeouts
     )
-    assert [settings["max_threads"] for settings in classifier_settings] == [4, 4, 4]
+    assert [settings["max_threads"] for settings in classifier_settings] == [8, 8, 8]
     assert [settings["max_result_rows"] for settings in classifier_settings] == [
         5_000,
         5_000,
@@ -5927,7 +5930,7 @@ def test_direct_exact_graph_readers_share_deadline_and_fence_final_publication(
             observe_type="span",
         )
 
-    assert observed_timeouts == [25_000]
+    assert observed_timeouts == [exact_module.EXACT_GRAPH_WALL_DEADLINE_MS - 5_000]
 
 
 @pytest.mark.unit
@@ -6624,7 +6627,7 @@ class _ScoreListManager:
 
 
 @pytest.mark.unit
-def test_annotation_reader_sets_postgres_readonly_snapshot_and_30s_timeout(
+def test_annotation_reader_sets_postgres_readonly_snapshot_and_remaining_timeout(
     monkeypatch,
 ):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
@@ -6693,9 +6696,9 @@ def test_annotation_reader_sets_postgres_readonly_snapshot_and_30s_timeout(
 
     assert statements == [
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-        "SET LOCAL statement_timeout = '28750ms'",
+        "SET LOCAL statement_timeout = '8250ms'",
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-        "SET LOCAL statement_timeout = '28750ms'",
+        "SET LOCAL statement_timeout = '8250ms'",
     ]
     assert transaction_state["active"] is False
     assert result["query_complete"] is True
@@ -6762,9 +6765,9 @@ def test_annotation_slow_empty_postgres_partition_exhausts_shared_deadline(
 
     assert statements == [
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-        "SET LOCAL statement_timeout = '30000ms'",
+        "SET LOCAL statement_timeout = '9500ms'",
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-        "SET LOCAL statement_timeout = '30000ms'",
+        "SET LOCAL statement_timeout = '9500ms'",
     ]
     assert analytics.main_calls == []
 
@@ -6832,7 +6835,7 @@ def test_annotation_slow_label_discovery_exhausts_deadline_before_score_work(
 
     assert statements == [
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-        "SET LOCAL statement_timeout = '30000ms'",
+        "SET LOCAL statement_timeout = '9500ms'",
     ]
     assert score_filters == []
     assert analytics.main_calls == []

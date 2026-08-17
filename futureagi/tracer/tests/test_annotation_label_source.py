@@ -457,6 +457,47 @@ class TestProjectPGDiscovery:
         result = AnnotationLabelScoresProjectPG().label_ids_for_project(project.id)
         assert result == [str(label.id)]
 
+    def test_label_visibility_exists_is_project_isolated_and_excludes_sessions(
+        self, organization, workspace, project, trace, user
+    ):
+        from tracer.models.trace_session import TraceSession
+        from tracer.services.annotation_label_source import (
+            AnnotationLabelScoresProjectPG,
+        )
+
+        visible_label = _make_label(organization, workspace, project)
+        _make_span_score(
+            label=visible_label,
+            span=_make_span(project, trace),
+            organization=organization,
+            workspace=workspace,
+            user=user,
+            project=project,
+        )
+        session_label = _make_label(organization, workspace, project)
+        Score.objects.create(
+            source_type=QueueItemSourceType.TRACE_SESSION.value,
+            trace_session=TraceSession.objects.create(project=project),
+            label=session_label,
+            value={"rating": 4.0},
+            score_source="HUMAN",
+            annotator=user,
+            organization=organization,
+            workspace=workspace,
+            tracer_project_id=project.id,
+            deleted=False,
+        )
+
+        source = AnnotationLabelScoresProjectPG()
+        assert source.label_has_scores_for_projects(visible_label.id, [str(project.id)])
+        assert not source.label_has_scores_for_projects(
+            visible_label.id, [str(uuid.uuid4())]
+        )
+        assert not source.label_has_scores_for_projects(
+            session_label.id, [str(project.id)]
+        )
+        assert not source.label_has_scores_for_projects(visible_label.id, [])
+
     def test_filter_values_are_project_isolated(
         self, organization, workspace, project, trace, user
     ):

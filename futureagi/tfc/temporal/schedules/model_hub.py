@@ -4,13 +4,11 @@ Model Hub Temporal schedules.
 These replace the Celery Beat schedules for model_hub tasks.
 """
 
-from typing import List
-
 from tfc.temporal.schedules.config import ScheduleConfig
 
 # Model Hub schedules (migrated from Celery Beat)
 # Note: execute_run_prompt removed - workflows are now triggered directly from API
-MODEL_HUB_SCHEDULES: List[ScheduleConfig] = [
+MODEL_HUB_SCHEDULES: list[ScheduleConfig] = [
     ScheduleConfig(
         schedule_id="eval-evaluation",
         activity_name="execute_evaluation",
@@ -59,6 +57,14 @@ MODEL_HUB_SCHEDULES: List[ScheduleConfig] = [
         interval_seconds=3600,  # Due checker for hourly/daily/weekly/monthly rules
         queue="default",
         description="Evaluate due annotation automation rules",
+    ),
+    ScheduleConfig(
+        schedule_id="reconcile-annotation-score-values",
+        activity_name="reconcile_annotation_score_values",
+        interval_seconds=60,
+        catchup_window_seconds=300,
+        queue="default",
+        description="Repair annotation value projection and tenant readiness",
     ),
     ScheduleConfig(
         schedule_id="annotation-realtime-digest",

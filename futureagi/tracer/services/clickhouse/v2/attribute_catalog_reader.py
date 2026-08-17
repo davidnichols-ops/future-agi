@@ -62,6 +62,7 @@ CATALOG_READ_SETTINGS: dict[str, Any] = {
 }
 
 AttributeType = Literal["string", "number", "boolean", "array", "map", "json"]
+CatalogSourceKind = Literal["custom_attribute", "system_attribute"]
 CatalogScalar: TypeAlias = str | int | Decimal | bool
 
 _ATTRIBUTE_TYPES = frozenset(("string", "number", "boolean", "array", "map", "json"))
@@ -235,6 +236,7 @@ WITH activation_rows AS
         argMax(
             tuple(
                 catalog_epoch,
+                projection_version,
                 handoff_start,
                 handoff_end,
                 writer_watermark,
@@ -247,6 +249,7 @@ WITH activation_rows AS
         uniqExactIf(
             tuple(
                 catalog_epoch,
+                projection_version,
                 handoff_start,
                 handoff_end,
                 writer_watermark,
@@ -261,11 +264,12 @@ WITH activation_rows AS
 SELECT
     toString(project_id) AS project_id,
     tupleElement(state, 1) AS catalog_epoch,
-    tupleElement(state, 2) AS handoff_start,
-    tupleElement(state, 3) AS handoff_end,
-    tupleElement(state, 4) AS writer_watermark,
-    toString(tupleElement(state, 5)) AS status,
-    tupleElement(state, 6) AS qualified_at,
+    tupleElement(state, 2) AS projection_version,
+    tupleElement(state, 3) AS handoff_start,
+    tupleElement(state, 4) AS handoff_end,
+    tupleElement(state, 5) AS writer_watermark,
+    toString(tupleElement(state, 6)) AS status,
+    tupleElement(state, 7) AS qualified_at,
     state_version,
     latest_state_variants
 FROM latest_activations
@@ -405,6 +409,7 @@ WITH checkpoint_rows AS
         argMax(
             tuple(
                 source_version_fence,
+                projection_version,
                 status,
                 source_rows,
                 processed_rows,
@@ -417,6 +422,7 @@ WITH checkpoint_rows AS
         uniqExactIf(
             tuple(
                 source_version_fence,
+                projection_version,
                 status,
                 source_rows,
                 processed_rows,
@@ -434,11 +440,12 @@ WITH checkpoint_rows AS
         window_start,
         window_end,
         tupleElement(state, 1) AS source_version_fence,
-        toString(tupleElement(state, 2)) AS status,
-        tupleElement(state, 3) AS source_rows,
-        tupleElement(state, 4) AS processed_rows,
-        tupleElement(state, 5) AS gap_count,
-        tupleElement(state, 6) AS gap_reasons,
+        tupleElement(state, 2) AS projection_version,
+        toString(tupleElement(state, 3)) AS status,
+        tupleElement(state, 4) AS source_rows,
+        tupleElement(state, 5) AS processed_rows,
+        tupleElement(state, 6) AS gap_count,
+        tupleElement(state, 7) AS gap_reasons,
         checkpoint_state_version,
         latest_state_variants,
         max(toNullable(window_end)) OVER
@@ -456,6 +463,7 @@ SELECT
     countIf(gap_count != 0 OR notEmpty(gap_reasons)) AS declared_gap_count,
     countIf(source_rows != processed_rows) AS row_mismatch_count,
     countIf(source_version_fence = 0) AS missing_fence_count,
+    min(projection_version) AS projection_version,
     countIf(latest_state_variants != 1) AS version_conflict_count,
     min(window_start) AS coverage_start,
     max(window_end) AS coverage_end,
@@ -497,6 +505,7 @@ WITH grouped_keys AS
     FROM span_attribute_key_catalog
     PREWHERE project_id IN %(catalog_project_ids)s
       AND catalog_epoch = %(catalog_epoch)s
+      AND source_kind = 'custom_attribute'
       AND attribute_type IN %(catalog_key_attribute_types)s
     WHERE key_folded LIKE %(catalog_key_search_pattern)s
        OR length(key_folded) != lengthUTF8(key_folded)
@@ -547,6 +556,7 @@ WITH source_values AS
     FROM span_attribute_value_catalog
     PREWHERE project_id IN %(catalog_project_ids)s
       AND catalog_epoch = %(catalog_epoch)s
+      AND source_kind = %(catalog_source_kind)s
       AND attribute_key = %(catalog_attribute_key)s
     WHERE lower(value_search_text) LIKE %(catalog_value_search_pattern)s
        OR length(value_search_text) != lengthUTF8(value_search_text)
@@ -619,6 +629,7 @@ class AttributeCatalogReader:
         window_start: datetime,
         window_end: datetime,
         catalog_database: str | None = None,
+        required_projection_version: int = 1,
     ) -> None:
         self._executor = executor
         self.project_ids = _canonical_project_ids(project_ids)
@@ -630,6 +641,12 @@ class AttributeCatalogReader:
         if self.window_start >= self.window_end:
             raise ValueError("catalog window must be a non-empty half-open interval")
         self.catalog_database = _catalog_database(catalog_database)
+        if (
+            type(required_projection_version) is not int
+            or not 1 <= required_projection_version <= 65_535
+        ):
+            raise ValueError("required projection version must be a positive UInt16")
+        self.required_projection_version = required_projection_version
         self._activation_sql = _qualify_catalog_sql(
             _ACTIVATION_SQL, self.catalog_database
         )
@@ -903,6 +920,7 @@ class AttributeCatalogReader:
         attribute_types: Iterable[AttributeType] | None = None,
         search: str | None = None,
         after: CatalogValueCheckpoint | None = None,
+        source_kind: CatalogSourceKind = "custom_attribute",
     ) -> CatalogValuePageResult:
         """Return one strict typed-scalar candidate page for one attribute key."""
 
@@ -921,12 +939,14 @@ class AttributeCatalogReader:
             allow_empty=True,
         )
         normalized_search = _normalize_value_search(search_value)
+        source_kind = _source_kind(source_kind)
         types = _attribute_types(attribute_types)
         query_fingerprint = self._value_query_fingerprint(
             attribute_key=key,
             attribute_types=types,
             normalized_search=normalized_search,
             page_size=limit,
+            source_kind=source_kind,
         )
         if after is not None:
             self._validate_value_checkpoint(
@@ -962,6 +982,7 @@ class AttributeCatalogReader:
                 params = {
                     "catalog_project_ids": self.project_ids,
                     "catalog_epoch": self.catalog_epoch,
+                    "catalog_source_kind": source_kind,
                     "catalog_window_start_us": _unix_microseconds(self.window_start),
                     "catalog_window_end_us": _unix_microseconds(self.window_end),
                     "catalog_attribute_key": key,
@@ -1073,10 +1094,13 @@ class AttributeCatalogReader:
             row = by_project[project_id]
             try:
                 epoch = _strict_int(row.get("catalog_epoch"))
+                projection_version = _strict_int(row.get("projection_version", 1))
             except (TypeError, ValueError):
                 return CatalogUnavailable("activation_invalid")
             if epoch != self.catalog_epoch:
                 return CatalogUnavailable("activation_epoch_mismatch")
+            if projection_version < self.required_projection_version:
+                return CatalogUnavailable("activation_projection_incompatible")
             if row.get("status") != "active":
                 return CatalogUnavailable("activation_status_not_active")
             try:
@@ -1174,6 +1198,7 @@ class AttributeCatalogReader:
                 declared_gap_count = _strict_int(row.get("declared_gap_count"))
                 row_mismatch_count = _strict_int(row.get("row_mismatch_count"))
                 missing_fence_count = _strict_int(row.get("missing_fence_count"))
+                projection_version = _strict_int(row.get("projection_version", 1))
                 version_conflict_count = _strict_int(row.get("version_conflict_count"))
                 interior_gap_count = _strict_int(row.get("interior_gap_count"))
                 coverage_start = _row_datetime(row.get("coverage_start"))
@@ -1191,6 +1216,8 @@ class AttributeCatalogReader:
                 return CatalogUnavailable("checkpoint_row_mismatch")
             if missing_fence_count:
                 return CatalogUnavailable("checkpoint_source_fence_missing")
+            if projection_version < self.required_projection_version:
+                return CatalogUnavailable("checkpoint_projection_incompatible")
             if version_conflict_count:
                 return CatalogUnavailable("checkpoint_version_conflict")
             if (
@@ -1330,6 +1357,7 @@ class AttributeCatalogReader:
         attribute_types: tuple[AttributeType, ...],
         normalized_search: str,
         page_size: int,
+        source_kind: CatalogSourceKind = "custom_attribute",
     ) -> str:
         return _identity_fingerprint(
             "value-query-v1",
@@ -1339,6 +1367,7 @@ class AttributeCatalogReader:
                 "window_start_us": _unix_microseconds(self.window_start),
                 "window_end_us": _unix_microseconds(self.window_end),
                 "attribute_key": attribute_key,
+                "source_kind": source_kind,
                 "attribute_types": attribute_types,
                 "normalized_search": normalized_search,
                 "page_size": page_size,
@@ -1458,6 +1487,7 @@ def _qualification_fingerprint(
             {
                 "project_id": project_id,
                 "catalog_epoch": _strict_int(row["catalog_epoch"]),
+                "projection_version": _strict_int(row.get("projection_version", 1)),
                 "handoff_start_us": _unix_microseconds(
                     _row_datetime(row["handoff_start"])
                 ),
@@ -1477,6 +1507,7 @@ def _qualification_fingerprint(
         source_streams.append(
             {
                 "project_id": project_id,
+                "projection_version": _strict_int(row.get("projection_version", 1)),
                 "source_stream_fences": _source_stream_fences(
                     row["source_stream_fences"]
                 ),
@@ -1746,6 +1777,12 @@ def _row_attribute_type(value: Any) -> AttributeType:
     if not isinstance(value, str) or value not in _ATTRIBUTE_TYPES:
         raise ValueError("invalid catalog attribute type")
     return cast(AttributeType, value)
+
+
+def _source_kind(value: Any) -> CatalogSourceKind:
+    if value not in {"custom_attribute", "system_attribute"}:
+        raise ValueError("unsupported catalog source kind")
+    return cast(CatalogSourceKind, value)
 
 
 def _ascii_fold(value: str) -> str:

@@ -78,10 +78,15 @@ from tracer.utils.helper import get_annotation_labels_for_project
 logger = structlog.get_logger(__name__)
 
 # Exact graphs run only in a deduplicated background refresh and publish
-# atomically, but their database reads still share the production hard
-# 30-second ceiling. Source-row volume is not capped; byte, memory, result,
-# partition, and admission limits remain the independent safety boundaries.
-EXACT_GRAPH_QUERY_TIMEOUT_MS = 30_000
+# atomically. Every database statement and the final publication fence consume
+# one action-owned wall deadline; no nested query receives a fresh grant. Match
+# the interactive session-graph contract so an exact trace/span action cannot
+# outlive its bounded wait. Source-row volume is not capped; byte,
+# memory, result, partition, and admission limits remain independent boundaries.
+EXACT_GRAPH_WALL_DEADLINE_MS = 9_500
+# Keep one canonical alias for refresh-budget arithmetic and qualification
+# overrides.
+EXACT_GRAPH_QUERY_TIMEOUT_MS = EXACT_GRAPH_WALL_DEADLINE_MS
 # This partition size belongs to the PostgreSQL-backed annotation membership
 # reader below. Most system graphs deliberately remain one ClickHouse statement
 # so CH25.3 cannot stitch independently changing ReplacingMergeTree snapshots.
@@ -100,12 +105,9 @@ EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE = 5_000
 # an exact broadness sentinel, not sampling or a public result ceiling.
 EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL = 1_001
 # Broad positive scalar Map filters use an authoritative latest-state scan over
-# disjoint whole-hour storage identities. Two hours stayed below 15 seconds on
-# the densest observed production period; the corresponding three-hour page
-# exceeded that qualification boundary after the transport sentinel was raised
-# to 50k. The production statement ceiling is now 30 seconds.
-# A failing slice is still split to whole-hour children without publishing its
-# partial rows.
+# disjoint whole-hour storage identities. A failing slice is split to
+# whole-hour children without publishing its partial rows. Every attempt is
+# additionally clamped to the action-owned wall below.
 EXACT_GRAPH_TRACE_ANCHOR_PARTITION_WIDTH = timedelta(hours=2)
 EXACT_GRAPH_TRACE_ANCHOR_MIN_PARTITION_WIDTH = timedelta(hours=1)
 # Exact aggregation has one admitted background refresh at a time and the
@@ -116,7 +118,7 @@ EXACT_GRAPH_TRACE_ANCHOR_MIN_PARTITION_WIDTH = timedelta(hours=1)
 EXACT_GRAPH_TRACE_ANCHOR_MAX_WORKERS = 2
 EXACT_GRAPH_TRACE_ANCHOR_PAGE_SIZE = 50_000
 EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL = EXACT_GRAPH_TRACE_ANCHOR_PAGE_SIZE + 1
-EXACT_GRAPH_TRACE_ANCHOR_QUERY_TIMEOUT_MS = 30_000
+EXACT_GRAPH_TRACE_ANCHOR_QUERY_TIMEOUT_MS = EXACT_GRAPH_WALL_DEADLINE_MS
 EXACT_GRAPH_TRACE_ANCHOR_MAX_BYTES_TO_READ = 36 * 1024 * 1024 * 1024
 # Scanning complete retained history is worthwhile only when the requested
 # root window is both substantial in absolute terms and covers a meaningful
@@ -142,25 +144,19 @@ EXACT_GRAPH_TRACE_ROOT_VERIFY_BATCH_SIZE = 512
 # partial aggregate.
 EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE = 5_000
 # Production A/B on a fixed 5k Coletia population measured the one-statement
-# contribution at 0.95 seconds and 1.79 GB. Preserve explicit headroom, then
-# bisect a hotter tenant-specific batch instead of allowing one statement to
-# inherit the whole background-refresh deadline.
-EXACT_GRAPH_TRACE_CONTRIBUTION_QUERY_TIMEOUT_MS = 30_000
+# contribution at 0.95 seconds and 1.79 GB. A hotter tenant-specific batch is
+# bisected, and every retry receives only the action's remaining wall time.
+EXACT_GRAPH_TRACE_CONTRIBUTION_QUERY_TIMEOUT_MS = EXACT_GRAPH_WALL_DEADLINE_MS
 EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ = 36 * 1024 * 1024 * 1024
 # Witness work runs only in the exact-snapshot background activity; public
-# graph polls never wait on an individual statement.  Production qualification
-# includes raw witness slices whose valid bounded reads exceed the former
-# three-second ceiling. A deployed-credential Coletia replay measured the
-# identity-scoped classifier above ten seconds on a dense Coletia batch.  A
-# frozen 1,012-ID A/B completed exactly in 12.581 seconds under a 15-second
-# ceiling, while the former 10-second ceiling discarded the same work and
-# replayed both halves.  Match the independently bounded witness/contribution
-# statements; adaptive bisection remains fail-closed for any hotter batch.
-EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS = 30_000
-EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 30_000
+# graph polls never wait on an individual statement. Witnesses, classifiers,
+# and contributions consume the same action wall; adaptive bisection remains
+# fail-closed for any batch that cannot complete inside the remaining budget.
+EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS = EXACT_GRAPH_WALL_DEADLINE_MS
+EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = EXACT_GRAPH_WALL_DEADLINE_MS
 EXACT_GRAPH_TRACE_INITIAL_SLICE = timedelta(minutes=5)
 # A failed raw witness slice is retried at the same upper bound so no interval
-# is skipped. Thirty seconds bounds retry fan-out while still allowing a hot
+# is skipped. The shared wall bounds retry fan-out while still allowing a hot
 # five-minute partition to be divided without a schema or index dependency.
 EXACT_GRAPH_TRACE_MIN_SLICE = timedelta(seconds=30)
 # Even proven-empty history must not collapse a long unindexed time predicate
@@ -186,7 +182,7 @@ EXACT_GRAPH_SPAN_MAX_PARTITION_WIDTH = timedelta(days=1)
 # current slice was cheap. All growth/retry widths remain integer multiples of
 # the one-hour storage-identity floor.
 EXACT_GRAPH_SPAN_GROW_BELOW_QUERY_MS = 250.0
-EXACT_GRAPH_SPAN_PARTITION_QUERY_TIMEOUT_MS = 30_000
+EXACT_GRAPH_SPAN_PARTITION_QUERY_TIMEOUT_MS = EXACT_GRAPH_WALL_DEADLINE_MS
 EXACT_GRAPH_MAX_RESULT_ROWS = 10_000
 EXACT_GRAPH_RESULT_ROW_SENTINEL = EXACT_GRAPH_MAX_RESULT_ROWS + 1
 EXACT_GRAPH_MAX_RESULT_BYTES = 32 * 1024 * 1024
@@ -241,15 +237,15 @@ EXACT_GRAPH_READ_SETTINGS = {
 }
 # The all-time latest-state classifier is the one measured exception to the
 # default single-thread policy. On a frozen Coletia population, four threads
-# reduced an exact 1,012-ID classification from 12.15s to 3.34s and completed
-# the existing 5,000-ID maximum in 10.62s (the one-thread query timed out at
-# 15s). Both successful reads returned the same identities/digests; peak memory
-# stayed below 376 MiB. Exact refresh admission and classifier batches are
-# serial, so this does not multiply concurrent statements or relax any time,
-# memory, result, or read-only guardrail.
+# reduced an exact 1,012-ID classification from 12.15s to 3.34s, but the full
+# 5,000-ID classifier still took 10.62s and therefore cannot satisfy the 9.5s
+# action wall. Give this one serial, identity-bounded statement up to eight
+# workers. Exact-refresh admission remains one activity, classifier batches
+# remain serial, and the unchanged memory/read/result/deadline ceilings stay
+# authoritative; this raises parallelism, never work or result cardinality.
 EXACT_GRAPH_TRACE_CLASSIFIER_READ_SETTINGS = {
     **EXACT_GRAPH_READ_SETTINGS,
-    "max_threads": 4,
+    "max_threads": 8,
 }
 EXACT_GRAPH_SPAN_PARTITION_READ_SETTINGS = {
     **EXACT_GRAPH_READ_SETTINGS,
@@ -360,20 +356,28 @@ def _metadata(
     return metadata
 
 
-def _remaining_exact_graph_timeout_ms(started: float) -> int:
+def _remaining_exact_graph_timeout_ms(
+    started: float,
+    statement_ceiling_ms: int | None = None,
+) -> int:
     """Return the time left on one authoritative exact-refresh wall.
 
     Direct readers do builder, relation, database, formatting, and publication
-    work under one 30-second budget.  A later statement may consume only the
-    remaining portion; it never receives a fresh 30 seconds.
+    work under one 9.5-second budget. A later statement may consume only the
+    remaining portion; it never receives a fresh per-statement grant.
     """
 
-    remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
-        max(monotonic() - started, 0.0) * 1000
-    )
-    if remaining_ms <= 0:
-        raise ExactGraphReadError("exact graph refresh deadline exceeded")
-    return remaining_ms
+    elapsed_ms = max(monotonic() - started, 0.0) * 1000
+    # Floor the remaining duration, rather than subtracting a floored elapsed
+    # duration, so rounding can never grant a statement time beyond the wall.
+    remaining_ms = int(EXACT_GRAPH_QUERY_TIMEOUT_MS - elapsed_ms)
+    if remaining_ms < 25:
+        raise ExactGraphReadError("exact graph refresh bounded deadline exceeded")
+    if statement_ceiling_ms is None:
+        return remaining_ms
+    if statement_ceiling_ms <= 0:
+        raise ValueError("exact graph statement timeout must be positive")
+    return min(int(statement_ceiling_ms), remaining_ms)
 
 
 def _execute_direct_exact_graph_query(
@@ -527,14 +531,10 @@ def _enumerate_authoritative_anchor_trace_ids(
     stats_lock = Lock()
 
     def remaining_timeout_ms(statement_ceiling_ms: int) -> int:
-        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
-            (monotonic() - started) * 1000
+        return _remaining_exact_graph_timeout_ms(
+            started,
+            statement_ceiling_ms,
         )
-        if remaining_ms < 25:
-            raise ExactGraphReadError(
-                "Exact trace graph refresh exceeded its bounded deadline."
-            )
-        return min(statement_ceiling_ms, remaining_ms)
 
     bounds_query, bounds_params = builder.build_exact_graph_anchor_scan_bounds()
     if not bounds_query:
@@ -975,14 +975,10 @@ def _enumerate_exact_trace_ids(
     learned_classifier_batch_size = EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE
 
     def remaining_statement_timeout_ms(statement_ceiling_ms: int) -> int:
-        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
-            (monotonic() - started) * 1000
+        return _remaining_exact_graph_timeout_ms(
+            started,
+            statement_ceiling_ms,
         )
-        if remaining_ms < 25:
-            raise ExactGraphReadError(
-                "Exact trace graph refresh exceeded its bounded deadline."
-            )
-        return min(statement_ceiling_ms, remaining_ms)
 
     def seed_key(row: dict[str, Any]) -> tuple[datetime, Any]:
         seed_start_time = row.get("start_time")
@@ -1433,21 +1429,14 @@ def _read_exact_filtered_trace_graph(
         nonlocal query_count, rows_returned
         if not batch_trace_ids:
             return
-        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
-            (monotonic() - started) * 1000
-        )
-        if remaining_ms < 25:
-            raise ExactGraphReadError(
-                "Exact trace graph refresh exceeded its bounded deadline."
-            )
         query, params = builder.build_exact_trace_contribution_batch(batch_trace_ids)
         query_count += 1
         try:
             result = analytics.execute_ch_query(
                 query,
                 params,
-                timeout_ms=min(
-                    remaining_ms,
+                timeout_ms=_remaining_exact_graph_timeout_ms(
+                    started,
                     EXACT_GRAPH_TRACE_CONTRIBUTION_QUERY_TIMEOUT_MS,
                 ),
                 settings=EXACT_GRAPH_TRACE_CONTRIBUTION_READ_SETTINGS,
@@ -1513,13 +1502,6 @@ def _read_exact_filtered_span_graph(
     max_partition_width = min(EXACT_GRAPH_SPAN_MAX_PARTITION_WIDTH, scan_width)
     while partition_start < partition_limit:
         partition_end = min(partition_start + partition_width, partition_limit)
-        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
-            (monotonic() - started) * 1000
-        )
-        if remaining_ms < 25:
-            raise ExactGraphReadError(
-                "Exact span graph refresh exceeded its bounded deadline."
-            )
         query, params = builder.build_exact_span_partition(
             partition_start=partition_start,
             partition_end=partition_end,
@@ -1530,9 +1512,9 @@ def _read_exact_filtered_span_graph(
             result = analytics.execute_ch_query(
                 query,
                 params,
-                timeout_ms=min(
+                timeout_ms=_remaining_exact_graph_timeout_ms(
+                    started,
                     EXACT_GRAPH_SPAN_PARTITION_QUERY_TIMEOUT_MS,
-                    remaining_ms,
                 ),
                 settings=EXACT_GRAPH_SPAN_PARTITION_READ_SETTINGS,
             )
@@ -2234,12 +2216,7 @@ def read_exact_annotation_graph(
     started = monotonic()
 
     def remaining_statement_timeout_ms() -> int:
-        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
-            max(monotonic() - started, 0.0) * 1000
-        )
-        if remaining_ms <= 0:
-            raise ExactGraphReadError("exact annotation graph deadline exceeded")
-        return remaining_ms
+        return _remaining_exact_graph_timeout_ms(started)
 
     aggregation_context = str(aggregation_context or "trace").strip().lower()
     if aggregation_context not in {"trace", "session", "user"}:
@@ -2361,7 +2338,7 @@ def read_exact_annotation_graph(
     # while CH checks only those finite annotated identities. Any membership
     # batch failure aborts the refresh before publication. Each partition's PG
     # statement receives only the refresh's remaining wall time; a later
-    # partition can never reset the timeout back to a fresh 30 seconds.
+    # partition can never reset the timeout back to a fresh action deadline.
     remaining_statement_timeout_ms()
     with transaction.atomic():
         if connection.vendor == "postgresql":

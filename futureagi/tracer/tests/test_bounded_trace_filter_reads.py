@@ -936,9 +936,7 @@ def test_voice_annotator_and_turn_count_use_positive_candidate_seed() -> None:
         limit=26,
     )
     compact_sql = " ".join(sql.split())
-    match_sql, match_params = builder.build_filter_match_query(
-        ["trace-a", "trace-b"]
-    )
+    match_sql, match_params = builder.build_filter_match_query(["trace-a", "trace-b"])
 
     assert builder.supports_filter_candidate_seed_page() is True
     assert builder.recommended_filter_initial_slice_width() == END - START
@@ -1232,9 +1230,7 @@ def test_conjoined_positive_relation_seeds_then_reclassifies_every_filter() -> N
         slice_end=END,
         limit=26,
     )
-    match_sql, match_params = builder.build_filter_match_query(
-        ["trace-a", "trace-b"]
-    )
+    match_sql, match_params = builder.build_filter_match_query(["trace-a", "trace-b"])
 
     assert builder.supports_filter_candidate_seed_page() is True
     assert "tracer_eval_logger_v2 AS eval_scan" in seed_sql
@@ -1462,9 +1458,7 @@ def test_voice_eval_value_filter_uses_project_scoped_positive_candidate_seed(
         project_id=PROJECT_ID,
         filters=[_time_filter(), eval_filter],
         eval_config_ids=[config_id],
-        eval_filter_metadata={
-            config_id: EvalFilterMetadata((config_id,), "PASS_FAIL")
-        },
+        eval_filter_metadata={config_id: EvalFilterMetadata((config_id,), "PASS_FAIL")},
     )
 
     seed_sql, seed_params = builder.build_filter_candidate_seed_page(
@@ -1474,9 +1468,7 @@ def test_voice_eval_value_filter_uses_project_scoped_positive_candidate_seed(
         before_start_time=END - timedelta(minutes=1),
         before_id="trace-z",
     )
-    match_sql, match_params = builder.build_filter_match_query(
-        ["trace-a", "trace-b"]
-    )
+    match_sql, match_params = builder.build_filter_match_query(["trace-a", "trace-b"])
 
     comparison = "NOT IN" if operation == "not_in" else "IN"
     assert builder.supports_filter_candidate_seed_page() is True
@@ -1517,9 +1509,7 @@ def test_voice_eval_and_annotator_conjunction_prefers_score_seed_and_rechecks_ev
             _annotator_filter(annotator_id),
         ],
         eval_config_ids=[config_id],
-        eval_filter_metadata={
-            config_id: EvalFilterMetadata((config_id,), "PASS_FAIL")
-        },
+        eval_filter_metadata={config_id: EvalFilterMetadata((config_id,), "PASS_FAIL")},
     )
 
     seed_sql, seed_params = builder.build_filter_candidate_seed_page(
@@ -2530,6 +2520,37 @@ def test_long_window_span_mixed_text_numeric_uses_numeric_value_index_anchor() -
     sql, _params = builder.build_filter_anchor_probe(limit=64)
     assert "has(mapValues(attrs_number)" in sql
     assert "attrs_string" in sql
+
+
+def test_long_window_span_error_status_uses_indexed_full_window_anchor() -> None:
+    builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _system_filter("status", "ERROR")],
+        page_size=25,
+        bounded_internal_scan=True,
+    )
+
+    assert builder.allow_filter_anchor_probe_for_initial_continuation() is True
+    assert builder.supports_filter_anchor_probe() is True
+    assert builder.recommended_filter_anchor_probe_limit() == 64
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 300
+    assert builder.recommended_filter_anchor_probe_strata() == 4
+    assert builder.skip_full_window_filter_anchor_probe() is False
+    sql, _params = builder.build_filter_anchor_probe(limit=64)
+    assert "status" in sql
+    assert "ERROR" not in sql  # the value remains a bound parameter
+
+
+def test_long_window_span_completed_status_keeps_temporal_scanner() -> None:
+    builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _system_filter("status", "OK")],
+        page_size=25,
+        bounded_internal_scan=True,
+    )
+
+    assert builder.allow_filter_anchor_probe_for_initial_continuation() is False
+    assert builder.recommended_filter_anchor_probe_limit() is None
 
 
 def test_long_window_span_numeric_range_has_no_full_window_value_anchor() -> None:
@@ -6262,6 +6283,22 @@ class _IdentityHydrationFakeBuilder(_FakeBuilder):
         if start_time.tzinfo is not None:
             start_time = start_time.astimezone(UTC).replace(tzinfo=None)
         return row["id"], row["root_span_id"], start_time
+
+
+@dataclass
+class _CursorPageFillIdentityHydrationFakeBuilder(_IdentityHydrationFakeBuilder):
+    @staticmethod
+    def fill_bounded_cursor_page_across_slices() -> bool:
+        return True
+
+
+@dataclass
+class _WideGenericCursorIdentityHydrationFakeBuilder(
+    _CursorPageFillIdentityHydrationFakeBuilder
+):
+    @staticmethod
+    def recommended_filter_cursor_seed_batch_size() -> int:
+        return 80
 
 
 @dataclass
@@ -10931,6 +10968,96 @@ def test_sparse_identity_cursor_publishes_each_hydrated_classified_slice() -> No
         for page in pages
         for row in page.rows
     )
+
+
+def test_opted_in_identity_cursor_fills_across_classified_slices() -> None:
+    request_start = END - timedelta(minutes=30)
+    rows = [
+        {
+            "id": row_id,
+            "root_span_id": f"root-{row_id}",
+            "start_time": END - timedelta(minutes=minute),
+            "trace_name": f"presented-{row_id}",
+        }
+        for row_id, minute in (
+            ("newer-nonmatch", 1),
+            ("match-a", 6),
+            ("match-b", 7),
+            ("match-c", 16),
+        )
+    ]
+    expected_matches = rows[1:]
+    builder = _CursorPageFillIdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=expected_matches,
+        recommended_batch_size=10,
+        recommended_seed_batch_size=10,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder, reverse_hydration=True)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        page_size=5,
+        deadline_ms=5_000,
+        max_seed_attempts=24,
+        max_candidates=10,
+        max_query_count=50,
+        classify_batch_size=10,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == [row["id"] for row in expected_matches]
+    assert page.has_more is False
+    assert page.continuation_slice_end is None
+    assert [attempt.kind for attempt in page.attempts].count("hydrate") == 1
+
+
+def test_generic_cursor_honors_explicit_wider_seed_recommendation() -> None:
+    request_start = END - timedelta(hours=2)
+    rows = [
+        {
+            "id": f"trace-{index:03d}",
+            "root_span_id": f"root-{index:03d}",
+            "start_time": END - timedelta(minutes=index + 1),
+        }
+        for index in range(80)
+    ]
+    builder = _WideGenericCursorIdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        recommended_batch_size=10,
+        recommended_seed_batch_size=10,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        page_size=15,
+        deadline_ms=5_000,
+        max_seed_attempts=24,
+        max_candidates=100,
+        max_query_count=50,
+        classify_batch_size=10,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert executor.calls[0][0] == "seed"
+    assert executor.calls[0][1]["limit"] == 80
 
 
 def test_sparse_identity_cursor_waits_for_the_whole_active_slice() -> None:

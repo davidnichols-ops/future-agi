@@ -1738,6 +1738,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         org_project_count_cte = ""
         org_project_count_join = ""
         org_project_count_select = ""
+        org_project_evidence_select = ""
         if self.project_ids is not None:
             # Session UUIDs are generated globally, but an imported/direct-write
             # tenant can still reuse one.  Detect that impossible-to-represent
@@ -1757,6 +1758,11 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 "INNER JOIN candidate_session_project_counts USING (session_id)"
             )
             org_project_count_select = ", max(project_count) AS project_count"
+            # Cross-project user-detail rows still need one authoritative
+            # project identity for route construction and enrichment. The
+            # collision guard proves this aggregate has exactly one project
+            # before the view consumes it.
+            org_project_evidence_select = ", any(project_id) AS project_id"
         return f"""
         {ts_map_ctes}
         {candidate_session_cte}
@@ -1812,6 +1818,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 min(start_time) AS session_start
                 {session_metric_select}
                 {org_project_count_select}
+                {org_project_evidence_select}
             FROM resolved_root_sessions
             {org_project_count_join}
             WHERE 1 = 1
@@ -2136,7 +2143,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         {candidate_ctes}
         {seed_order_ctes}
         SELECT session_id, {seed_order_select}
-            {", project_count" if self.project_ids is not None else ""}
+            {", project_id, project_count" if self.project_ids is not None else ""}
         FROM sessions
         {seed_order_join}
         {seed_order_clause}
@@ -2197,6 +2204,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         SELECT
             session_id,
             session_start,
+            {"project_id," if self.project_ids is not None else ""}
             {"project_count," if self.project_ids is not None else ""}
             {"max(project_count) OVER() AS max_project_count," if self.project_ids is not None else ""}
             count() OVER() AS total_count
@@ -2257,6 +2265,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         SELECT
             session_id,
             session_start,
+            {"project_id," if self.project_ids is not None else ""}
             {"project_count," if self.project_ids is not None else ""}
             {"max(project_count) OVER() AS max_project_count," if self.project_ids is not None else ""}
             count() OVER() AS remaining_count

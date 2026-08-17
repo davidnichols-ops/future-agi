@@ -1196,12 +1196,18 @@ def fetch_user_system_metric_graph_ch(
     filters: list[dict[str, Any]],
     interval: str,
     metric_id: str,
+    timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
     refresh: bool = False,
     organization_id: str | None = None,
     workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Read one complete exact user-grain graph snapshot."""
 
+    # Exact graph computation is out of band; the synchronous cache/dispatch
+    # boundary already has finite Redis and workflow-transport timeouts. Accept
+    # the caller's remaining wall for a uniform graph-action interface, while
+    # the view's final deadline check prevents late cache results from publishing.
+    del timeout_ms
     project_id = _validated_project_id(project_id)
     filters = list(filters or [])
     identity = {
