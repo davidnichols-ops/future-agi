@@ -899,11 +899,19 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """
 
         plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
+        error_status_plan = self._selective_error_status_anchor_plan()
         candidates = [
             (index, plan)
             for index, plan in enumerate(plans)
             if plan.scope == "any" and self._plan_uses_indexed_anchor(plan)
         ]
+        if error_status_plan is not None:
+            # The public status comparison is case-insensitive and therefore
+            # compiles through lowerUTF8(), which cannot use the deployed raw
+            # status bloom.  Prefer this equivalent positive raw witness for
+            # sparse ERROR/ERRORED/FAILED discovery; latest-state replay below
+            # remains authoritative and removes stale physical versions.
+            candidates.append((-1, error_status_plan))
         candidates.sort(
             key=lambda item: (
                 item[1].raw_witness_rank is None,
@@ -914,6 +922,74 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             )
         )
         return [plan for _, plan in candidates]
+
+    def _selective_error_status_anchor_plan(
+        self,
+    ) -> LatestFilterPredicate | None:
+        """Return the indexed positive error witness used by Display.
+
+        Trace status has any-span semantics.  A matching trace must therefore
+        have at least one physical error-status row somewhere in its history.
+        The raw status bloom is a safe candidate superset for equals/IN error
+        filters; the finite global classifier still decides current membership.
+        """
+
+        for item_index, item in enumerate(self._active_non_time_filters()):
+            key = str(item.get("column_id") or item.get("columnId") or "")
+            if key != "status":
+                continue
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            operation = normalize_filter_op(
+                str(config.get("filter_op") or config.get("filterOp") or "")
+            )
+            raw_value = config.get("filter_value", config.get("filterValue"))
+            values = raw_value if isinstance(raw_value, list) else [raw_value]
+            normalized_values = {
+                str(value).strip().upper() for value in values if value is not None
+            }
+            if (
+                operation in {"equals", "in"}
+                and normalized_values
+                and normalized_values <= {"ERROR", "ERRORED", "FAILED"}
+            ):
+                item_plans, residual = self._partition_trace_filter_plans([item])
+                if residual or len(item_plans) != 1 or item_plans[0].scope != "any":
+                    return None
+                plan = item_plans[0]
+                anchor_param = f"trace_error_status_anchor_values_{item_index}"
+                return LatestFilterPredicate(
+                    aggregates=plan.aggregates,
+                    predicate=plan.predicate,
+                    seed_predicate=plan.seed_predicate,
+                    params={
+                        **plan.params,
+                        anchor_param: tuple(sorted(normalized_values)),
+                    },
+                    scope=plan.scope,
+                    raw_witness_predicate=f"status IN %({anchor_param})s",
+                    raw_key_witness_predicate=plan.raw_key_witness_predicate,
+                    raw_witness_rank=0,
+                    source_metric=plan.source_metric,
+                )
+        return None
+
+    def _uses_global_error_status_anchor(self) -> bool:
+        """Whether a sparse list may prove its error candidate population.
+
+        A request-window child probe cannot prove trace absence because the
+        root can be in-window while its matching child is outside it.  For the
+        long-window Display error shape, probe the indexed error witness across
+        the project's complete retained history instead.  Exhausting that
+        finite superset is then an exact population proof after classification.
+        Graph strata retain their request-window sampling contract.
+        """
+
+        request_start, request_end = self._bounded_request_window
+        return bool(
+            not getattr(self, "_bounded_anchor_probe", False)
+            and request_end - request_start > timedelta(hours=1)
+            and self._selective_error_status_anchor_plan() is not None
+        )
 
     def _graph_key_witness_plans(self) -> list[LatestFilterPredicate]:
         """Return positive any-span Map keys for graph-only discovery.
@@ -1495,6 +1571,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return trace_id, str(row.get("project_id") or "")
         return trace_id
 
+    def allow_filter_anchor_probe_for_initial_continuation(self) -> bool:
+        """Run the global sparse-error proof only on a fresh cursor page."""
+
+        return self._uses_global_error_status_anchor()
+
     def supports_filter_anchor_probe(self) -> bool:
         """Whether a direct any-span leaf can classify sparse vs common."""
 
@@ -1506,18 +1587,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return False
         return bool(self._filter_anchor_plans())
 
-    @staticmethod
-    def filter_anchor_probe_proves_complete_population() -> bool:
-        """Return false because a temporal child anchor cannot prove absence.
+    def filter_anchor_probe_proves_complete_population(self) -> bool:
+        """Return true only for the complete-history sparse error witness.
 
-        The probe remains useful as a positive candidate accelerator.  Its
-        exhaustion is not a population proof: the canonical root may be in the
-        requested time window while the only matching child lies outside it.
-        The bounded reader must therefore continue through ordered roots and
-        global finite classification before claiming an exact page.
+        Ordinary temporal child anchors remain positive accelerators: the
+        canonical root may be in the requested window while its matching child
+        lies outside it.  The specialized error anchor deliberately scans the
+        indexed positive witness across complete retained project history, so
+        exhausting its sentinel does prove the full candidate population.
         """
 
-        return False
+        return self._uses_global_error_status_anchor()
 
     def supports_graph_key_witness_probe(self) -> bool:
         """Whether graph discovery can use one cheap typed-Map key leaf."""
@@ -1538,6 +1618,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         request_start, request_end = self._bounded_request_window
         return bool(
             request_end - request_start > timedelta(hours=1)
+            and not self._uses_global_error_status_anchor()
             and self.recommended_filter_anchor_probe_limit() is None
         )
 
@@ -1557,6 +1638,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         cannot prove that selector's final membership/order, so do not spend
         its fixed request budget before ordered candidate acquisition.
         """
+
+        if self._uses_global_error_status_anchor():
+            return _LONG_WINDOW_ANCHOR_SENTINEL
 
         # The production product-path gate showed that even partitioned long-
         # window probes routinely hit their deliberately tight row/byte caps
@@ -1584,6 +1668,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def recommended_filter_anchor_probe_strata(self) -> int | None:
         """Partition only the optional long-window list probe."""
 
+        if self._uses_global_error_status_anchor():
+            # This query intentionally covers complete retained history; date
+            # strata would turn the finite superset back into a temporal sample.
+            return 1
         if self.recommended_filter_anchor_probe_limit() is not None:
             return _LONG_WINDOW_ANCHOR_STRATA
         return None
@@ -1615,6 +1703,66 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         if limit <= 0 or (limit == 1 and slice_start is None and slice_end is None):
             raise ValueError("anchor probe limit must include a sentinel")
+        if (
+            not _graph_key_witness
+            and slice_start is None
+            and slice_end is None
+            and self._uses_global_error_status_anchor()
+        ):
+            anchor = self._selective_error_status_anchor_plan()
+            if anchor is None:  # pragma: no cover - guarded by capability hook
+                raise ValueError("trace error-status anchor is unavailable")
+            anchor_predicate = anchor.raw_witness_predicate
+            if not anchor_predicate:  # pragma: no cover - constructed above
+                raise ValueError("trace error-status witness is unavailable")
+            anchor_params = {
+                key: value
+                for key, value in anchor.params.items()
+                if f"%({key})s" in anchor_predicate
+            }
+            params: dict[str, Any] = {
+                **self.params,
+                **anchor_params,
+                "filter_anchor_limit": int(limit),
+            }
+            project_version_fragment = ""
+            if self.project_version_id:
+                params["project_version_id"] = self.project_version_id
+                project_version_fragment = (
+                    "AND project_version_id = %(project_version_id)s"
+                )
+            sampling_fragment = ""
+            if self._bounded_sampling_rate is not None:
+                params["bounded_sampling_salt"] = str(self._bounded_sampling_salt)
+                params["bounded_sampling_rate"] = float(self._bounded_sampling_rate)
+                sampling_fragment = """
+                  AND modulo(
+                      cityHash64(%(bounded_sampling_salt)s, toString(trace_id)), 100
+                  ) < %(bounded_sampling_rate)s
+                """
+            identity_projection = (
+                "project_id, trace_id"
+                if self.project_ids is not None
+                else "trace_id"
+            )
+            identity_limit_by = (
+                "project_id, trace_id"
+                if self.project_ids is not None
+                else "trace_id"
+            )
+            query = f"""
+            SELECT {identity_projection}
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND is_deleted = 0
+              {project_version_fragment}
+            WHERE {anchor_predicate}
+              {sampling_fragment}
+            LIMIT 1 BY {identity_limit_by}
+            LIMIT %(filter_anchor_limit)s
+            """
+            return query, params
+
         request_start, request_end = self.parse_time_range(self.filters)
         if (slice_start is None) != (slice_end is None):
             raise ValueError("anchor probe slice values must be provided together")

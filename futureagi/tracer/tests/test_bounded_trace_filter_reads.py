@@ -2541,6 +2541,44 @@ def test_long_window_span_error_status_uses_indexed_full_window_anchor() -> None
     assert "ERROR" not in sql  # the value remains a bound parameter
 
 
+def test_long_window_trace_error_status_uses_global_indexed_anchor() -> None:
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _system_filter("status", "ERROR")],
+        page_size=25,
+        bounded_internal_scan=True,
+    )
+
+    assert builder.allow_filter_anchor_probe_for_initial_continuation() is True
+    assert builder.supports_filter_anchor_probe() is True
+    assert builder.filter_anchor_probe_proves_complete_population() is True
+    assert builder.recommended_filter_anchor_probe_limit() == 64
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 900
+    assert builder.recommended_filter_anchor_probe_strata() == 1
+    assert builder.skip_full_window_filter_anchor_probe() is False
+
+    sql, params = builder.build_filter_anchor_probe(limit=64)
+    normalized_sql = " ".join(sql.split())
+    assert "status IN %(trace_error_status_anchor_values_0)s" in normalized_sql
+    assert "filter_anchor_start" not in normalized_sql
+    assert "start_time >=" not in normalized_sql
+    assert params["trace_error_status_anchor_values_0"] == ("ERROR",)
+    assert params["filter_anchor_limit"] == 64
+
+
+def test_long_window_trace_completed_status_keeps_temporal_scanner() -> None:
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _system_filter("status", "OK")],
+        page_size=25,
+        bounded_internal_scan=True,
+    )
+
+    assert builder.allow_filter_anchor_probe_for_initial_continuation() is False
+    assert builder.filter_anchor_probe_proves_complete_population() is False
+    assert builder.recommended_filter_anchor_probe_limit() is None
+
+
 def test_long_window_span_completed_status_keeps_temporal_scanner() -> None:
     builder = SpanListQueryBuilderV2(
         project_id=PROJECT_ID,
