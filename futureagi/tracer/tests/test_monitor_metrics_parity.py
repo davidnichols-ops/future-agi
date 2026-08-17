@@ -1,5 +1,6 @@
 """Monitor builder parity: calendar-bucketed historical stats for count/token
-metrics (matches the old Python statistics path). Pure SQL-string assertions."""
+metrics, stddevPop vs stddevSamp split, NULL-on-empty token windows, provider
+guard, and eval CHOICES containment. Pure SQL-string assertions."""
 
 from __future__ import annotations
 
@@ -23,6 +24,14 @@ TIME_AGGREGATED = [
     mm.TOKEN_USAGE,
     mm.DAILY_TOKENS_SPENT,
     mm.MONTHLY_TOKENS_SPENT,
+]
+PER_ROW_HISTORICAL = [
+    mm.ERROR_RATES_FOR_FUNCTION_CALLING,
+    mm.ERROR_FREE_SESSION_RATES,
+    mm.SERVICE_PROVIDER_ERROR_RATES,
+    mm.LLM_API_FAILURE_RATES,
+    mm.SPAN_RESPONSE_TIME,
+    mm.LLM_RESPONSE_TIME,
 ]
 
 
@@ -76,3 +85,64 @@ def test_time_aggregated_historical_agg_per_metric() -> None:
 def test_time_aggregated_historical_defaults_to_hour() -> None:
     sql, _ = _builder().build_historical_stats_query(mm.COUNT_OF_ERRORS, START, END)
     assert "toStartOfHour(created_at) AS bucket_ts" in sql
+
+
+# --- stddevPop for per-row + eval stats (PG StdDev is population) -------------
+
+
+@pytest.mark.parametrize("metric_type", PER_ROW_HISTORICAL)
+def test_per_row_historical_uses_population_stddev(metric_type: str) -> None:
+    sql, _ = _builder().build_historical_stats_query(metric_type, START, END)
+    assert "stddevPop(" in sql
+    assert "stddevSamp" not in sql
+
+
+def test_eval_stats_use_population_stddev() -> None:
+    sql, _ = _builder(eval_output_type="SCORE").build_historical_stats_query(
+        mm.EVALUATION_METRICS, START, END
+    )
+    assert "stddevPop(" in sql
+    assert "stddevSamp" not in sql
+
+
+# --- No-token window yields NULL, not 0 ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "metric_type",
+    [mm.TOKEN_USAGE, mm.DAILY_TOKENS_SPENT, mm.MONTHLY_TOKENS_SPENT],
+)
+def test_token_value_null_on_empty_window(metric_type: str) -> None:
+    sql, _ = _builder().build_metric_value_query(metric_type, START, END)
+    assert "CASE WHEN countIf(total_tokens != 0) = 0 THEN NULL" in sql
+    assert "sum(total_tokens)" in sql
+
+
+# --- Provider guard (v2 provider is non-Nullable; '' means no provider) -------
+
+
+def test_provider_guard_excludes_empty_string_only() -> None:
+    for sql, _ in (
+        _builder().build_metric_value_query(
+            mm.SERVICE_PROVIDER_ERROR_RATES, START, END
+        ),
+        _builder().build_historical_stats_query(
+            mm.SERVICE_PROVIDER_ERROR_RATES, START, END
+        ),
+        _builder().build_time_series_query(
+            mm.SERVICE_PROVIDER_ERROR_RATES, START, END, 3600
+        ),
+    ):
+        assert "provider != ''" in sql
+        assert "provider IS NOT NULL" not in sql
+
+
+# --- Eval CHOICES list containment only (PG parity) ---------------------------
+
+
+def test_eval_choices_no_output_str_fallback() -> None:
+    sql, _ = _builder(eval_output_type="CHOICES").build_metric_value_query(
+        mm.EVALUATION_METRICS, START, END
+    )
+    assert "has(JSONExtract(output_str_list, 'Array(String)'), %(choice_val)s)" in sql
+    assert "OR output_str" not in sql
