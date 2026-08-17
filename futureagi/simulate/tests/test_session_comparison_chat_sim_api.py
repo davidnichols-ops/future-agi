@@ -378,6 +378,7 @@ class TestSessionComparisonChatSimViewUnit:
 
         call_exec_id = uuid.uuid4()
         row_id = uuid.uuid4()
+        session_id = str(uuid.uuid4())
 
         fake_call_exec = SimpleNamespace(
             id=call_exec_id,
@@ -385,7 +386,7 @@ class TestSessionComparisonChatSimViewUnit:
             status=CallExecution.CallStatus.COMPLETED,
             row_id=row_id,
         )
-        fake_row = SimpleNamespace(metadata={"session_id": "session-123"})
+        fake_row = SimpleNamespace(metadata={"session_id": session_id})
 
         with (
             patch(
@@ -414,8 +415,8 @@ class TestSessionComparisonChatSimViewUnit:
         assert data["status"] is True
         assert "comparison_metrics" in data["result"]
         assert "comparison_transcripts" in data["result"]
-        mock_metrics.assert_called_once_with(fake_call_exec, "session-123")
-        mock_transcripts.assert_called_once_with(fake_call_exec, "session-123")
+        mock_metrics.assert_called_once_with(fake_call_exec, session_id)
+        mock_transcripts.assert_called_once_with(fake_call_exec, session_id)
 
     def test_get_voice_execution_returns_recordings(self, user):
         """Voice call executions are supported and include comparison_recordings."""
@@ -425,13 +426,14 @@ class TestSessionComparisonChatSimViewUnit:
 
         call_exec_id = uuid.uuid4()
         row_id = uuid.uuid4()
+        trace_id = str(uuid.uuid4())
         fake_call_exec = SimpleNamespace(
             id=call_exec_id,
             simulation_call_type=CallExecution.SimulationCallType.VOICE,
             status=CallExecution.CallStatus.COMPLETED,
             row_id=row_id,
         )
-        fake_row = SimpleNamespace(metadata={"trace_id": "trace-456"})
+        fake_row = SimpleNamespace(metadata={"trace_id": trace_id})
 
         with (
             patch(
@@ -472,13 +474,11 @@ class TestSessionComparisonChatSimViewUnit:
         assert "comparison_metrics" in data["result"]
         assert "comparison_transcripts" in data["result"]
         assert "comparison_recordings" in data["result"]
-        mock_span.assert_called_once_with("trace-456")
+        mock_span.assert_called_once_with(trace_id)
         span = mock_span.return_value
-        mock_metrics.assert_called_once_with(fake_call_exec, "trace-456", _span=span)
-        mock_transcripts.assert_called_once_with(
-            fake_call_exec, "trace-456", _span=span
-        )
-        mock_recordings.assert_called_once_with(fake_call_exec, "trace-456", _span=span)
+        mock_metrics.assert_called_once_with(fake_call_exec, trace_id, _span=span)
+        mock_transcripts.assert_called_once_with(fake_call_exec, trace_id, _span=span)
+        mock_recordings.assert_called_once_with(fake_call_exec, trace_id, _span=span)
 
     def test_get_rejects_not_completed_execution(self, user):
         factory = APIRequestFactory()
