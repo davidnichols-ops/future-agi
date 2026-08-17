@@ -24,9 +24,9 @@ const ChatCompareView = ({ data, onBack }) => {
   });
 
   const transcripts = useMemo(() => {
-    if (!compareData?.comparisonTranscripts) return null;
-    return transformToConversations(compareData.comparisonTranscripts);
-  }, [compareData?.comparisonTranscripts]);
+    if (!compareData?.comparison_transcripts) return null;
+    return transformToConversations(compareData.comparison_transcripts);
+  }, [compareData?.comparison_transcripts]);
 
   return (
     <Box

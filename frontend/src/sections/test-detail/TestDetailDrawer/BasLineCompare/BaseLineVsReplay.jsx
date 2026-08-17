@@ -159,7 +159,7 @@ export default function BaseLineVsReplay({ rowData }) {
           <TestDetailDrawerScenarioTable data={rowData} />
         </Box>
       </Suspense>
-      {baselineVsReplayData?.comparisonRecordings && (
+      {baselineVsReplayData?.comparison_recordings && (
         <Stack gap={1.5}>
           <Typography
             typography="m3"
@@ -172,14 +172,16 @@ export default function BaseLineVsReplay({ rowData }) {
             <Grid item xs={12} md={6}>
               <RecordingPlayer
                 label="Baseline Call"
-                recordings={baselineVsReplayData.comparisonRecordings.baseline}
+                recordings={baselineVsReplayData.comparison_recordings.baseline}
                 id={`baseline-${rowData?.id}`}
               />
             </Grid>
             <Grid item xs={12} md={6}>
               <RecordingPlayer
                 label="Simulated Call"
-                recordings={baselineVsReplayData.comparisonRecordings.simulated}
+                recordings={
+                  baselineVsReplayData.comparison_recordings.simulated
+                }
                 id={`simulated-${rowData?.id}`}
               />
             </Grid>
@@ -192,7 +194,7 @@ export default function BaseLineVsReplay({ rowData }) {
             isLoadingBaselineVsReplay
               ? null
               : transformToConversations(
-                  baselineVsReplayData?.comparisonTranscripts,
+                  baselineVsReplayData?.comparison_transcripts,
                 )
           }
           isLoading={isLoadingBaselineVsReplay}
