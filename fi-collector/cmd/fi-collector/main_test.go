@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/future-agi/future-agi/fi-collector/pkg/propertycatalog"
 )
 
 // logLines parses newline-delimited slog JSON output into a slice of
@@ -195,5 +197,55 @@ func TestKafkaCatalogEnvironmentRejectsClickHouseAccess(t *testing.T) {
 	if err := applyEnvOverrides(slog.Default(), &rootConfig{}); err == nil ||
 		!strings.Contains(err.Error(), "rejects ClickHouse settings") {
 		t.Fatalf("Kafka ClickHouse-access error=%v", err)
+	}
+}
+
+func setUnifiedPropertyCatalogEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("FI_PROPERTY_CATALOG_MODE", "kafka")
+	t.Setenv("FI_PROPERTY_CATALOG_ENVIRONMENT", "development")
+	t.Setenv("FI_PROPERTY_CATALOG_DEV_ACK", propertycatalog.DevelopmentAcknowledgement)
+	t.Setenv("FI_PROPERTY_CATALOG_EPOCH", "3")
+	t.Setenv("FI_PROPERTY_CATALOG_PROJECTION_VERSION", "1")
+	t.Setenv("FI_PROPERTY_CATALOG_PRODUCER_STREAM_ID", "44444444-4444-4444-8444-444444444444")
+	t.Setenv("FI_PROPERTY_CATALOG_WORKSPACE_ALLOWLIST", "22222222-2222-4222-8222-222222222222")
+	t.Setenv("FI_PROPERTY_CATALOG_REVISION_FENCE_FILE", filepath.Join(t.TempDir(), "revision-fence.json"))
+	t.Setenv("FI_PROPERTY_CATALOG_SPOOL_DIR", t.TempDir())
+	t.Setenv("FI_PROPERTY_CATALOG_KAFKA_BROKERS", "kafka:9092")
+	t.Setenv("FI_PROPERTY_CATALOG_KAFKA_TOPIC", "property-catalog-v1-dev")
+}
+
+func TestUnifiedPropertyCatalogEnvironmentIsExplicitDevKafkaOnly(t *testing.T) {
+	setUnifiedPropertyCatalogEnv(t)
+	var cfg rootConfig
+	if err := applyEnvOverrides(slog.Default(), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PropertyCatalog.Mode != propertycatalog.RuntimeKafka ||
+		cfg.PropertyCatalog.Environment != propertycatalog.DevelopmentEnvironment ||
+		cfg.PropertyCatalog.ProjectionVersion != 1 || len(cfg.PropertyCatalog.WorkspaceAllowlist) != 1 {
+		t.Fatalf("property catalog config=%+v", cfg.PropertyCatalog)
+	}
+}
+
+func TestUnifiedPropertyCatalogRejectsProductionAndLegacyCoactivation(t *testing.T) {
+	setUnifiedPropertyCatalogEnv(t)
+	t.Setenv("FI_PROPERTY_CATALOG_ENVIRONMENT", "production")
+	if err := applyEnvOverrides(slog.Default(), &rootConfig{}); err == nil ||
+		!strings.Contains(err.Error(), "development-only") {
+		t.Fatalf("production error=%v", err)
+	}
+
+	t.Setenv("FI_PROPERTY_CATALOG_ENVIRONMENT", "development")
+	t.Setenv("FI_CATALOG_MODE", "kafka")
+	t.Setenv("FI_CATALOG_ENVIRONMENT", "development")
+	t.Setenv("FI_CATALOG_EPOCH", "102")
+	t.Setenv("FI_CATALOG_PRODUCER_STREAM_ID", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+	t.Setenv("FI_CATALOG_SPOOL_DIR", t.TempDir())
+	t.Setenv("FI_CATALOG_KAFKA_BROKERS", "kafka:9092")
+	t.Setenv("FI_CATALOG_KAFKA_TOPIC", "legacy-catalog-dev")
+	if err := applyEnvOverrides(slog.Default(), &rootConfig{}); err == nil ||
+		!strings.Contains(err.Error(), "cannot both be enabled") {
+		t.Fatalf("coactivation error=%v", err)
 	}
 }

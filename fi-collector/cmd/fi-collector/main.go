@@ -37,16 +37,18 @@ import (
 	"github.com/future-agi/future-agi/fi-collector/pkg/catalogwriter"
 	"github.com/future-agi/future-agi/fi-collector/pkg/chwriter"
 	"github.com/future-agi/future-agi/fi-collector/pkg/pricing"
+	"github.com/future-agi/future-agi/fi-collector/pkg/propertycatalog"
 	"github.com/future-agi/future-agi/fi-collector/pkg/server"
 	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v3"
 )
 
 type rootConfig struct {
-	Writer  chwriter.Config             `yaml:"writer"`
-	Server  server.Config               `yaml:"server"`
-	Auth    auth.Config                 `yaml:"auth"`
-	Catalog catalogwriter.RuntimeConfig `yaml:"catalog"`
+	Writer          chwriter.Config               `yaml:"writer"`
+	Server          server.Config                 `yaml:"server"`
+	Auth            auth.Config                   `yaml:"auth"`
+	Catalog         catalogwriter.RuntimeConfig   `yaml:"catalog"`
+	PropertyCatalog propertycatalog.RuntimeConfig `yaml:"property_catalog"`
 }
 
 func main() {
@@ -172,6 +174,46 @@ func main() {
 			Writer: catalogWAL, Submitter: catalogSubmitter,
 		}))
 	}
+
+	propertyMode, err := cfg.PropertyCatalog.SelectedMode()
+	if err != nil {
+		log.Error("property catalog mode validation failed", "err", err)
+		os.Exit(1)
+	}
+	var propertyRuntime *propertycatalog.HotRuntime
+	var propertyProducer *propertycatalog.Producer
+	var stopPropertyRuntime context.CancelFunc
+	if propertyMode == propertycatalog.RuntimeKafka {
+		revisions, providerErr := propertycatalog.NewFileRevisionProvider(cfg.PropertyCatalog.RevisionFenceFile)
+		if providerErr != nil {
+			log.Error("property catalog revision provider init failed", "err", providerErr)
+			os.Exit(1)
+		}
+		propertyProducer, err = propertycatalog.NewFranzProducer(propertycatalog.FranzProducerConfig{
+			Brokers: cfg.PropertyCatalog.Kafka.Brokers,
+			Topic:   cfg.PropertyCatalog.Kafka.Topic,
+		})
+		if err != nil {
+			log.Error("property catalog Kafka producer init failed", "err", err)
+			os.Exit(1)
+		}
+		propertyRuntime, err = propertycatalog.NewHotRuntime(cfg.PropertyCatalog, revisions, propertyProducer)
+		if err != nil {
+			propertyProducer.Close()
+			log.Error("property catalog runtime init failed", "err", err)
+			os.Exit(1)
+		}
+		propertyCtx, stopRuntime := context.WithCancel(context.Background())
+		stopPropertyRuntime = stopRuntime
+		if err := propertyRuntime.Start(propertyCtx); err != nil {
+			stopRuntime()
+			propertyProducer.Close()
+			log.Error("property catalog runtime start failed", "err", err)
+			os.Exit(1)
+		}
+		opts = append(opts, server.WithPropertyCatalogWriter(propertyRuntime))
+		go logPropertyCatalogGaps(propertyCtx, propertyRuntime, log)
+	}
 	srv := server.New(cfg.Server, writer, authenticator, usageEmitter, metering, opts...)
 	var catalogReplayDone chan struct{}
 	if catalogWAL != nil {
@@ -220,6 +262,17 @@ func main() {
 	}
 	if catalogReplayDone != nil {
 		<-catalogReplayDone
+	}
+	if propertyRuntime != nil {
+		shutdownCtx, stopShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := propertyRuntime.Shutdown(shutdownCtx); err != nil {
+			log.Error("property catalog runtime shutdown incomplete", "err", err)
+		}
+		stopShutdown()
+		stopPropertyRuntime()
+	}
+	if propertyProducer != nil {
+		propertyProducer.Close()
 	}
 	if kafkaProducer != nil {
 		kafkaProducer.Close()
@@ -371,7 +424,82 @@ func applyEnvOverrides(log *slog.Logger, c *rootConfig) error {
 	if v := os.Getenv("FI_CATALOG_KAFKA_TOPIC"); v != "" {
 		c.Catalog.Kafka.Topic = v
 	}
-	return c.Catalog.ValidateMode()
+	if v := os.Getenv("FI_PROPERTY_CATALOG_MODE"); v != "" {
+		c.PropertyCatalog.Mode = propertycatalog.RuntimeMode(v)
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_ENVIRONMENT"); v != "" {
+		c.PropertyCatalog.Environment = v
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_DEV_ACK"); v != "" {
+		c.PropertyCatalog.DevelopmentAcknowledgement = v
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_EPOCH"); v != "" {
+		epoch, err := strconv.ParseUint(v, 10, 16)
+		if err != nil || epoch == 0 {
+			return fmt.Errorf("FI_PROPERTY_CATALOG_EPOCH must be a non-zero UInt16")
+		}
+		c.PropertyCatalog.CatalogEpoch = uint16(epoch)
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_PROJECTION_VERSION"); v != "" {
+		projection, err := strconv.ParseUint(v, 10, 16)
+		if err != nil || projection == 0 {
+			return fmt.Errorf("FI_PROPERTY_CATALOG_PROJECTION_VERSION must be a non-zero UInt16")
+		}
+		c.PropertyCatalog.ProjectionVersion = uint16(projection)
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_PRODUCER_STREAM_ID"); v != "" {
+		c.PropertyCatalog.ProducerStreamID = v
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_WORKSPACE_ALLOWLIST"); v != "" {
+		c.PropertyCatalog.WorkspaceAllowlist = splitNonempty(v)
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_REVISION_FENCE_FILE"); v != "" {
+		c.PropertyCatalog.RevisionFenceFile = v
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_SPOOL_DIR"); v != "" {
+		c.PropertyCatalog.SpoolDirectory = v
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_REPLAY_INTERVAL"); v != "" {
+		interval, err := time.ParseDuration(v)
+		if err != nil || interval <= 0 {
+			return fmt.Errorf("FI_PROPERTY_CATALOG_REPLAY_INTERVAL must be a positive duration")
+		}
+		c.PropertyCatalog.ReplayInterval = interval
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_KAFKA_BROKERS"); v != "" {
+		c.PropertyCatalog.Kafka.Brokers = splitNonempty(v)
+	}
+	if v := os.Getenv("FI_PROPERTY_CATALOG_KAFKA_TOPIC"); v != "" {
+		c.PropertyCatalog.Kafka.Topic = v
+	}
+	if err := c.Catalog.ValidateMode(); err != nil {
+		return err
+	}
+	propertyMode, err := c.PropertyCatalog.SelectedMode()
+	if err != nil {
+		return err
+	}
+	legacyMode, err := c.Catalog.SelectedMode()
+	if err != nil {
+		return err
+	}
+	if propertyMode != propertycatalog.RuntimeDisabled && legacyMode != catalogwriter.ModeDisabled {
+		return fmt.Errorf("legacy catalog and unified property catalog modes cannot both be enabled")
+	}
+	return nil
+}
+
+func logPropertyCatalogGaps(ctx context.Context, runtime *propertycatalog.HotRuntime, log *slog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-runtime.Gaps():
+			if err != nil {
+				log.Warn("property catalog delivery gap", "err", err)
+			}
+		}
+	}
 }
 
 func splitNonempty(value string) []string {
