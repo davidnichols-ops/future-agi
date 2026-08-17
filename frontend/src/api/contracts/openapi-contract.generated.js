@@ -46698,16 +46698,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Created by name",
           "type": "string",
           "readOnly": true,
-          "minLength": 1
+          "minLength": 1,
+          "x-nullable": true
         },
         "viewer_role": {
           "title": "Viewer role",
           "type": "string",
-          "readOnly": true
+          "readOnly": true,
+          "minLength": 1,
+          "x-nullable": true
         },
         "viewer_roles": {
-          "title": "Viewer roles",
-          "type": "string",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
           "readOnly": true
         },
         "deleted": {
@@ -66541,11 +66547,14 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Assigned to name",
           "type": "string",
           "readOnly": true,
-          "minLength": 1
+          "minLength": 1,
+          "x-nullable": true
         },
         "assigned_users": {
-          "title": "Assigned users",
-          "type": "string",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/QueueItemAssignedUser"
+          },
           "readOnly": true
         },
         "reserved_by": {
@@ -66558,7 +66567,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Reserved by name",
           "type": "string",
           "readOnly": true,
-          "minLength": 1
+          "minLength": 1,
+          "x-nullable": true
         },
         "reservation_expires_at": {
           "title": "Reservation expires at",
@@ -66582,7 +66592,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Reviewed by name",
           "type": "string",
           "readOnly": true,
-          "minLength": 1
+          "minLength": 1,
+          "x-nullable": true
         },
         "reviewed_at": {
           "title": "Reviewed at",
@@ -66597,17 +66608,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "source_preview": {
           "title": "Source preview",
-          "type": "string",
-          "readOnly": true
+          "type": "object",
+          "readOnly": true,
+          "x-json-value": true,
+          "description": "Any valid JSON value."
         },
         "comment_count": {
           "title": "Comment count",
-          "type": "string",
+          "type": "integer",
           "readOnly": true
         },
         "open_feedback_count": {
           "title": "Open feedback count",
-          "type": "string",
+          "type": "integer",
           "readOnly": true
         },
         "created_at": {
@@ -77698,8 +77711,11 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "minLength": 1
         },
         "roles": {
-          "title": "Roles",
-          "type": "string",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
           "readOnly": true
         }
       }
@@ -88271,6 +88287,34 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "imported": {
           "title": "Imported",
           "type": "integer"
+        }
+      }
+    },
+    "QueueItemAssignedUser": {
+      "required": [
+        "id",
+        "name",
+        "email"
+      ],
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string",
+          "format": "uuid"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "email": {
+          "title": "Email",
+          "type": "string",
+          "format": "email",
+          "minLength": 1,
+          "x-nullable": true
         }
       }
     },

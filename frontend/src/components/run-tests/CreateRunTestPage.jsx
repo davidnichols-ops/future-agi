@@ -248,16 +248,12 @@ const CreateRunTestPage = ({ open, onClose }) => {
       return response.data;
     },
     enabled: !!formData?.agentType,
-    keepPreviousData: true,
   });
 
   // Extract scenarios data
   const scenarios = scenariosData?.results || [];
   const scenariosTotal = scenariosData?.count || 0;
   const scenariosPage = scenariosPagination.page;
-  const scenariosTotalPages = Math.ceil(
-    scenariosTotal / scenariosPagination.pageSize,
-  );
 
   // Since search is done server-side, we don't need to filter locally
   const filteredScenarios = scenarios;
@@ -1030,7 +1026,10 @@ const CreateRunTestPage = ({ open, onClose }) => {
       case 1:
         return (
           <>
-            {filteredScenarios.length === 0 && debouncedSearch === "" ? (
+            {!isLoadingScenarios &&
+            !scenariosError &&
+            filteredScenarios.length === 0 &&
+            debouncedSearch === "" ? (
               <EmptyLayout
                 title="Add your first scenario"
                 description="Create scenarios and experiments to evaluate your application across different test cases and conditions."
@@ -1256,8 +1255,11 @@ const CreateRunTestPage = ({ open, onClose }) => {
                       })}
                     </List>
 
-                    {/* Pagination */}
-                    {scenariosTotalPages > 1 && (
+                    {/* Gated on rows, not on page count: the rows-per-page
+                        selector lives in this bar, so hiding it whenever the
+                        chosen size covers everything strands the user at that
+                        size with no way back. */}
+                    {scenariosTotal > 0 && (
                       <Box
                         sx={{
                           display: "flex",
