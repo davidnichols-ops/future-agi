@@ -941,8 +941,13 @@ def _telephony_provider() -> str:
     """PSTN carrier for the SIP path. Global switch, default ``twilio`` (no
     change to existing runs). Set ``TELEPHONY_PROVIDER=telnyx`` to route
     hosted SIP runs onto the Telnyx pool / trunk."""
-    value = (_voice_setting("TELEPHONY_PROVIDER") or "twilio").strip().lower()
-    return value if value in _TELEPHONY_PROVIDERS else "twilio"
+    configured = _voice_setting("TELEPHONY_PROVIDER")
+    value = (
+        configured.strip().lower() if configured and configured.strip() else "twilio"
+    )
+    if value not in _TELEPHONY_PROVIDERS:
+        raise HostedRunnerBuildError(f"unsupported telephony provider: {value}")
+    return value
 
 
 def _carrier_setting(name: str, carrier: str) -> str | None:

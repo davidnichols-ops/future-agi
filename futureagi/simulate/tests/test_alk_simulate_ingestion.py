@@ -1044,6 +1044,27 @@ class TestBuildVoiceRunnerJob:
         assert resolve_runner_mode(web) == "voice_webrtc"
         assert resolve_runner_mode(phoned) == "voice_sip"
 
+    def test_unknown_telephony_provider_fails_closed(
+        self, organization, workspace, simulator_agent
+    ):
+        from django.test import override_settings
+
+        from simulate.services.hosted_runner import HostedRunnerBuildError
+
+        agent = self._voice_agent(
+            organization,
+            workspace,
+            provider="livekit",
+            phone="+15551230000",
+            inbound=True,
+        )
+        with override_settings(TELEPHONY_PROVIDER="carrier_x"):
+            with pytest.raises(
+                HostedRunnerBuildError,
+                match="unsupported telephony provider: carrier_x",
+            ):
+                self._build(organization, workspace, simulator_agent, agent)
+
     def test_builds_vapi_websocket_job(self, organization, workspace, simulator_agent):
         agent = self._voice_agent(
             organization, workspace, provider="vapi", phone="", assistant_id="asst_123"
