@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { renderHook, act } from "@testing-library/react";
 
 // These cover the session-storage layer behind review comments 6, 7 and 8 on
 // PR #2000. All three are the same defect: each key is written only when the
@@ -11,18 +12,32 @@ vi.mock("src/utils/axios", () => ({
     get: vi.fn(),
     post: vi.fn(),
   },
-  endpoints: { workspaces: { list: "/workspaces/" }, organizations: {} },
+  endpoints: {
+    workspaces: { list: "/workspaces/", switch: "/workspaces/switch/" },
+    organizations: {},
+  },
 }));
 
 vi.mock("src/components/snackbar", () => ({ enqueueSnackbar: vi.fn() }));
 vi.mock("src/auth/hooks", () => ({ useAuthContext: () => ({}) }));
+// The provider reads the org context; leaving it unsettled is what makes the
+// pinned org the only remaining source for the switch payload.
+vi.mock("src/contexts/OrganizationContext", () => ({
+  useOrganization: () => ({ currentOrganizationId: null, isReady: false }),
+}));
 
+import axios from "src/utils/axios";
 import {
-  readSessionOrgId,
   readSessionWorkspaceForOrg,
   writeSessionWorkspace,
+  useWorkspace,
+  WorkspaceProvider,
 } from "../WorkspaceContext";
 import { pinResolvedOrganization } from "src/auth/context/jwt/auth-provider";
+
+// switchWorkspace ends in a hard reload, which jsdom cannot perform.
+const assigned = [];
+vi.stubGlobal("location", { assign: (u) => assigned.push(u), href: "/" });
 
 const ORG_A = "org-aaaa";
 const ORG_B = "org-bbbb";
@@ -109,21 +124,35 @@ describe("comment 6 — pinning a new org must not leave the previous org's deta
 });
 
 describe("comment 8 — the tab's pinned org is the last-resort owner", () => {
-  it("keeps the workspace when only sessionStorage knows the org", () => {
-    // switchWorkspace resolves orgId as
-    //   currentOrganizationId || workspace.orgId || readSessionOrgId()
-    // The first two are null before the org context settles; without the
-    // third the row is written with no owner and discarded on the next load.
-    sessionStorage.setItem("organizationId", ORG_A);
-    writeSessionWorkspace({
-      id: "ws-1",
-      name: "Analytics",
-      displayName: "Analytics",
-      role: "Owner",
-      wsLevel: 15,
-      orgId: null || null || readSessionOrgId() || null,
+  beforeEach(() => {
+    axios.post.mockReset();
+    assigned.length = 0;
+  });
+
+  it("keeps the workspace when only sessionStorage knows the org", async () => {
+    // Driven through switchWorkspace itself: inlining its orgId chain here
+    // would assert only that writeSessionWorkspace stores what it is handed,
+    // and would still pass with readSessionOrgId() removed from the chain.
+    axios.post.mockResolvedValue({
+      data: {
+        workspace: { id: "ws-1", name: "Analytics", display_name: "Analytics" },
+        user_role: "Owner",
+      },
     });
+
+    // The org context has not settled and no workspace row exists, so the
+    // first two links of the chain are null — only the pinned org is left.
+    sessionStorage.setItem("organizationId", ORG_A);
+
+    const { result } = renderHook(() => useWorkspace(), {
+      wrapper: WorkspaceProvider,
+    });
+    await act(() => result.current.switchWorkspace("ws-1", "ws-0"));
+
     expect(sessionStorage.getItem("workspaceOrgId")).toBe(ORG_A);
     expect(readSessionWorkspaceForOrg(ORG_A)?.id).toBe("ws-1");
+    // The switch ends in a hard reload; without an owner on the row the
+    // reader rejects it and the tab reseeds from the default workspace.
+    expect(assigned).toEqual(["/dashboard/develop"]);
   });
 });
