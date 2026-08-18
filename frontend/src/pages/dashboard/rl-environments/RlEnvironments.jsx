@@ -6,14 +6,18 @@ import { useNavigate } from "react-router-dom";
 import { useCreateAlkSession } from "src/api/al-environment/alEnvironment";
 import { paths } from "src/routes/paths";
 import EnvironmentsListView from "src/sections/rl-environments/EnvironmentsListView";
+import { useEnvironmentFixtures } from "src/sections/rl-environments/environmentFixtures";
 
 const RlEnvironments = () => {
   const navigate = useNavigate();
 
   const createSession = useCreateAlkSession();
+  // Swap for the real hook when GET environments exists.
+  const { environments, isLoading } = useEnvironmentFixtures();
 
   const handleOpen = useCallback(
-    (sessionId) => navigate(paths.dashboard.simulate.alEnvironmentDetail(sessionId)),
+    (sessionId) =>
+      navigate(paths.dashboard.simulate.alEnvironmentDetail(sessionId)),
     [navigate],
   );
 
@@ -24,7 +28,9 @@ const RlEnvironments = () => {
       createSession.mutate("", {
         onSuccess: (status) => {
           if (status?.session?.id) {
-            navigate(paths.dashboard.simulate.alEnvironmentDetail(status.session.id));
+            navigate(
+              paths.dashboard.simulate.alEnvironmentDetail(status.session.id),
+            );
           }
         },
       }),
@@ -45,7 +51,12 @@ const RlEnvironments = () => {
           overflow: "hidden",
         }}
       >
-        <EnvironmentsListView onOpen={handleOpen} onAdd={handleAdd} />
+        <EnvironmentsListView
+          environments={environments}
+          isLoading={isLoading}
+          onOpen={handleOpen}
+          onAdd={handleAdd}
+        />
       </Box>
     </>
   );

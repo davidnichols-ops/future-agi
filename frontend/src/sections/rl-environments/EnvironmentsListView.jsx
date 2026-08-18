@@ -113,18 +113,18 @@ function EmptyState({ title, description, action }) {
   return (
     <Box
       sx={{
-        flex: 1,
-        minHeight: 200,
+        // No panel: a bordered box stretched to the viewport left the message adrift halfway
+        // down it, and one sized to its content read as a stray band across the top. The
+        // invitation is the content, so it just sits centred below the header.
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
-        justifyContent: "center",
         gap: 1,
         textAlign: "center",
-        border: "1px solid",
-        borderColor: "divider",
-        borderRadius: 1,
-        p: 4,
+        maxWidth: 460,
+        mx: "auto",
+        pt: 12,
+        pb: 6,
       }}
     >
       <Typography typography="s1" fontWeight="fontWeightSemiBold">
@@ -281,19 +281,23 @@ const EnvironmentsListView = ({
             transcripts — tools, sub-goals and the scenarios they are graded on
           </Typography>
         </Stack>
-        <Button
-          variant="contained"
-          color="primary"
-          sx={{ px: 3, borderRadius: "4px", height: 38 }}
-          startIcon={
-            <Iconify icon="octicon:plus-24" sx={{ width: 20, height: 20 }} />
-          }
-          onClick={() => onAdd?.()}
-        >
-          <Typography typography="s1" fontWeight="fontWeightMedium">
-            Add Environment
-          </Typography>
-        </Button>
+        {/* The empty state carries its own call to action, so a second one up here is just
+            the same button twice. */}
+        {hasEnvironments && (
+          <Button
+            variant="contained"
+            color="primary"
+            sx={{ px: 3, borderRadius: "4px", height: 38 }}
+            startIcon={
+              <Iconify icon="octicon:plus-24" sx={{ width: 20, height: 20 }} />
+            }
+            onClick={() => onAdd?.()}
+          >
+            <Typography typography="s1" fontWeight="fontWeightMedium">
+              Add Environment
+            </Typography>
+          </Button>
+        )}
       </Box>
 
       {hasEnvironments && (

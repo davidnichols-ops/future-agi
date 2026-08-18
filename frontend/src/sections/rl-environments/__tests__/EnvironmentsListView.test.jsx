@@ -59,6 +59,14 @@ const chipTone = (label) =>
   screen.getByText(label).closest("[data-testid='runs-chip']")?.dataset.tone;
 
 describe("EnvironmentsListView", () => {
+  it("offers only one way to create when there is nothing yet", () => {
+    render(<EnvironmentsListView environments={[]} onAdd={vi.fn()} onOpen={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /add environment/i })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /create your first environment/i })
+    ).toBeInTheDocument();
+  });
+
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(NOW);

@@ -7,7 +7,7 @@
  * nothing else in the view needs to change.
  */
 
-export const USE_FIXTURES = true;
+export const USE_FIXTURES = false;
 
 // Timestamps are epoch SECONDS as a float (that is what the harness emits).
 // They are generated relative to module load so the "Updated" column keeps
@@ -190,7 +190,9 @@ export const ENVIRONMENT_FIXTURES = [
  * the call site. Deliberately synchronous — there is no request to make.
  */
 export const useEnvironmentFixtures = () => ({
-  environments: ENVIRONMENT_FIXTURES,
+  // The flag is what decides, so turning the placeholders off shows the real empty state
+  // rather than a list nobody can click.
+  environments: USE_FIXTURES ? ENVIRONMENT_FIXTURES : [],
   isLoading: false,
   error: null,
 });
