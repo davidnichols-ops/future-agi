@@ -44,7 +44,11 @@ class WorldWebhook:
     stays configured while every scenario still starts from its own restored copy.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0) -> None:
+    def __init__(self, host: str | None = None, port: int | None = None) -> None:
+        # A container must bind 0.0.0.0 on a fixed port or nothing outside can
+        # be configured to call it; a laptop keeps loopback and an ephemeral port.
+        host = host if host is not None else os.environ.get("HARNESS_WEBHOOK_HOST", "127.0.0.1")
+        port = port if port is not None else int(os.environ.get("HARNESS_WEBHOOK_PORT", "0"))
         self._world: GeneratedWorld | None = None
         self._lock = threading.Lock()
         try:

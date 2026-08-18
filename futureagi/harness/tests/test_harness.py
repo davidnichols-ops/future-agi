@@ -3260,3 +3260,26 @@ def test_the_platform_is_used_only_when_it_is_configured():
             os.environ.pop(name, None)
             if value is not None:
                 os.environ[name] = value
+
+
+def test_webhook_binds_where_the_environment_says(monkeypatch):
+    from harness.run.voice import WorldWebhook
+
+    monkeypatch.setenv("HARNESS_WEBHOOK_HOST", "127.0.0.1")
+    monkeypatch.setenv("HARNESS_WEBHOOK_PORT", "0")
+    webhook = WorldWebhook()
+    try:
+        assert webhook._server.server_address[0] == "127.0.0.1"
+    finally:
+        webhook._server.server_close()
+
+
+def test_webhook_arguments_beat_the_environment(monkeypatch):
+    from harness.run.voice import WorldWebhook
+
+    monkeypatch.setenv("HARNESS_WEBHOOK_PORT", "1")
+    webhook = WorldWebhook(port=0)
+    try:
+        assert webhook.port != 1
+    finally:
+        webhook._server.server_close()
