@@ -992,7 +992,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         )
 
     def supports_candidate_cursor_page(self) -> bool:
-        """Use the exact keyset fast path for a single positive user filter.
+        """Use the exact keyset fast path for a finite positive identity seed.
 
         Cursor mode normally uses the generic bounded classifier so arbitrary
         span predicates can publish a resumable prefix.  A user-detail page is
@@ -1002,14 +1002,23 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         shape through the generic root scan makes a sparse user search replay
         unrelated roots until its wall deadline.
 
-        Keep the exception deliberately narrow.  Negative/null user filters,
-        extra session/span predicates, and custom sorts retain the existing
-        bounded path and its semantics.
+        An explicit positive session-ID filter is even narrower.  The selected
+        IDs (including remap aliases) are a finite authorization-scoped seed,
+        so every other candidate-safe session/user predicate can be evaluated
+        against only those sessions.  Keeping that shape on the generic scan
+        path turns a one-session lookup into a project-wide 12-month search.
+
+        Keep both exceptions deliberately narrow.  Without a positive session
+        seed, negative/null user filters, extra session/span predicates, and
+        custom sorts retain the existing bounded path and its semantics.
         """
 
         if self.sort_params or not self.supports_candidate_first_page():
             return False
-        return self._positive_exact_end_user_detail_filter()
+        return (
+            bool(self._candidate_positive_filter_values(self._SESSION_ID_FILTER_COLS))
+            or self._positive_exact_end_user_detail_filter()
+        )
 
     def _positive_exact_end_user_detail_filter(self) -> bool:
         """Recognize only the structural user-detail membership predicate."""
@@ -2221,7 +2230,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         before_start_time: datetime | None = None,
         before_session_id: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Select an exact positive-user cursor page in stable root order.
+        """Select an exact finite-identity cursor page in stable root order.
 
         The cursor order is the same total order as the numbered default page:
         ``(session_start DESC, session_id DESC)``.  ``remaining_count`` is

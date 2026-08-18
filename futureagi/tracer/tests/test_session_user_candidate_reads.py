@@ -1663,6 +1663,94 @@ def test_positive_end_user_cursor_uses_exact_stable_keyset_query():
 
 
 @pytest.mark.unit
+def test_positive_session_cursor_uses_finite_session_seed():
+    session_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        page_size=25,
+        filters=[
+            {
+                "column_id": "trace_session_id",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": session_ids,
+                },
+            }
+        ],
+        bounded_internal_scan=True,
+    )
+
+    sql, params = builder.build_candidate_cursor_page_query()
+
+    assert builder.supports_candidate_cursor_page() is True
+    assert params["candidate_filter_session_id_array"] == session_ids
+    assert params["candidate_sess_1"] == tuple(session_ids)
+    assert "candidate_filter_sessions AS" in sql
+    assert "candidate_root_raw_session_ids AS" not in sql
+    assert "count() OVER() AS remaining_count" in sql
+
+
+@pytest.mark.unit
+def test_positive_session_cursor_can_intersect_user_membership():
+    session_id = str(uuid.uuid4())
+    end_user_id = str(uuid.uuid4())
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        page_size=25,
+        filters=[
+            {
+                "column_id": "trace_session_id",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": session_id,
+                },
+            },
+            {
+                "column_id": "end_user_id",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": [end_user_id],
+                },
+            },
+        ],
+        bounded_internal_scan=True,
+    )
+
+    sql, params = builder.build_candidate_cursor_page_query()
+
+    assert builder.supports_candidate_cursor_page() is True
+    assert params["candidate_filter_session_id_array"] == [session_id]
+    assert params["candidate_filter_user_ids"] == (end_user_id,)
+    assert "candidate_filter_sessions AS" in sql
+    assert "matching_user_sessions AS" in sql
+    assert "session_id IN (SELECT session_id FROM matching_user_sessions)" in sql
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("operator", ["not_equals", "not_in", "is_null", "is_not_null"])
+def test_non_positive_session_cursor_keeps_bounded_path(operator):
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            {
+                "column_id": "trace_session_id",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": operator,
+                    "filter_value": [str(uuid.uuid4())],
+                },
+            }
+        ],
+        bounded_internal_scan=True,
+    )
+
+    assert builder.supports_candidate_cursor_page() is False
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("operator", ["not_equals", "not_in", "is_null", "is_not_null"])
 def test_non_positive_end_user_cursor_keeps_bounded_path(operator):
     builder = SessionListQueryBuilderV2(
