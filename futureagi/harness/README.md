@@ -114,6 +114,12 @@ So the division is:
 | this service | the contract, the world, the scenarios, the gates, grading on state |
 | hosted runner | driving a simulated caller, personas, transport, reporting |
 
+**Nor can this service call the runner and collect files from it.** The runner exposes no HTTP
+port — it is a Temporal worker polling a queue, started by a workflow, and it reports
+fire-and-forget: results post to the backend's ingestion endpoint and artifacts travel as URLs,
+never as bytes in a response. This service does not need it anyway: it already copies each run's
+recordings into `runs/<run-id>/` in its own volume as the run finishes.
+
 ## What it grades on
 
 Three kinds of verdict: **code** (a `checks/<goal>.py` function returned true or false), **eval**
@@ -145,14 +151,103 @@ npm install -g @anthropic-ai/claude-code     # the SDK drives this as a subproce
 
 Then say what to test, and one message is enough to start.
 
-### Configuration
+## What it talks to
+
+Nothing in this list is optional-by-accident: each is needed for a specific stage, and the table
+says which. Only the first is needed to get the page up.
+
+| service | needed for | how it is reached |
+|---|---|---|
+| **Model provider (Vertex)** | **everything.** Every stage is a model session | `CLAUDE_CODE_USE_VERTEX` is set internally; you supply the project, region and credentials file |
+| **Store containers** it starts itself | only worlds whose store is a real database engine | the Docker API, via `DOCKER_HOST`. Attached to `ALK_DOCKER_NETWORK` and addressed by container name |
+| **The agent under test** | running scenarios | chat: in-process. Voice: the agent runs wherever it runs and calls the world webhook |
+| **A voice provider** | voice runs only | provider API, plus a publicly reachable webhook URL |
+| **The platform's eval API** | sub-goals settled by a platform eval rather than by code | the `ai-evaluation` package, over HTTP |
+
+It needs **no database**, no message broker, no cache, and no Django. It does not mount into the
+backend's ASGI stack.
+
+## Configuration
+
+Complete list of what the harness reads. Anything not here is not consulted.
+
+### Required
 
 | variable | what it does |
 |---|---|
-| `HARNESS_HOST` / `HARNESS_PORT` | where the server binds. Defaults to loopback on 8777; a container must set the host to `0.0.0.0` |
-| `ALK_HARNESS_MODEL` | which model the stages run on. Use Sonnet — smaller models misread `modality`, and modality decides the entire run path |
-| `GOOGLE_APPLICATION_CREDENTIALS`, `CLOUD_ML_REGION` | provider credentials, read from the environment and never from source |
-| `ALK_DOCKER_NETWORK` | when set, containers this service starts join that network and are addressed by container name instead of loopback |
+| `GOOGLE_APPLICATION_CREDENTIALS` | path to the Vertex service-account JSON, **as resolvable inside the container**. A host path from an env file means nothing here — mount the file and point this at where it now lives |
+| `GOOGLE_CLOUD_PROJECT` or `ANTHROPIC_VERTEX_PROJECT_ID` | the GCP project. Either works; Claude Code also falls back to the credential file |
+| `CLOUD_ML_REGION` | Vertex region. Use `global` unless you know otherwise — some models are not served regionally |
+
+### Serving
+
+| variable | default | what it does |
+|---|---|---|
+| `HARNESS_HOST` | `127.0.0.1` | where the FastAPI server binds. **A container must set `0.0.0.0`** |
+| `HARNESS_PORT` | `8777` | the UI and API port |
+
+The world webhook is **not** configured here — its host and port are constructor arguments, and
+it defaults to loopback on an ephemeral port. See "Two servers, two ports".
+
+### Models
+
+| variable | default | role |
+|---|---|---|
+| `ALK_HARNESS_MODEL` | `claude-sonnet-4-6` | the four stages. **Use Sonnet** — smaller models misread `modality`, and modality decides the entire run path |
+| `ALK_AGENT_MODEL` | `claude-sonnet-4-6` | the agent, on the chat path only |
+| `ALK_USER_MODEL` | `claude-sonnet-4-6` | the simulated person |
+| `ALK_JUDGE_MODEL` | `claude-opus-4-7` | judged sub-goals. Deliberately stronger — a judged verdict decides a pass, runs once, and nobody re-reads it |
+
+### Starting containers
+
+| variable | what it does |
+|---|---|
+| `DOCKER_HOST` | point at a socket proxy rather than mounting the daemon socket |
+| `ALK_DOCKER_NETWORK` | when set, containers this service starts join that network and are addressed **by container name**. Unset, they publish on loopback — which from inside a container is its own |
+
+### Voice
+
+| variable | what it does |
+|---|---|
+| `HARNESS_WEBHOOK_URL` | a webhook URL that is already reachable. **Set this and no tunnel is started** — which is what you want when the agent runs on the same network |
+| `VAPI_API_KEY`, `VAPI_ASSISTANT_ID` | the current voice provider. Refuses to start a voice run without them |
+| `VAPI_API_BASE_URL` | override the provider endpoint |
+| `HARNESS_VOICE_CASE` | which voice case the runner drives |
+
+`HARNESS_INSTRUCTION`, `HARNESS_SCENARIO` and `HARNESS_OUTCOME` are set **by** the harness to pass
+the scenario into the voice subprocess. Do not set them yourself — and note that this is why voice
+concurrency above one is unsafe today: they are process-wide, so two scenarios at once overwrite
+each other silently.
+
+## Where it writes, and what to mount
+
+**One directory, and it must be a volume.** Everything a session produces goes under
+`artifacts/`, a path **relative to the working directory** — so where it lands depends on
+`WORKDIR`. If sessions disappear between restarts, that is the reason.
+
+```
+artifacts/sessions/<session-id>/
+    session.json          which agent, which stage, status
+    chat.jsonl            every message in the conversation
+    contract.json         the agent's tools, arguments, rules, data
+    world.py              the generated world
+    handlers/<tool>.py    one real implementation per tool
+    state.json            the world's contents
+    sub_goals.json        what doing this correctly means
+    simulator_prompt.md   how the simulated person behaves
+    scenarios/<name>/     scenario.json, setup.py, ready.py, checks/
+    runs/<run-id>/        result.json, transcript.txt, calls.json, recordings
+```
+
+Nothing is held in memory that is not also on disk, so refreshing the page, restarting the
+process or coming back tomorrow all resume by reading this folder. That property is why the mount
+matters more than it looks: lose the volume and you lose the environment, the proved scenarios
+and every result, not just a cache.
+
+**Sizing.** A measured 30-scenario voice session came to **891 MB — of which 888 MB was `.wav`
+recordings**. Everything defining the environment and its scenarios was **under 700 KB**. So size
+the volume for audio, and note that a session minus its recordings is small enough to zip and
+send to someone.
 
 ## Running it in a container
 
@@ -192,16 +287,6 @@ name**; without it they are published on loopback, which from inside a container
 
 **8. Do not restart it mid-suite.** A run in flight is lost. Long suites are the normal case — a
 30-scenario voice suite took 69 minutes.
-
-## Storage
-
-Files, on a volume. No database, no tables, no migrations. Everything a session generates is
-loaded as text and executed, so none of it needs to be importable from disk — but the folder is
-the source of truth, and that is what makes a session something you can zip and hand to someone
-else.
-
-Recordings are the exception worth planning for: a measured session was 891 MB, of which 888 MB
-was audio and under 700 KB was everything defining the environment and its scenarios.
 
 ## Known limits
 
