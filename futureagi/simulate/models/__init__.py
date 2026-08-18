@@ -9,6 +9,7 @@ from .chat_message import ChatMessageModel
 from .chat_simulator import ChatSimulatorAssistant, ChatSimulatorSession
 from .component_evaluation import ComponentEvaluation
 from .eval_config import SimulateEvalConfig
+from .harness_session_link import HarnessSessionLink
 from .persona import Persona
 from .prompt_trial import PromptTrial
 from .run_test import RunTest
@@ -51,4 +52,5 @@ __all__ = [
     "ChatSimulatorAssistant",
     "ChatSimulatorSession",
     "TrialItemResult",
+    "HarnessSessionLink",
 ]
