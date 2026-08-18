@@ -243,10 +243,10 @@ const validateFilterValueCursor = (page, consumedCursors = new Set()) => {
 // page-fill wall below. A signed cursor always keeps the vocabulary resumable.
 export const FILTER_VALUE_REQUEST_TIMEOUT_MS = 4_800;
 // Sparse system dimensions (for example Model) are walked in exact physical
-// time-slice checkpoints. Fill one visible picker page from those checkpoints
-// while keeping the complete browser gesture below the product's ten-second
-// SLA. The signed cursor remains available when this bounded walk cannot fill
-// the page before the deadline.
+// time-slice checkpoints. Follow checkpoint-only pages until the first useful
+// result, publish it immediately, and leave every later signed checkpoint for
+// the picker's explicit Load more action. This keeps a slow later slice from
+// hiding values that the API already returned inside the ten-second SLA.
 const SYSTEM_FILTER_VALUE_PAGE_FILL_DEADLINE_MS = 9_500;
 const SYSTEM_FILTER_VALUE_PAGE_FILL_MAX_CONTINUATIONS = 12;
 
@@ -873,7 +873,7 @@ export function useDashboardFilterValues({
       knownIdentities: knownValueIdentities,
       targetRowCount:
         metricType === "system_metric"
-          ? pageSize || 10
+          ? 1
           : isFreshChainRead
             ? 1
             : pageSize || 10,
@@ -894,10 +894,10 @@ export function useDashboardFilterValues({
       isCurrent: () => !signal?.aborted,
       cancellationSignal: signal,
       startedAt: actionStartedAt,
-      // A visible system page can span several exact physical time slices.
-      // Both the initial read and each explicit Load more gesture fill up to
-      // page_size without turning the picker into an unbounded cursor drain.
-      // Other metric families retain their one-request behavior.
+      // A system gesture may cross empty exact time slices, but stops as soon
+      // as one non-empty slice is available. The public signed cursor keeps
+      // the remaining vocabulary explicitly pageable. Other metric families
+      // retain their one-request behavior.
       maxContinuations:
         metricType === "system_metric"
           ? SYSTEM_FILTER_VALUE_PAGE_FILL_MAX_CONTINUATIONS

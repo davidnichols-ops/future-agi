@@ -917,7 +917,7 @@ describe("useDashboardFilterValues bounded-read state", () => {
     expect(result.current.hasNextPage).toBe(false);
   });
 
-  it("fills initial and later system-metric pages across exact physical checkpoints", async () => {
+  it("publishes each non-empty system page without draining later checkpoints", async () => {
     const options = (start, count) =>
       Array.from({ length: count }, (_, index) => {
         const value = `model-${start + index}`;
@@ -966,8 +966,18 @@ describe("useDashboardFilterValues bounded-read state", () => {
     });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+    expect(result.current.data).toEqual(options(1, 1));
+    expect(result.current.hasNextPage).toBe(true);
+
+    await act(async () => result.current.fetchNextPage());
     await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
     expect(result.current.data).toEqual(options(1, 10));
+    expect(result.current.hasNextPage).toBe(true);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(3));
+    expect(result.current.data).toEqual(options(1, 12));
     expect(result.current.hasNextPage).toBe(true);
 
     await act(async () => result.current.fetchNextPage());

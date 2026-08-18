@@ -631,6 +631,14 @@ def read_span_system_filter_value_cursor_page(
                 (current_end - current_start) / 2,
             )
             if narrowed_width >= current_end - current_start:
+                # Earlier exact slices in this same request may already have
+                # produced selectable values. Do not discard them merely
+                # because the next, still-unconsumed floor slice is dense.
+                # Return the partial page with a checkpoint at that frontier;
+                # an explicit Load more can retry it with the accumulated
+                # seen-value proof. A first-slice failure still fails loudly.
+                if emitted:
+                    break
                 raise
             width = narrowed_width
             active_start = max(start, current_end - width)
