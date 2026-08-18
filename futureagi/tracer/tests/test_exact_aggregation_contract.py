@@ -4472,8 +4472,16 @@ def test_exact_trace_membership_exhausts_5k_identity_classifier_boundary(monkeyp
 
 
 @pytest.mark.unit
-def test_exact_trace_membership_bisects_read_budget_classifier_without_gaps(
+@pytest.mark.parametrize(
+    "classifier_error",
+    [
+        ServerException("private bounded classifier timeout", code=159),
+        ServerException("Max query size exceeded at position 262133", code=62),
+    ],
+)
+def test_exact_trace_membership_bisects_retryable_classifier_without_gaps(
     monkeypatch,
+    classifier_error,
 ):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
@@ -4535,7 +4543,7 @@ def test_exact_trace_membership_bisects_read_budget_classifier_without_gaps(
                     query_time_ms=1,
                 )
             if len(params["ids"]) > 1:
-                raise ServerException("private bounded classifier timeout", code=159)
+                raise classifier_error
             return SimpleNamespace(
                 data=[{"trace_id": params["ids"][0]}],
                 columns=["trace_id"],
@@ -5058,8 +5066,16 @@ def test_exact_trace_contribution_builder_accepts_5k_and_rejects_larger_batch():
 
 
 @pytest.mark.unit
-def test_exact_trace_graph_bisects_budget_limited_contribution_without_gaps(
+@pytest.mark.parametrize(
+    "contribution_error",
+    [
+        ServerException("private detail", code=159),
+        ServerException("Max query size exceeded at position 262133", code=62),
+    ],
+)
+def test_exact_trace_graph_bisects_retryable_contribution_without_gaps(
     monkeypatch,
+    contribution_error,
 ):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
@@ -5079,7 +5095,7 @@ def test_exact_trace_graph_bisects_budget_limited_contribution_without_gaps(
             batch_size = len(params["graph_candidate_trace_ids"])
             self.batch_sizes.append(batch_size)
             if batch_size > 2:
-                raise ServerException("private detail", code=159)
+                raise contribution_error
             return SimpleNamespace(
                 data=[
                     {

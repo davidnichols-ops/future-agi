@@ -53,7 +53,10 @@ from tracer.services.clickhouse.query_builders.session_filters import (
     build_session_id_filter_clause,
 )
 from tracer.services.clickhouse.query_builders.user_list import UserListQueryBuilder
-from tracer.services.clickhouse.read_budget import is_read_budget_error
+from tracer.services.clickhouse.read_budget import (
+    is_clickhouse_query_size_error,
+    is_read_budget_error,
+)
 from tracer.services.clickhouse.v2.id_remap_sql import (
     resolved_id_expr,
 )
@@ -884,7 +887,9 @@ def _enumerate_authoritative_anchor_trace_ids(
                 },
             )
         except Exception as exc:
-            if is_read_budget_error(exc) and len(batch) > 1:
+            if (
+                is_read_budget_error(exc) or is_clickhouse_query_size_error(exc)
+            ) and len(batch) > 1:
                 midpoint = len(batch) // 2
                 verify_root_batch(batch[:midpoint])
                 verify_root_batch(batch[midpoint:])
@@ -1034,7 +1039,9 @@ def _enumerate_exact_trace_ids(
                     },
                 )
             except Exception as exc:
-                if is_read_budget_error(exc) and len(batch) > 1:
+                if (
+                    is_read_budget_error(exc) or is_clickhouse_query_size_error(exc)
+                ) and len(batch) > 1:
                     # The classifier is identity-bounded but intentionally
                     # scans child witnesses across all time: ingestion has no
                     # maximum trace duration. A tenant can therefore make a
@@ -1442,7 +1449,9 @@ def _read_exact_filtered_trace_graph(
                 settings=EXACT_GRAPH_TRACE_CONTRIBUTION_READ_SETTINGS,
             )
         except Exception as exc:
-            if is_read_budget_error(exc) and len(batch_trace_ids) > 1:
+            if (
+                is_read_budget_error(exc) or is_clickhouse_query_size_error(exc)
+            ) and len(batch_trace_ids) > 1:
                 midpoint = len(batch_trace_ids) // 2
                 read_contribution_batch(batch_trace_ids[:midpoint])
                 read_contribution_batch(batch_trace_ids[midpoint:])

@@ -9,6 +9,7 @@ from tracer.services.clickhouse.read_budget import (
     ReadDeadlineExceeded,
     is_clickhouse_api_read_unavailable_error,
     is_clickhouse_query_error,
+    is_clickhouse_query_size_error,
     is_read_budget_error,
 )
 
@@ -45,6 +46,27 @@ def test_non_budget_codes_are_not_classified_for_either_driver() -> None:
         ClickHouseConnectDatabaseError(
             "Received ClickHouse exception, code: 62, server response: private"
         )
+    )
+
+
+def test_max_query_size_is_narrowly_classified_for_identity_batching() -> None:
+    assert is_clickhouse_query_size_error(
+        ServerException("Max query size exceeded at position 262133", code=62)
+    )
+    assert is_clickhouse_query_size_error(
+        ClickHouseConnectDatabaseError(
+            "Received ClickHouse exception, code: 62, server response: "
+            "Max query size exceeded at position 262133"
+        )
+    )
+
+
+def test_other_syntax_errors_are_not_query_size_errors() -> None:
+    assert not is_clickhouse_query_size_error(
+        ServerException("Syntax error at position 12", code=62)
+    )
+    assert not is_clickhouse_query_size_error(
+        RuntimeError("Max query size exceeded at position 262133")
     )
 
 
