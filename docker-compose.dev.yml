@@ -4,9 +4,14 @@ x-dev-worker: &dev-worker
   pull_policy: never
   volumes:
     - ./futureagi:/app/backend
+    # .env names the key by a path relative to the working directory, which lands inside the
+    # mounted source tree where no key lives. Supplied here instead, from the one copy at the
+    # repository root, and named absolutely below.
+    - ${VERTEX_CREDENTIALS:-./Vertex_AI_Creds.json}:/etc/vertex/creds.json:ro
   environment:
     FAST_STARTUP: "true"
     HARNESS_INTERNAL_URL: http://harness:8777
+    GOOGLE_APPLICATION_CREDENTIALS: /etc/vertex/creds.json
 
 services:
   frontend:
@@ -37,9 +42,12 @@ services:
     volumes:
       - ./futureagi:/app/backend
       - harness-artifacts:/app/harness-artifacts
+      # Same reason as the worker anchor above: the one key lives at the repository root.
+      - ${VERTEX_CREDENTIALS:-./Vertex_AI_Creds.json}:/etc/vertex/creds.json:ro
     environment:
       FAST_STARTUP: "true"
       HARNESS_INTERNAL_URL: http://harness:8777
+      GOOGLE_APPLICATION_CREDENTIALS: /etc/vertex/creds.json
       HARNESS_LINKS_DIR: /app/harness-artifacts/platform-links
 
   # agentcc-gateway, serving, and code-executor are separate services we
