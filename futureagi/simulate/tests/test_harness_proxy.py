@@ -12,9 +12,10 @@ Tests cover:
 """
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
+from asgiref.sync import async_to_sync
 from django.urls import reverse
 
 from simulate.models import HarnessSessionLink
@@ -24,6 +25,13 @@ STATUS_PAYLOAD = {"session": {"id": "abc123"}, "stage": "build", "busy": False}
 
 def _url(path):
     return reverse("simulate:harness-proxy", kwargs={"path": path})
+
+
+def _drain(response):
+    async def collect():
+        return b"".join([chunk async for chunk in response.streaming_content])
+
+    return async_to_sync(collect)()
 
 
 def test_anonymous_requests_are_rejected(api_client):
@@ -66,7 +74,9 @@ def test_harness_errors_pass_through(mock_request, auth_client):
         json={"error": "still working on the last thing"},
         headers={"content-type": "application/json"},
     )
-    answered = auth_client.post(_url("stage"), data={}, format="json")
+    answered = auth_client.post(
+        _url("stage"), data=json.dumps({}), content_type="application/json"
+    )
     assert answered.status_code == 409
     assert "run_test_id" not in answered.json()
 
@@ -95,3 +105,27 @@ def test_non_post_to_streaming_paths_is_405(mock_request, auth_client):
     answered = auth_client.get(_url("say"))
     assert answered.status_code == 405
     mock_request.assert_not_called()
+
+
+@patch("simulate.views.harness_proxy.httpx.Client")
+def test_sse_stream_relays_chunks(mock_client_cls, auth_client):
+    chunks = [b'data: {"kind": "text"}\n\n', b'data: {"kind": "status"}\n\n']
+    upstream = MagicMock()
+    upstream.status_code = 200
+    upstream.headers = {}
+    upstream.iter_bytes.return_value = iter(chunks)
+
+    stream_cm = MagicMock()
+    stream_cm.__enter__.return_value = upstream
+    stream_cm.__exit__.return_value = None
+
+    mock_client = MagicMock()
+    mock_client.stream.return_value = stream_cm
+    mock_client_cls.return_value = mock_client
+
+    answered = auth_client.post(
+        _url("say"), data=json.dumps({}), content_type="application/json"
+    )
+    assert answered.status_code == 200
+    assert answered["Content-Type"] == "text/event-stream"
+    assert _drain(answered) == b"".join(chunks)

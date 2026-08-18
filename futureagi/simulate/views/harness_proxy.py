@@ -1,6 +1,7 @@
 import json
 
 import httpx
+from asgiref.sync import sync_to_async
 from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from rest_framework.negotiation import BaseContentNegotiation
 from rest_framework.permissions import IsAuthenticated
@@ -47,7 +48,7 @@ class HarnessProxyView(APIView):
 
     def _forward(self, request, path):
         path = path.strip("/")
-        if not path or ".." in path:
+        if not path or ".." in path or "%" in path:
             return JsonResponse({"error": "unknown harness path"}, status=404)
         url = f"{resolve_harness_internal_url()}/api/{path}"
         body, links = self._body_and_links(request, path)
@@ -100,7 +101,10 @@ class HarnessProxyView(APIView):
         if session.get("id"):
             HarnessSessionLink.objects.update_or_create(
                 session_id=session["id"],
-                defaults={key: value for key, value in links.items() if value},
+                defaults={
+                    "run_test_id": links.get("run_test_id"),
+                    "execution_id": links.get("execution_id"),
+                },
             )
 
     def _enrich(self, path, payload):
@@ -152,11 +156,32 @@ class HarnessProxyView(APIView):
                 content_type=upstream.headers.get("content-type", "application/json"),
             )
 
-        def relay():
-            try:
-                yield from upstream.iter_bytes()
-            finally:
-                stream.__exit__(None, None, None)
-                client.close()
+        chunks = upstream.iter_bytes()
+        done = object()
 
-        return StreamingHttpResponse(relay(), content_type="text/event-stream")
+        def pull():
+            try:
+                return next(chunks)
+            except StopIteration:
+                return done
+
+        def close():
+            stream.__exit__(None, None, None)
+            client.close()
+
+        async def relay():
+            # Chunk pulls run off the thread-sensitive executor, so one long
+            # suite cannot serialize every other request on the worker.
+            step = sync_to_async(pull, thread_sensitive=False)
+            try:
+                while (chunk := await step()) is not done:
+                    yield chunk
+            finally:
+                await sync_to_async(close, thread_sensitive=False)()
+
+        response = StreamingHttpResponse(relay(), content_type="text/event-stream")
+        # A buffering reverse proxy in front would reintroduce exactly the
+        # problem this generator exists to avoid.
+        response["Cache-Control"] = "no-cache"
+        response["X-Accel-Buffering"] = "no"
+        return response
