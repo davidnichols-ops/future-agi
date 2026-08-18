@@ -23,7 +23,7 @@ STATUS_PAYLOAD = {"session": {"id": "abc123"}, "stage": "build", "busy": False}
 
 
 def _url(path):
-    return reverse("harness-proxy", kwargs={"path": path})
+    return reverse("simulate:harness-proxy", kwargs={"path": path})
 
 
 def test_anonymous_requests_are_rejected(api_client):
