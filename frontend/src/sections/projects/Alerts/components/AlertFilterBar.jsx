@@ -12,7 +12,6 @@ import {
   SPAN_TYPE_PROPERTY,
   toPanelRows,
   toFormRows,
-  toPanelType,
 } from "./alertFilterRows";
 
 const OP_DISPLAY = {
@@ -92,22 +91,18 @@ FilterChip.propTypes = {
 };
 
 export default function AlertFilterBar({ control, setValue, projectId }) {
-  const anchorRef = useRef();
+  const buttonRef = useRef();
   const [open, setOpen] = useState(false);
 
   const formFilters = useWatch({ control, name: "filters" });
 
-  // Typed attribute inventory. Passing `properties` to the panel also stops it
-  // fetching its own, which is workspace-scoped and returns nothing for
-  // projects without a workspace.
+  // Passing `properties` also stops the panel fetching its own, which is
+  // workspace-scoped and returns nothing for projects without a workspace.
   const { data: attributes = [] } = useQuery({
-    queryKey: ["eval-attributes-typed", projectId],
+    queryKey: ["eval-attributes", projectId],
     queryFn: () =>
       axios.get(endpoints.project.getEvalAttributeList(), {
-        params: {
-          filters: JSON.stringify({ project_id: projectId }),
-          include_types: true,
-        },
+        params: { filters: JSON.stringify({ project_id: projectId }) },
       }),
     enabled: !!projectId,
     select: (data) => data.data?.result ?? [],
@@ -116,12 +111,15 @@ export default function AlertFilterBar({ control, setValue, projectId }) {
   const properties = useMemo(
     () => [
       SPAN_TYPE_PROPERTY,
-      ...attributes.map((attr) => ({
-        id: attr.key,
-        name: attr.key,
+      // The API does not say what an attribute holds, so the row carries a
+      // Type the user picks, defaulting to text as the old form did.
+      ...attributes.map((key) => ({
+        id: key,
+        name: key,
         category: "attribute",
         rawCategory: "custom_attribute",
-        type: toPanelType(attr.type),
+        type: "text",
+        typeSelectable: true,
         apiColType: "SPAN_ATTRIBUTE",
       })),
     ],
@@ -158,7 +156,6 @@ export default function AlertFilterBar({ control, setValue, projectId }) {
 
   return (
     <Box
-      ref={anchorRef}
       sx={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 1 }}
     >
       {panelFilters.map((filter, index) => (
@@ -171,6 +168,7 @@ export default function AlertFilterBar({ control, setValue, projectId }) {
       ))}
 
       <Button
+        ref={buttonRef}
         startIcon={<Iconify color="text.primary" icon="material-symbols:add" />}
         onClick={() => setOpen(true)}
         variant="text"
@@ -190,7 +188,7 @@ export default function AlertFilterBar({ control, setValue, projectId }) {
       </Button>
 
       <TraceFilterPanel
-        anchorEl={anchorRef?.current}
+        anchorEl={buttonRef?.current}
         open={open}
         onClose={() => setOpen(false)}
         currentFilters={panelFilters}
@@ -200,6 +198,7 @@ export default function AlertFilterBar({ control, setValue, projectId }) {
         projectId={projectId}
         showAi={false}
         showQueryTab={false}
+        panelWidth={720}
       />
     </Box>
   );

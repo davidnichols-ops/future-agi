@@ -42,6 +42,7 @@ import { SpanTypes } from "src/utils/constant";
 import { useDashboardFilterValues } from "src/hooks/useDashboards";
 import { useDebounce } from "src/hooks/use-debounce";
 import { useAIFilter } from "src/hooks/use-ai-filter";
+import { FILTER_INPUT_TYPES } from "src/utils/constants";
 import { QueryInput } from "src/components/filter-panel";
 import {
   getPickerOptionExactMatches,
@@ -445,6 +446,8 @@ export const hasIncompleteNumericRow = (rows) =>
   });
 
 // Scalar ops — value picker forces single-select. Multi-value goes via in/not_in.
+const USER_SELECTABLE_TYPES = new Set(["text", "number", "boolean"]);
+
 const SINGLE_VALUE_OPS = new Set([
   "equals",
   "not_equals",
@@ -984,8 +987,7 @@ function ValuePicker({
   // page can only be found by the backend. Other field types keep
   // client-side filtering of the fetched page.
   const usesBackendSearch =
-    !hasStaticChoices &&
-    (isIdOnlyField || metricType === "custom_attribute");
+    !hasStaticChoices && (isIdOnlyField || metricType === "custom_attribute");
 
   // Primary: dashboard API values
   const {
@@ -1441,6 +1443,18 @@ function FilterRow({
 
   const handlePropertySelect = useCallback(
     (prop) => {
+      // When the row owns its type, swapping the property must not reset it —
+      // the type is the user's choice, not a fact about the field.
+      if (prop.typeSelectable && USER_SELECTABLE_TYPES.has(filter.fieldType)) {
+        onChange(index, {
+          ...filter,
+          field: prop.id,
+          fieldName: prop.name,
+          fieldCategory: prop.category,
+          apiColType: prop.apiColType,
+        });
+        return;
+      }
       // Preserve custom annotation types (categorical, thumbs, text) —
       // normalizeFieldType would collapse them to "string" losing
       // operator/input specificity.
@@ -1471,7 +1485,7 @@ function FilterRow({
         value: defaultValue,
       });
     },
-    [index, onChange, defaultOperatorForType],
+    [index, filter, onChange, defaultOperatorForType],
   );
 
   const handleOperatorChange = useCallback(
@@ -1504,6 +1518,19 @@ function FilterRow({
       onChange(index, { ...filter, operator: newOp, value: newVal });
     },
     [index, filter, selectedProp, safeOperator, isNumber, isDate, onChange],
+  );
+
+  const handleTypeChange = useCallback(
+    (e) => {
+      const fieldType = e.target.value;
+      onChange(index, {
+        ...filter,
+        fieldType,
+        operator: DEFAULT_OP_FOR_TYPE[fieldType] || "equals",
+        value: fieldType === "boolean" ? "true" : "",
+      });
+    },
+    [index, filter, onChange],
   );
 
   const renderValueInput = () => {
@@ -1801,6 +1828,26 @@ function FilterRow({
         categories={categories}
         onSelect={handlePropertySelect}
       />
+
+      {selectedProp?.typeSelectable && (
+        <Select
+          size="small"
+          value={filter.fieldType}
+          onChange={handleTypeChange}
+          sx={{
+            flex: "0 1 104px",
+            minWidth: 84,
+            fontSize: 12,
+            height: 28,
+          }}
+        >
+          {FILTER_INPUT_TYPES.map((t) => (
+            <MenuItem key={t.value} value={t.value} sx={{ fontSize: 12 }}>
+              {t.label}
+            </MenuItem>
+          ))}
+        </Select>
+      )}
 
       <Select
         size="small"

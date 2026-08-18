@@ -29,24 +29,23 @@ export const CATEGORIES = [
   { key: "attribute", label: "Attributes" },
 ];
 
-// CH reports the type from which typed map the key lives in; the panel's
-// operator sets are keyed off its own vocabulary.
-const PANEL_TYPE_BY_ATTR_TYPE = {
-  number: "number",
-  boolean: "boolean",
-  string: "text",
-};
-
 const FILTER_TYPE_BY_PANEL_TYPE = {
   number: "number",
   boolean: "boolean",
 };
 
 export const toPanelType = (filterType) =>
-  PANEL_TYPE_BY_ATTR_TYPE[filterType] || "text";
+  FILTER_TYPE_BY_PANEL_TYPE[filterType] || "text";
 
 const toFilterType = (panelType) =>
   FILTER_TYPE_BY_PANEL_TYPE[panelType] || "text";
+
+// The panel's boolean control works in the strings "true"/"false"; the API
+// takes a native bool and drops the condition outright if given anything else.
+const toPanelBool = (value) =>
+  typeof value === "boolean" ? String(value) : value;
+const toApiBool = (value) =>
+  value === "true" ? true : value === "false" ? false : value;
 
 /**
  * Form rows → panel rows.
@@ -74,7 +73,10 @@ export const toPanelRows = (formRows = []) => {
       fieldType: toPanelType(row?.filterConfig?.filterType),
       apiColType: "SPAN_ATTRIBUTE",
       operator: row?.filterConfig?.filterOp || "equals",
-      value: row?.filterConfig?.filterValue ?? "",
+      value:
+        row?.filterConfig?.filterType === "boolean"
+          ? toPanelBool(row?.filterConfig?.filterValue)
+          : row?.filterConfig?.filterValue ?? "",
     });
   });
 
@@ -141,14 +143,16 @@ export const toFormRows = (panelRows = []) => {
       row.value,
     );
 
+    const filterType = toFilterType(row.fieldType);
+
     out.push({
       id: getRandomId(),
       propertyId: row.field,
       property: "attributes",
       filterConfig: {
-        filterType: toFilterType(row.fieldType),
+        filterType,
         filterOp: operator,
-        filterValue: value,
+        filterValue: filterType === "boolean" ? toApiBool(value) : value,
       },
     });
   });

@@ -153,6 +153,30 @@ describe("alert filter bar round-trip", () => {
     });
   });
 
+  it("bridges boolean values between the panel and the API", () => {
+    // The panel's boolean control works in "true"/"false"; the API takes a
+    // native bool and silently drops the condition given anything else.
+    const saved = transformFilterResponse({
+      observation_type: [],
+      span_attributes_filters: [
+        {
+          column_id: "cache_hit",
+          filter_config: {
+            filter_type: "boolean",
+            filter_op: "equals",
+            filter_value: true,
+            col_type: "SPAN_ATTRIBUTE",
+          },
+        },
+      ],
+    });
+
+    expect(toPanelRows(saved)[0].value).toBe("true");
+    expect(toFormRows(toPanelRows(saved))[0].filterConfig.filterValue).toBe(
+      true,
+    );
+  });
+
   it("drops attribute rows with no selected property", () => {
     expect(toPanelRows([{ property: "attributes", propertyId: "" }])).toEqual(
       [],
