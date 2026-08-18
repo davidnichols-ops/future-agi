@@ -75,11 +75,7 @@ class SessionComparisonChatSimView(APIView):
 
         if is_voice:
             # Voice replay: look for baseline trace ID
-            trace_id = resolve_baseline_id(
-                metadata,
-                is_replay=True,
-                simulation_call_type=CallExecution.SimulationCallType.VOICE,
-            )
+            trace_id = resolve_baseline_id(metadata, is_replay=True)
             if trace_id:
                 return trace_id, "trace"
 
@@ -100,15 +96,7 @@ class SessionComparisonChatSimView(APIView):
 
             raise ValidationError("Comparison is only available for replay sessions")
 
-        # Chat replay: only a real session_id is usable here. The chat pipeline
-        # resolves the baseline into Postgres Trace rows by session, so a
-        # voice-shaped trace_id would match nothing and render an empty
-        # baseline as a successful comparison — fail loudly instead.
-        session_id = resolve_baseline_id(
-            metadata,
-            is_replay=True,
-            simulation_call_type=CallExecution.SimulationCallType.TEXT,
-        )
+        session_id = resolve_baseline_id(metadata, is_replay=True)
         if not session_id:
             raise ValidationError("No session ID found for comparison")
         return session_id, "session"

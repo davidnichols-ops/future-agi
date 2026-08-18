@@ -2349,11 +2349,7 @@ class TestExecutionDetailView(APIView):
                 )
 
             # Bulk fetch dataset baseline ids (Row.metadata) for this page to avoid N+1.
-            # Track each row's modality alongside: the baseline key that counts
-            # differs per modality, so resolving without it marks chat rows
-            # comparable off a voice-only trace_id.
             row_ids = set()
-            row_call_types = {}
             for call_execution in paginated_calls:
                 row_id = getattr(call_execution, "row_id", None)
                 if (
@@ -2364,10 +2360,6 @@ class TestExecutionDetailView(APIView):
                     row_id = call_execution.call_metadata.get("row_id")
                 if row_id:
                     row_ids.add(str(row_id))
-                    row_call_types.setdefault(
-                        str(row_id),
-                        getattr(call_execution, "simulation_call_type", None),
-                    )
 
             # Check if any scenario is from a replay session — only query if
             # there are scenario IDs to avoid a pointless DB hit
@@ -2385,11 +2377,7 @@ class TestExecutionDetailView(APIView):
                 for row_id, metadata in Row.all_objects.filter(
                     id__in=row_ids
                 ).values_list("id", "metadata"):
-                    baseline_id = resolve_baseline_id(
-                        metadata,
-                        is_replay=is_replay,
-                        simulation_call_type=row_call_types.get(str(row_id)),
-                    )
+                    baseline_id = resolve_baseline_id(metadata, is_replay=is_replay)
                     if baseline_id:
                         row_session_id_map[str(row_id)] = baseline_id
 
@@ -3198,11 +3186,7 @@ class CallExecutionDetailView(APIView):
                         metadata__created_from="replay_session",
                     ).exists()
                 )
-                baseline_id = resolve_baseline_id(
-                    metadata,
-                    is_replay=is_replay,
-                    simulation_call_type=call_execution.simulation_call_type,
-                )
+                baseline_id = resolve_baseline_id(metadata, is_replay=is_replay)
                 if baseline_id:
                     row_session_id_map[str(row_id)] = baseline_id
 
@@ -7500,29 +7484,20 @@ def add_trace_details_to_call_executions(call_executions):
     # Add the dataset baseline id (from Row.metadata) to grouped/flattened call
     # executions. We only do one Row query for the whole page to avoid N+1.
     # Routed through resolve_baseline_id so this path agrees with the list and
-    # detail views; reading session_id directly hid the voice baseline (stored
-    # under trace_id) and never lit the button for voice rows.
+    # detail views.
     row_ids = set()
-    row_call_types = {}
     for call_execution in call_executions_dict.values():
         call_metadata = call_execution.get("call_metadata") or {}
         row_id = call_execution.get("row_id") or call_metadata.get("row_id")
         if row_id:
             row_ids.add(str(row_id))
-            row_call_types.setdefault(
-                str(row_id), call_execution.get("simulation_call_type")
-            )
 
     row_session_id_map = {}
     if row_ids:
         for row_id, metadata in Row.all_objects.filter(id__in=row_ids).values_list(
             "id", "metadata"
         ):
-            baseline_id = resolve_baseline_id(
-                metadata,
-                is_replay=False,
-                simulation_call_type=row_call_types.get(str(row_id)),
-            )
+            baseline_id = resolve_baseline_id(metadata, is_replay=False)
             if baseline_id:
                 row_session_id_map[str(row_id)] = baseline_id
 
