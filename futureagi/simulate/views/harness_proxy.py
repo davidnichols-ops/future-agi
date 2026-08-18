@@ -2,6 +2,7 @@ import json
 
 import httpx
 from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
+from rest_framework.negotiation import BaseContentNegotiation
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 
@@ -10,6 +11,17 @@ from simulate.services.harness_client import NON_STREAMING_TIMEOUT, resolve_harn
 
 # SSE responses; everything else is JSON (or a recording, passed through as-is).
 STREAMING_PATHS = frozenset({"say", "run"})
+
+
+class _PassthroughNegotiation(BaseContentNegotiation):
+    """The upstream harness decides the response shape, so the Accept header
+    must not be able to 406 a request before it is even forwarded."""
+
+    def select_parser(self, request, parsers):
+        return parsers[0] if parsers else None
+
+    def select_renderer(self, request, renderers, format_suffix=None):
+        return (renderers[0], renderers[0].media_type)
 
 
 class HarnessProxyView(APIView):
@@ -22,6 +34,7 @@ class HarnessProxyView(APIView):
     """
 
     permission_classes = [IsAuthenticated]
+    content_negotiation_class = _PassthroughNegotiation
 
     def get(self, request, path=""):
         return self._forward(request, path)
@@ -39,6 +52,8 @@ class HarnessProxyView(APIView):
         url = f"{resolve_harness_internal_url()}/api/{path}"
         body, links = self._body_and_links(request, path)
         if path in STREAMING_PATHS:
+            if request.method != "POST":
+                return JsonResponse({"error": "method not allowed"}, status=405)
             return self._stream(url, body)
         try:
             answered = httpx.request(
