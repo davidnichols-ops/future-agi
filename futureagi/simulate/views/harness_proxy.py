@@ -7,7 +7,7 @@ from rest_framework.negotiation import BaseContentNegotiation
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 
-from simulate.models import HarnessSessionLink
+from simulate.services import harness_links
 from simulate.services.harness_client import NON_STREAMING_TIMEOUT, resolve_harness_internal_url
 
 # SSE responses; everything else is JSON (or a recording, passed through as-is).
@@ -99,12 +99,8 @@ class HarnessProxyView(APIView):
             return
         session = (payload or {}).get("session") or {}
         if session.get("id"):
-            HarnessSessionLink.objects.update_or_create(
-                session_id=session["id"],
-                defaults={
-                    "run_test_id": links.get("run_test_id"),
-                    "execution_id": links.get("execution_id"),
-                },
+            harness_links.remember(
+                session["id"], links.get("run_test_id"), links.get("execution_id")
             )
 
     def _enrich(self, path, payload):
@@ -119,23 +115,13 @@ class HarnessProxyView(APIView):
             self._attach_all(payload.get("environments") or [], "session_id")
 
     def _attach_all(self, rows, key):
-        wanted = [one.get(key) for one in rows if one.get(key)]
-        found = {
-            link.session_id: link
-            for link in HarnessSessionLink.objects.filter(session_id__in=wanted)
-        }
         for one in rows:
-            link = found.get(one.get(key))
-            one["run_test_id"] = link.run_test_id if link else None
-            one["execution_id"] = link.execution_id if link else None
+            self._attach(one, one.get(key))
 
     def _attach(self, target, session_id):
-        try:
-            link = HarnessSessionLink.objects.get(session_id=session_id) if session_id else None
-        except HarnessSessionLink.DoesNotExist:
-            link = None
-        target["run_test_id"] = link.run_test_id if link else None
-        target["execution_id"] = link.execution_id if link else None
+        link = harness_links.lookup(session_id)
+        target["run_test_id"] = link.get("run_test_id")
+        target["execution_id"] = link.get("execution_id")
 
     def _stream(self, url, body):
         # No read timeout: a stage or a suite legitimately streams for minutes.

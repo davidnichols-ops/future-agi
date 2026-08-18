@@ -4,7 +4,7 @@ API tests for HarnessProxyView.
 Tests cover:
 - Auth gating (anonymous rejected)
 - Response enrichment with platform run_test/execution ids
-- Platform ids stripped from the forwarded body and persisted to HarnessSessionLink
+- Platform ids stripped from the forwarded body and persisted via harness_links
 - Harness error/timeout passthrough (409, 502)
 - Path traversal refusal
 - SSE Accept header not triggering DRF content negotiation 406
@@ -15,12 +15,18 @@ import json
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 from asgiref.sync import async_to_sync
 from django.urls import reverse
 
-from simulate.models import HarnessSessionLink
+from simulate.services import harness_links
 
 STATUS_PAYLOAD = {"session": {"id": "abc123"}, "stage": "build", "busy": False}
+
+
+@pytest.fixture(autouse=True)
+def links_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_LINKS_DIR", str(tmp_path / "platform-links"))
 
 
 def _url(path):
@@ -40,9 +46,7 @@ def test_anonymous_requests_are_rejected(api_client):
 
 @patch("simulate.views.harness_proxy.httpx.request")
 def test_status_is_enriched_with_platform_ids(mock_request, auth_client):
-    HarnessSessionLink.objects.create(
-        session_id="abc123", run_test_id="rt-1", execution_id="ex-1"
-    )
+    harness_links.remember("abc123", "rt-1", "ex-1")
     mock_request.return_value = httpx.Response(
         200, json=STATUS_PAYLOAD, headers={"content-type": "application/json"}
     )
@@ -63,8 +67,7 @@ def test_session_creation_strips_and_stores_platform_ids(mock_request, auth_clie
     )
     forwarded = mock_request.call_args.kwargs["json"]
     assert "run_test_id" not in forwarded and forwarded == {"agent": "support"}
-    link = HarnessSessionLink.objects.get(session_id="abc123")
-    assert (link.run_test_id, link.execution_id) == ("rt-9", "ex-9")
+    assert harness_links.lookup("abc123") == {"run_test_id": "rt-9", "execution_id": "ex-9"}
 
 
 @patch("simulate.views.harness_proxy.httpx.request")
