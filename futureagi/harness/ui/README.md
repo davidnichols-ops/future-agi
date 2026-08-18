@@ -60,8 +60,15 @@ Open **http://localhost:8777**, press **+ new**, and say what you want tested:
 i want to test my voice ordering agent. the code is at /absolute/path/to/the/agent
 ```
 
-One message is enough to begin. Reception takes the path out of the sentence and hands straight
-over to reading the agent. From there it is a conversation:
+Or paste a public GitHub repository URL. The harness shallow-clones it into that session's
+`source/` directory before it starts reading it; no local clone is required:
+
+```
+i want to test https://github.com/example/voice-agent
+```
+
+One message is enough to begin. Reception takes the path or URL out of the sentence and hands
+straight over to reading the agent. From there it is a conversation:
 
 ```
 now build the environment for it

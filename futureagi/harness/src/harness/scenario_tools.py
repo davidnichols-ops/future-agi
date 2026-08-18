@@ -188,6 +188,10 @@ def scenario_tools(
     simulator_prompt = load_simulator_prompt(destination)
     target = {"count": wanted}
 
+    scenario_required = ["name", "instruction", "solution", "sub_goals"]
+    if contract.conversational:
+        scenario_required.append("persona")
+
     @tool(
         "inspect_world",
         "Look at what is in the world. Without a table, lists the tables and how many rows each "
@@ -328,9 +332,38 @@ def scenario_tools(
                     "description": "The task, written to the person the agent is serving. For a "
                     "conversational agent this fills the simulator prompt's slot.",
                 },
+                "persona": {
+                    "type": "object",
+                    "description": "Who the simulated person is, separate from the task. Use "
+                    "the established voice-scenario shape and only grounded, test-relevant "
+                    "details. This fills the simulator prompt's persona slot.",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "gender": {"type": "string"},
+                        "age_group": {"type": "string"},
+                        "occupation": {"type": "string"},
+                        "location": {"type": "string"},
+                        "personality": {"type": "string"},
+                        "communication_style": {"type": "string"},
+                        "keywords": {"type": "array", "items": {"type": "string"}},
+                        "languages": {"type": "array", "items": {"type": "string"}},
+                        "accent": {"type": "string"},
+                        "multilingual": {"type": "boolean"},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": [
+                        "name",
+                        "personality",
+                        "communication_style",
+                        "languages",
+                        "accent",
+                        "keywords",
+                    ],
+                },
                 "variables": {
                     "type": "object",
-                    "description": "Any other slot the simulator prompt asks for, by name.",
+                    "description": "Any other slot the simulator prompt asks for, by name. Do "
+                    "not put persona here; use the structured persona field.",
                 },
                 "setup_code": {
                     "type": "string",
@@ -369,7 +402,7 @@ def scenario_tools(
                 },
                 "max_turns": {"type": "integer"},
             },
-            ["name", "instruction", "solution", "sub_goals"],
+            scenario_required,
         ),
     )
     async def submit_scenario(args: dict[str, Any]) -> dict[str, Any]:

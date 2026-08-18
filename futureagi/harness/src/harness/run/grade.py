@@ -35,7 +35,7 @@ from ..scenario import Scenario
 from ..session import Stage
 from ..tools import qualified
 from ..checks import Outcome, run_check
-from ..catalogue import Catalogue
+from ..catalogue import Catalogue, SuiteEval
 from ..world.runtime import GeneratedWorld
 from .conversation import Transcript
 
@@ -150,6 +150,17 @@ def _claims(scenario: Scenario, catalogue: Catalogue) -> list[tuple[str, str]]:
     return judged
 
 
+def _record(scenario: Scenario, transcript: Transcript, ending: str) -> dict[str, str]:
+    """The evidence every Future AGI evaluation gets for one scenario."""
+    return {
+        "what_the_person_was_asked_to_do": scenario.instruction,
+        "what_the_agent_did": transcript.actions(),
+        "what_was_said": transcript.spoken() or "(nothing was said)",
+        "how_it_ended": transcript.ended,
+        "the_world_afterwards": ending,
+    }
+
+
 def _judge_prompt(contract: AgentContract) -> str:
     return (
         "You are grading one run of an agent under test. You are given three kinds of evidence: "
@@ -220,13 +231,7 @@ def _on_platform(
     # whether an answer was right, because the answer's truth is in what the tools returned, and
     # it says so rather than guessing: the verdict then reads as a failure of the agent when it
     # was a failure to show the eval the run.
-    record = {
-        "what_the_person_was_asked_to_do": scenario.instruction,
-        "what_the_agent_did": transcript.actions(),
-        "what_was_said": transcript.spoken() or "(nothing was said)",
-        "how_it_ended": transcript.ended,
-        "the_world_afterwards": ending,
-    }
+    record = _record(scenario, transcript, ending)
     verdicts: list[Judgement] = []
     for claim, name in claims:
         eval_name = platform_evals.eval_name(contract.agent, name)
@@ -245,6 +250,64 @@ def _on_platform(
                 holds=bool(answered["held"]),
                 why=answered["why"],
                 by=f"{eval_name} ({answered['model']})",
+            )
+        )
+    return verdicts
+
+
+def judge_suite_evals(
+    suite_evals: list[SuiteEval],
+    scenario: Scenario,
+    transcript: Transcript,
+    contract: AgentContract,
+    *,
+    ending: str = "",
+) -> list[Judgement]:
+    """Run the configured Future AGI eval pack for every scenario.
+
+    These are intentionally platform-only. A missing account must not silently turn reusable,
+    versioned templates into private, ad-hoc local judgements.
+    """
+    from . import platform_evals
+
+    if contract.modality != "voice" or not suite_evals or not platform_evals.configured():
+        return []
+    verdicts: list[Judgement] = []
+    for suite_eval in suite_evals:
+        inputs = {
+            "conversation": transcript.spoken() or "(nothing was said)",
+            "agent_prompt": contract.system_prompt_excerpt,
+        }
+        missing = [name for name in suite_eval.required_inputs if not inputs.get(name)]
+        if missing:
+            logging.getLogger(__name__).warning(
+                "platform suite eval %s skipped: missing %s", suite_eval.name, ", ".join(missing)
+            )
+            continue
+        try:
+            answered = platform_evals.judge_builtin(
+                suite_eval.name,
+                {name: inputs[name] for name in suite_eval.required_inputs},
+            )
+        except Exception as failed:  # noqa: BLE001 - one unavailable eval must not lose the run
+            logging.getLogger(__name__).warning(
+                "platform suite eval %s unavailable: %s", suite_eval.name, failed
+            )
+            continue
+        output = answered["output"]
+        choice = output.get("choice") if isinstance(output, dict) else None
+        holds = (
+            int(choice) >= suite_eval.minimum_score
+            if suite_eval.minimum_score is not None and str(choice).isdigit()
+            else platform_evals._passed(output)
+        )
+        verdicts.append(
+            Judgement(
+                claim=suite_eval.name,
+                kind=suite_eval.name,
+                holds=holds,
+                why=answered["why"],
+                by=f"{suite_eval.name} ({answered['model']})",
             )
         )
     return verdicts

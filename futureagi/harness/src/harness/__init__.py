@@ -13,6 +13,7 @@ code, and where an agent comes from is a registered source, so a new kind of age
 rather than a new code path.
 """
 
+from .chat import Conversation, open_conversation
 from .config import (
     DEFAULT_MODEL,
     artifact_dir,
@@ -20,12 +21,12 @@ from .config import (
     provider_env,
     read_only_session,
 )
-from .chat import Conversation, open_conversation
 from .contract import AgentContract, ToolSpec, validate_contract
 from .scenario import Scenario, validate_scenario
 from .session import Stage, Turn
 from .sources import (
     AgentSource,
+    GitHubSource,
     RepoSource,
     SpecSource,
     register_source,
@@ -39,6 +40,7 @@ __all__ = [
     "AgentSource",
     "Conversation",
     "DEFAULT_MODEL",
+    "GitHubSource",
     "RepoSource",
     "Scenario",
     "SpecSource",

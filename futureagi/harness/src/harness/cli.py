@@ -344,7 +344,7 @@ async def _chat(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="harness", description=__doc__)
+    parser = argparse.ArgumentParser(prog="agent-harness", description=__doc__)
     # Talking to it is the way in, so that is what happens when you just start it.
     sub = parser.add_subparsers(dest="stage", required=False)
 

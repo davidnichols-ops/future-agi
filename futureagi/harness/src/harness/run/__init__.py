@@ -30,6 +30,7 @@ from .grade import (
     checkpoints,
     grade_sub_goals,
     judge,
+    judge_suite_evals,
     summarise,
 )
 from .targets import LocalAgent, Target, register_target, resolve, supported
@@ -189,6 +190,9 @@ async def run_scenario(
         )
         judgements, judged_cost = await judge(
             scenario, transcript, contract, catalogue, model=model, ending=ending
+        )
+        judgements += judge_suite_evals(
+            catalogue.suite_evals, scenario, transcript, contract, ending=ending
         )
         return Result(
             scenario=scenario.name,

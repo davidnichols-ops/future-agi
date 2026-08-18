@@ -110,7 +110,7 @@ def transcript_since(started: float) -> str:
     any of the call. Only a report written after this run started counts — the newest file on
     disk is otherwise last week's call wearing today's verdict.
     """
-    root = Path("artifacts/simulation-acceptance")
+    root = ARTIFACTS_ROOT / "simulation-acceptance"
     if not root.exists():
         return ""
     newest: tuple[float, Path] | None = None
@@ -452,7 +452,7 @@ def recording_since(started: float, into: Path) -> str:
     files it wrote are found the same way the transcript is, by being newer than the moment this
     run began, and the one worth keeping is copied in beside the result.
     """
-    root = Path("artifacts/simulation-acceptance")
+    root = ARTIFACTS_ROOT / "simulation-acceptance"
     if not root.exists():
         return ""
     fresh = [
@@ -473,3 +473,4 @@ def recording_since(started: float, into: Path) -> str:
     landed = into / f"recording{chosen.suffix}"
     shutil.copyfile(chosen, landed)
     return str(landed)
+from ..config import ARTIFACTS_ROOT

@@ -8,10 +8,6 @@ It also carries a **solution**: what a correct agent would do. That is not decor
 proves, before the scenario is ever used, that the scenario can be passed at all and that its
 checks are not vacuous — the two gates in ``prove.py``. Terminal-bench keeps its tasks honest the
 same way, and it needs no model to do it.
-
-There is no persona and no opening line. Variability comes from real conditions — an item in
-stock or not, a customer who exists or does not — which live in ``setup``, not from an invented
-character.
 """
 
 from __future__ import annotations
@@ -29,6 +25,104 @@ class Step(BaseModel):
 
     tool: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class Persona(BaseModel):
+    """The simulated caller, in the same shape used by existing voice scenarios.
+
+    A persona controls how the caller pursues a scenario's task. The task itself remains on
+    ``Scenario.instruction`` so the harness can vary either one without conflating them.
+    """
+
+    name: str = ""
+    gender: str = ""
+    age_group: str = ""
+    occupation: str = ""
+    location: str = ""
+    personality: str = ""
+    communication_style: str = ""
+    keywords: list[str] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=list)
+    accent: str = ""
+    multilingual: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def described(self) -> bool:
+        return bool(
+            self.name
+            or self.gender
+            or self.age_group
+            or self.occupation
+            or self.location
+            or self.personality
+            or self.communication_style
+            or self.keywords
+            or self.languages
+            or self.accent
+            or self.metadata
+        )
+
+    def missing_profile_fields(self) -> list[str]:
+        """The minimum needed for a scenario to exercise caller variation intentionally."""
+        missing = [
+            name
+            for name, value in (
+                ("name", self.name),
+                ("personality", self.personality),
+                ("communication_style", self.communication_style),
+                ("accent", self.accent),
+            )
+            if not value.strip()
+        ]
+        if not self.languages:
+            missing.append("languages")
+        if not self.keywords:
+            missing.append("keywords")
+        return missing
+
+    def format_persona(self) -> str:
+        """A stable, human-readable profile the simulator can consistently embody."""
+        parts = []
+        identity = []
+        for label, value in (
+            ("Name", self.name),
+            ("Gender", self.gender),
+            ("Age Group", self.age_group),
+            ("Occupation", self.occupation),
+            ("Location", self.location),
+        ):
+            if value:
+                identity.append(f"- {label}: {value}")
+        if identity:
+            parts.append("# YOUR IDENTITY\n\n" + "\n".join(identity))
+
+        behavior = []
+        if self.personality:
+            behavior.append(f"- Personality: {self.personality}")
+        if self.communication_style:
+            behavior.append(f"- Communication Style: {self.communication_style}")
+        if self.keywords:
+            behavior.append("- Key Traits: " + ", ".join(self.keywords))
+        if behavior:
+            parts.append("# YOUR PERSONALITY & COMMUNICATION\n\n" + "\n".join(behavior))
+
+        speech = []
+        if self.languages:
+            speech.append("- Language(s): " + ", ".join(self.languages))
+        if self.accent:
+            speech.append(f"- Accent: {self.accent}")
+        if self.multilingual:
+            speech.append("- Switch languages naturally when the conversation calls for it.")
+        if speech:
+            parts.append("# LANGUAGE & SPEECH PATTERNS\n\n" + "\n".join(speech))
+
+        if self.metadata:
+            characteristics = [
+                f"- {key.replace('_', ' ').title()}: {value}"
+                for key, value in self.metadata.items()
+            ]
+            parts.append("# ADDITIONAL CHARACTERISTICS\n\n" + "\n".join(characteristics))
+        return "\n".join(parts)
 
 
 class Scenario(BaseModel):
@@ -57,6 +151,9 @@ class Scenario(BaseModel):
     # The task. For a conversational agent it fills the simulator prompt's instruction slot; for
     # a browser or coding agent it goes to the agent directly.
     instruction: str = ""
+    # Who is making the request. This is deliberately separate from the task so a caller's
+    # communication needs do not get buried in an unstructured instruction.
+    persona: Persona | None = None
     # Anything else that prompt asks for, by slot name.
     variables: dict[str, str] = Field(default_factory=dict)
 
@@ -71,7 +168,8 @@ class Scenario(BaseModel):
 
     def slots(self) -> dict[str, str]:
         """Every value this scenario offers the simulator prompt."""
-        return {"instruction": self.instruction, **self.variables}
+        persona = {"persona": self.persona.format_persona()} if self.persona else {}
+        return {"instruction": self.instruction, **self.variables, **persona}
 
 
 def validate_scenario(
@@ -90,6 +188,10 @@ def validate_scenario(
         problems.append("no name")
     if not scenario.instruction.strip():
         problems.append("no instruction: there is nothing for the run to be about")
+    if scenario.persona is not None and not scenario.persona.described():
+        problems.append("persona has no details")
+    elif scenario.persona is not None and (missing := scenario.persona.missing_profile_fields()):
+        problems.append("persona is incomplete: " + ", ".join(missing))
     if not scenario.sub_goals:
         problems.append(
             "no sub_goals: nothing would be graded. Name the entries of the catalogue this "

@@ -12,9 +12,12 @@ registering one class, not editing any stage.
 from __future__ import annotations
 
 import json
+import re
+import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 
 class AgentSource(Protocol):
@@ -63,6 +66,47 @@ class RepoSource:
 
 
 @dataclass
+class GitHubSource(RepoSource):
+    """A public GitHub repository cloned into this harness session."""
+
+    url: str = ""
+    kind: str = "github"
+
+    def briefing(self) -> str:
+        return (
+            f"This agent was cloned from {self.url or 'GitHub'} into {self.root}. Its truth is "
+            "the cloned source code: the tool registrations, function signatures, validation "
+            "logic, and whatever holds its data. Read it with Read, Glob and Grep."
+        )
+
+
+_GITHUB_REPOSITORY = re.compile(
+    r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$"
+)
+
+
+def clone_github_repository(url: str, destination: Path) -> Path:
+    """Shallow-clone one public GitHub repository into a session-owned directory."""
+    url = url.strip().rstrip("/")
+    if not _GITHUB_REPOSITORY.fullmatch(url):
+        raise ValueError("use a public HTTPS GitHub repository URL such as https://github.com/owner/repo")
+    if destination.exists():
+        raise ValueError(f"the session source directory already exists: {destination}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        ["git", "clone", "--depth", "1", url, str(destination)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if completed.returncode:
+        detail = completed.stderr.strip() or "git clone failed"
+        raise RuntimeError(detail)
+    return destination
+
+
+@dataclass
 class SpecSource:
     """An agent supplied directly as a prompt and a tool schema, with no repository.
 
@@ -103,6 +147,9 @@ class SpecSource:
 
 _REGISTRY: dict[str, Callable[..., AgentSource]] = {
     "repo": lambda **kw: RepoSource(name=kw["name"], root=Path(kw["root"])),
+    "github": lambda **kw: GitHubSource(
+        name=kw["name"], root=Path(kw["root"]), url=kw.get("url", "")
+    ),
     "spec": lambda **kw: SpecSource(
         name=kw["name"],
         system_prompt=kw.get("system_prompt", ""),

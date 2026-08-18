@@ -368,7 +368,7 @@ async def _typed_to(
     """
     from ..catalogue import load_catalogue
     from . import converse
-    from .grade import checkpoints, grade_sub_goals, judge
+    from .grade import checkpoints, grade_sub_goals, judge, judge_suite_evals
     from .targets import resolve
 
     agent = resolve("local")(contract, world, model=roles["agent"])
@@ -382,6 +382,9 @@ async def _typed_to(
     )
     judgements, judged_cost = await judge(
         scenario, transcript, contract, catalogue, model=roles["judge"], ending=ending
+    )
+    judgements += judge_suite_evals(
+        catalogue.suite_evals, scenario, transcript, contract, ending=ending
     )
     result = Result(
         scenario=scenario.name,
@@ -442,7 +445,7 @@ async def _spoken_to(
     from ..catalogue import load_catalogue
     from .call import place_the_call
     from .conversation import Exchange, Transcript
-    from .grade import checkpoints, grade_sub_goals, judge
+    from .grade import checkpoints, grade_sub_goals, judge, judge_suite_evals
     from .live import wire
     from .evidence import measured, newest_report, tracks_in
     from .tools import missing_prerequisites
@@ -500,6 +503,16 @@ async def _spoken_to(
         contract,
         catalogue,
         model=roles["judge"],
+        ending=", ".join(
+            f"{name}: {len(rows)} rows"
+            for name, rows in sorted(world.observe().state.items())
+        ),
+    )
+    judgements += judge_suite_evals(
+        catalogue.suite_evals,
+        scenario,
+        spoken_transcript,
+        contract,
         ending=", ".join(
             f"{name}: {len(rows)} rows"
             for name, rows in sorted(world.observe().state.items())

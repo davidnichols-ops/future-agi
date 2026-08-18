@@ -12,17 +12,18 @@ is an implementation detail, not something to make somebody manage.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from . import build as build_stage
 from . import reception as reception_stage
 from . import scenarios as scenario_stage
 from . import understand as understand_stage
-from .run import stage as run_stage
 from .config import artifact_dir
 from .contract import AgentContract
+from .run import stage as run_stage
 from .session import Stage
 from .sources import AgentSource, resolve
 from .world.snapshot import saved as world_saved
@@ -124,7 +125,11 @@ class Conversation:
         self.stage_name = stage_name
         if stage_name == RECEPTION:
             self.stage, self._found = reception_stage.open_stage(
-                cwd=self.workspace, ask=self.ask
+                cwd=self.workspace,
+                ask=self.ask,
+                # The UI allocates a session before the agent has a name. Put a GitHub clone in
+                # that existing session rather than creating a second artifact directory.
+                source_dir=(self.out / "source") if self.out else None,
             )
             self._grant_flow()
             await self.stage.__aenter__()

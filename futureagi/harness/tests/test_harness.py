@@ -8,11 +8,13 @@ rather than half-works, and the submit gate returns its problems instead of writ
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from harness import (
     AgentContract,
+    GitHubSource,
     RepoSource,
     SpecSource,
     ToolSpec,
@@ -107,7 +109,7 @@ def test_shapes_are_normalised_rather_than_rejected():
 
 
 def test_repo_and_spec_sources_are_registered():
-    assert {"repo", "spec"}.issubset(set(supported()))
+    assert {"repo", "github", "spec"}.issubset(set(supported()))
 
 
 def test_unsupported_source_refuses_and_names_what_exists():
@@ -120,6 +122,12 @@ def test_repo_source_gets_read_tools_and_a_briefing_that_points_at_the_code(tmp_
     source = RepoSource(name="a", root=tmp_path)
     assert source.builtin_tools() == ("Read", "Glob", "Grep")
     assert str(tmp_path) in source.briefing()
+
+
+def test_github_source_reads_like_a_repository(tmp_path):
+    source = GitHubSource(name="a", root=tmp_path, url="https://github.com/acme/agent")
+    assert source.builtin_tools() == ("Read", "Glob", "Grep")
+    assert "https://github.com/acme/agent" in source.briefing()
 
 
 def test_spec_source_gets_no_file_tools_because_there_is_nothing_to_read():
@@ -491,6 +499,45 @@ def test_pointing_at_somewhere_that_does_not_exist_is_refused(tmp_path):
     accepted = point_at("mine", str(tmp_path), "repo", found)
     assert not accepted.get("is_error")
     assert found["source"].name == "mine"
+
+
+def test_pointing_at_a_github_url_clones_it_into_the_session(tmp_path, monkeypatch):
+    from harness.reception import point_at
+
+    called = {}
+
+    def clone(command, **kwargs):
+        called["command"] = command
+        destination = Path(command[-1])
+        destination.mkdir(parents=True)
+        return type("Completed", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr("harness.sources.subprocess.run", clone)
+    found = {}
+    source_dir = tmp_path / "session" / "source"
+    accepted = point_at(
+        "demo-agent",
+        "https://github.com/acme/demo-agent",
+        "github",
+        found,
+        source_dir=source_dir,
+    )
+
+    assert not accepted.get("is_error")
+    assert called["command"][:4] == ["git", "clone", "--depth", "1"]
+    assert found["source"].root == source_dir
+    assert found["source"].kind == "github"
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["git@github.com:acme/demo-agent.git", "https://example.com/acme/demo-agent", "https://github.com/acme"],
+)
+def test_github_source_refuses_urls_that_cannot_be_public_https_clones(tmp_path, url):
+    from harness.reception import point_at
+
+    refused = point_at("demo-agent", url, "github", {}, source_dir=tmp_path / "source")
+    assert refused["is_error"]
 
 
 def test_how_many_scenarios_is_something_you_say():
@@ -975,6 +1022,84 @@ def test_a_simulator_prompt_without_a_slot_runs_the_same_conversation_every_time
     assert "order a big mac" in filled and missing == ["facts"]
 
 
+def test_a_conversational_simulator_prompt_requires_a_persona_slot():
+    from harness.simulator import validate_simulator_prompt
+
+    prompt = "You are a customer. " * 10 + "\nWhat you want: {{ instruction }}"
+
+    assert any("no persona slot" in problem for problem in validate_simulator_prompt(prompt, require_persona=True))
+    assert validate_simulator_prompt(prompt + "\nWho you are: {{ persona }}", require_persona=True) == []
+
+
+def test_a_persona_is_a_structured_simulator_prompt_slot():
+    from harness.scenario import Persona, Scenario
+    from harness.simulator import fill
+
+    scenario = Scenario(
+        name="anxious-rider",
+        instruction="You need help finding your pickup point.",
+        persona=Persona(
+            name="Maya",
+            occupation="rider",
+            languages=["English", "Hindi"],
+            accent="South Asian English",
+            personality="anxious",
+            communication_style="direct and concise",
+            keywords=["in a noisy curbside area", "will ask for clarification"],
+            multilingual=True,
+            metadata={"pickup_context": "busy airport curb"},
+        ),
+    )
+
+    filled, missing = fill("Caller:\n{{ persona }}\n\nNeed:\n{{ instruction }}", scenario.slots())
+
+    assert missing == []
+    assert "Name: Maya" in filled
+    assert "Occupation: rider" in filled
+    assert "Personality: anxious" in filled
+    assert "Language(s): English, Hindi" in filled
+    assert "Accent: South Asian English" in filled
+    assert "Key Traits: in a noisy curbside area, will ask for clarification" in filled
+    assert "Pickup Context: busy airport curb" in filled
+
+
+def test_an_empty_persona_is_rejected():
+    from harness.catalogue import Catalogue, SubGoal
+    from harness.scenario import Persona, Scenario, validate_scenario
+
+    scenario = Scenario(
+        name="empty-persona",
+        instruction="Place an order.",
+        persona=Persona(),
+        solution=[{"tool": "place", "arguments": {}}],
+        sub_goals=["placed"],
+    )
+    catalogue = Catalogue(sub_goals=[SubGoal(name="placed", what="placed", judged="visible only to a judge")])
+
+    problems = validate_scenario(scenario, catalogue, {}, "{{ persona }}\n{{ instruction }}")
+
+    assert "persona has no details" in problems
+
+
+def test_a_persona_must_contain_the_profile_that_drives_variation():
+    from harness.catalogue import Catalogue, SubGoal
+    from harness.scenario import Persona, Scenario, validate_scenario
+
+    scenario = Scenario(
+        name="thin-persona",
+        instruction="Place an order.",
+        persona=Persona(name="Maya"),
+        solution=[{"tool": "place", "arguments": {}}],
+        sub_goals=["placed"],
+    )
+    catalogue = Catalogue(sub_goals=[SubGoal(name="placed", what="placed", judged="visible only to a judge")])
+
+    problems = validate_scenario(scenario, catalogue, {}, "{{ persona }}\n{{ instruction }}")
+
+    assert any("persona is incomplete" in problem for problem in problems)
+    assert all(field in problems[0] for field in ("personality", "languages", "accent"))
+
+
 def test_a_check_that_raises_is_broken_not_failed():
     """A typo in an assertion must never read as a finding about the agent."""
     from harness.checks import run_check
@@ -1403,7 +1528,9 @@ def test_every_contract_field_is_advertised_to_the_model(tmp_path):
 
     from pydantic import BaseModel
 
-    advertised = Path("src/harness/tools.py").read_text(encoding="utf-8")
+    advertised = (
+        Path(__file__).resolve().parents[1] / "src" / "harness" / "tools.py"
+    ).read_text(encoding="utf-8")
     # Set by the amendment tools during later stages, never by whoever submits the contract.
     ours = {"amendments"}
 
@@ -2032,10 +2159,10 @@ def test_a_skill_only_names_tools_its_stage_actually_has():
     # not tools, and the list of them is derived rather than hand-kept so it cannot go stale.
     from harness.contract import AgentContract, ToolSpec
     from harness.catalogue import SubGoal
-    from harness.scenario import Scenario
+    from harness.scenario import Persona, Scenario
 
     fields = set()
-    for model in (AgentContract, ToolSpec, Scenario, SubGoal):
+    for model in (AgentContract, ToolSpec, Scenario, Persona, SubGoal):
         fields |= set(model.model_fields)
     # Names from the check-writing examples the skills contain.
     from harness.contract import MODALITIES
@@ -3260,3 +3387,77 @@ def test_the_platform_is_used_only_when_it_is_configured():
             os.environ.pop(name, None)
             if value is not None:
                 os.environ[name] = value
+
+
+def test_voice_suite_evals_use_the_documented_platform_inputs(monkeypatch):
+    from harness.catalogue import default_suite_evals
+    from harness.contract import AgentContract
+    from harness.run.conversation import Exchange, Transcript
+    from harness.run.grade import judge_suite_evals
+    from harness.run import platform_evals
+    from harness.scenario import Scenario
+
+    calls = []
+
+    def judge_builtin(name, inputs):
+        calls.append((name, inputs))
+        output = "Pass" if name == "customer_agent_task_completion" else {"choice": "4"}
+        return {"output": output, "why": "verified", "model": "turing_flash"}
+
+    monkeypatch.setattr(platform_evals, "configured", lambda: True)
+    monkeypatch.setattr(platform_evals, "judge_builtin", judge_builtin)
+    contract = AgentContract(
+        agent="voice-agent",
+        modality="voice",
+        system_prompt_excerpt="Resolve support requests accurately.",
+        tools=[{"name": "lookup", "args": ["order_id"]}],
+        real_use_cases=["support"],
+    )
+    transcript = Transcript(
+        exchanges=[Exchange("customer", "Where is my order?"), Exchange("agent", "It arrives tomorrow.")]
+    )
+    verdicts = judge_suite_evals(
+        default_suite_evals(),
+        Scenario(name="order-status", instruction="check an order", sub_goals=[]),
+        transcript,
+        contract,
+    )
+
+    assert calls == [
+        (
+            "customer_agent_task_completion",
+            {
+                "agent_prompt": "Resolve support requests accurately.",
+                "conversation": "customer: Where is my order?\nagent: It arrives tomorrow.",
+            },
+        ),
+        (
+            "customer_agent_conversation_quality",
+            {"conversation": "customer: Where is my order?\nagent: It arrives tomorrow."},
+        ),
+    ]
+    assert all(verdict.holds for verdict in verdicts)
+
+
+def test_suite_evals_do_not_run_for_non_voice_agents(monkeypatch):
+    from harness.catalogue import default_suite_evals
+    from harness.contract import AgentContract
+    from harness.run.conversation import Transcript
+    from harness.run.grade import judge_suite_evals
+    from harness.run import platform_evals
+    from harness.scenario import Scenario
+
+    monkeypatch.setattr(platform_evals, "configured", lambda: True)
+    monkeypatch.setattr(platform_evals, "judge_builtin", lambda *_args: pytest.fail("should not run"))
+    contract = AgentContract(
+        agent="chat-agent",
+        modality="chat",
+        tools=[{"name": "lookup", "args": ["order_id"]}],
+        real_use_cases=["support"],
+    )
+    assert judge_suite_evals(
+        default_suite_evals(),
+        Scenario(name="status", instruction="check", sub_goals=[]),
+        Transcript(),
+        contract,
+    ) == []

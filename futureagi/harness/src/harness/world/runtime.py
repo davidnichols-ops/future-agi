@@ -21,11 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .adapter import (
-    EnvironmentAdapter,
-    EnvironmentSnapshot,
-    ToolExecutionResult,
-)
+from ..environment import EnvironmentAdapter, EnvironmentSnapshot, ToolExecutionResult
 
 
 class ToolError(Exception):

@@ -19,6 +19,8 @@ from claude_agent_sdk import ClaudeAgentOptions
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
 SKILLS_ROOT = Path(__file__).parent / "skills"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ARTIFACTS_ROOT = PROJECT_ROOT / "artifacts"
 
 _READ_ONLY_TOOLS = ("Read", "Glob", "Grep")
 
@@ -186,7 +188,7 @@ def artifact_dir(agent: str, root: str | Path | None = None) -> Path:
     One conversation, one directory. Everything about testing one agent lives together, which is
     what makes a session something you can close, reopen, hand over or delete as one thing.
     """
-    base = Path(root) if root else Path("artifacts/sessions")
+    base = Path(root) if root else ARTIFACTS_ROOT / "sessions"
     return base / agent
 
 

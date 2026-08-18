@@ -51,7 +51,7 @@ def fill(prompt: str, values: dict[str, Any]) -> tuple[str, list[str]]:
     return filled, missing
 
 
-def validate_simulator_prompt(prompt: str) -> list[str]:
+def validate_simulator_prompt(prompt: str, *, require_persona: bool = False) -> list[str]:
     """Problems that make a simulator prompt unusable.
 
     Deliberately thin. What a good simulator prompt says is judgement, and belongs in the skill;
@@ -65,5 +65,10 @@ def validate_simulator_prompt(prompt: str) -> list[str]:
         problems.append(
             "no variables: without a slot for the scenario's instruction, every scenario would "
             "run the same conversation. Write them as {{ instruction }}"
+        )
+    if require_persona and "persona" not in variables_in(prompt):
+        problems.append(
+            "no persona slot: conversational scenarios need {{ persona }} so each caller's "
+            "identity and communication profile is explicit"
         )
     return problems

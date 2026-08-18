@@ -13,7 +13,7 @@ on, the caller's instruction, and the grading afterwards.
 Run it:
 
     set -a; . ./.env.acceptance; set +a
-    .venv/bin/python -m harness.run.call --name drive_thru --scenario orders_a_big_mac
+    uv run python -m harness.run.call --name drive_thru --scenario orders_a_big_mac
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def place_the_call(case: str, dry_run: bool = False) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="harness.run.call", description=__doc__)
+    parser = argparse.ArgumentParser(prog="agent-harness-call", description=__doc__)
     parser.add_argument("--name", required=True, help="which agent")
     parser.add_argument("--scenario", required=True, help="which scenario, by name")
     parser.add_argument("--case", default=CASE, help="ALK voice case id")

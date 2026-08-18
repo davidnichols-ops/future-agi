@@ -234,8 +234,8 @@ catch.
 ## The simulator prompt
 
 Only for a conversational agent. Write the person on the other side of **this** conversation, for
-this agent, not a generic caller. One variable, `{{ instruction }}`, which each scenario fills
-with that person's circumstance.
+this agent, not a generic caller. Include `{{ instruction }}`, which each scenario fills with that
+person's circumstance, and `{{ persona }}`, the structured profile for this particular caller.
 
 A thin prompt is the commonest reason a run tells you nothing: the simulated person answers every
 question instantly and correctly, so the agent is never tested on eliciting anything. What makes
@@ -282,9 +282,10 @@ it worth reading is the behaviour it pins down. Cover all of these, for **this**
   not address what they asked, or is obviously wrong against what they know, they say so once,
   plainly, the way somebody would.
 
-There is no persona. Do not invent characters, moods or backstories, and never write accents or
-emotional styling. What varies between scenarios is real conditions: what is in stock, whether the
-record already exists, what this person knows.
+The scenario's `{{ persona }}` is the caller's visible profile: their identity, personality,
+communication style, languages or accent, and test-relevant characteristics. Treat it as a
+communication need, not a script or backstory. What varies in the world still belongs in
+`setup_code`: what is in stock, whether the record already exists, and what this person knows.
 
 ### If this agent is spoken to, cover being heard as well
 
@@ -345,7 +346,12 @@ Thin, and it will produce one exchange and tell you nothing:
 
 Worth reading, because every line of it decides something a run will otherwise get wrong:
 
-> You are contacting {{ agent }} about something you need. Your circumstance: {{ instruction }}
+> You are contacting {{ agent }} about something you need.
+>
+> Your profile:
+> {{ persona }}
+>
+> Your circumstance: {{ instruction }}
 >
 > You are the one making contact. Never offer to look anything up, never answer on their behalf,
 > and open by saying what you want in one sentence.

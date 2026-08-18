@@ -54,6 +54,28 @@ def eval_name(agent: str, sub_goal: str) -> str:
     return _ALLOWED.sub("-", f"{agent}-{sub_goal}".lower()).strip("-")[:64]
 
 
+def suite_eval_name(agent: str, eval_name: str) -> str:
+    """A stable, non-colliding platform name for a suite-wide evaluation."""
+    return _ALLOWED.sub("-", f"{agent}-suite-{eval_name}".lower()).strip("-")[:64]
+
+
+def judge_builtin(name: str, inputs: dict[str, str]) -> dict[str, Any]:
+    """Run a built-in eval by identifier, with its documented inputs."""
+    from fi.evals import Evaluator
+
+    answered = Evaluator().evaluate(eval_templates=name, inputs=inputs, model_name="turing_flash")
+    first = (getattr(answered, "eval_results", None) or [None])[0]
+    output = getattr(first, "output", None)
+    reason = getattr(first, "reason", "") or ""
+    if first is None or (output is None and reason):
+        raise RuntimeError(f"{name} did not run: {reason or 'no result'}")
+    return {
+        "output": output,
+        "why": reason,
+        "model": getattr(first, "model", None) or "turing_flash",
+    }
+
+
 def instructions_for(claim: str, agent: str, rules: list[str] | None = None) -> str:
     """The eval's own prompt: what to decide, and what to decide it from.
 

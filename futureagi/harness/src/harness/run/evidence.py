@@ -16,8 +16,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..config import ARTIFACTS_ROOT
+
 # Where the voice runner writes. Its own directory, because the call belongs to it.
-ACCEPTANCE = Path("artifacts/simulation-acceptance")
+ACCEPTANCE = ARTIFACTS_ROOT / "simulation-acceptance"
 
 # Which recording to prefer, best first. Both voices on one track beats either alone, because
 # the questions asked of a call are mostly about the interaction: whether the agent talked over

@@ -32,7 +32,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SESSIONS = Path("artifacts/sessions")
+from .config import ARTIFACTS_ROOT
+
+SESSIONS = ARTIFACTS_ROOT / "sessions"
 META = "session.json"
 CHAT = "chat.jsonl"
 

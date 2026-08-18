@@ -40,16 +40,52 @@ class SubGoal(BaseModel):
         return bool(self.check.strip())
 
 
+class SuiteEval(BaseModel):
+    """One built-in Future AGI eval applied to every compatible scenario."""
+
+    name: str
+    required_inputs: list[str] = Field(default_factory=lambda: ["conversation"])
+    minimum_score: float | None = None
+
+
+def default_suite_evals() -> list[SuiteEval]:
+    """The two verified built-in evals initially run for every voice scenario."""
+    return [
+        SuiteEval(
+            name="customer_agent_task_completion",
+            required_inputs=["agent_prompt", "conversation"],
+        ),
+        SuiteEval(
+            name="customer_agent_conversation_quality",
+            minimum_score=4,
+        ),
+    ]
+
+
 class Catalogue(BaseModel):
     """Every sub-goal this agent has, defined once."""
 
     sub_goals: list[SubGoal] = Field(default_factory=list)
+    # Deliberately separate from sub-goals: these assess every scenario, while a sub-goal only
+    # applies where a scenario names it.
+    suite_evals: list[SuiteEval] = Field(default_factory=default_suite_evals)
 
     def named(self, name: str) -> SubGoal | None:
         return next((one for one in self.sub_goals if one.name == name), None)
 
     def names(self) -> set[str]:
         return {one.name for one in self.sub_goals}
+
+    def suite_eval(self, name: str) -> SuiteEval | None:
+        return next((one for one in self.suite_evals if one.name == name), None)
+
+
+def validate_suite_eval(suite_eval: SuiteEval) -> list[str]:
+    if not suite_eval.name.strip():
+        return ["no name"]
+    if not suite_eval.required_inputs:
+        return [f"{suite_eval.name}: no required inputs"]
+    return []
 
 
 def validate_sub_goal(sub_goal: SubGoal) -> list[str]:

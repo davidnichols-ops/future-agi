@@ -794,7 +794,7 @@ def world_tools(
         "write_simulator_prompt",
         "Write the prompt that drives the simulated user of this agent, for a conversational "
         "agent only. It is written once and every scenario fills its slots, so leave variables "
-        "as {{ instruction }} and any others this agent needs.\n\n"
+        "as {{ instruction }}, {{ persona }} and any others this agent needs.\n\n"
         "It has to cover how a person in this conversation actually behaves: that they are "
         "living the situation rather than describing it, that they speak one turn at a time, "
         "that they never break character or explain that they are testing anything, what they "
@@ -804,7 +804,7 @@ def world_tools(
     )
     async def write_simulator_prompt(args: dict[str, Any]) -> dict[str, Any]:
         prompt = str(args.get("prompt") or "")
-        problems = validate_simulator_prompt(prompt)
+        problems = validate_simulator_prompt(prompt, require_persona=contract.conversational)
         if problems:
             return _err("Not saved:\n  - " + "\n  - ".join(problems))
         path = save_simulator_prompt(prompt, destination)
@@ -1071,6 +1071,12 @@ def world_tools(
                 "Not saved. This agent is conversational, so it needs a simulator prompt for "
                 "the person on the other side. Write it with write_simulator_prompt."
             )
+        if contract.conversational:
+            problems = validate_simulator_prompt(
+                load_simulator_prompt(destination), require_persona=True
+            )
+            if problems:
+                return _err("Not saved. The simulator prompt is incomplete:\n  - " + "\n  - ".join(problems))
         dirty = dirty_state(world, sequences, kind)
         if dirty:
             counts = world.state()

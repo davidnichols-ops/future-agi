@@ -22,15 +22,20 @@ name          short identifier; it becomes this scenario's folder
 use_case      which of the agent's use cases this belongs to
 tests         one line: what this scenario is trying to find out
 instruction   the task, written to the person the agent is serving
+persona       who that person is: identity, communication style, languages/accent and characteristics
 setup_code    Python: def setup(world) — what this scenario changes first
 ready_code    Python: def ready(world) — is the world ready for this scenario
 solution      what a correct agent would do: [{tool, arguments}]
 sub_goals     names from the shared catalogue that must hold
 ```
 
-There is no persona and no opening line. **Variability comes from real conditions**: the item is
-out of stock, the record already exists, the order has already shipped. Those live in
-`setup_code`. Do not invent a character.
+**Persona and world condition are different things.** `persona` is the clean, structured profile
+of the person making this request. It uses the existing voice-scenario shape: `name`, `gender`,
+`age_group`, `occupation`, `location`, `personality`, `communication_style`, `keywords`,
+`languages`, `accent`, `multilingual`, and free-form `metadata`. Use the details that change the
+conversational risk being tested. `setup_code` is the world condition: the item
+is out of stock, the record already exists, or the order has already shipped. Keep both grounded
+in the requested test; do not invent backstory that changes nothing.
 
 ## Three parts that must never leak into each other
 
@@ -103,9 +108,14 @@ not exist, and no lookup will ever find them.
 **Possessing and volunteering are separate.** Whether the person offers a value unprompted is the
 scenario's business. Whether they have it at all is not optional.
 
-**Never write personality, accent or mood** unless the scenario is specifically about handling
-one. A rude customer is a different scenario from a polite one only if the correct outcome
-differs.
+**Use persona deliberately.** An accent, personality or characteristic belongs in `persona` only
+when it changes the conversational risk being exercised. A rude customer is a different scenario
+from a polite one only if the agent must handle that difference. Persona never contains the
+answer, hidden checks or values the person has not been given. Every conversational scenario must
+supply one when the simulator prompt asks for `{{ persona }}`. Before submitting, fill its
+required profile: `name`, `personality`, `communication_style`, `languages`, `accent`, and at
+least one `keywords` entry. The harness rejects an incomplete persona rather than quietly generating a
+generic caller.
 
 ## Writing setup, and the mistake to avoid
 
