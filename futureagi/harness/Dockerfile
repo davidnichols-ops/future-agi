@@ -12,7 +12,7 @@ RUN apt-get update \
  && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" \
       > /etc/apt/sources.list.d/docker.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends nodejs docker-ce-cli \
+ && apt-get install -y --no-install-recommends nodejs docker-ce-cli git \
  && npm install -g @anthropic-ai/claude-code \
  && apt-get purge -y gnupg && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
