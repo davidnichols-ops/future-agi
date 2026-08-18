@@ -1071,6 +1071,9 @@ class DurableWorkspaceCatalogLifecycle:
             active=active,
             observed_at=observed_at,
         )
+        if active is not None and mode is LifecycleRunMode.INCREMENTAL:
+            if active.build_plan.source_scope.project_ids != scope.project_ids:
+                mode = LifecycleRunMode.FULL_REPAIR
         if mode is LifecycleRunMode.INITIAL_BACKFILL:
             if active is not None:
                 raise DurableLifecycleError(
@@ -1316,13 +1319,9 @@ class ClickHouseLifecycleStateReader:
         if reservation.lease.projection_version != active.projection_version:
             raise DurableLifecycleError("active reservation projection changed")
         decoded_plan = _decode_plan_scope(reservation.lease.build_plan)
-        if (
-            reservation.lease.build_plan.source_scope.project_ids != scope.project_ids
-            or CatalogLifecycleMode(decoded_plan.mode.value)
-            is not active.lifecycle_mode
-        ):
+        if CatalogLifecycleMode(decoded_plan.mode.value) is not active.lifecycle_mode:
             raise DurableLifecycleError(
-                "active reservation changed its project scope or lifecycle mode"
+                "active reservation changed its lifecycle mode"
             )
         manifest_streams = _manifest_streams(active.source_manifest_json)
         planned = {

@@ -1050,6 +1050,37 @@ def test_auto_schedule_selects_incremental_then_due_full_repair() -> None:
     )
 
 
+def test_auto_schedule_promotes_project_scope_change_to_full_repair() -> None:
+    clock = _Clock(INITIAL_UNTIL)
+    state = _State()
+    lifecycle = _lifecycle(
+        state=state,
+        clock=clock,
+        freezer=_Freezer(clock),
+        tokens=[TOKEN_A, TOKEN_B],
+    )
+    initial_scope = replace(_scope(), project_ids=(PROJECT_A,))
+    initial = lifecycle.prepare(
+        scope=initial_scope,
+        mode=LifecycleRunMode.INITIAL_BACKFILL,
+        configured_bounds=_bounds(),
+    )
+    state.activate(initial, at=clock.current)
+    clock.current += timedelta(minutes=2)
+
+    repaired = lifecycle.prepare(
+        scope=_scope(),
+        mode=LifecycleRunMode.AUTO,
+        configured_bounds=_bounds(),
+    )
+
+    assert repaired.mode is LifecycleRunMode.FULL_REPAIR
+    assert repaired.lifecycle_mode is CatalogLifecycleMode.FULL_REPAIR
+    assert repaired.cutoffs.span_window.since == INITIAL_SINCE
+    assert repaired.scope.project_ids == (PROJECT_A, PROJECT_B)
+    assert all(value.lower_watermark == "" for value in repaired.streams)
+
+
 def test_decoder_accepts_legacy_incremental_system_revision_marker() -> None:
     clock = _Clock(INITIAL_UNTIL)
     state = _State()
