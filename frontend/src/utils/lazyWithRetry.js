@@ -1,6 +1,75 @@
 import { lazy } from "react";
 
 const RELOAD_KEY = "chunk_reload_attempted";
+const RELOAD_GUARD_TTL_MS = 2 * 60 * 1000;
+
+function getReloadScope() {
+  try {
+    const entrypoint =
+      document.querySelector('script[type="module"][src]')?.src || "app";
+    return `${entrypoint}|${window.location.pathname}${window.location.search}`;
+  } catch {
+    return "app";
+  }
+}
+
+function hasReloadAttempt() {
+  try {
+    const raw = sessionStorage.getItem(RELOAD_KEY);
+    if (!raw) return false;
+
+    // Preserve the guard written by older builds. App clears it after a stable
+    // mount, so an already-looping tab stops instead of immediately looping on
+    // the newly deployed bundle too.
+    if (raw === "1") return true;
+
+    const attempt = JSON.parse(raw);
+    const isFresh =
+      Number.isFinite(attempt?.attemptedAt) &&
+      Date.now() - attempt.attemptedAt < RELOAD_GUARD_TTL_MS;
+    if (attempt?.scope === getReloadScope() && isFresh) return true;
+
+    sessionStorage.removeItem(RELOAD_KEY);
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function markReloadAttempt() {
+  try {
+    sessionStorage.setItem(
+      RELOAD_KEY,
+      JSON.stringify({ scope: getReloadScope(), attemptedAt: Date.now() }),
+    );
+    return true;
+  } catch {
+    // If storage is unavailable, reloading cannot be bounded safely. Surface
+    // the error boundary instead of risking an infinite reload loop.
+    return false;
+  }
+}
+
+export function clearChunkReloadAttempt() {
+  try {
+    sessionStorage.removeItem(RELOAD_KEY);
+  } catch {
+    // Storage can be unavailable in private/test contexts.
+  }
+}
+
+export function requestChunkReload() {
+  if (hasReloadAttempt() || !markReloadAttempt()) return false;
+  window.location.reload();
+  return true;
+}
+
+function persistentChunkError(message) {
+  const error = new Error(message);
+  error.name = "ChunkLoadError";
+  error.skipChunkRetry = true;
+  return error;
+}
 
 /**
  * Drop-in replacement for React.lazy that retries failed dynamic imports.
@@ -36,9 +105,7 @@ export async function retryImport(importFn, retriesLeft) {
     // skip the retry loop and go straight to a one-time silent reload (a fresh
     // document gets a fresh module map and a fresh index.html).
     if (!module || typeof module.default === "undefined") {
-      if (!sessionStorage.getItem(RELOAD_KEY)) {
-        sessionStorage.setItem(RELOAD_KEY, "1");
-        window.location.reload();
+      if (requestChunkReload()) {
         // Never-resolving promise so React keeps the Suspense fallback while
         // the page reloads, instead of surfacing the bad module to lazy().
         return new Promise(() => {});
@@ -46,25 +113,25 @@ export async function retryImport(importFn, retriesLeft) {
       // Reload already attempted this session — surface a recognized chunk
       // error (matched by isChunkError/ignoreErrors) rather than letting React
       // throw the opaque "reading 'default'" TypeError, and avoid a reload loop.
-      throw new Error(
+      throw persistentChunkError(
         "Failed to fetch dynamically imported module (resolved without a default export)",
       );
     }
 
-    // Success — clear any previous reload flag
-    sessionStorage.removeItem(RELOAD_KEY);
+    // Do not clear the reload guard here. An earlier lazy import can succeed
+    // while a nested route chunk still fails; clearing globally at that point
+    // was the cause of the DEV reload loop. App clears it only after a stable
+    // mount window.
     return module;
   } catch (error) {
-    if (retriesLeft > 0 && isChunkError(error)) {
+    if (retriesLeft > 0 && isChunkError(error) && !error?.skipChunkRetry) {
       // Wait briefly — CDN may need time to propagate new chunks
       await new Promise((r) => setTimeout(r, 1000 * (4 - retriesLeft)));
       return retryImport(importFn, retriesLeft - 1);
     }
 
     // All retries exhausted — try a silent one-time page reload
-    if (isChunkError(error) && !sessionStorage.getItem(RELOAD_KEY)) {
-      sessionStorage.setItem(RELOAD_KEY, "1");
-      window.location.reload();
+    if (isChunkError(error) && requestChunkReload()) {
       // Return a never-resolving promise to prevent React error boundary
       // while the page reloads
       return new Promise(() => {});
