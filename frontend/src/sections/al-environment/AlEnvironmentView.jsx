@@ -1,10 +1,12 @@
 import { useState } from "react";
-import { Box, Stack, Tab, Tabs, Typography } from "@mui/material";
+import { Box, Button, Stack, Tab, Tabs, Typography } from "@mui/material";
 import {
   useAlkContract, useAlkHistory, useAlkScenarios, useAlkSessions, useAlkSimulation,
   useAlkRuns, useAlkSimulations, useAlkStatus, useAlkSubgoals, useAlkWorld,
   useCreateAlkSession, useDeleteAlkSession, useOpenAlkSession, useSetAlkStage,
 } from "src/api/al-environment/alEnvironment";
+import { RouterLink } from "src/routes/components";
+import { paths } from "src/routes/paths";
 import { alkBaseUrl } from "src/api/al-environment/client";
 import { useAlkConversation } from "src/api/al-environment/useAlkConversation";
 import { ALK_MONO } from "./alkTokens";
@@ -25,7 +27,8 @@ const TABS = [
   { value: "contract", label: "Contract", count: (s) => (s?.have?.contract ? "✓" : "") },
   { value: "world", label: "Environment", count: (s) => (s?.have?.world ? "✓" : "") },
   { value: "scenarios", label: "Scenarios", count: (s) => s?.have?.scenarios || "" },
-  { value: "runs", label: "Runs", count: (s) => s?.have?.runs || "" },
+  // Hidden alongside the Runs stage in the roadmap — uncomment to bring the tab back.
+  // { value: "runs", label: "Runs", count: (s) => s?.have?.runs || "" },
 ];
 
 const AlEnvironmentView = () => {
@@ -34,6 +37,9 @@ const AlEnvironmentView = () => {
 
   const { status, isError, refetch } = useAlkStatus();
   const hasSession = Boolean(status?.session);
+  // Supplied by the harness on the open session once a platform run exists for it.
+  const runTestId = status?.session?.run_test_id;
+  const executionId = status?.session?.execution_id;
 
   const { sessions, openSessionId } = useAlkSessions();
   const { messages } = useAlkHistory(hasSession);
@@ -181,6 +187,15 @@ const AlEnvironmentView = () => {
           // flexBasis 0 so the tab content's intrinsic width never feeds back into the split.
           sx={{ flexGrow: 1, flexBasis: 0, minWidth: 0, display: "flex", flexDirection: "column" }}
         >
+          <Stack
+            direction="row"
+            alignItems="center"
+            sx={{
+              backgroundColor: "background.paper",
+              borderBottom: (theme) => `1px solid ${theme.palette.divider}`,
+              pr: 2,
+            }}
+          >
           <Tabs
             value={tab}
             onChange={(event, next) => setTab(next)}
@@ -191,8 +206,7 @@ const AlEnvironmentView = () => {
             sx={{
               px: 2,
               minHeight: 40,
-              backgroundColor: "background.paper",
-              borderBottom: (theme) => `1px solid ${theme.palette.divider}`,
+              flexGrow: 1,
               // The theme spaces tabs with `&:not(:last-of-type) { marginRight }`, so the
               // override has to match that selector to win. The reference's tabs sit next to
               // each other and are spaced by their own padding instead.
@@ -226,6 +240,25 @@ const AlEnvironmentView = () => {
               />
             ))}
           </Tabs>
+
+            {/* The harness reports the platform run this session belongs to. Until it does,
+                there is nowhere to send anyone, so the button says so rather than guessing. */}
+            <Button
+              size="small"
+              variant="contained"
+              disabled={!runTestId || !executionId}
+              {...(runTestId && executionId
+                ? { component: RouterLink, href: paths.dashboard.simulate.callDetails(runTestId, executionId) }
+                : {})}
+              title={
+                runTestId && executionId
+                  ? "Open this session's simulation run"
+                  : "Available once this session has a simulation run"
+              }
+            >
+              Run Simulation
+            </Button>
+          </Stack>
           <Box
             sx={{
               flexGrow: 1,
@@ -245,7 +278,8 @@ const AlEnvironmentView = () => {
                 runs={legacyRuns}
                 hasWorld={Boolean(status?.have?.world)}
                 onSay={conversation.say}
-                onSeeRun={() => setTab("runs")}
+                // Nothing to jump to while the Runs tab is hidden.
+                // onSeeRun={() => setTab("runs")}
               />
             )}
             {tab === "runs" && (

@@ -13,12 +13,14 @@ const statusWith = (overrides = {}) => ({
 });
 
 describe("StageRoadmap", () => {
-  it("shows the five stages by their labels, never their raw keys", () => {
+  it("shows each stage by its label, never its raw key", () => {
     render(<StageRoadmap status={statusWith()} onSelectStage={() => {}} />);
-    ["Agent", "Contract", "Environment", "Scenarios", "Runs"].forEach((label) => {
+    // "Runs" is commented out of stages.js for now; add it back here when it returns.
+    ["Agent", "Contract", "Environment", "Scenarios"].forEach((label) => {
       expect(screen.getByRole("button", { name: new RegExp(label) })).toBeInTheDocument();
     });
     expect(screen.queryByText("understand")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Runs/ })).not.toBeInTheDocument();
   });
 
   it("disables a stage the server says is blocked and quotes its reason", () => {
@@ -45,7 +47,8 @@ describe("StageRoadmap", () => {
     render(<StageRoadmap status={status} onSelectStage={() => {}} />);
     expect(screen.getByText("7 sub-goals")).toBeInTheDocument();
     expect(screen.getByText("5 proved")).toBeInTheDocument();
-    expect(screen.getByText("1/2 passed")).toBeInTheDocument();
+    // The run tally goes with the hidden Runs stage.
+    expect(screen.queryByText("1/2 passed")).not.toBeInTheDocument();
   });
 
   it("cannot open any stage before a session exists", () => {

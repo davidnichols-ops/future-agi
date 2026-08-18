@@ -140,6 +140,28 @@ describe("AlEnvironmentView", () => {
     expect(clearLive).toHaveBeenCalledTimes(1);
   });
 
+  it("cannot open a simulation run until the harness names one", () => {
+    render(<AlEnvironmentView />);
+    expect(screen.getByRole("button", { name: /run simulation/i })).toBeDisabled();
+  });
+
+  it("links to the platform run once the harness reports its ids", () => {
+    hooks.useAlkStatus.mockReturnValue({
+      status: {
+        ...openStatus,
+        session: { id: "s1", run_test_id: "test-uuid", execution_id: "exec-uuid" },
+      },
+      isError: false,
+      refetch: vi.fn(),
+    });
+    render(<AlEnvironmentView />);
+    const link = screen.getByRole("link", { name: /run simulation/i });
+    expect(link).toHaveAttribute(
+      "href",
+      "/dashboard/simulate/test/test-uuid/exec-uuid/call-details"
+    );
+  });
+
   it("offers a composer so the session can be talked to", () => {
     render(<AlEnvironmentView />);
     expect(screen.getByRole("textbox")).toBeInTheDocument();

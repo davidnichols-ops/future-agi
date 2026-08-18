@@ -8,5 +8,6 @@ export const ALK_STAGES = [
   { key: "understand", label: "Contract", tab: "contract" },
   { key: "build", label: "Environment", tab: "world" },
   { key: "scenarios", label: "Scenarios", tab: "scenarios" },
-  { key: "run", label: "Runs", tab: "runs" },
+  // Runs is hidden for now — uncomment to bring the stage back.
+  // { key: "run", label: "Runs", tab: "runs" },
 ];
