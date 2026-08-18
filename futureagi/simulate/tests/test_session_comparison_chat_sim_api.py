@@ -302,12 +302,16 @@ class TestSessionComparisonChatSimAPI:
         ]
 
     def test_bad_request_when_voice_execution_has_no_replay_baseline(
-        self, auth_client, completed_text_call_execution
+        self, auth_client, completed_text_call_execution, dataset_row
     ):
         completed_text_call_execution.simulation_call_type = (
             CallExecution.SimulationCallType.VOICE
         )
         completed_text_call_execution.save()
+        # The fixture row carries a chat-shaped session_id. Clear it so the row
+        # genuinely has no baseline, which is what this case is about.
+        dataset_row.metadata = {}
+        dataset_row.save()
 
         response = auth_client.get(
             f"/simulate/call-executions/{completed_text_call_execution.id}/session-comparison/"
