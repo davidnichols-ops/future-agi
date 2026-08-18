@@ -131,15 +131,6 @@ export default function App() {
     }
   }, [location.pathname]);
 
-  // Keep the guard through nested lazy-route loading. Clearing it immediately
-  // lets one successful parent import hide a failing child import and causes a
-  // reload loop. A stable mount window is enough to permit recovery from a
-  // future deployment without weakening the current guard.
-  useEffect(() => {
-    const timer = window.setTimeout(clearChunkReloadAttempt, 30_000);
-    return () => window.clearTimeout(timer);
-  }, []);
-
   const logError = (error, info) => {
     // Chunk errors after a deploy — silently reload once instead of showing error page
     if (isChunkError(error) && requestChunkReload()) return;

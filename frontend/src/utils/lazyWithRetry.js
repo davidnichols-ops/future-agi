@@ -1,7 +1,7 @@
 import { lazy } from "react";
 
 const RELOAD_KEY = "chunk_reload_attempted";
-const RELOAD_GUARD_TTL_MS = 2 * 60 * 1000;
+const CHUNK_IMPORT_TIMEOUT_MS = 10_000;
 
 function getReloadScope() {
   try {
@@ -18,16 +18,19 @@ function hasReloadAttempt() {
     const raw = sessionStorage.getItem(RELOAD_KEY);
     if (!raw) return false;
 
-    // Preserve the guard written by older builds. App clears it after a stable
-    // mount, so an already-looping tab stops instead of immediately looping on
-    // the newly deployed bundle too.
-    if (raw === "1") return true;
+    // Preserve the guard written by older builds, but migrate it to the current
+    // entrypoint + URL scope. That stops an already-looping tab while allowing
+    // a later deployment or route to perform its own single recovery reload.
+    if (raw === "1") {
+      sessionStorage.setItem(
+        RELOAD_KEY,
+        JSON.stringify({ scope: getReloadScope(), attemptedAt: Date.now() }),
+      );
+      return true;
+    }
 
     const attempt = JSON.parse(raw);
-    const isFresh =
-      Number.isFinite(attempt?.attemptedAt) &&
-      Date.now() - attempt.attemptedAt < RELOAD_GUARD_TTL_MS;
-    if (attempt?.scope === getReloadScope() && isFresh) return true;
+    if (attempt?.scope === getReloadScope()) return true;
 
     sessionStorage.removeItem(RELOAD_KEY);
     return false;
@@ -71,6 +74,29 @@ function persistentChunkError(message) {
   return error;
 }
 
+function importWithTimeout(importPromise) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(
+        persistentChunkError(
+          `Failed to fetch dynamically imported module (timed out after ${CHUNK_IMPORT_TIMEOUT_MS}ms)`,
+        ),
+      );
+    }, CHUNK_IMPORT_TIMEOUT_MS);
+
+    Promise.resolve(importPromise).then(
+      (module) => {
+        clearTimeout(timeout);
+        resolve(module);
+      },
+      (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+
 /**
  * Drop-in replacement for React.lazy that retries failed dynamic imports.
  *
@@ -91,7 +117,7 @@ export default function lazyWithRetry(importFn, maxRetries = 3) {
 // Exported for unit testing the post-deploy recovery logic directly.
 export async function retryImport(importFn, retriesLeft) {
   try {
-    const module = await importFn();
+    const module = await importWithTimeout(importFn());
 
     // A dynamic import can RESOLVE (not reject) to a module that is undefined
     // or missing its `default` export. This happens with stale module graphs
@@ -120,8 +146,8 @@ export async function retryImport(importFn, retriesLeft) {
 
     // Do not clear the reload guard here. An earlier lazy import can succeed
     // while a nested route chunk still fails; clearing globally at that point
-    // was the cause of the DEV reload loop. App clears it only after a stable
-    // mount window.
+    // was the cause of the DEV reload loop. The entrypoint + URL scope changes
+    // naturally for a new deployment or route, and explicit Retry clears it.
     return module;
   } catch (error) {
     if (retriesLeft > 0 && isChunkError(error) && !error?.skipChunkRetry) {

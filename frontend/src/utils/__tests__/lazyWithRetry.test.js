@@ -27,6 +27,7 @@ describe("retryImport — resolved-to-undefined / missing-default recovery", () 
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -57,6 +58,31 @@ describe("retryImport — resolved-to-undefined / missing-default recovery", () 
     expect(reloadMock).toHaveBeenCalledTimes(1);
   });
 
+  it("bounds an import that remains pending and performs one recovery reload", async () => {
+    vi.useFakeTimers();
+    retryImport(() => new Promise(() => {}), 3);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(reloadMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(store[RELOAD_KEY])).toEqual(
+      expect.objectContaining({ attemptedAt: expect.any(Number) }),
+    );
+  });
+
+  it("surfaces a second pending import instead of reloading again", async () => {
+    store[RELOAD_KEY] = "1";
+    vi.useFakeTimers();
+    const rejection = expect(
+      retryImport(() => new Promise(() => {}), 3),
+    ).rejects.toThrow(/timed out after 10000ms/);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    await rejection;
+
+    expect(reloadMock).not.toHaveBeenCalled();
+  });
+
   it("throws a recognized chunk error (no second reload) if reload already attempted", async () => {
     store[RELOAD_KEY] = "1";
     await expect(
@@ -82,7 +108,6 @@ describe("retryImport — resolved-to-undefined / missing-default recovery", () 
     await vi.runAllTimersAsync();
     await expect(p).resolves.toBe(mod);
     expect(importFn).toHaveBeenCalledTimes(2);
-    vi.useRealTimers();
   });
 });
 
