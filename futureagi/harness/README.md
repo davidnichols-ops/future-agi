@@ -47,6 +47,33 @@ solution passes the scenario's own checks), and **not vacuous** (running *nothin
 those checks). The third is the one that earns its keep — a check that passes while the agent
 did nothing grades nothing while reporting a result.
 
+## Two servers, two ports
+
+This trips people up, so it is stated before anything else about running it. The harness listens
+on **two** ports, from **two** different HTTP servers, for two unrelated audiences.
+
+| | what | who talks to it | port |
+|---|---|---|---|
+| `ui/server.py` | **FastAPI**, served by uvicorn. The chat, the event stream, and the endpoints that read sessions, contracts, worlds, scenarios and runs | a person, or a front end | `HARNESS_PORT`, default **8777** |
+| `WorldWebhook` in `run/voice.py` | **stdlib `http.server.HTTPServer`** in a daemon thread. Not FastAPI, not uvicorn, not part of the app above | **the agent under test**, delivering its tool calls | chosen at construction, **ephemeral by default** |
+
+They are deliberately separate. The UI server is long-lived for a session; the webhook comes up
+around a voice run and swaps which world is bound between scenarios.
+
+**Two things follow that matter when running this in a container:**
+
+- **Expose both ports.** Publishing 8777 alone gives you a working UI and a voice run whose tool
+  calls never arrive.
+- **Pin the webhook's port, and bind it on `0.0.0.0`.** It defaults to
+  `WorldWebhook(host="127.0.0.1", port=0)` — the OS picks the port, which was fine when a tunnel
+  discovered the public URL after binding. It is not fine when a sibling container needs a stable
+  address to call: loopback is that container's own, and an ephemeral port cannot be published or
+  configured ahead of time. Both are constructor arguments, so this is a call-site change.
+
+**It is a standalone FastAPI app, not a Django app.** It does not mount into the backend's ASGI
+stack and does not share its middleware, authentication or workspace context. Anything needing
+those should sit in front of it rather than inside it.
+
 ## How the world is wired, and who owns it
 
 **The harness owns the world. Nothing else does.** This is the most common misunderstanding, so
@@ -127,12 +154,44 @@ Then say what to test, and one message is enough to start.
 | `GOOGLE_APPLICATION_CREDENTIALS`, `CLOUD_ML_REGION` | provider credentials, read from the environment and never from source |
 | `ALK_DOCKER_NETWORK` | when set, containers this service starts join that network and are addressed by container name instead of loopback |
 
-### Three runtimes
+## Running it in a container
 
-Python runs the harness. **Node runs the Claude Code CLI, which the Agent SDK drives as a
-subprocess — without it every stage fails at its first model call.** A Docker client is needed
-only for worlds whose store is a real database engine, and it talks to a daemon rather than
-running one.
+Everything a container author needs, in one place. Each item here is something that fails in a
+way that does not obviously point at its cause.
+
+**1. Three runtimes have to be in the image.**
+
+| runtime | why |
+|---|---|
+| Python 3.11+ | the harness itself |
+| **Node** | the Agent SDK drives the Claude Code CLI (`@anthropic-ai/claude-code`) as a **subprocess**. Without it **every stage fails at its first model call**, and nothing in the Python dependencies reveals the requirement |
+| Docker **client** | only for worlds whose store is a real database engine. The client alone — it talks to a daemon, it must never run one |
+
+**2. Expose both ports** — see "Two servers, two ports" above. The UI port alone gives you a
+working chat and a voice run whose tool calls silently never arrive.
+
+**3. Bind on `0.0.0.0`, both servers.** `HARNESS_HOST=0.0.0.0` for the UI. The webhook takes its
+host and port as constructor arguments and defaults to loopback on an ephemeral port; give it a
+fixed port too, or nothing outside can be configured to call it.
+
+**4. Mount a volume for `artifacts/`, and mind the working directory.** Sessions are written to
+`artifacts/sessions/`, a path **relative to the working directory** — so the mount point depends
+on `WORKDIR`. If sessions vanish between restarts, this is why. It is files only; there is no
+database.
+
+**5. Credentials come from the environment, never from source** — and a host path inside an env
+file means nothing in the container. If a variable names a credentials *file*, mount the file and
+repoint the variable at where it now lives.
+
+**6. To start containers of its own**, set `DOCKER_HOST` at a socket proxy rather than mounting
+the daemon socket, and set `ALK_DOCKER_NETWORK` to the shared network name. With that set, the
+harness attaches the containers it starts to that network and addresses them **by container
+name**; without it they are published on loopback, which from inside a container is its own.
+
+**7. Use Sonnet.** Smaller models misread `modality`, and modality decides the entire run path.
+
+**8. Do not restart it mid-suite.** A run in flight is lost. Long suites are the normal case — a
+30-scenario voice suite took 69 minutes.
 
 ## Storage
 
