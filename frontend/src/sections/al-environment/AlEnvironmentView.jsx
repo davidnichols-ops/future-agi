@@ -96,28 +96,48 @@ const AlEnvironmentView = () => {
    */
   const opening = useRef(null);
   const refused = useRef(null);
+  const wanted = useRef(sessionId);
+  wanted.current = sessionId;
+
+  // One attempt per navigation. Arriving at the same id again — a retry, a fresh link — is a
+  // new attempt; a status refetch is not.
+  useEffect(() => {
+    refused.current = null;
+  }, [sessionId]);
+
   useEffect(() => {
     if (!sessionId || !status || status.busy) return;
-    if (openId === sessionId || opening.current === sessionId) return;
-    // Navigating away is asynchronous, so without remembering the id that failed this keeps
-    // firing until the redirect lands — which is the repainting loop it is meant to end.
+    if (openId === sessionId) return;
+    // Any open in flight blocks the next one, not just one for the same id. The harness takes
+    // a single request at a time and answers 409 to the second — which would look like the
+    // session was bad and bounce the operator off a perfectly good environment. When the first
+    // settles, status changes and this runs again for whatever the URL now asks for.
+    if (opening.current) return;
+    // Without remembering the id that failed this keeps firing until the redirect lands, which
+    // is the repainting loop it exists to end.
     if (refused.current === sessionId) return;
-    opening.current = sessionId;
-    openSession.mutate(sessionId, {
+
+    const target = sessionId;
+    opening.current = target;
+    openSession.mutate(target, {
       onSuccess: conversation.clearLive,
-      // A URL naming a session the harness does not have has nowhere to go. Opening also
-      // invalidates status, so staying here would re-run this effect and retry forever,
-      // repainting the page each time — send them back to the list and say what happened.
       onError: (failed) => {
-        refused.current = sessionId;
+        refused.current = target;
+        // The answer arrives after a navigation may already have moved on. Reporting a
+        // failure for an environment nobody is looking at any more would be noise.
+        if (wanted.current !== target) return;
+        const gone = failed?.response?.status === 404;
         enqueueSnackbar(
-          failed?.response?.status === 404
-            ? `That environment no longer exists (${sessionId})`
+          gone
+            ? `That environment no longer exists (${target})`
             : failed?.response?.data?.error ||
                 "Could not open that environment",
           { variant: "error" },
         );
-        navigate(paths.dashboard.simulate.alEnvironment, { replace: true });
+        // Only a missing environment has nowhere to go. A refusal or a transient failure
+        // leaves a perfectly valid URL, so stay on it and say what happened.
+        if (gone)
+          navigate(paths.dashboard.simulate.alEnvironment, { replace: true });
       },
       onSettled: () => {
         opening.current = null;

@@ -292,6 +292,64 @@ describe("AlEnvironmentView, addressed by URL", () => {
     expect(window.location.pathname).toBe("/dashboard/simulate/rl-environment");
   });
 
+  it("stays put when opening is refused rather than failing", async () => {
+    // A 409 means a stage is running, not that the environment is bad. Bouncing here would
+    // throw the operator off a perfectly valid URL.
+    const mutate = vi.fn((id, opts) =>
+      opts.onError({ response: { status: 409, data: { error: "still working on the last thing" } } })
+    );
+    hooks.useOpenAlkSession.mockReturnValue({ mutate, isPending: false });
+    hooks.useAlkStatus.mockReturnValue({
+      status: { ...openStatus, session: { id: "other" } },
+      isError: false,
+      refetch: vi.fn(),
+    });
+    renderAt("/rl-environment/wanted");
+    await waitFor(() => expect(mutate).toHaveBeenCalledTimes(1));
+    expect(window.location.pathname).toBe("/rl-environment/wanted");
+  });
+
+  it("does not open a second session while one is already in flight", async () => {
+    // The harness takes one request at a time; a concurrent open comes back 409 and would
+    // look like the environment was bad.
+    const mutate = vi.fn(); // never settles
+    hooks.useOpenAlkSession.mockReturnValue({ mutate, isPending: false });
+    hooks.useAlkStatus.mockReturnValue({
+      status: { ...openStatus, session: { id: "other" } },
+      isError: false,
+      refetch: vi.fn(),
+    });
+    const { rerender } = renderAt("/rl-environment/first");
+    await waitFor(() => expect(mutate).toHaveBeenCalledTimes(1));
+    // A status refetch re-renders while the first open is still outstanding.
+    hooks.useAlkStatus.mockReturnValue({
+      status: { ...openStatus, session: { id: "other" }, spent_usd: 0.2 },
+      isError: false,
+      refetch: vi.fn(),
+    });
+    rerender(
+      <Routes>
+        <Route path="/rl-environment/:sessionId" element={<AlEnvironmentView />} />
+      </Routes>
+    );
+    await waitFor(() => expect(mutate).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not re-open a session it has just created", async () => {
+    // Creating makes the new session current and seeds status with it, so arriving at its URL
+    // finds it already open. Opening again would be a wasted request the harness may refuse.
+    const open = vi.fn();
+    hooks.useOpenAlkSession.mockReturnValue({ mutate: open, isPending: false });
+    hooks.useAlkStatus.mockReturnValue({
+      status: { ...openStatus, session: { id: "fresh" } },
+      isError: false,
+      refetch: vi.fn(),
+    });
+    renderAt("/rl-environment/fresh");
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeInTheDocument());
+    expect(open).not.toHaveBeenCalled();
+  });
+
   it("offers a way back to the list", () => {
     renderAt("/rl-environment/s1");
     expect(screen.getByRole("link", { name: /all environments/i })).toHaveAttribute(
