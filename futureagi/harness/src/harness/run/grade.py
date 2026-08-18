@@ -87,6 +87,10 @@ class Result:
     calls: int = 0
     spent_usd: float = 0.0
     transcript: str = ""
+    # The same conversation with its speakers still separate. ``transcript`` is rendered for a
+    # person to read, and reading it back apart again cannot be done safely once a turn spans
+    # more than one line -- so anything that needs the turns keeps them from here instead.
+    exchanges: list[dict] = field(default_factory=list)
     # Kept alongside the transcript because a run is diagnosed by comparing them: what the
     # agent said it did against what it actually did.
     actions: str = ""

@@ -208,6 +208,7 @@ async def run_scenario(
             calls=len(transcript.calls),
             spent_usd=transcript.spent_usd + judged_cost,
             transcript=transcript.spoken(),
+            exchanges=[{"speaker": turn.speaker, "text": turn.text} for turn in transcript.exchanges],
             actions=transcript.actions(),
         )
     finally:

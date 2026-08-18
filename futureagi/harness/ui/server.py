@@ -466,9 +466,51 @@ async def run_scenarios(said: Said):
                 }})())
 
         async with busy:
-            await run_suite(chosen, contract, out, on_result=result, on_exchange=exchange)
+            produced = await run_suite(
+                chosen, contract, out, on_result=result, on_exchange=exchange
+            )
+        _report_to_platform(produced, chosen, out, on_event)
 
     return StreamingResponse(_stream_turn(run), media_type="text/event-stream")
+
+
+def _report_to_platform(produced, chosen, out, on_event) -> None:
+    """Put this run where every other run on the platform already is.
+
+    Never fails a run. The suite has finished and its results are on disk by the time this is
+    called; a platform that is unreachable is worth saying out loud, not worth throwing away a
+    completed run over.
+    """
+    from harness import platform as platform_api  # noqa: PLC0415 - optional path
+
+    def say(kind: str, text: str, detail: dict | None = None) -> None:
+        on_event(type("E", (), {"kind": kind, "text": text, "tool": "", "detail": detail or {}})())
+
+    blocked = platform_api.configured()
+    if blocked:
+        say("text", f"not reported to the platform: {blocked}")
+        return
+    try:
+        reported = platform_api.report(
+            produced,
+            chosen,
+            name=(out.name if out else "harness run"),
+            run_test_id=platform_api.remembered(out) if out else "",
+        )
+    except platform_api.PlatformError as failed:
+        say("text", f"the run finished, but reporting it to the platform failed: {failed}")
+        return
+    if out:
+        platform_api.remember(out, reported)
+    for problem in reported.problems:
+        say("text", f"partly reported: {problem}")
+    say(
+        "platform_run",
+        f"reported to the platform: {reported.url}",
+        {"run_test_id": reported.run_test_id,
+         "test_execution_id": reported.test_execution_id,
+         "url": reported.url},
+    )
 
 
 @app.get("/api/contract")
@@ -640,6 +682,27 @@ async def subgoals():
 @app.get("/api/runs")
 async def runs():
     return _runs(current.path if current else None)
+
+
+@app.get("/api/platform")
+async def platform_link():
+    """Where this session's runs are on the platform, for a page wanting to link there.
+
+    Answers before any run has been reported too, so the caller can tell "not wired up" from
+    "nothing run yet" rather than reading both as an absent link.
+    """
+    from harness import platform as platform_api
+
+    out = current.path if current else None
+    return {
+        "run_test_id": platform_api.remembered(out) if out else "",
+        "url": (
+            f"/dashboard/simulate/test/{platform_api.remembered(out)}/runs"
+            if out and platform_api.remembered(out)
+            else ""
+        ),
+        "blocked": platform_api.configured(),
+    }
 
 
 @app.get("/api/simulations")

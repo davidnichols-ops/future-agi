@@ -3525,3 +3525,120 @@ def test_environments_counts_simulation_runs_not_chat_runs(tmp_path):
     rows = sessions.environments(tmp_path)
     assert rows[0]["runs"] == 2
     assert rows[0]["runs_passed"] == 1
+
+
+# --- reporting a run to the platform ---------------------------------------------------
+
+
+def _reported_result(**over):
+    from harness.run.grade import Checkpoint, Result
+
+    result = Result(
+        scenario=over.pop("scenario", "cancel-pending-order"),
+        ended="finished",
+        seconds=12.5,
+        spent_usd=0.25,
+        checkpoints=[
+            Checkpoint(name="user_authenticated", kind="code", passed=True),
+            Checkpoint(name="confirmation_obtained", kind="judged", passed=False, detail="never asked"),
+        ],
+    )
+    result.exchanges = [
+        {"speaker": "customer", "text": "cancel my order"},
+        {"speaker": "agent", "text": "which one?"},
+    ]
+    result.calls_detail = [
+        {"name": "cancel_pending_order", "arguments": {"order_id": "#W1"},
+         "result": "cancelled", "ok": True, "refused": False, "error": "", "at": 1.0}
+    ]
+    for key, value in over.items():
+        setattr(result, key, value)
+    return result
+
+
+def test_a_run_reaches_the_platform_as_transcript_rows_it_understands():
+    from harness import platform
+
+    rows = platform.segments_of(_reported_result())
+    assert [r["speaker_role"] for r in rows] == [
+        "user", "assistant", "tool_calls", "tool_call_result",
+    ]
+    # The platform derives its metrics from timings, so inventing them here would be
+    # indistinguishable downstream from timings that were actually measured.
+    assert all("start_time_ms" not in row for row in rows)
+
+
+def test_sub_goals_travel_named_so_a_page_can_show_one_per_column():
+    from harness import platform
+
+    payload = platform.result_of(_reported_result())
+    checks = payload["call_metadata"]["harness_checkpoints"]
+    assert [c["name"] for c in checks] == ["user_authenticated", "confirmation_obtained"]
+    assert [c["passed"] for c in checks] == [True, False]
+    assert payload["call_metadata"]["harness_of"] == 2
+
+
+def test_a_scenario_that_never_ran_is_not_reported_as_one_the_agent_failed():
+    from harness import platform
+
+    ran = platform.result_of(_reported_result())
+    blocked = platform.result_of(_reported_result(problems=["the world was not ready"]))
+    assert ran["status"] == "completed"
+    assert blocked["status"] == "failed"
+    assert "not ready" in blocked["error_message"]
+
+
+def test_a_second_run_joins_the_same_test_rather_than_starting_another():
+    from harness import platform
+
+    class Recording:
+        def __init__(self):
+            self.provisioned = 0
+            self.started = 0
+
+        def provision(self, name, personas):
+            self.provisioned += 1
+            return {"run_test_id": "rt-1"}
+
+        def start(self, run_test_id):
+            self.started += 1
+            return {"test_execution_id": f"te-{self.started}"}
+
+        def batch(self, test_execution_id, count):
+            return {"call_execution_ids": [f"ce-{n}" for n in range(count)]}
+
+        def result(self, call_execution_id, payload):
+            return {"status": "ingested"}
+
+    api = Recording()
+    first = platform.report([_reported_result()], [], name="s", platform=api)
+    second = platform.report(
+        [_reported_result()], [], name="s", run_test_id=first.run_test_id, platform=api
+    )
+    assert api.provisioned == 1
+    assert (first.test_execution_id, second.test_execution_id) == ("te-1", "te-2")
+    assert second.url == "/dashboard/simulate/test/rt-1/runs"
+
+
+def test_reporting_says_when_the_platform_allocated_too_few_calls():
+    from harness import platform
+
+    class Short:
+        def provision(self, name, personas):
+            return {"run_test_id": "rt-1"}
+
+        def start(self, run_test_id):
+            return {"test_execution_id": "te-1"}
+
+        def batch(self, test_execution_id, count):
+            return {"call_execution_ids": ["ce-0"]}
+
+        def result(self, call_execution_id, payload):
+            return {"status": "ingested"}
+
+    reported = platform.report(
+        [_reported_result(scenario="a"), _reported_result(scenario="b")],
+        [], name="s", platform=Short(),
+    )
+    assert reported.calls == {"a": "ce-0"}
+    assert "allocated 1 calls for 2 scenarios" in " ".join(reported.problems)

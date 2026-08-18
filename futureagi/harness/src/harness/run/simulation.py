@@ -398,6 +398,7 @@ async def _typed_to(
         calls=len(transcript.calls),
         spent_usd=transcript.spent_usd + judged_cost,
         transcript=transcript.spoken(),
+        exchanges=[{"speaker": turn.speaker, "text": turn.text} for turn in transcript.exchanges],
         actions=transcript.actions(),
     )
     result.calls_detail = _calls_of(transcript.calls)
@@ -529,6 +530,8 @@ async def _spoken_to(
         turns=len([line for line in spoken.splitlines() if line.strip()]),
         calls=len(world.calls),
         transcript=spoken,
+        exchanges=[{"speaker": turn.speaker, "text": turn.text}
+                   for turn in spoken_transcript.exchanges],
         recording=(kept[0]["path"] if kept else ""),
     )
     result.tracks = kept
