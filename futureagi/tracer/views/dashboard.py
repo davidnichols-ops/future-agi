@@ -141,10 +141,14 @@ from tracer.services.clickhouse.v2.property_catalog.reader import (
     PropertyCatalogReader,
     PropertyCatalogUnavailable,
 )
+from tracer.services.clickhouse.v2.property_catalog.source_adapters import (
+    system_property_value_adapter,
+)
 from tracer.services.clickhouse.v2.property_catalog.value_cursor import (
     PropertyCatalogValueCursorError,
 )
 from tracer.services.clickhouse.v2.property_catalog.value_reader import (
+    PROPERTY_CATALOG_VALUE_ADAPTER,
     PROPERTY_CATALOG_VALUE_MAX_PROJECTS,
     PropertyCatalogValueNotReady,
     PropertyCatalogValueReader,
@@ -166,6 +170,7 @@ from tracer.services.exact_aggregation_cache import (
     read_or_schedule_exact_snapshot,
 )
 from tracer.utils.helper import get_annotation_labels_by_project
+from tracer.utils.property_registry import parse_property_registry_id
 from tracer.utils.workspace_scope import (
     project_queryset_for_request,
     project_workspace_scope_q,
@@ -208,6 +213,21 @@ def _read_property_catalog_value_page(request, query_params, *, deadline):
         or page_size is None
     ):
         raise PropertyCatalogValueNotReady("native_value_adapter")
+
+    if property_kind == "system_attribute":
+        try:
+            decoded_property = parse_property_registry_id(property_id)
+        except ValueError as exc:
+            raise _PropertyCatalogValueRequestError("invalid property_id") from exc
+        value_adapter = system_property_value_adapter(
+            decoded_property["definition_source"],
+            decoded_property["metric_name"],
+        )
+        if (
+            value_adapter is not None
+            and value_adapter != PROPERTY_CATALOG_VALUE_ADAPTER
+        ):
+            raise PropertyCatalogValueNotReady("native_value_adapter")
 
     raw_project_ids = query_params.get("project_ids", [])
     if len(raw_project_ids) > PROPERTY_CATALOG_VALUE_MAX_PROJECTS:

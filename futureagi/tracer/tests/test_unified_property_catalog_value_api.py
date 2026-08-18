@@ -8,6 +8,9 @@ from unittest.mock import Mock, patch
 import pytest
 from rest_framework.response import Response
 
+from tracer.services.clickhouse.v2.property_catalog.source_adapters import (
+    system_property_value_adapter,
+)
 from tracer.services.clickhouse.v2.property_catalog.value_cursor import (
     PropertyCatalogValueCursorError,
 )
@@ -225,11 +228,6 @@ def test_filter_values_catalog_cursor_error_is_sanitized_400(settings):
 
 def test_native_value_cursor_bypasses_additive_catalog_decoder(settings):
     _enable(settings)
-    reader = Mock()
-    reader.read_page.side_effect = PropertyCatalogValueCursorError(
-        "invalid_cursor",
-        "The property-value continuation cursor is invalid.",
-    )
     request = _request(
         property_id="system_attribute:traces:provider",
         _property_kind="system_attribute",
@@ -245,9 +243,9 @@ def test_native_value_cursor_bypasses_additive_catalog_decoder(settings):
         patch(
             "tracer.views.dashboard.resolve_property_catalog_project_scope",
             return_value=[PROJECT_ID],
-        ),
+        ) as authorize,
         patch("tracer.views.dashboard.PropertyCatalogReadExecutor"),
-        patch("tracer.views.dashboard.PropertyCatalogValueReader", return_value=reader),
+        patch("tracer.views.dashboard.PropertyCatalogValueReader") as reader,
         pytest.raises(PropertyCatalogValueNotReady) as raised,
     ):
         _read_property_catalog_value_page(
@@ -255,7 +253,51 @@ def test_native_value_cursor_bypasses_additive_catalog_decoder(settings):
             request.validated_query_data,
             deadline=deadline,
         )
-    assert raised.value.reason == "native_cursor_adapter"
+    assert raised.value.reason == "native_value_adapter"
+    authorize.assert_not_called()
+    reader.assert_not_called()
+
+
+def test_native_system_value_preflight_skips_catalog_queries(settings):
+    _enable(settings)
+    request = _request(
+        property_id="system_attribute:voice_calls:ended_reason",
+        _property_kind="system_attribute",
+        metric_name="ended_reason",
+        metric_type="system_metric",
+        source="traces",
+        search="",
+    )
+    deadline = Mock()
+
+    with (
+        patch(
+            "tracer.views.dashboard.resolve_property_catalog_project_scope"
+        ) as authorize,
+        patch("tracer.views.dashboard.PropertyCatalogReadExecutor") as executor,
+        patch("tracer.views.dashboard.PropertyCatalogValueReader") as reader,
+        pytest.raises(PropertyCatalogValueNotReady) as raised,
+    ):
+        _read_property_catalog_value_page(
+            request,
+            request.validated_query_data,
+            deadline=deadline,
+        )
+
+    assert raised.value.reason == "native_value_adapter"
+    authorize.assert_not_called()
+    executor.assert_not_called()
+    reader.assert_not_called()
+    deadline.remaining_ms.assert_not_called()
+
+
+def test_system_value_adapter_preflight_matches_manifest_contract():
+    assert system_property_value_adapter("traces", "model") == ("span_attribute_value")
+    assert system_property_value_adapter("voice_calls", "ended_reason") == (
+        "system_traces"
+    )
+    assert system_property_value_adapter("spans", "provider") == "system_traces"
+    assert system_property_value_adapter("missing", "property") is None
 
 
 def test_only_typed_not_ready_signal_enters_existing_native_adapter(settings):

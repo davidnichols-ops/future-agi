@@ -461,6 +461,41 @@ SYSTEM_MANIFEST_EXPECTED_SHA256 = (
     "04eb2a4874197be84cbc1347f52181bdf9d453717889af76c1bdc0d323707054"
 )
 
+_SYSTEM_VALUE_ADAPTER_BY_SOURCE = {
+    "spans": "system_traces",
+    "voice_calls": "system_traces",
+    "users": "system_sessions",
+}
+_CATALOG_BACKED_SYSTEM_VALUE_IDENTITIES = frozenset({("traces", "model")})
+_SYSTEM_PROPERTY_IDENTITIES = frozenset(
+    (
+        source,
+        canonical_system_attribute_name(source, raw_name),
+    )
+    for source, raw_name, *_ in _SYSTEM_PROPERTY_SPECS
+)
+
+
+def system_property_value_adapter(
+    definition_source: str,
+    metric_name: str,
+) -> str | None:
+    """Return the checked-in value adapter for one known system property.
+
+    The helper is deliberately pure so latency-sensitive API dispatch can
+    bypass an unnecessary ClickHouse catalog probe for definitions whose
+    manifest already binds them to an established native reader.
+    """
+
+    source = str(definition_source or "").strip()
+    name = canonical_system_attribute_name(source, metric_name)
+    identity = (source, name)
+    if identity not in _SYSTEM_PROPERTY_IDENTITIES:
+        return None
+    if identity in _CATALOG_BACKED_SYSTEM_VALUE_IDENTITIES:
+        return "span_attribute_value"
+    return _SYSTEM_VALUE_ADAPTER_BY_SOURCE.get(source, f"system_{source}")
+
 
 class PropertySourceError(RuntimeError):
     """A source could not be read completely within the fixed contract."""
@@ -483,11 +518,6 @@ def canonical_system_definitions() -> tuple[PropertyDefinition, ...]:
         "all": 6,
         "datasets": 7,
         "simulation": 8,
-    }
-    value_adapter = {
-        "spans": "system_traces",
-        "voice_calls": "system_traces",
-        "users": "system_sessions",
     }
     definitions: list[PropertyDefinition] = []
     # Older UI surfaces spell a few native ids with ``_id``.  Collapse only
@@ -521,8 +551,10 @@ def canonical_system_definitions() -> tuple[PropertyDefinition, ...]:
             details["unit"] = unit
         if source in {"datasets", "simulation"} and value_type == "string":
             details["allowed_aggregations"] = ("count", "count_distinct")
-        resolved_value_adapter = value_adapter.get(source, f"system_{source}")
-        if source == "traces" and name == "model":
+        resolved_value_adapter = system_property_value_adapter(source, name)
+        if resolved_value_adapter is None:
+            raise PropertySourceError("system manifest value adapter drifted")
+        if resolved_value_adapter == "span_attribute_value":
             # The collector currently materializes this system key in the
             # revision-pinned native value catalog. Other system definitions
             # retain their existing native adapters.
