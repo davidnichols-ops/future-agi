@@ -22,7 +22,7 @@ export const ALK_KEYS = {
 export const useAlkStatus = () => {
   const query = useQuery({
     queryKey: ALK_KEYS.status,
-    queryFn: () => alkAxios.get("/api/status").then((r) => r.data),
+    queryFn: () => alkAxios.get("/status").then((r) => r.data),
     refetchInterval: (q) => (q.state.data?.busy ? 2000 : false),
     retry: false,
   });
@@ -32,7 +32,7 @@ export const useAlkStatus = () => {
 export const useAlkSessions = () => {
   const query = useQuery({
     queryKey: ALK_KEYS.sessions,
-    queryFn: () => alkAxios.get("/api/sessions").then((r) => r.data),
+    queryFn: () => alkAxios.get("/sessions").then((r) => r.data),
     retry: false,
   });
   return {
@@ -67,7 +67,7 @@ const flattenStored = (messages = []) =>
 export const useAlkHistory = (enabled = true) => {
   const query = useQuery({
     queryKey: ALK_KEYS.history,
-    queryFn: () => alkAxios.get("/api/history").then((r) => r.data),
+    queryFn: () => alkAxios.get("/history").then((r) => r.data),
     enabled,
     retry: false,
   });
@@ -77,7 +77,7 @@ export const useAlkHistory = (enabled = true) => {
 export const useAlkContract = (enabled = true) => {
   const query = useQuery({
     queryKey: ALK_KEYS.contract,
-    queryFn: () => alkAxios.get("/api/contract").then((r) => r.data),
+    queryFn: () => alkAxios.get("/contract").then((r) => r.data),
     enabled,
     retry: false,
   });
@@ -87,7 +87,7 @@ export const useAlkContract = (enabled = true) => {
 export const useAlkWorld = (enabled = true) => {
   const query = useQuery({
     queryKey: ALK_KEYS.world,
-    queryFn: () => alkAxios.get("/api/world").then((r) => r.data),
+    queryFn: () => alkAxios.get("/world").then((r) => r.data),
     enabled,
     retry: false,
   });
@@ -98,7 +98,7 @@ export const useAlkWorld = (enabled = true) => {
 export const useAlkScenarios = (enabled = true) => {
   const query = useQuery({
     queryKey: ALK_KEYS.scenarios,
-    queryFn: () => alkAxios.get("/api/scenarios").then((r) => r.data),
+    queryFn: () => alkAxios.get("/scenarios").then((r) => r.data),
     enabled,
     retry: false,
   });
@@ -109,7 +109,7 @@ export const useAlkScenarios = (enabled = true) => {
 export const useAlkSubgoals = (enabled = true) => {
   const query = useQuery({
     queryKey: ALK_KEYS.subgoals,
-    queryFn: () => alkAxios.get("/api/subgoals").then((r) => r.data),
+    queryFn: () => alkAxios.get("/subgoals").then((r) => r.data),
     enabled,
     retry: false,
   });
@@ -124,7 +124,7 @@ export const useAlkSubgoals = (enabled = true) => {
 export const useAlkRuns = (enabled = true) => {
   const query = useQuery({
     queryKey: ALK_KEYS.runs,
-    queryFn: () => alkAxios.get("/api/runs").then((r) => r.data),
+    queryFn: () => alkAxios.get("/runs").then((r) => r.data),
     enabled,
     retry: false,
   });
@@ -136,14 +136,14 @@ export const useAlkRuns = (enabled = true) => {
 /** One file out of a scenario's folder, fetched only when the reader opens it. */
 export const fetchScenarioFile = (name, path) =>
   alkAxios
-    .get("/api/scenario-file", { params: { name, path } })
+    .get("/scenario-file", { params: { name, path } })
     .then((r) => r.data)
     .catch((failed) => ({ error: failed?.response?.data?.error || failed.message }));
 
 export const useAlkSimulations = (enabled = true) => {
   const query = useQuery({
     queryKey: ALK_KEYS.simulations,
-    queryFn: () => alkAxios.get("/api/simulations").then((r) => r.data),
+    queryFn: () => alkAxios.get("/simulations").then((r) => r.data),
     enabled,
     retry: false,
   });
@@ -186,14 +186,14 @@ const useAlkMutation = (mutationFn) => {
 
 export const useCreateAlkSession = () =>
   useAlkMutation((agent = "") =>
-    alkAxios.post("/api/sessions", { agent }).then((r) => r.data)
+    alkAxios.post("/sessions", { agent }).then((r) => r.data)
   );
 
 export const useOpenAlkSession = () =>
-  useAlkMutation((id) => alkAxios.post("/api/sessions/open", { id }).then((r) => r.data));
+  useAlkMutation((id) => alkAxios.post("/sessions/open", { id }).then((r) => r.data));
 
 export const useDeleteAlkSession = () =>
   useAlkMutation((id) => alkAxios.delete(`/api/sessions/${id}`).then((r) => r.data));
 
 export const useSetAlkStage = () =>
-  useAlkMutation((stage) => alkAxios.post("/api/stage", { stage }).then((r) => r.data));
+  useAlkMutation((stage) => alkAxios.post("/stage", { stage }).then((r) => r.data));

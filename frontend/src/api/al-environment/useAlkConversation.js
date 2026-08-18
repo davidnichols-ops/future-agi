@@ -13,7 +13,8 @@ import { streamHarness } from "./streamHarness";
 const asMessage = (event) => {
   switch (event.kind) {
     case "text":
-      return { role: "tester", text: event.text };
+      // Marked so consecutive chunks can be merged — see append().
+      return { role: "tester", text: event.text, streamed: true };
     case "tool":
       return { tool: event.tool, detail: event.detail };
     case "result":
@@ -33,6 +34,13 @@ const asMessage = (event) => {
     case "artifact":
       // A signal to refresh the artifact tabs, not something to say in the thread.
       return null;
+    case "done":
+      // A stage can end badly without the transport failing: the server synthesises
+      // {outcome: "stopped"|"failed", error} on an interrupt or a crash. Without reading it
+      // a failed stage just stops, leaving the operator with a turn that went quiet.
+      return event.detail?.outcome === "failed" && event.detail?.error
+        ? { role: "error", text: event.detail.error }
+        : null;
     default:
       return null;
   }
@@ -72,7 +80,18 @@ export const useAlkConversation = () => {
   const abortRef = useRef(null);
 
   const append = useCallback((message) => {
-    if (message) setLive((all) => [...all, message]);
+    if (!message) return;
+    setLive((all) => {
+      const last = all[all.length - 1];
+      // Prose arrives one chunk at a time. Pushing each chunk separately would turn a
+      // single sentence into a column of fragments, each with its own speaker label, so
+      // consecutive chunks join up. Any tool call in between ends the paragraph, which is
+      // what makes the next chunk start a fresh one.
+      if (message.streamed && last?.streamed) {
+        return [...all.slice(0, -1), { ...last, text: last.text + message.text }];
+      }
+      return [...all, message];
+    });
   }, []);
 
   const drive = useCallback(
@@ -93,6 +112,13 @@ export const useAlkConversation = () => {
           onEvent: (event) => {
             const said = labelFor(event);
             if (said) setThinking(said);
+            // An artifact lands mid-stage — the build stage runs for minutes — so the tabs
+            // refresh as it arrives rather than only once the whole turn finishes.
+            if (event.kind === "artifact") {
+              TOUCHED_BY_A_TURN.forEach((queryKey) =>
+                queryClient.invalidateQueries({ queryKey })
+              );
+            }
             append(asMessage(event));
           },
         });
@@ -118,17 +144,17 @@ export const useAlkConversation = () => {
   );
 
   const say = useCallback(
-    (text) => drive("/api/say", { text }, { role: "you", text }),
+    (text) => drive("/say", { text }, { role: "you", text }),
     [drive]
   );
 
   /** An empty string runs every scenario; names separated by spaces run only those. */
-  const runScenarios = useCallback((names = "") => drive("/api/run", { text: names }, null), [drive]);
+  const runScenarios = useCallback((names = "") => drive("/run", { text: names }, null), [drive]);
 
   const stop = useCallback(async () => {
     abortRef.current?.abort();
     try {
-      await alkAxios.post("/api/stop");
+      await alkAxios.post("/stop");
     } catch {
       // Stopping is best-effort: if the turn already ended there is nothing to interrupt.
     }

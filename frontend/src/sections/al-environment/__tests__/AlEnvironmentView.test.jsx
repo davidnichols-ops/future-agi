@@ -147,10 +147,7 @@ describe("AlEnvironmentView", () => {
 
   it("links to the platform run once the harness reports its ids", () => {
     hooks.useAlkStatus.mockReturnValue({
-      status: {
-        ...openStatus,
-        session: { id: "s1", run_test_id: "test-uuid", execution_id: "exec-uuid" },
-      },
+      status: { ...openStatus, run_test_id: "test-uuid", execution_id: "exec-uuid" },
       isError: false,
       refetch: vi.fn(),
     });

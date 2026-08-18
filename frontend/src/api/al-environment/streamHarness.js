@@ -1,4 +1,5 @@
-import { alkBaseUrl } from "./client";
+import appAxios from "src/utils/axios";
+import { alkBaseUrl, AUTH_HEADERS, isDirectToHarness } from "./client";
 import { createSseParser } from "./parseSse";
 
 /**
@@ -12,9 +13,19 @@ import { createSseParser } from "./parseSse";
  * with one, and it is what the header and tabs resync from.
  */
 export const streamHarness = async ({ path, body, onEvent, signal }) => {
-  const response = await fetch(`${alkBaseUrl(import.meta.env)}${path}`, {
+  const base = alkBaseUrl(import.meta.env);
+  // fetch does not go through the axios instance, so the same headers are applied by hand.
+  const headers = { "Content-Type": "application/json" };
+  if (!isDirectToHarness(base)) {
+    AUTH_HEADERS.forEach((header) => {
+      const value = appAxios.defaults.headers.common?.[header];
+      if (value) headers[header] = value;
+    });
+  }
+
+  const response = await fetch(`${base}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body ?? {}),
     signal,
   });

@@ -50,6 +50,35 @@ describe("useAlkConversation", () => {
     expect(rendered.map((m) => m.tool || m.role)).toEqual(["tester", "save_world", "save_world"]);
   });
 
+  it("joins streamed prose into one message instead of one per chunk", async () => {
+    streamsBack([
+      { kind: "text", text: "Read it. " },
+      { kind: "text", text: "Four tools, " },
+      { kind: "text", text: "all on DriveThruTools." },
+    ]);
+    const { result } = renderHook(() => useAlkConversation(), { wrapper });
+    await act(async () => {
+      await result.current.say("go");
+    });
+    const prose = result.current.live.slice(1);
+    expect(prose).toHaveLength(1);
+    expect(prose[0].text).toBe("Read it. Four tools, all on DriveThruTools.");
+  });
+
+  it("starts a fresh paragraph after a tool call", async () => {
+    streamsBack([
+      { kind: "text", text: "first" },
+      { kind: "tool", tool: "save_world", detail: {} },
+      { kind: "text", text: "second" },
+    ]);
+    const { result } = renderHook(() => useAlkConversation(), { wrapper });
+    await act(async () => {
+      await result.current.say("go");
+    });
+    const said = result.current.live.slice(1).map((m) => m.text || m.tool);
+    expect(said).toEqual(["first", "save_world", "second"]);
+  });
+
   it("leaves control events out of the transcript", async () => {
     streamsBack([
       { kind: "status", detail: { busy: false } },
@@ -104,6 +133,44 @@ describe("useAlkConversation", () => {
       await result.current.say("go");
     });
     expect(result.current.live.at(-1)).toMatchObject({ role: "error" });
+  });
+
+  it("reports a stage that failed, which the transport cannot tell you about", async () => {
+    streamsBack([
+      { kind: "text", text: "reading" },
+      { kind: "done", detail: { outcome: "failed", error: "the model refused to continue" } },
+    ]);
+    const { result } = renderHook(() => useAlkConversation(), { wrapper });
+    await act(async () => {
+      await result.current.say("go");
+    });
+    expect(result.current.live.at(-1)).toMatchObject({
+      role: "error",
+      text: "the model refused to continue",
+    });
+  });
+
+  it("says nothing extra when a stage ends normally", async () => {
+    streamsBack([{ kind: "done", detail: { outcome: "ok", turns: 3 } }]);
+    const { result } = renderHook(() => useAlkConversation(), { wrapper });
+    await act(async () => {
+      await result.current.say("go");
+    });
+    expect(result.current.live.filter((m) => m.role === "error")).toHaveLength(0);
+  });
+
+  it("refreshes the tabs as each artifact lands, not just at the end", async () => {
+    streamsBack([{ kind: "artifact", text: "contract.json", detail: { path: "contract.json" } }]);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useAlkConversation(), { wrapper });
+    await act(async () => {
+      await result.current.say("go");
+    });
+    const contractRefreshes = invalidate.mock.calls.filter(
+      (c) => c[0].queryKey.join(".") === "alk.contract"
+    );
+    // Once for the artifact, once for the completed turn.
+    expect(contractRefreshes.length).toBeGreaterThanOrEqual(2);
   });
 
   it("resyncs the cached status and tabs once a stream finishes", async () => {

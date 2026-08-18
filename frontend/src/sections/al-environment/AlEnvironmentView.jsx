@@ -37,9 +37,10 @@ const AlEnvironmentView = () => {
 
   const { status, isError, refetch } = useAlkStatus();
   const hasSession = Boolean(status?.session);
-  // Supplied by the harness on the open session once a platform run exists for it.
-  const runTestId = status?.session?.run_test_id;
-  const executionId = status?.session?.execution_id;
+  // Added by the backend proxy at the top level of the status object, beside `busy` — not
+  // inside `session`. Absent entirely when talking to the harness directly, hence nullable.
+  const runTestId = status?.run_test_id;
+  const executionId = status?.execution_id;
 
   const { sessions, openSessionId } = useAlkSessions();
   const { messages } = useAlkHistory(hasSession);
