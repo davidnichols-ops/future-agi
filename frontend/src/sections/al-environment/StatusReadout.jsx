@@ -1,0 +1,25 @@
+import PropTypes from "prop-types";
+import { Box, Stack, Typography } from "@mui/material";
+import { ALK_MONO } from "./alkTokens";
+
+const StatusReadout = ({ model, spentUsd, busy }) => (
+  <Stack direction="row" alignItems="center" spacing={1}>
+    {busy && (
+      <Box
+        aria-label="working"
+        sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: "warning.main" }}
+      />
+    )}
+    <Typography variant="caption" sx={{ fontFamily: ALK_MONO, color: "text.secondary" }}>
+      {model || "no model"} · ${Number(spentUsd || 0).toFixed(4)}
+    </Typography>
+  </Stack>
+);
+
+StatusReadout.propTypes = {
+  model: PropTypes.string,
+  spentUsd: PropTypes.number,
+  busy: PropTypes.bool,
+};
+
+export default StatusReadout;

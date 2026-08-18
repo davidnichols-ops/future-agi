@@ -258,6 +258,11 @@ export function useNavData() {
               });
             },
           },
+          {
+            title: "AL Environment",
+            path: paths.dashboard.simulate.alEnvironment,
+            icon: ICONS.prototype,
+          },
         ],
       },
       // {
