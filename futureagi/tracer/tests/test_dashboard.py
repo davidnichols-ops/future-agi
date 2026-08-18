@@ -1064,6 +1064,11 @@ def _get_metrics_with_annotation_labels(auth_client, project_id, label_ids):
             "tracer.services.dashboard_metrics_catalog.AnnotationLabelScoresProjectPG",
             source_class,
         ) as direct_source_class,
+        patch(
+            "tracer.services.dashboard_metrics_catalog."
+            "V2AnalyticsQueryService.get_span_attribute_keys_ch_for_projects",
+            return_value=[],
+        ),
     ):
         response = auth_client.get(
             f"/tracer/dashboard/metrics/?project_ids={project_id}"
@@ -2599,7 +2604,16 @@ class TestMetricsEndpoint:
             organization=organization,
             workspace=workspace,
             project=project,
-            settings={"options": [{"value": "ready", "label": "Ready"}]},
+            settings={
+                "options": [
+                    {"value": "ready", "label": "Ready"},
+                    {"value": "blocked", "label": "Blocked"},
+                ],
+                "strategy": None,
+                "auto_annotate": False,
+                "multi_choice": False,
+                "rule_prompt": "",
+            },
         )
 
         response = _get_metrics_with_annotation_labels(
@@ -2615,7 +2629,10 @@ class TestMetricsEndpoint:
             if entry["name"] == str(label.id)
         )
         assert metric["category"] == "annotation_metric"
-        assert metric["choice_options"] == [{"value": "ready", "label": "Ready"}]
+        assert metric["choice_options"] == [
+            {"value": "ready", "label": "Ready"},
+            {"value": "blocked", "label": "Blocked"},
+        ]
 
     @pytest.mark.django_db
     @patch("tracer.services.dashboard_metrics_catalog.V2AnalyticsQueryService")
@@ -11863,7 +11880,7 @@ class TestFilterValuesEndpoint:
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=False)
-    def test_simulation_source_returns_empty_when_clickhouse_disabled(
+    def test_simulation_source_fails_closed_when_clickhouse_disabled(
         self, _mock_ch, auth_client
     ):
         response = auth_client.get(
@@ -11874,8 +11891,10 @@ class TestFilterValuesEndpoint:
                 "metric_name": "status",
             },
         )
-        assert response.status_code == 200
-        assert response.json()["result"]["values"] == []
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["code"] == "service_unavailable"
+        assert "temporarily unavailable" in json.dumps(payload)
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
