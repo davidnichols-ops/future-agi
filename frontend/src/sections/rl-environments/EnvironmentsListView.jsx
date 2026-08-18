@@ -113,17 +113,19 @@ function EmptyState({ title, description, action }) {
   return (
     <Box
       sx={{
-        // No panel: a bordered box stretched to the viewport left the message adrift halfway
-        // down it, and one sized to its content read as a stray band across the top. The
-        // invitation is the content, so it just sits centred below the header.
+        // No panel — a border around this read as a stray band. The content is centred in
+        // whatever height is left instead of pinned to the top, which left it clinging to the
+        // header above a large void.
+        flex: 1,
+        minHeight: 0,
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
+        justifyContent: "center",
         gap: 1,
         textAlign: "center",
         maxWidth: 460,
         mx: "auto",
-        pt: 12,
         pb: 6,
       }}
     >
