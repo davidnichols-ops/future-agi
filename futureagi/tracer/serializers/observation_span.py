@@ -3,7 +3,6 @@ import json
 from django.db.models import Q
 from rest_framework import serializers
 
-from tfc.utils.serializer_fields import StringOrObjectField
 from tracer.constants.provider_logos import PROVIDER_LOGOS
 from tracer.models.observation_span import ObservationSpan
 from tracer.models.project import Project
@@ -51,14 +50,11 @@ class ObservationAttributeListQuerySerializer(serializers.Serializer):
         required=False,
         default="spans",
     )
-    include_types = serializers.BooleanField(required=False, default=False)
 
 
 class ObservationAttributeListResponseSerializer(serializers.Serializer):
     status = serializers.BooleanField(default=True)
-    # Attribute keys as bare strings, or ``{"key", "type"}`` objects when the
-    # caller passes ``include_types`` on the spans surface.
-    result = serializers.ListField(child=StringOrObjectField())
+    result = serializers.ListField(child=serializers.CharField())
 
 
 class RootSpansQuerySerializer(serializers.Serializer):

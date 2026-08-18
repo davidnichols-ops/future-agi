@@ -38077,27 +38077,24 @@ export const TracerObservationSpanCreateOtelSpanBody = zod.object({
     filters: JSON {"project_id": "<uuid>"} (required)
     row_type: spans | traces | sessions (default spans;
               voiceCalls aliases to spans)
-    include_types: spans/voiceCalls only — traces and sessions
-              return interpolated paths, which are always strings.
  * @summary Attribute paths the EvalPicker exposes per row_type.
  */
 
 export const tracerObservationSpanGetEvalAttributesListQueryRowTypeDefault = `spans`;
-export const tracerObservationSpanGetEvalAttributesListQueryIncludeTypesDefault = false;
 
 export const TracerObservationSpanGetEvalAttributesListQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
   "limit": zod.number().optional().describe('Number of results to return per page.'),
   "filters": zod.string().min(1),
-  "row_type": zod.enum(['spans', 'traces', 'sessions', 'voiceCalls']).default(tracerObservationSpanGetEvalAttributesListQueryRowTypeDefault),
-  "include_types": zod.boolean().default(tracerObservationSpanGetEvalAttributesListQueryIncludeTypesDefault)
+  "row_type": zod.enum(['spans', 'traces', 'sessions', 'voiceCalls']).default(tracerObservationSpanGetEvalAttributesListQueryRowTypeDefault)
 })
 
 export const tracerObservationSpanGetEvalAttributesListResponseStatusDefault = true;
 
+
 export const TracerObservationSpanGetEvalAttributesListResponse = zod.object({
   "status": zod.boolean().default(tracerObservationSpanGetEvalAttributesListResponseStatusDefault),
-  "result": zod.array(zod.union([zod.string(), zod.object({}).passthrough()]).describe('String or JSON object.'))
+  "result": zod.array(zod.string().min(1))
 })
 
 
@@ -38323,27 +38320,24 @@ export const TracerObservationSpanGetObservationSpanFieldsResponse = zod.object(
 /**
  * Query params:
     filters: JSON {"project_id": "<uuid>"} (required)
-    include_types: when true, return ``{"key", "type"}`` objects so
-        the caller can pick an operator set without asking the user.
  * @summary Distinct span_attributes keys for a project (spans surface).
  */
 
 export const tracerObservationSpanGetSpanAttributesListQueryRowTypeDefault = `spans`;
-export const tracerObservationSpanGetSpanAttributesListQueryIncludeTypesDefault = false;
 
 export const TracerObservationSpanGetSpanAttributesListQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
   "limit": zod.number().optional().describe('Number of results to return per page.'),
   "filters": zod.string().min(1),
-  "row_type": zod.enum(['spans', 'traces', 'sessions', 'voiceCalls']).default(tracerObservationSpanGetSpanAttributesListQueryRowTypeDefault),
-  "include_types": zod.boolean().default(tracerObservationSpanGetSpanAttributesListQueryIncludeTypesDefault)
+  "row_type": zod.enum(['spans', 'traces', 'sessions', 'voiceCalls']).default(tracerObservationSpanGetSpanAttributesListQueryRowTypeDefault)
 })
 
 export const tracerObservationSpanGetSpanAttributesListResponseStatusDefault = true;
 
+
 export const TracerObservationSpanGetSpanAttributesListResponse = zod.object({
   "status": zod.boolean().default(tracerObservationSpanGetSpanAttributesListResponseStatusDefault),
-  "result": zod.array(zod.union([zod.string(), zod.object({}).passthrough()]).describe('String or JSON object.'))
+  "result": zod.array(zod.string().min(1))
 })
 
 

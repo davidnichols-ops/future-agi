@@ -62233,8 +62233,6 @@ export const getTracerObservationSpanGetEvalAttributesListUrl = (params: TracerO
     filters: JSON {"project_id": "<uuid>"} (required)
     row_type: spans | traces | sessions (default spans;
               voiceCalls aliases to spans)
-    include_types: spans/voiceCalls only — traces and sessions
-              return interpolated paths, which are always strings.
  * @summary Attribute paths the EvalPicker exposes per row_type.
  */
 export const tracerObservationSpanGetEvalAttributesList = async (params: TracerObservationSpanGetEvalAttributesListParams, options?: RequestInit): Promise<tracerObservationSpanGetEvalAttributesListResponse> => {
@@ -62437,8 +62435,6 @@ export const getTracerObservationSpanGetSpanAttributesListUrl = (params: TracerO
 /**
  * Query params:
     filters: JSON {"project_id": "<uuid>"} (required)
-    include_types: when true, return ``{"key", "type"}`` objects so
-        the caller can pick an operator set without asking the user.
  * @summary Distinct span_attributes keys for a project (spans surface).
  */
 export const tracerObservationSpanGetSpanAttributesList = async (params: TracerObservationSpanGetSpanAttributesListParams, options?: RequestInit): Promise<tracerObservationSpanGetSpanAttributesListResponse> => {

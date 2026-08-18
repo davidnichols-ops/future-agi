@@ -220,65 +220,6 @@ class TestGetEvalAttributesListSessions:
 
 @pytest.mark.integration
 @pytest.mark.api
-class TestGetEvalAttributesListIncludeTypes:
-    """``include_types`` opts into ``{key, type}`` on the spans surface.
-
-    It is opt-in because every existing caller reads the flat list; the
-    traces/sessions surfaces ignore it since their paths are always strings.
-    """
-
-    def test_spans_include_types_returns_key_type_objects(
-        self, auth_client, populated_observe_project
-    ):
-        project = populated_observe_project["project"]
-        response = auth_client.get(
-            "/tracer/observation-span/get_eval_attributes_list/",
-            {
-                "filters": json.dumps({"project_id": str(project.id)}),
-                "include_types": "true",
-            },
-        )
-        assert response.status_code == 200
-        result = response.json().get("result", [])
-        assert result, "expected at least one attribute"
-        assert all(isinstance(row, dict) for row in result)
-        assert all({"key", "type"} <= set(row) for row in result)
-        assert "input" in {row["key"] for row in result}
-
-    def test_omitting_the_flag_keeps_the_flat_list(
-        self, auth_client, populated_observe_project
-    ):
-        """The 11 existing callers must see no change."""
-        project = populated_observe_project["project"]
-        response = auth_client.get(
-            "/tracer/observation-span/get_eval_attributes_list/",
-            {"filters": json.dumps({"project_id": str(project.id)})},
-        )
-        assert response.status_code == 200
-        assert all(isinstance(row, str) for row in response.json()["result"])
-
-    @pytest.mark.parametrize("row_type", ["traces", "sessions"])
-    def test_path_surfaces_ignore_the_flag(
-        self, auth_client, populated_observe_project, row_type
-    ):
-        """Paths are interpolated strings — a dict here would corrupt them."""
-        project = populated_observe_project["project"]
-        response = auth_client.get(
-            "/tracer/observation-span/get_eval_attributes_list/",
-            {
-                "filters": json.dumps({"project_id": str(project.id)}),
-                "row_type": row_type,
-                "include_types": "true",
-            },
-        )
-        assert response.status_code == 200
-        result = response.json().get("result", [])
-        assert all(isinstance(path, str) for path in result)
-        assert not any("{" in path or "}" in path for path in result)
-
-
-@pytest.mark.integration
-@pytest.mark.api
 class TestSpanAttributeKeysNormalisation:
     """``_get_span_attribute_keys`` must hand callers bare strings.
 
@@ -327,49 +268,6 @@ class TestSpanAttributeKeysNormalisation:
             "gen_ai.input.foo",
             "bare_string_key",
             "gen_ai.output.bar",
-        ]
-
-    def test_rows_keep_the_type_ch_resolved(self, monkeypatch):
-        """``_get_span_attribute_rows`` is the typed counterpart.
-
-        CH decides the type from which typed map the key lives in, so the
-        picker can offer the right operators without asking the user.
-        Entries dropped by the string normaliser are dropped here too.
-        """
-        from tracer.services.clickhouse.query_service import (
-            AnalyticsQueryService,
-        )
-        from tracer.views.observation_span import ObservationSpanView
-
-        raw_input = [
-            {"key": "customer_tier", "type": "string"},
-            {"key": "retry_count", "type": "number"},
-            {"key": "escalated", "type": "boolean"},
-            "bare_string_key",  # legacy shape — defaults to string
-            {"type": "number"},  # no key — must be dropped
-            "",  # empty — must be dropped
-        ]
-
-        monkeypatch.setattr(
-            AnalyticsQueryService,
-            "get_span_attribute_keys_ch",
-            lambda self, pid: raw_input,
-        )
-
-        view = ObservationSpanView()
-
-        assert view._get_span_attribute_rows("any-project-id") == [
-            {"key": "customer_tier", "type": "string"},
-            {"key": "retry_count", "type": "number"},
-            {"key": "escalated", "type": "boolean"},
-            {"key": "bare_string_key", "type": "string"},
-        ]
-        # The string surface stays byte-identical for existing callers.
-        assert view._get_span_attribute_keys("any-project-id") == [
-            "customer_tier",
-            "retry_count",
-            "escalated",
-            "bare_string_key",
         ]
 
     def test_no_curly_braces_in_traces_response(
