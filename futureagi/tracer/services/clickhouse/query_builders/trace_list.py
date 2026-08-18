@@ -574,12 +574,18 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 # ``annotator`` is a Score relation independent of col_type,
                 # except that an explicit SPAN_ATTRIBUTE means the caller
                 # intentionally selected a raw customer attribute with the
-                # same name.
+                # same name. ``is_not_null`` also has a positive Score-row
+                # witness, so it can seed candidates without scanning every
+                # trace in the requested window. ``is_null`` remains
+                # classifier-only because absence has no row to seed from.
                 if col_type not in {"", "NORMAL", "SYSTEM_METRIC", "ANNOTATION"}:
                     continue
                 if filter_type not in {"", "text", "annotator"}:
                     continue
                 values = value if isinstance(value, (list, tuple)) else [value]
+                if operation == "is_not_null":
+                    candidates.append((0, index, item))
+                    continue
                 if (
                     operation in {"equals", "in", "not_equals", "not_in"}
                     and values

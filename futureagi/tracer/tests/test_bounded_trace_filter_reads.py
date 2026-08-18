@@ -959,6 +959,53 @@ def test_voice_annotator_and_turn_count_use_positive_candidate_seed() -> None:
     assert match_params["candidate_trace_ids"] == ("trace-a", "trace-b")
 
 
+def test_voice_annotator_is_not_null_uses_positive_candidate_seed() -> None:
+    builder = VoiceCallListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            {
+                "column_id": "annotator",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "annotator",
+                    "filter_op": "is_not_null",
+                    "filter_value": None,
+                },
+            },
+            {
+                "column_id": "turn_count",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "number",
+                    "filter_op": "greater_than",
+                    "filter_value": 1,
+                },
+            },
+        ],
+    )
+
+    sql, params = builder.build_filter_candidate_seed_page(
+        slice_start=START,
+        slice_end=END,
+        limit=26,
+    )
+    compact_sql = " ".join(sql.split())
+    match_sql, match_params = builder.build_filter_match_query(["trace-a"])
+
+    assert builder.supports_filter_candidate_seed_page() is True
+    assert builder.recommended_filter_initial_slice_width() == END - START
+    assert "model_hub_score AS s FINAL" in compact_sql
+    assert "isNotNull(s.annotator_id)" in compact_sql
+    assert "ORDER BY start_time DESC, trace_id DESC" in compact_sql
+    assert params["filter_seed_limit"] == 26
+    # Candidate acquisition is only a narrowing witness. The finite
+    # classifier still repeats both public predicates before publication.
+    assert "isNotNull(s.annotator_id)" in match_sql
+    assert "candidate_trace_ids" in match_sql
+    assert 1 in match_params.values()
+
+
 def test_negative_voice_annotator_uses_exact_relation_candidate_seed() -> None:
     annotator_id = "00000000-0000-4000-8000-000000000099"
     builder = VoiceCallListQueryBuilderV2(
