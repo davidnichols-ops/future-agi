@@ -153,7 +153,7 @@ export const useAlkSimulations = (enabled = true) => {
 export const useAlkSimulation = (runId) => {
   const query = useQuery({
     queryKey: ALK_KEYS.simulation(runId),
-    queryFn: () => alkAxios.get(`/api/simulations/${runId}`).then((r) => r.data),
+    queryFn: () => alkAxios.get(`/simulations/${runId}`).then((r) => r.data),
     enabled: Boolean(runId),
     retry: false,
   });
@@ -193,7 +193,7 @@ export const useOpenAlkSession = () =>
   useAlkMutation((id) => alkAxios.post("/sessions/open", { id }).then((r) => r.data));
 
 export const useDeleteAlkSession = () =>
-  useAlkMutation((id) => alkAxios.delete(`/api/sessions/${id}`).then((r) => r.data));
+  useAlkMutation((id) => alkAxios.delete(`/sessions/${id}`).then((r) => r.data));
 
 export const useSetAlkStage = () =>
   useAlkMutation((stage) => alkAxios.post("/stage", { stage }).then((r) => r.data));

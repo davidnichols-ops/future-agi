@@ -163,6 +163,32 @@ describe("AlEnvironmentView", () => {
     );
   });
 
+  it("does not show a finished turn twice once history has it", () => {
+    // History has refetched with the turn the stream just produced; `live` still holds its
+    // copy. Showing both is what rendered every completed turn twice.
+    hooks.useAlkHistory.mockReturnValue({
+      messages: [{ role: "you", text: "build the world" }],
+    });
+    conversation.useAlkConversation.mockReturnValue({
+      live: [{ role: "you", text: "build the world" }],
+      streaming: false, error: "", thinking: "",
+      say: vi.fn(), runScenarios: vi.fn(), stop: vi.fn(), clearLive: vi.fn(),
+    });
+    render(<AlEnvironmentView />);
+    expect(screen.getAllByText("build the world")).toHaveLength(1);
+  });
+
+  it("keeps an error line after the turn ends, since history never has it", () => {
+    hooks.useAlkHistory.mockReturnValue({ messages: [] });
+    conversation.useAlkConversation.mockReturnValue({
+      live: [{ role: "error", text: "the model refused to continue" }],
+      streaming: false, error: "", thinking: "",
+      say: vi.fn(), runScenarios: vi.fn(), stop: vi.fn(), clearLive: vi.fn(),
+    });
+    render(<AlEnvironmentView />);
+    expect(screen.getByText(/the model refused to continue/)).toBeInTheDocument();
+  });
+
   it("offers a composer so the session can be talked to", () => {
     render(<AlEnvironmentView />);
     expect(screen.getByRole("textbox")).toBeInTheDocument();

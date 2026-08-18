@@ -122,7 +122,14 @@ export const useAlkConversation = () => {
             append(asMessage(event));
           },
         });
-        TOUCHED_BY_A_TURN.forEach((queryKey) => queryClient.invalidateQueries({ queryKey }));
+        // The harness writes the turn to disk as it ends, so refetched history will contain
+        // what `live` is still holding. Stay "streaming" until that refetch lands: the view
+        // shows the live half only while streaming, so this is what stops a finished turn
+        // appearing twice without blinking it out in between.
+        TOUCHED_BY_A_TURN.filter((queryKey) => queryKey !== ALK_KEYS.history).forEach(
+          (queryKey) => queryClient.invalidateQueries({ queryKey })
+        );
+        await queryClient.invalidateQueries({ queryKey: ALK_KEYS.history });
       } catch (failed) {
         // Pressing Stop aborts the reader on purpose. That is not something to report.
         const stopped =

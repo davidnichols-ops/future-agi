@@ -158,9 +158,14 @@ const AlEnvironmentView = () => {
   const refusalMessage =
     refusal?.response?.data?.error || refusal?.message || "";
 
-  // Stored history plus whatever is still arriving. The harness writes the turn to disk when
-  // it finishes, so the live half is dropped as soon as history catches up.
-  const transcript = [...messages, ...conversation.live];
+  // The live half is only shown while a turn is running. The hook stays "streaming" until the
+  // finished turn has been refetched into history, so the handover happens with neither a gap
+  // nor a moment where history and `live` both hold the same turn.
+  const transcript = conversation.streaming
+    ? [...messages, ...conversation.live]
+    : // Once the turn is in history the live copy would double it — except the error lines,
+      // which we author ourselves and the harness never writes down.
+      [...messages, ...conversation.live.filter((one) => one.role === "error")];
 
   /** The roadmap is navigation as well as a control: opening a finished stage shows its output. */
   const selectStage = (stageKey) => {
