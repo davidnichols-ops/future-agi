@@ -39,7 +39,22 @@ const Composer = ({ onSay, onRun, onStop, streaming, status, sessionId, artifact
   const chips = hasSession ? quickChips(status) : [];
 
   return (
-    <Box sx={{ px: 2, pt: 1.5, pb: 1.75, borderTop: "1px solid", borderColor: "divider" }}>
+    <Box sx={{
+        px: 3,
+        pt: 1.5,
+        pb: 1.75,
+        position: "relative",
+        // Matches the toolbar rule: inset to the content, not run to the pane edge.
+        "&::before": {
+          content: '""',
+          position: "absolute",
+          left: 24,
+          right: 24,
+          top: 0,
+          borderTop: "1px solid",
+          borderColor: "divider",
+        },
+      }}>
       {chips.length > 0 && (
         <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap sx={{ mb: 1 }}>
           {chips.map((chip) => (

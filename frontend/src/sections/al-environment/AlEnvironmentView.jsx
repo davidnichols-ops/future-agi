@@ -90,8 +90,18 @@ const AlEnvironmentView = () => {
           flexWrap: "wrap",
           gap: 1,
           bgcolor: "background.paper",
-          borderBottom: "1px solid",
-          borderColor: "divider",
+          // The rule is inset to the same 24px as the content it separates; run edge to edge
+          // it sticks out past everything and reads as belonging to the sidebar.
+          "&::after": {
+            content: '""',
+            position: "absolute",
+            left: 24,
+            right: 24,
+            bottom: 0,
+            borderBottom: "1px solid",
+            borderColor: "divider",
+          },
+          position: "relative",
         }}
       >
         <SessionPicker

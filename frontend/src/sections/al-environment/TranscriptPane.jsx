@@ -21,7 +21,7 @@ const TranscriptPane = ({ messages, hasSession, thinking }) => {
 
   if (!hasSession) {
     return (
-      <Box sx={{ p: 2 }}>
+      <Box sx={{ px: 3, py: 2 }}>
         <Typography variant="caption" sx={{ fontFamily: ALK_MONO, color: "text.secondary" }}>
           TESTER
         </Typography>
@@ -35,7 +35,7 @@ const TranscriptPane = ({ messages, hasSession, thinking }) => {
 
   if (messages.length === 0 && !thinking) {
     return (
-      <Box sx={{ p: 2 }}>
+      <Box sx={{ px: 3, py: 2 }}>
         <Typography variant="caption" sx={{ fontFamily: ALK_MONO, color: "text.secondary" }}>
           TESTER
         </Typography>
@@ -47,7 +47,7 @@ const TranscriptPane = ({ messages, hasSession, thinking }) => {
   }
 
   return (
-    <Stack spacing={1.5} sx={{ p: 2, overflowY: "auto" }}>
+    <Stack spacing={1.5} sx={{ px: 3, py: 2, overflowY: "auto" }}>
       {messages.map((message, index) => (
         // History entries have no id of their own; order is their identity.
         // eslint-disable-next-line react/no-array-index-key
