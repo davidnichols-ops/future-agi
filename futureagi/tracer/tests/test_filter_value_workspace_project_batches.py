@@ -26,6 +26,7 @@ from tracer.services.clickhouse.attribute_reads import (
 from tracer.services.clickhouse.filter_value_reads import (
     FilterValueCursorPageRead,
     FilterValueRead,
+    SessionFilterValueCursorPageRead,
 )
 from tracer.views import dashboard as dashboard_view
 
@@ -139,6 +140,68 @@ def _invoke(params):
 def _result(response):
     assert response.status_code == 200
     return response.data["result"]
+
+
+@pytest.mark.unit
+def test_workspace_session_search_finishes_after_bounded_project_batches(
+    monkeypatch,
+):
+    project_ids = [_uuid(index) for index in range(1, 66)]
+    projects = _ProjectQuery(project_ids, [])
+    _install_scope_and_seen_state(monkeypatch, projects)
+    session_id = _uuid(90_001)
+    observed_batches = []
+
+    def read_page(_analytics, **kwargs):
+        observed_batches.append(tuple(kwargs["project_ids"]))
+        values = (session_id,) if len(observed_batches) == 1 else ()
+        return SessionFilterValueCursorPageRead(
+            values,
+            False,
+            None,
+            "exhausted",
+        )
+
+    monkeypatch.setattr(dashboard_view, "V2AnalyticsQueryService", object)
+    monkeypatch.setattr(
+        dashboard_view,
+        "read_session_filter_value_cursor_page",
+        read_page,
+    )
+    monkeypatch.setattr(
+        dashboard_view,
+        "_session_overlay_filter_value_ids",
+        lambda **_kwargs: (),
+    )
+
+    from tracer.services.clickhouse.v2 import trace_session_dict_reader
+
+    monkeypatch.setattr(
+        trace_session_dict_reader,
+        "resolve_session_fields",
+        lambda values, **_kwargs: {
+            value: {"external_session_id": "matching-session"} for value in values
+        },
+    )
+    params = {
+        "metric_name": "session",
+        "metric_type": "system_metric",
+        "source": "sessions",
+        "project_ids": [],
+        "search": "matching-session",
+        "page_size": 10,
+    }
+
+    first = _result(_invoke(params))
+    second = _result(_invoke({**params, "cursor": first["next_cursor"]}))
+
+    assert first["values"] == [{"value": session_id, "label": "matching-session"}]
+    assert first["has_more"] is True
+    assert second["values"] == []
+    assert second["has_more"] is False
+    assert second["browse_status"] == "exhausted"
+    assert second["next_cursor"] is None
+    assert [len(batch) for batch in observed_batches] == [64, 1]
 
 
 @pytest.mark.unit

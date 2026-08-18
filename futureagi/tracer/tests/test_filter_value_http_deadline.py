@@ -14,6 +14,7 @@ from tracer.services.clickhouse.attribute_reads import (
 from tracer.services.clickhouse.filter_value_reads import (
     FilterValueCursorPageRead,
     FilterValueRead,
+    SessionFilterValueCursorPageRead,
 )
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 from tracer.views import dashboard as dashboard_view
@@ -409,31 +410,20 @@ def test_system_filter_value_cursor_receives_view_owned_deadline(monkeypatch):
 
 
 @pytest.mark.parametrize("source", ["traces", "sessions"])
-def test_session_display_label_search_keeps_raw_cursor_project_scoped(
+def test_session_display_label_search_uses_curated_cursor_project_scoped(
     monkeypatch, source
 ):
     project_id = "00000000-0000-4000-8000-000000000001"
     foreign_project_id = "00000000-0000-4000-8000-000000000099"
     session_id = "00000000-0000-4000-8000-000000000010"
-    window_end = datetime(2026, 8, 12, tzinfo=UTC)
-    window_start = window_end - timedelta(days=30)
     request_deadline = Mock()
     request_deadline.remaining_ms.return_value = 3_900
 
-    selector = Mock()
-    selector.retained_window_start.return_value = window_start
-    page_read = FilterValueCursorPageRead(
+    page_read = SessionFilterValueCursorPageRead(
         values=(session_id,),
-        query_window_start=window_start,
-        query_window_end=window_end,
         has_more=True,
-        next_segment_end=window_end - timedelta(minutes=5),
-        next_segment_start=window_end - timedelta(minutes=10),
         next_value_after=session_id,
-        seen_value_digests=("d" * 32,),
         browse_status="continuation",
-        appended_value_digests=("d" * 32,),
-        seen_value_count=1,
     )
     read_cursor_page = Mock(return_value=page_read)
     resolved_calls = []
@@ -458,9 +448,6 @@ def test_session_display_label_search_keeps_raw_cursor_project_scoped(
         "cursor_scope_for_request",
         lambda *_args, **_kwargs: {"principal": "unit"},
     )
-    monkeypatch.setattr(
-        dashboard_view, "AttributeReadSelector", lambda **_kwargs: selector
-    )
     monkeypatch.setattr(dashboard_view, "V2AnalyticsQueryService", lambda: object())
     monkeypatch.setattr(
         dashboard_view,
@@ -479,8 +466,14 @@ def test_session_display_label_search_keeps_raw_cursor_project_scoped(
     )
     monkeypatch.setattr(
         dashboard_view,
-        "read_span_system_filter_value_cursor_page",
+        "read_session_filter_value_cursor_page",
         read_cursor_page,
+    )
+    overlay_ids = Mock(return_value=(session_id,))
+    monkeypatch.setattr(
+        dashboard_view,
+        "_session_overlay_filter_value_ids",
+        overlay_ids,
     )
 
     from tracer.services.clickhouse.v2 import trace_session_dict_reader
@@ -526,14 +519,20 @@ def test_session_display_label_search_keeps_raw_cursor_project_scoped(
         ],
         "query_complete": True,
         "query_status": "complete",
-        "query_window_start": window_start.isoformat(),
-        "query_window_end": window_end.isoformat(),
         "has_more": True,
         "browse_status": "continuation",
         "next_cursor": "signed-next",
     }
     assert read_cursor_page.call_args.kwargs["project_ids"] == [project_id]
-    assert read_cursor_page.call_args.kwargs["search"] == ""
+    assert read_cursor_page.call_args.kwargs["search"] == "external-customer"
+    assert read_cursor_page.call_args.kwargs["overlay_session_ids"] == (session_id,)
+    overlay_ids.assert_called_once_with(
+        project_ids=[project_id],
+        search="external-customer",
+        value_after=None,
+        limit=11,
+        deadline=request_deadline,
+    )
     assert resolved_calls == [
         (
             (session_id,),

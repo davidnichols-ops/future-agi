@@ -77,6 +77,7 @@ from tracer.services.clickhouse.dashboard_action_deadline import (
 from tracer.services.clickhouse.filter_value_reads import (
     SYSTEM_FILTER_VALUE_METRICS,
     read_end_user_filter_value_cursor_page,
+    read_session_filter_value_cursor_page,
     read_span_system_filter_value_cursor_page,
     read_span_system_filter_values,
 )
@@ -488,6 +489,38 @@ def _run_filter_value_pg_read(deadline, read):
         raise ReadDeadlineExceeded(
             "Filter-value PostgreSQL read exceeded its request deadline"
         ) from exc
+
+
+def _session_overlay_filter_value_ids(
+    *,
+    project_ids,
+    search: str,
+    value_after: str | None,
+    limit: int,
+    deadline,
+) -> tuple[str, ...]:
+    """Return a bounded keyset of session ids matching editable UI labels."""
+
+    if not search:
+        return ()
+    from tracer.models.trace_session import TraceSessionOverlay
+
+    def read_overlay_ids():
+        queryset = TraceSessionOverlay.objects.filter(
+            project_id__in=project_ids,
+            display_name__icontains=search,
+        )
+        if value_after is not None:
+            queryset = queryset.filter(trace_session_id__gt=value_after)
+        return list(
+            queryset.order_by("trace_session_id").values_list(
+                "trace_session_id", flat=True
+            )[:limit]
+        )
+
+    return tuple(
+        str(value) for value in _run_filter_value_pg_read(deadline, read_overlay_ids)
+    )
 
 
 def _filter_value_digest(value: str) -> str:
@@ -4101,10 +4134,11 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         else options
                     )
 
-                # Session/project labels are hydrated after their raw ids are
-                # read. Searching the ids in CH would make a displayed-name
-                # match permanently unreachable.
-                storage_search = "" if label_backed_system_metric else search
+                # Project labels exist only in PostgreSQL and must still be
+                # filtered after hydration. Session external labels live in
+                # the curated CH dimension; its dedicated cursor also accepts
+                # the bounded PostgreSQL display-name matches.
+                storage_search = "" if metric_name == "project" else search
 
                 page_size = query_params.get("page_size")
                 cursor_token = query_params.get("cursor")
@@ -4134,11 +4168,12 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 else {}
                             ),
                         }
-                        batch_lane = (
-                            "end_user"
-                            if metric_name in enduser_string_cols
-                            else "span_system"
-                        )
+                        if metric_name == "session":
+                            batch_lane = "session"
+                        elif metric_name in enduser_string_cols:
+                            batch_lane = "end_user"
+                        else:
+                            batch_lane = "span_system"
                         batched_cursor = _batched_filter_value_cursor(
                             request,
                             project_scope,
@@ -4178,7 +4213,10 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             )
                         )
 
-                        if metric_name in enduser_string_cols:
+                        if (
+                            metric_name in enduser_string_cols
+                            or metric_name == "session"
+                        ):
                             physical_order = batched_cursor.physical_order
                             if batched_cursor.new_project_batch:
                                 value_after = None
@@ -4191,15 +4229,33 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 )
                             else:
                                 value_after = physical_order[0] or None
-                            page_read = read_end_user_filter_value_cursor_page(
-                                analytics,
-                                project_ids=project_ids,
-                                source_column=enduser_string_cols[metric_name],
-                                page_size=page_size,
-                                search=search,
-                                value_after=value_after,
-                                deadline=filter_value_deadline,
-                            )
+                            if metric_name == "session":
+                                overlay_session_ids = _session_overlay_filter_value_ids(
+                                    project_ids=project_ids,
+                                    search=search,
+                                    value_after=value_after,
+                                    limit=page_size + 1,
+                                    deadline=filter_value_deadline,
+                                )
+                                page_read = read_session_filter_value_cursor_page(
+                                    analytics,
+                                    project_ids=project_ids,
+                                    page_size=page_size,
+                                    search=search,
+                                    value_after=value_after,
+                                    overlay_session_ids=overlay_session_ids,
+                                    deadline=filter_value_deadline,
+                                )
+                            else:
+                                page_read = read_end_user_filter_value_cursor_page(
+                                    analytics,
+                                    project_ids=project_ids,
+                                    source_column=enduser_string_cols[metric_name],
+                                    page_size=page_size,
+                                    search=search,
+                                    value_after=value_after,
+                                    deadline=filter_value_deadline,
+                                )
                             values = tuple(
                                 value
                                 for value in page_read.values
@@ -4479,7 +4535,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         cursor_window_mode = CATALOG_SNAPSHOT_MODE
                         cursor_query["query_window_mode"] = cursor_window_mode
                     cursor_resource = "dashboard_system_filter_values"
-                    if metric_name in enduser_string_cols:
+                    if metric_name in enduser_string_cols or metric_name == "session":
                         if cursor_token:
                             cursor_state = decode_list_cursor(
                                 cursor_token,
@@ -4504,15 +4560,33 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             value_after = None
                             window_start = datetime(1970, 1, 1, tzinfo=UTC)
                             window_end = datetime.now(UTC)
-                        page_read = read_end_user_filter_value_cursor_page(
-                            analytics,
-                            project_ids=project_ids,
-                            source_column=enduser_string_cols[metric_name],
-                            page_size=page_size,
-                            search=search,
-                            value_after=value_after,
-                            deadline=filter_value_deadline,
-                        )
+                        if metric_name == "session":
+                            overlay_session_ids = _session_overlay_filter_value_ids(
+                                project_ids=project_ids,
+                                search=search,
+                                value_after=value_after,
+                                limit=page_size + 1,
+                                deadline=filter_value_deadline,
+                            )
+                            page_read = read_session_filter_value_cursor_page(
+                                analytics,
+                                project_ids=project_ids,
+                                page_size=page_size,
+                                search=search,
+                                value_after=value_after,
+                                overlay_session_ids=overlay_session_ids,
+                                deadline=filter_value_deadline,
+                            )
+                        else:
+                            page_read = read_end_user_filter_value_cursor_page(
+                                analytics,
+                                project_ids=project_ids,
+                                source_column=enduser_string_cols[metric_name],
+                                page_size=page_size,
+                                search=search,
+                                value_after=value_after,
+                                deadline=filter_value_deadline,
+                            )
                         next_cursor = None
                         if page_read.has_more:
                             next_cursor = encode_list_cursor(

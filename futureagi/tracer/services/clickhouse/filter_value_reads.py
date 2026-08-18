@@ -166,6 +166,16 @@ class EndUserFilterValueCursorPageRead:
     browse_status: Literal["continuation", "exhausted"]
 
 
+@dataclass(frozen=True)
+class SessionFilterValueCursorPageRead:
+    """One exact keyset page from the curated trace-session dimension."""
+
+    values: tuple[str, ...]
+    has_more: bool
+    next_value_after: str | None
+    browse_status: Literal["continuation", "exhausted"]
+
+
 def _window(*, lookback_days: int, now: datetime | None) -> tuple[datetime, datetime]:
     if not 1 <= int(lookback_days) <= 365:
         raise ValueError("filter-value lookback must be between 1 and 365 days")
@@ -447,6 +457,141 @@ def read_end_user_filter_value_cursor_page(
     has_more = len(rows) > int(page_size)
     values = rows[: int(page_size)]
     return EndUserFilterValueCursorPageRead(
+        values,
+        has_more,
+        values[-1] if has_more and values else None,
+        "continuation" if has_more else "exhausted",
+    )
+
+
+def read_session_filter_value_cursor_page(
+    analytics: QueryExecutor,
+    *,
+    project_ids: list[str] | tuple[str, ...],
+    page_size: int,
+    search: str = "",
+    value_after: str | None = None,
+    overlay_session_ids: list[str] | tuple[str, ...] = (),
+    deadline: ReadDeadline | None = None,
+) -> SessionFilterValueCursorPageRead:
+    """Read an exact keyset page from the curated trace-session state.
+
+    Session labels do not live on spans: the immutable external id is in the
+    curated ``trace_sessions`` dimension and an optional user-edited label is
+    a small PostgreSQL overlay. Reading raw span ids and filtering hydrated
+    labels after each time-slice page made an exact search appear to have an
+    effectively endless continuation. This selector applies external-id/raw-
+    id search before ``LIMIT`` and accepts the bounded overlay matches selected
+    by the API, so every continuation advances by the public canonical UUID.
+    """
+
+    if not 1 <= int(page_size) <= 50:
+        raise ValueError("filter-value page_size must be between 1 and 50")
+    project_scope = tuple(dict.fromkeys(str(value) for value in project_ids if value))
+    if not project_scope:
+        return SessionFilterValueCursorPageRead((), False, None, "exhausted")
+
+    overlay_scope = tuple(
+        dict.fromkeys(str(value) for value in overlay_session_ids if value)
+    )
+    resolved_session_id = resolved_id_expr(
+        "latest_trace_sessions.trace_session_id",
+        "filter_value_session_remap",
+    )
+    session_remap_join = remap_left_join(
+        "latest_trace_sessions.trace_session_id",
+        "trace_session_id_remap",
+        "filter_value_session_remap",
+    )
+    search_clause = ""
+    if search:
+        overlay_clause = (
+            " OR resolved_session_id IN %(overlay_session_ids)s"
+            if overlay_scope
+            else ""
+        )
+        search_clause = f"""
+          AND (
+                arrayExists(
+                    label -> positionCaseInsensitiveUTF8(
+                        label, %(filter_value_search)s
+                    ) > 0,
+                    external_session_ids
+                )
+                OR positionCaseInsensitiveUTF8(
+                    toString(resolved_session_id), %(filter_value_search)s
+                ) > 0
+                {overlay_clause}
+          )
+        """
+    after_clause = (
+        "AND toString(resolved_session_id) > %(value_after)s"
+        if value_after is not None
+        else ""
+    )
+    query = f"""
+        WITH latest_trace_sessions AS (
+            SELECT
+                project_id,
+                trace_session_id,
+                argMax(tuple(external_session_id), version).1
+                    AS external_session_id,
+                argMax(is_deleted, version) AS latest_is_deleted
+            FROM trace_sessions
+            PREWHERE project_id IN %(project_ids)s
+            GROUP BY project_id, trace_session_id
+        ), resolved_sessions AS (
+            SELECT
+                latest_trace_sessions.project_id AS project_id,
+                {resolved_session_id} AS resolved_session_id,
+                latest_trace_sessions.external_session_id AS external_session_id
+            FROM latest_trace_sessions
+            {session_remap_join}
+            WHERE latest_trace_sessions.latest_is_deleted = 0
+        ), session_values AS (
+            SELECT
+                resolved_session_id,
+                groupUniqArray(external_session_id) AS external_session_ids
+            FROM resolved_sessions
+            WHERE resolved_session_id != toUUID('{NIL_UUID}')
+            GROUP BY resolved_session_id
+        )
+        SELECT toString(resolved_session_id) AS val
+        FROM session_values
+        WHERE 1
+          {search_clause}
+          {after_clause}
+        ORDER BY val
+        LIMIT %(result_limit)s
+    """
+    params: dict[str, Any] = {
+        "project_ids": project_scope,
+        "result_limit": int(page_size) + 1,
+    }
+    if search:
+        params["filter_value_search"] = search
+    if overlay_scope:
+        params["overlay_session_ids"] = overlay_scope
+    if value_after is not None:
+        params["value_after"] = value_after
+    query_timeout_ms = (
+        deadline.remaining_ms(FILTER_VALUE_READ_TIMEOUT_MS)
+        if deadline is not None
+        else FILTER_VALUE_READ_TIMEOUT_MS
+    )
+    result = analytics.execute_ch_query(
+        query,
+        params,
+        timeout_ms=query_timeout_ms,
+        settings={
+            **FILTER_VALUE_READ_SETTINGS,
+            "max_result_rows": int(page_size) + 1,
+        },
+    )
+    rows = tuple(str(row["val"]) for row in (result.data or []))
+    has_more = len(rows) > int(page_size)
+    values = rows[: int(page_size)]
+    return SessionFilterValueCursorPageRead(
         values,
         has_more,
         values[-1] if has_more and values else None,
@@ -829,7 +974,9 @@ __all__ = [
     "EndUserFilterValueCursorPageRead",
     "FilterValueCursorPageRead",
     "FilterValueRead",
+    "SessionFilterValueCursorPageRead",
     "read_end_user_filter_value_cursor_page",
+    "read_session_filter_value_cursor_page",
     "read_session_message_filter_values",
     "read_span_system_filter_value_cursor_page",
     "read_span_system_filter_values",
