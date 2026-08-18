@@ -26,10 +26,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Where the platform is, from the same variables the rest of the stack already uses.
-BASE_URL = "FI_BASE_URL"
-API_KEY = "FI_API_KEY"
-SECRET_KEY = "FI_SECRET_KEY"
+# Where runs are reported. Its own variables, because reporting and evaluating go to different
+# places: the eval templates a run is scored against live on the hosted platform, while the runs
+# themselves belong wherever the person is looking at them -- usually the backend beside this
+# harness. Sharing FI_* for both means one of the two is always pointed at the wrong host.
+# FI_* is the fallback, so a setup that genuinely uses one platform for both still works unchanged.
+BASE_URL = ("HARNESS_PLATFORM_URL", "FI_BASE_URL")
+API_KEY = ("HARNESS_PLATFORM_API_KEY", "FI_API_KEY")
+SECRET_KEY = ("HARNESS_PLATFORM_SECRET_KEY", "FI_SECRET_KEY")
+
+
+def _setting(names: tuple[str, ...]) -> str:
+    """The first of these that is set, so the specific name wins over the shared one."""
+    for name in names:
+        found = os.environ.get(name, "").strip()
+        if found:
+            return found
+    return ""
 
 INGESTION = "/simulate/api/alk-simulate"
 
@@ -59,7 +72,7 @@ class Reported:
 
 def configured() -> str:
     """Why a run cannot be reported, or an empty string when it can."""
-    missing = [name for name in (BASE_URL, API_KEY, SECRET_KEY) if not os.environ.get(name)]
+    missing = [names[0] for names in (BASE_URL, API_KEY, SECRET_KEY) if not _setting(names)]
     if missing:
         return f"{', '.join(missing)} not set, so this run stays local"
     return ""
@@ -69,9 +82,9 @@ class Platform:
     """The ingestion API, as the few calls a run actually makes."""
 
     def __init__(self, base: str = "", key: str = "", secret: str = "") -> None:
-        self.base = (base or os.environ.get(BASE_URL, "")).rstrip("/")
-        self.key = key or os.environ.get(API_KEY, "")
-        self.secret = secret or os.environ.get(SECRET_KEY, "")
+        self.base = (base or _setting(BASE_URL)).rstrip("/")
+        self.key = key or _setting(API_KEY)
+        self.secret = secret or _setting(SECRET_KEY)
 
     def _call(self, path: str, payload: dict[str, Any], method: str = "POST") -> dict[str, Any]:
         request = urllib.request.Request(

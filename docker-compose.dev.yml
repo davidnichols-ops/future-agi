@@ -192,6 +192,11 @@ services:
       # addressed by container name instead of loopback.
       ALK_DOCKER_NETWORK: ${HARNESS_DOCKER_NETWORK:-futureagi_default}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Evals are scored against the hosted platform, where the templates live; runs are
+      # reported to the backend beside us, so they appear in the UI being looked at.
+      HARNESS_PLATFORM_URL: ${HARNESS_PLATFORM_URL:-http://backend:80}
+      HARNESS_PLATFORM_API_KEY: ${HARNESS_PLATFORM_API_KEY:-}
+      HARNESS_PLATFORM_SECRET_KEY: ${HARNESS_PLATFORM_SECRET_KEY:-}
       # .env names the credentials by a path relative to the host checkout, which resolves to
       # nothing in here. Mounted below at a fixed location and repointed, or every stage fails
       # at its first model call.
