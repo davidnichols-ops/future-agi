@@ -49,6 +49,7 @@ from .reconciler import CheckpointWrite, ReconcileMode
 _SOURCE_STREAM_TABLE = "property_catalog_source_streams"
 _ACTIVATION_TABLE = "property_catalog_activations"
 _STREAM_NAMESPACE = uuid.UUID("52d4b43e-f3a1-5e2c-84c5-8c99adf4be57")
+_MAX_SOURCE_WINDOW = timedelta(days=366)
 _RELATIONAL_ADAPTERS = frozenset(
     {
         SourceAdapter.EVAL_TEMPLATE,
@@ -199,7 +200,7 @@ class SourceWindow:
         _require_utc(self.until, "until")
         if self.since >= self.until:
             raise ValueError("source window since must precede until")
-        if (self.until - self.since).total_seconds() > 366 * 24 * 60 * 60:
+        if self.until - self.since > _MAX_SOURCE_WINDOW:
             raise ValueError("source window cannot exceed 366 days")
 
 
@@ -208,8 +209,9 @@ class ConfiguredSourceBounds:
     """Explicit origin and initial frozen upper bound.
 
     The management-command initial backfill uses both values.  Scheduled full
-    repairs reuse only ``origin`` and derive a fresh upper bound.  Incremental
-    runs derive their lower bound from the prior active build plan.
+    repairs use ``origin`` as their earliest retained bound and derive a fresh,
+    rolling upper bound. Incremental runs derive their lower bound from the
+    prior active build plan.
     """
 
     origin: datetime
@@ -786,6 +788,8 @@ class FreshSpanLifecycleCutoffFreezer:
                     "scheduled revision cannot use a configured static upper cutoff"
                 )
             until = self._now()
+            if mode is LifecycleRunMode.FULL_REPAIR:
+                span_since = max(span_since, until - _MAX_SOURCE_WINDOW)
         window = SourceWindow(span_since, until)
         frozen = self._span_reader.freeze(
             project_ids=scope.project_ids,
@@ -1104,7 +1108,12 @@ class DurableWorkspaceCatalogLifecycle:
         )
         frozen_at = self._now()
         _require_utc(frozen_at, "now")
-        if cutoffs.span_window.since != span_since:
+        expected_span_since = (
+            max(span_since, cutoffs.snapshot_upper - _MAX_SOURCE_WINDOW)
+            if mode is LifecycleRunMode.FULL_REPAIR
+            else span_since
+        )
+        if cutoffs.span_window.since != expected_span_since:
             raise DurableLifecycleError(
                 "cutoff freezer changed the required lower bound"
             )

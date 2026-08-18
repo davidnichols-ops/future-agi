@@ -691,6 +691,44 @@ def test_checked_in_freezer_uses_clock_not_static_until_for_schedule() -> None:
     ]
 
 
+def test_checked_in_freezer_bounds_aged_full_repair_to_366_days() -> None:
+    clock = _Clock(INITIAL_UNTIL + timedelta(days=367, hours=3))
+
+    class _Reader:
+        calls: list[dict[str, Any]] = []
+
+        def freeze(self, **kwargs: Any) -> FrozenSpanSource:
+            self.calls.append(dict(kwargs))
+            return FrozenSpanSource(
+                tuple(kwargs["project_ids"]),
+                kwargs["since"],
+                kwargs["until"],
+                audit_generation=124,
+            )
+
+    reader = _Reader()
+    freezer = FreshSpanLifecycleCutoffFreezer(reader, now=clock)
+    frozen = freezer(
+        scope=_scope(),
+        mode=LifecycleRunMode.FULL_REPAIR,
+        span_since=INITIAL_SINCE,
+        configured_until=None,
+        prior_active=None,
+    )
+    expected_since = clock.current - timedelta(days=366)
+
+    assert frozen.snapshot_upper == clock.current
+    assert frozen.span_window == SourceWindow(expected_since, clock.current)
+    assert frozen.span_audit_generation == 124
+    assert reader.calls == [
+        {
+            "project_ids": (PROJECT_A, PROJECT_B),
+            "since": expected_since,
+            "until": clock.current,
+        }
+    ]
+
+
 def test_restart_rejects_project_inventory_drift_before_coordinator_replay() -> None:
     clock = _Clock(INITIAL_UNTIL)
     state = _State()
