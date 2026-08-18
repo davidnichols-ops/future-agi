@@ -5,7 +5,7 @@ import AlEnvironmentView from "src/sections/al-environment/AlEnvironmentView";
 const AlEnvironment = () => (
   <>
     <Helmet>
-      <title>AL Environment</title>
+      <title>RL Environment</title>
     </Helmet>
     <Box
       sx={{

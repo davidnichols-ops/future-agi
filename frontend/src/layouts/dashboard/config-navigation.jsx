@@ -259,7 +259,7 @@ export function useNavData() {
             },
           },
           {
-            title: "AL Environment",
+            title: "RL Environment",
             path: paths.dashboard.simulate.alEnvironment,
             icon: ICONS.prototype,
           },

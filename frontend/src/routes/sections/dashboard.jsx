@@ -1367,7 +1367,7 @@ export const dashboardRoutes = (
           element: <Personas />,
         },
         {
-          path: "al-environment",
+          path: "rl-environment",
           element: <AlEnvironment />,
         },
         {
