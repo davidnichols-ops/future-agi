@@ -281,6 +281,48 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
 
         return self.recommended_filter_initial_slice_width()
 
+    def allow_filter_anchor_probe_for_initial_continuation(self) -> bool:
+        """Let fresh cursor pages use the trace selector's sparse proof."""
+
+        return self._bounded_delegate().allow_filter_anchor_probe_for_initial_continuation()
+
+    def supports_filter_anchor_probe(self) -> bool:
+        """Expose indexed trace witnesses to the shared bounded selector.
+
+        Voice pages delegate membership to ``TraceListQueryBuilder`` but used
+        to omit its anchor capability hooks.  A long-range ``status=ERROR``
+        request therefore walked the complete window in resumable time slices
+        even when the indexed global error witness was empty.  Forwarding the
+        full capability contract lets that safe population proof terminate the
+        voice page while the normal finite classifier still enforces the
+        conversation-root invariant whenever candidates exist.
+        """
+
+        return self._bounded_delegate().supports_filter_anchor_probe()
+
+    def filter_anchor_probe_proves_complete_population(self) -> bool:
+        return self._bounded_delegate().filter_anchor_probe_proves_complete_population()
+
+    def skip_full_window_filter_anchor_probe(self) -> bool:
+        return self._bounded_delegate().skip_full_window_filter_anchor_probe()
+
+    def recommended_filter_anchor_probe_limit(self) -> int | None:
+        return self._bounded_delegate().recommended_filter_anchor_probe_limit()
+
+    def recommended_filter_anchor_probe_timeout_ms(self) -> int | None:
+        return self._bounded_delegate().recommended_filter_anchor_probe_timeout_ms()
+
+    def recommended_filter_anchor_probe_strata(self) -> int | None:
+        return self._bounded_delegate().recommended_filter_anchor_probe_strata()
+
+    def recommended_filter_anchor_probe_max_bytes_to_read(self) -> int | None:
+        return (
+            self._bounded_delegate().recommended_filter_anchor_probe_max_bytes_to_read()
+        )
+
+    def build_filter_anchor_probe(self, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return self._bounded_delegate().build_filter_anchor_probe(**kwargs)
+
     def bounded_filter_degraded_error_code(self) -> str | None:
         return self._bounded_delegate().bounded_filter_degraded_error_code()
 

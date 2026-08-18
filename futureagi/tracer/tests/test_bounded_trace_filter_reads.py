@@ -2616,6 +2616,71 @@ def test_long_window_trace_error_status_uses_global_indexed_anchor() -> None:
     assert params["filter_anchor_limit"] == 64
 
 
+def test_long_window_voice_error_status_forwards_global_indexed_anchor() -> None:
+    filters = [_time_filter(), _system_filter("status", "ERROR")]
+    builder = VoiceCallListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=filters,
+        page_size=15,
+    )
+
+    assert builder.allow_filter_anchor_probe_for_initial_continuation() is True
+    assert builder.supports_filter_anchor_probe() is True
+    assert builder.filter_anchor_probe_proves_complete_population() is True
+    assert builder.recommended_filter_anchor_probe_limit() == 64
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 900
+    assert builder.recommended_filter_anchor_probe_strata() == 1
+    assert builder.skip_full_window_filter_anchor_probe() is False
+
+    sql, params = builder.build_filter_anchor_probe(limit=64)
+    normalized_sql = " ".join(sql.split())
+    assert "status IN %(trace_error_status_anchor_values_0)s" in normalized_sql
+    assert "start_time >=" not in normalized_sql
+    assert params["trace_error_status_anchor_values_0"] == ("ERROR",)
+    assert params["filter_anchor_limit"] == 64
+
+
+def test_long_window_voice_empty_error_anchor_completes_in_one_query() -> None:
+    filters = [_time_filter(), _system_filter("status", "ERROR")]
+    builder = VoiceCallListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=filters,
+        page_size=15,
+    )
+    analytics = mock.Mock(supports_per_query_read_settings=True)
+    analytics.execute_ch_query.return_value = QueryResult(
+        [],
+        0,
+        "clickhouse",
+        1.0,
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=analytics,
+        filters=filters,
+        key_field="trace_id",
+        page_number=0,
+        page_size=15,
+        deadline_ms=9_500,
+        max_seed_attempts=24,
+        max_candidates=512,
+        max_query_count=128,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert page.status == "complete"
+    assert page.error_code is None
+    assert page.rows == []
+    assert page.has_more is False
+    assert page.continuation_slice_end is None
+    analytics.execute_ch_query.assert_called_once()
+    anchor_sql = analytics.execute_ch_query.call_args.args[0]
+    assert "trace_error_status_anchor_values_0" in anchor_sql
+
+
 def test_long_window_trace_completed_status_keeps_temporal_scanner() -> None:
     builder = TraceListQueryBuilderV2(
         project_id=PROJECT_ID,
