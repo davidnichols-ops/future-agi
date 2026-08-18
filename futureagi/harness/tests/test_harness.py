@@ -3283,3 +3283,46 @@ def test_webhook_arguments_beat_the_environment(monkeypatch):
         assert webhook.port != 1
     finally:
         webhook._server.server_close()
+
+
+# --- environments cross-session listing -----------------------------------------------
+
+
+def _environment_session(base, name, runs=()):
+    from harness import sessions
+
+    session = sessions.create(agent=name, base=base)
+    (session.path / "contract.json").write_text(
+        json.dumps({"agent": name, "one_liner": f"{name} does things"}), encoding="utf-8"
+    )
+    (session.path / "manifest.json").write_text(
+        json.dumps({"tables": {}, "tools": ["lookup", "refund"]}), encoding="utf-8"
+    )
+    for run_id, (total, passed) in runs:
+        folder = session.path / "runs" / run_id
+        folder.mkdir(parents=True)
+        (folder / "run.json").write_text(
+            json.dumps({"run_id": run_id, "scenarios": total, "passed": passed}),
+            encoding="utf-8",
+        )
+    return session
+
+
+def test_environments_lists_only_sessions_with_a_world(tmp_path):
+    from harness import sessions
+
+    _environment_session(tmp_path, "support")
+    sessions.create(agent="incomplete", base=tmp_path)  # no world
+    rows = sessions.environments(tmp_path)
+    assert [one["agent"] for one in rows] == ["support"]
+    assert rows[0]["one_liner"] == "support does things"
+    assert rows[0]["tools"] == 2
+
+
+def test_environments_counts_simulation_runs_not_chat_runs(tmp_path):
+    from harness import sessions
+
+    _environment_session(tmp_path, "billing", runs=[("run-1", (3, 3)), ("run-2", (3, 1))])
+    rows = sessions.environments(tmp_path)
+    assert rows[0]["runs"] == 2
+    assert rows[0]["runs_passed"] == 1
