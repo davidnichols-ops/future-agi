@@ -184,11 +184,16 @@ services:
       # addressed by container name instead of loopback.
       ALK_DOCKER_NETWORK: ${HARNESS_DOCKER_NETWORK:-futureagi_default}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # .env names the credentials by a path relative to the host checkout, which resolves to
+      # nothing in here. Mounted below at a fixed location and repointed, or every stage fails
+      # at its first model call.
+      GOOGLE_APPLICATION_CREDENTIALS: /etc/harness/vertex.json
     volumes:
       # Source of truth for every session, world and recording — not a cache.
       - harness-artifacts:/app/artifacts
       # Source edits apply on restart without a rebuild.
       - ./futureagi/harness:/app
+      - ${HARNESS_VERTEX_CREDENTIALS:-./Vertex_AI_Creds.json}:/etc/harness/vertex.json:ro
     depends_on:
       - docker-proxy
     restart: unless-stopped
