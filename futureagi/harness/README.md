@@ -207,6 +207,19 @@ it defaults to loopback on an ephemeral port. See "Two servers, two ports".
 
 ### Voice
 
+> **This package alone cannot run a voice suite yet.** The settings below are read, but the run
+> shells out to `oss/simulation-acceptance/run_voice_case.py`, a script in the harness's original
+> repository that is **not shipped here** — so a voice run stops at
+> `no voice runner at oss/simulation-acceptance/run_voice_case.py`. Copying the script is not
+> sufficient either: it imports `fi.alk.simulate`, `fi.simulate.evaluation` and
+> `fi.simulate.runtime`, so it needs the full SDK with its LiveKit extra.
+>
+> Chat runs are unaffected. To make voice work, either install that SDK alongside this package
+> and bring the script into the image, or replace the subprocess with a LiveKit target that talks
+> to the room directly — the latter is the intended direction and removes the dependency
+> entirely. Until one of those is done, treat voice settings here as configuration for a path
+> that is not yet complete.
+
 | variable | what it does |
 |---|---|
 | `HARNESS_WEBHOOK_URL` | a webhook URL that is already reachable. **Set this and no tunnel is started** — which is what you want when the agent runs on the same network |
@@ -289,6 +302,11 @@ name**; without it they are published on loopback, which from inside a container
 30-scenario voice suite took 69 minutes.
 
 ## Known limits
+
+- **Voice is not runnable from this package on its own.** It shells out to a script that lives in
+  the harness's original repository and pulls in the full SDK. See the note under Configuration →
+  Voice. Chat is unaffected. The offline test suite does not cover this, so a green test run is
+  not evidence that voice works.
 
 - Ten to twenty scenarios in one pass works; a hundred does not.
 - A stage cannot hand back to an earlier stage on its own.
