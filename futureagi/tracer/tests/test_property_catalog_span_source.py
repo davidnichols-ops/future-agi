@@ -366,12 +366,12 @@ def _payload(*, span_id: str, seen_at: datetime) -> Mapping[str, Any]:
     }
 
 
-@pytest.mark.parametrize("page_rows", (0, 257, True))
+@pytest.mark.parametrize("page_rows", (0, 1_025, True))
 def test_canonical_span_page_bound_rejects_invalid_or_implicit_booleans(
     page_rows: Any,
 ) -> None:
     client = _SpanSourceClient(occupied={})
-    with pytest.raises(ValueError, match=r"page_rows must be in \[1, 256\]"):
+    with pytest.raises(ValueError, match=r"page_rows must be in \[1, 1024\]"):
         _reader(client, page_rows=page_rows)
 
 

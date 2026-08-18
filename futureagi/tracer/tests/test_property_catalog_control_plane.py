@@ -325,13 +325,11 @@ def test_native_insert_rows_rehydrate_every_catalog_datetime64_column() -> None:
     }
     delivery = {"delivered_at": NOW}
 
-    definition = _native_insert_rows(
-        "property_definition_catalog", (definition_wire,)
-    )[0]
+    definition = _native_insert_rows("property_definition_catalog", (definition_wire,))[
+        0
+    ]
     value = _native_insert_rows("span_attribute_value_catalog", (value_wire,))[0]
-    typed_delivery = _native_insert_rows(
-        "property_catalog_deliveries", (delivery,)
-    )[0]
+    typed_delivery = _native_insert_rows("property_catalog_deliveries", (delivery,))[0]
 
     # Preserve the immutable wire representation and change only insert rows.
     assert definition_wire["first_seen"] == timestamp
@@ -346,8 +344,7 @@ def test_native_insert_rows_rehydrate_every_catalog_datetime64_column() -> None:
         typed_delivery["delivered_at"],
     )
     assert all(
-        isinstance(item, datetime) and item.tzinfo is UTC
-        for item in datetime_values
+        isinstance(item, datetime) and item.tzinfo is UTC for item in datetime_values
     )
 
     # Exercise the pinned driver's actual DateTime64 conversion boundary. This
@@ -390,9 +387,7 @@ def test_delivery_identity_queries_qualify_raw_aggregate_inputs() -> None:
     publisher.publish(_value_envelope(plan, stream), value_rows=(_value_row(),))
 
     identity_queries = tuple(
-        query
-        for query in client.queries
-        if "property_catalog_deliveries" in query
+        query for query in client.queries if "property_catalog_deliveries" in query
     )
     assert len(identity_queries) == 2
     for query in identity_queries:
@@ -564,7 +559,7 @@ def test_clickhouse_uuid_rows_have_canonical_control_state_identities() -> None:
         column for column in _SOURCE_STREAM_AUDIT_COLUMNS if column != "_version"
     )
     source = {
-        **{column: None for column in _SOURCE_STREAM_AUDIT_COLUMNS},
+        **dict.fromkeys(_SOURCE_STREAM_AUDIT_COLUMNS),
         "producer_stream_id": _stream_id(21),
         "_version": 7,
     }
@@ -572,7 +567,7 @@ def test_clickhouse_uuid_rows_have_canonical_control_state_identities() -> None:
         column for column in _ACTIVATION_COLUMNS if column != "_version"
     )
     activation = {
-        **{column: None for column in _ACTIVATION_COLUMNS},
+        **dict.fromkeys(_ACTIVATION_COLUMNS),
         "organization_id": ORG,
         "workspace_id": WORKSPACE,
         "build_token": BUILD,
@@ -602,10 +597,7 @@ def test_clickhouse_uuid_rows_have_canonical_control_state_identities() -> None:
     for label, text_row, logical_columns, uuid_fields in cases:
         driver_row = {
             **text_row,
-            **{
-                field: _clickhouse_uuid(str(text_row[field]))
-                for field in uuid_fields
-            },
+            **{field: _clickhouse_uuid(str(text_row[field])) for field in uuid_fields},
         }
         assert _row_identity(driver_row, logical_columns) == _row_identity(
             text_row, logical_columns
@@ -1135,6 +1127,49 @@ def test_current_binding_rev_minus_one_never_admits_current_build_token() -> Non
     assert client.definition_params[-1]["allowed_lineage"][-1] == (5, BUILD, 1)
 
 
+def test_current_binding_empty_prior_lineage_returns_without_tuple_set_query() -> None:
+    class Client:
+        catalog_database = DATABASE
+
+        def __init__(self) -> None:
+            self.sql: list[str] = []
+
+        def query(
+            self,
+            sql: str,
+            _params: Mapping[str, Any],
+            *,
+            timeout_ms: int,
+        ) -> Sequence[Mapping[str, Any]]:
+            assert timeout_ms > 0
+            self.sql.append(sql)
+            return ()
+
+    client = Client()
+    reader = ClickHouseCurrentBindingReader(client, database=DATABASE)
+    context = PostgresSnapshotContext(
+        organization_id=ORG,
+        workspace_id=WORKSPACE,
+        project_ids=(PROJECT,),
+        catalog_epoch=1,
+        catalog_revision=2,
+        projection_version=1,
+        snapshot_cutoff=NOW,
+    )
+
+    assert (
+        reader.read_current(
+            context=context,
+            source_adapter=SourceAdapter.DATASET_COLUMN,
+            at_revision=1,
+            build_token=BUILD,
+        )
+        == ()
+    )
+    assert len(client.sql) == 1
+    assert "property_catalog_activations" in client.sql[0]
+
+
 class _SpanAuditClient:
     source_database = "source_ch25"
 
@@ -1170,8 +1205,9 @@ class _SpanAuditClient:
         )
 
 
-def test_source_audit_is_one_select_per_bounded_shard_and_matches_paged_components(
-) -> None:
+def test_source_audit_is_one_select_per_bounded_shard_and_matches_paged_components() -> (
+    None
+):
     client = _SpanAuditClient()
     reader = CanonicalSpanSourceReader(
         client,
@@ -1220,8 +1256,7 @@ def test_source_audit_splits_one_large_project_into_weekly_time_shards() -> None
         (PROJECT,),
     ]
     assert [
-        (params["catalog_since"], params["catalog_until"])
-        for params in client.params
+        (params["catalog_since"], params["catalog_until"]) for params in client.params
     ] == [(since, split), (split, until)]
 
 

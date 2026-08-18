@@ -2,10 +2,11 @@
 
 PostgreSQL-backed adapters run their complete page loop inside one read-only,
 repeatable-read transaction. They use the stable ``(updated_at, id)`` keyset,
-never OFFSET, and enforce one shared 8.5-second PostgreSQL wall plus row and
-byte caps. Non-PostgreSQL adapters retain the same row and byte bounds, but may
-use the caller's longer overall source wall when an explicitly bounded rollout
-shares that deadline with every other operation.
+never OFFSET, and enforce one shared 8.5-second PostgreSQL wall for normal
+runs, or a bounded 540-second wall for an explicit initial backfill, plus row
+and byte caps. Non-PostgreSQL adapters retain the same row and byte bounds, but
+may use the caller's longer overall source wall when an explicitly bounded
+rollout shares that deadline with every other operation.
 """
 
 from __future__ import annotations
@@ -1963,6 +1964,21 @@ def _eval_definition(
     )
 
 
+def _relational_display_name(
+    row: Mapping[str, Any],
+    *,
+    fallback_prefix: str,
+) -> str:
+    """Keep malformed legacy names from aborting a workspace projection."""
+
+    source_id = str(row["id"])
+    raw_name = row.get("name")
+    display_name = str(raw_name) if raw_name is not None else ""
+    if display_name.strip():
+        return display_name
+    return f"{fallback_prefix} {source_id}"
+
+
 def _annotation_definition(row: Mapping[str, Any]) -> PropertyDefinition:
     label_type = str(row.get("type") or "numeric")
     settings = row.get("settings") if isinstance(row.get("settings"), Mapping) else {}
@@ -2003,7 +2019,10 @@ def _annotation_definition(row: Mapping[str, Any]) -> PropertyDefinition:
         source_tokens=("annotation", "datasets", "traces"),
         value_adapter="annotation_label",
         name=str(row["id"]),
-        display_name=str(row["name"]),
+        display_name=_relational_display_name(
+            row,
+            fallback_prefix="Annotation",
+        ),
         value_type=label_type,
         output_type=label_type,
         role=PropertyRole.METRIC,
@@ -2025,7 +2044,10 @@ def _dataset_column_definition(row: Mapping[str, Any]) -> PropertyDefinition:
         source_tokens=("dataset", "column", data_type),
         value_adapter="dataset_column",
         name=str(row["id"]),
-        display_name=str(row["name"]),
+        display_name=_relational_display_name(
+            row,
+            fallback_prefix="Dataset column",
+        ),
         value_type=value_type,
         output_type=data_type,
         role=role,

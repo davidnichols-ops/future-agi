@@ -123,6 +123,7 @@ _ACTIVATION_LOGICAL_COLUMNS = tuple(
 MAX_ACTIVE_REVISIONS_SINCE_ANCHOR = 2_048
 MAX_LINEAGE_ANCHOR_AGE_SECONDS = 26 * 60 * 60
 FULL_REPAIR_INTERVAL_SECONDS = 24 * 60 * 60
+_MAX_NONTERMINAL_RESERVATION_ROWS = 64
 
 
 class DurableLifecycleError(RuntimeError):
@@ -871,6 +872,7 @@ class DurableWorkspaceCatalogLifecycle:
         scope: WorkspaceCatalogScope,
         mode: LifecycleRunMode,
         configured_bounds: ConfiguredSourceBounds,
+        allow_expired_repair: bool = False,
     ) -> PreparedLifecycleRevision:
         if not isinstance(scope, WorkspaceCatalogScope):
             raise TypeError("scope must be a WorkspaceCatalogScope")
@@ -878,23 +880,32 @@ class DurableWorkspaceCatalogLifecycle:
             raise TypeError("mode must be a LifecycleRunMode")
         if not isinstance(configured_bounds, ConfiguredSourceBounds):
             raise TypeError("configured_bounds must be ConfiguredSourceBounds")
+        if type(allow_expired_repair) is not bool:
+            raise TypeError("allow_expired_repair must be a bool")
         observed_at = self._now()
         _require_utc(observed_at, "now")
         active = self._state_reader.load_latest_active(scope)
         open_reservation = self._state_reader.load_nonterminal(scope)
-        if (
-            open_reservation is not None
-            and open_reservation.status is ReservationStatus.FENCED
-            and active is not None
-        ):
-            fenced_lease = open_reservation.lease
-            if fenced_lease.catalog_revision == active.catalog_revision:
-                if fenced_lease.build_token != active.build_token:
+        if open_reservation is not None and active is not None:
+            open_lease = open_reservation.lease
+            if open_lease.catalog_revision == active.catalog_revision:
+                if open_reservation.status is not ReservationStatus.FENCED:
+                    raise DurableLifecycleError(
+                        "active revision still has a non-fenced reservation"
+                    )
+                if open_lease.build_token != active.build_token:
                     raise DurableLifecycleError(
                         "active revision conflicts with the newest fenced build"
                     )
                 open_reservation = None
-            elif fenced_lease.catalog_revision < active.catalog_revision:
+            elif open_lease.catalog_revision < active.catalog_revision:
+                if (
+                    open_reservation.status is not ReservationStatus.FENCED
+                    and open_lease.expires_at > observed_at
+                ):
+                    raise DurableLifecycleError(
+                        "active lineage advanced past a live older reservation"
+                    )
                 open_reservation = None
         if open_reservation is not None:
             return self._recover(
@@ -904,6 +915,7 @@ class DurableWorkspaceCatalogLifecycle:
                 active=active,
                 reservation=open_reservation,
                 observed_at=observed_at,
+                allow_expired_repair=allow_expired_repair,
             )
         return self._reserve(
             scope=scope,
@@ -949,20 +961,49 @@ class DurableWorkspaceCatalogLifecycle:
         active: PriorActiveEvidence | None,
         reservation: PersistedReservation,
         observed_at: datetime,
+        allow_expired_repair: bool,
     ) -> PreparedLifecycleRevision:
         lease = reservation.lease
-        if (
-            reservation.status is not ReservationStatus.FENCED
-            and lease.expires_at <= observed_at
-        ):
-            raise DurableLifecycleError(
-                "workspace has an expired incomplete revision; explicit repair is required"
-            )
         _require_lease_scope(lease, scope)
         decoded = _decode_plan_scope(lease.build_plan)
         if lease.build_plan.source_scope.project_ids != scope.project_ids:
             raise DurableLifecycleError(
                 "open revision project inventory differs from the workspace scope"
+            )
+        _validate_prior_marker(decoded.prior_active_revision, active)
+        if active is not None and active.catalog_revision >= lease.catalog_revision:
+            raise DurableLifecycleError(
+                "active lineage advanced into or beyond the incomplete revision"
+            )
+        if (
+            reservation.status is not ReservationStatus.FENCED
+            and lease.expires_at <= observed_at
+        ):
+            if not allow_expired_repair:
+                raise DurableLifecycleError(
+                    "workspace has an expired incomplete revision; explicit repair is required"
+                )
+            if active is None:
+                if (
+                    requested_mode is not LifecycleRunMode.INITIAL_BACKFILL
+                    or decoded.mode is not LifecycleRunMode.INITIAL_BACKFILL
+                ):
+                    raise DurableLifecycleError(
+                        "expired no-active repair requires explicit initial-backfill mode"
+                    )
+                repair_mode = LifecycleRunMode.INITIAL_BACKFILL
+            else:
+                if requested_mode is not LifecycleRunMode.FULL_REPAIR:
+                    raise DurableLifecycleError(
+                        "expired active repair requires explicit full-repair mode"
+                    )
+                repair_mode = LifecycleRunMode.FULL_REPAIR
+            return self._reserve(
+                scope=scope,
+                mode=repair_mode,
+                configured_bounds=configured_bounds,
+                active=active,
+                observed_at=observed_at,
             )
         # Persisted mode always wins.  In particular, the next two-minute
         # incremental tick may safely finish a crashed full repair, but can
@@ -973,7 +1014,6 @@ class DurableWorkspaceCatalogLifecycle:
         # is consulted only before a new reservation; a restart never recomputes
         # or widens the already-admitted half-open plan.
         _ = configured_bounds
-        _validate_prior_marker(decoded.prior_active_revision, active)
         if active is not None:
             prior_cutoffs = _decode_plan_scope(active.build_plan).cutoffs
             if decoded.cutoffs.snapshot_upper <= prior_cutoffs.snapshot_upper:
@@ -986,10 +1026,6 @@ class DurableWorkspaceCatalogLifecycle:
                 raise DurableLifecycleError(
                     "open incremental build does not continue the active span window"
                 )
-        if active is not None and active.catalog_revision >= lease.catalog_revision:
-            raise DurableLifecycleError(
-                "active lineage advanced into or beyond the incomplete revision"
-            )
         if reservation.status is not ReservationStatus.FENCED:
             # ``allocate`` is the serialized read-after-write verifier. Supplying
             # persisted bytes makes OPEN/DRAINING recovery idempotent.
@@ -1212,19 +1248,31 @@ class ClickHouseLifecycleStateReader:
         self,
         scope: WorkspaceCatalogScope,
     ) -> PersistedReservation | None:
-        reservations = self._reservations(scope)
-        nonterminal = tuple(
+        candidates = list(self._reservations(scope))
+        fenced = self._latest_fenced(scope)
+        if fenced is not None:
+            candidates.append(fenced)
+        if not candidates:
+            return None
+        newest_revision = max(value.lease.catalog_revision for value in candidates)
+        newest = tuple(
             value
-            for value in reservations
-            if value.status in {ReservationStatus.OPEN, ReservationStatus.DRAINING}
+            for value in candidates
+            if value.lease.catalog_revision == newest_revision
         )
-        if len(nonterminal) > 1:
+        if len(newest) != 1:
             raise DurableLifecycleError(
-                "workspace has multiple nonterminal revision reservations"
+                "newest recoverable revision has multiple build tokens"
             )
-        if nonterminal:
-            return nonterminal[0]
-        return self._latest_fenced(scope)
+        selected = newest[0]
+        for stale in candidates:
+            if stale is selected or stale.status is ReservationStatus.FENCED:
+                continue
+            if stale.lease.expires_at > selected.lease.issued_at:
+                raise DurableLifecycleError(
+                    "workspace has overlapping nonterminal revision reservations"
+                )
+        return selected
 
     def load_latest_active(
         self,
@@ -1543,14 +1591,19 @@ class ClickHouseLifecycleStateReader:
                 "AND s.envelope_version=0 AND s.producer_stream_id=s.build_token "
                 "AND s.status IN ('open', 'draining') "
                 "ORDER BY s.catalog_revision DESC, s.build_token, s._version DESC "
-                "LIMIT 3",
+                "LIMIT %(reservation_limit)s",
                 {
                     "organization_id": scope.organization_id,
                     "workspace_id": scope.workspace_id,
                     "catalog_epoch": scope.catalog_epoch,
+                    "reservation_limit": _MAX_NONTERMINAL_RESERVATION_ROWS + 1,
                 },
             )
         )
+        if len(rows) > _MAX_NONTERMINAL_RESERVATION_ROWS:
+            raise DurableLifecycleError(
+                "nonterminal reservation history exceeded its bounded row cap"
+            )
         grouped: dict[tuple[int, str], list[Mapping[str, Any]]] = {}
         for row in rows:
             key = (
@@ -1574,10 +1627,6 @@ class ClickHouseLifecycleStateReader:
                     "nonterminal reservation candidate changed during verification"
                 )
             result.append(verified)
-        if len(result) > 1:
-            raise DurableLifecycleError(
-                "workspace has multiple nonterminal revision reservations"
-            )
         return tuple(result)
 
     def _reservation_for(

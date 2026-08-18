@@ -30,6 +30,7 @@ from tracer.services.clickhouse.v2.property_catalog.dev_rollout import (
     DevRolloutMode,
     DevRolloutRequest,
     DevRolloutStage,
+    UnifiedDevRollout,
     run_configured_dev_rollout,
     run_workspace_reconcile,
 )
@@ -72,6 +73,7 @@ from tracer.services.clickhouse.v2.property_catalog.publisher import (
 from tracer.services.clickhouse.v2.property_catalog.reconciler import ReconcileMode
 from tracer.services.clickhouse.v2.property_catalog.span_source import (
     CANONICAL_SPAN_QUERY_TIMEOUT_MS,
+    DEV_INITIAL_BACKFILL_CANONICAL_SPAN_PAGE_ROWS,
     DEV_INITIAL_BACKFILL_CANONICAL_SPAN_QUERY_TIMEOUT_MS,
     SPAN_AUDIT_CUTOFF_LABEL,
     FrozenSpanSource,
@@ -411,11 +413,13 @@ def test_management_command_maps_explicit_initial_backfill_wall() -> None:
             "execute": True,
             "status": False,
             "initial_backfill_wall_ms": DEV_INITIAL_BACKFILL_MAX_WALL_MS,
+            "repair_expired_incomplete": True,
         }
     )
 
     assert request.mode is DevRolloutMode.EXECUTE
     assert request.initial_backfill_wall_ms == DEV_INITIAL_BACKFILL_MAX_WALL_MS
+    assert request.repair_expired_incomplete is True
 
 
 def test_management_command_status_uses_checked_in_factory_with_fake_clients(
@@ -1405,6 +1409,8 @@ def test_concrete_scheduled_incremental_uses_auto_and_fenced_resume_skips_source
         {"target_database": "production_dev"},
         {"acknowledgement": "wrong"},
         {"execute": True, "status": True},
+        {"repair_expired_incomplete": True},
+        {"execute": True, "repair_expired_incomplete": 1},
     ),
 )
 def test_rollout_rejects_non_dev_or_ambiguous_targets(
@@ -1426,6 +1432,15 @@ def test_explicit_initial_backfill_wall_is_strictly_bounded(wall_ms: object) -> 
 def test_explicit_initial_backfill_wall_requires_execute() -> None:
     with pytest.raises(DevRolloutError, match="requires --execute"):
         _request(initial_backfill_wall_ms=DEV_STANDARD_MAX_WALL_MS + 1)
+
+
+def test_expired_repair_is_explicit_in_execute_plan() -> None:
+    request = _request(execute=True, repair_expired_incomplete=True)
+
+    plan = UnifiedDevRollout.plan(request)
+
+    assert plan.repair_expired_incomplete is True
+    assert plan.as_dict()["repair_expired_incomplete"] is True
 
 
 def test_checked_in_runtime_builds_exact_ten_stream_plan() -> None:
@@ -1520,8 +1535,8 @@ def test_dev_runtime_requires_v2_shared_proof_and_temporal_headroom(
         )
     with pytest.raises(PropertyCatalogDevRuntimeError, match="100000"):
         replace(config, rollout_wall_ms=100_001)
-    with pytest.raises(PropertyCatalogDevRuntimeError, match=r"\[1, 256\]"):
-        replace(config, span_page_rows=257)
+    with pytest.raises(PropertyCatalogDevRuntimeError, match=r"\[1, 1024\]"):
+        replace(config, span_page_rows=1_025)
     with pytest.raises(PropertyCatalogDevRuntimeError, match="read-only identity"):
         replace(config.catalog, read_timeout_ceiling_ms=30_000)
     extended = replace(
@@ -1533,9 +1548,7 @@ def test_dev_runtime_requires_v2_shared_proof_and_temporal_headroom(
         extended.span_query_timeout_ms
         == DEV_INITIAL_BACKFILL_CANONICAL_SPAN_QUERY_TIMEOUT_MS
     )
-    assert (
-        MAX_REVISION_LEASE_SECONDS * 1_000 - extended.rollout_wall_ms
-    ) == 60_000
+    assert (MAX_REVISION_LEASE_SECONDS * 1_000 - extended.rollout_wall_ms) == 60_000
     with pytest.raises(PropertyCatalogDevRuntimeError, match="1740000"):
         replace(
             config,
@@ -1616,6 +1629,9 @@ def test_factory_shares_one_extended_deadline_with_lease_headroom(
         == DEV_INITIAL_BACKFILL_CANONICAL_SPAN_QUERY_TIMEOUT_MS
     )
     assert runtime.source_client._explicit_initial_backfill is True
+    assert (
+        runtime.config.span_page_rows == DEV_INITIAL_BACKFILL_CANONICAL_SPAN_PAGE_ROWS
+    )
     assert runtime.config.source.read_timeout_ceiling_ms == 30_000
     assert runtime.config.catalog.read_timeout_ceiling_ms == 9_500
     assert runtime.lifecycle_state is not None
@@ -1629,7 +1645,8 @@ def test_factory_shares_one_extended_deadline_with_lease_headroom(
     assert 8.5 < source_budget.adapter_wall_timeout_seconds <= 540.0
     assert source_budget.shared_deadline is runtime.deadline
     assert source_budget.postgres.statement_timeout_ms == 8_000
-    assert source_budget.postgres.wall_timeout_seconds == 8.5
+    assert source_budget.postgres.wall_timeout_seconds == 540.0
+    assert source_budget.postgres.initial_backfill is True
     authorization = runtime.provenance.project_tenant_authorization
     assert authorization is not None
     assert authorization.organization_id == ORG
@@ -1664,6 +1681,7 @@ def test_default_runtime_source_budget_stays_below_standard_shared_wall(
     assert source_budget.shared_deadline is runtime.deadline
     assert source_budget.postgres.statement_timeout_ms <= 8_000
     assert source_budget.postgres.wall_timeout_seconds <= 8.5
+    assert source_budget.postgres.initial_backfill is False
 
 
 def test_concrete_runtime_publishes_prior_retirement_then_opens_all_streams(

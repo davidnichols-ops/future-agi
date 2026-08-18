@@ -69,6 +69,7 @@ class DevRolloutRequest:
     execute: bool = False
     status: bool = False
     initial_backfill_wall_ms: int | None = None
+    repair_expired_incomplete: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -114,10 +115,20 @@ class DevRolloutRequest:
             raise DevRolloutError(
                 "the exact unified DEV rollout acknowledgement is required"
             )
-        if type(self.execute) is not bool or type(self.status) is not bool:
-            raise DevRolloutError("execute and status must be bools")
+        if (
+            type(self.execute) is not bool
+            or type(self.status) is not bool
+            or type(self.repair_expired_incomplete) is not bool
+        ):
+            raise DevRolloutError(
+                "execute, status, and repair_expired_incomplete must be bools"
+            )
         if self.execute and self.status:
             raise DevRolloutError("execute and status are mutually exclusive")
+        if self.repair_expired_incomplete and (not self.execute or self.status):
+            raise DevRolloutError(
+                "expired incomplete repair requires explicit --execute"
+            )
         if self.initial_backfill_wall_ms is not None:
             if (
                 type(self.initial_backfill_wall_ms) is not int
@@ -150,12 +161,14 @@ class DevRolloutPlan:
     legacy_source_access: str = "select_only"
     zero_io: bool = False
     initial_backfill_wall_ms: int | None = None
+    repair_expired_incomplete: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "legacy_source_access": self.legacy_source_access,
             "initial_backfill_wall_ms": self.initial_backfill_wall_ms,
             "mode": self.mode,
+            "repair_expired_incomplete": self.repair_expired_incomplete,
             "source_database": self.source_database,
             "stages": list(self.stages),
             "target_database": self.target_database,
@@ -253,6 +266,7 @@ class UnifiedDevRollout:
             write_allowlist=tuple(sorted(PROPERTY_CATALOG_TABLES)),
             zero_io=request.mode is DevRolloutMode.DRY_RUN,
             initial_backfill_wall_ms=request.initial_backfill_wall_ms,
+            repair_expired_incomplete=request.repair_expired_incomplete,
         )
 
     def run(
@@ -331,6 +345,7 @@ def configured_dev_rollout_request(
     execute: bool,
     status: bool = False,
     initial_backfill_wall_ms: int | None = None,
+    repair_expired_incomplete: bool = False,
     overrides: Mapping[str, str | None] | None = None,
 ) -> DevRolloutRequest:
     """Build one allowlisted request from explicit Django settings."""
@@ -361,6 +376,7 @@ def configured_dev_rollout_request(
         execute=execute,
         status=status,
         initial_backfill_wall_ms=initial_backfill_wall_ms,
+        repair_expired_incomplete=repair_expired_incomplete,
     )
 
 
@@ -400,6 +416,10 @@ def run_workspace_reconcile(
     if request.initial_backfill_wall_ms is not None:
         raise DevRolloutError(
             "scheduled workspace reconciliation refuses an initial backfill wall"
+        )
+    if request.repair_expired_incomplete and mode is not ReconcileMode.FULL_REPAIR:
+        raise DevRolloutError(
+            "expired incomplete scheduled repair requires full-repair mode"
         )
     if mode not in {ReconcileMode.INCREMENTAL, ReconcileMode.FULL_REPAIR}:
         raise DevRolloutError("workspace reconciliation mode is unsupported")

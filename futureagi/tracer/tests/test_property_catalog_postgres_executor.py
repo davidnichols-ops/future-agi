@@ -199,6 +199,7 @@ def test_revision_coordinator_shares_one_snapshot_across_adapters_and_resumes(
             request: ReconcileRequest,
         ) -> ReconcileResult:
             assert inside_snapshot is True
+            assert request.postgres_snapshot_guard is snapshot_guard
             calls[adapter.source_adapter] = calls.get(adapter.source_adapter, 0) + 1
             events.append(f"reconcile-{adapter.source_adapter}")
             if (
@@ -233,11 +234,14 @@ def test_revision_coordinator_shares_one_snapshot_across_adapters_and_resumes(
         events.append(f"request-{adapter.source_adapter}")
         return _request(adapter, context=context, budget=budget)
 
+    def snapshot_guard() -> None:
+        events.append("snapshot-guard")
+
     result = reconcile_postgres_revision(
         reconciler=ScriptedReconciler(),
         request_factory=request_factory,
         adapters=adapters,
-        snapshot_guard=lambda: events.append("snapshot-guard"),
+        snapshot_guard=snapshot_guard,
     )
 
     assert snapshot_arguments == [{"context": context, "budget": budget.postgres}]
@@ -314,7 +318,8 @@ def test_revision_coordinator_rehydrates_completed_adapter_and_only_runs_remaini
         ) -> ReconcileResult:
             assert inside_snapshot is True
             assert adapter.source_adapter is SourceAdapter.DATASET_COLUMN
-            assert request is requests[SourceAdapter.DATASET_COLUMN]
+            assert request == requests[SourceAdapter.DATASET_COLUMN]
+            assert request.postgres_snapshot_guard is None
             reconcile_calls.append(adapter.source_adapter)
             return _result(
                 adapter=adapter,

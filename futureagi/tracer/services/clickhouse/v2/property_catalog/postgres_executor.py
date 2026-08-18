@@ -170,6 +170,7 @@ def reconcile_postgres_revision(
                     reconciler=reconciler,
                     adapter=adapter,
                     request=request,
+                    snapshot_guard=(snapshot_guard if open_snapshot else None),
                 )
             )
 
@@ -262,12 +263,17 @@ def _reconcile_all_segments(
     reconciler: PostgresRevisionReconciler,
     adapter: DefinitionSourceAdapter,
     request: ReconcileRequest,
+    snapshot_guard: PostgresSnapshotGuard | None = None,
 ) -> PostgresAdapterReconcileResult:
     segment_results: list[ReconcileResult] = []
     seen_cursors: set[str] = set()
     if request.resume is not None and request.resume.source_cursor:
         seen_cursors.add(request.resume.source_cursor)
-    active_request = request
+    active_request = (
+        replace(request, postgres_snapshot_guard=snapshot_guard)
+        if snapshot_guard is not None
+        else request
+    )
 
     while True:
         result = reconciler.reconcile(adapter, active_request)

@@ -8,22 +8,22 @@ model-hub, annotation, and workflow actions that are not part of the Cartesian
 production gate, is maintained in
 [`TH7247_INTERACTIVE_READ_MATRIX.md`](TH7247_INTERACTIVE_READ_MATRIX.md).
 
-> **Current freeze, 2026-08-17.** The reviewed DEV deployment reads canonical
+> **Current freeze, 2026-08-18.** The reviewed DEV deployment reads canonical
 > source database `futureagi` and writes only the fresh six-table target
-> `th7247_catalog_dev_kartik_0817j`. Canonical PostgreSQL ownership resolved 33
-> projects for Kartik's organization/workspace. Epoch 14, revision 1 activated
-> build `7e4a7506-83a5-4a97-a9e5-3602909413f3` after 35,586 source rows emitted
-> 941,080 value rows through the six-partition DEV Kafka topic. The activated
-> view has 9,383 live definitions, 261 tombstones, and 659,148 unique semantic
-> value states; all ten populated streams plus the zero-sequence lifecycle
-> reservation are fenced, with zero delivery gaps, poison rows, or conflicts.
-> DEV backend readers are enabled only for the reviewed workspace. Source
+> `th7247_catalog_dev_kartik_0817j`. Canonical PostgreSQL ownership resolved 90
+> eligible workspaces and 263 projects; 289 legacy projects without a workspace
+> were excluded. All 90 workspaces have active qualified catalog lineage. The
+> six-table target contains 89,894 physical definition rows and 2,151,977
+> physical value rows. DEV backend readers are enabled for that exact
+> 90-workspace set. Source
 > ClickHouse/PostgreSQL access remained SELECT-only and no existing application
 > table or data was changed. No production deployment, backfill, DDL, or DML
 > occurred. An isolated server-read-only production SELECT matrix was
 > authorized and is summarized below; it is query-builder evidence, not the
 > still-pending authenticated dense Whatfix, sparse Colektia, and Mudflap voice
-> HTTP release matrix.
+> production release matrix. Authenticated DEV reads across Trace, Span,
+> Session, User, Voice, and Prompt sources returned HTTP 200 in 1.02–1.22
+> seconds; a custom-value page returned 17 values in 1.19 seconds.
 
 ## Logical property model
 

@@ -8,8 +8,8 @@ only after all earlier segment bindings are durably readable in the catalog.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
@@ -113,12 +113,21 @@ class ReconcileRequest:
     incremental_overlap_seconds: int = DEFAULT_INCREMENTAL_OVERLAP_SECONDS
     source_budget: SourceReadBudget = SourceReadBudget()
     envelope_budget: EnvelopeBudget = EnvelopeBudget()
+    postgres_snapshot_guard: Callable[[], None] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.context, PostgresSnapshotContext):
             raise TypeError("context must be a PostgresSnapshotContext")
         if not isinstance(self.mode, ReconcileMode):
             raise TypeError("mode must be a ReconcileMode")
+        if self.postgres_snapshot_guard is not None and not callable(
+            self.postgres_snapshot_guard
+        ):
+            raise TypeError("postgres_snapshot_guard must be callable")
         object.__setattr__(
             self,
             "build_token",
@@ -229,6 +238,7 @@ class PropertyCatalogReconciler:
         )
         if snapshot.source_adapter is not adapter.source_adapter:
             raise PropertyCatalogReconcileError("source snapshot adapter mismatch")
+        _guard_postgres_snapshot(request)
 
         current = tuple(
             self._current_bindings.read_current(
@@ -249,6 +259,7 @@ class PropertyCatalogReconciler:
             current=current,
             request=request,
         )
+        _guard_postgres_snapshot(request)
 
         segment_source_digest = progress.source_digest
         for record in snapshot.records:
@@ -360,6 +371,11 @@ class PropertyCatalogReconciler:
             )
             envelopes.append(envelope)
             try:
+                # A large relational snapshot can produce many catalog
+                # envelopes. Keep the same read-only REPEATABLE READ session
+                # active between ClickHouse publishes so PostgreSQL's
+                # idle-in-transaction protection cannot sever it at COMMIT.
+                _guard_postgres_snapshot(request)
                 payload_sha256 = self._publisher.publish(envelope)
                 require_sha256(payload_sha256, field="payload_sha256")
             except Exception as exc:  # retain the pre-segment cursor for replay
@@ -425,6 +441,7 @@ class PropertyCatalogReconciler:
             source_cursor=snapshot.next_cursor or "",
             conflict_count=0,
         )
+        _guard_postgres_snapshot(request)
         self._checkpoint_writer.append(checkpoint_write)
         return ReconcileResult(
             snapshot=snapshot,
@@ -493,6 +510,12 @@ class PropertyCatalogReconciler:
             checkpoint_write=checkpoint_write,
             error=error,
         )
+
+
+def _guard_postgres_snapshot(request: ReconcileRequest) -> None:
+    guard = request.postgres_snapshot_guard
+    if guard is not None:
+        guard()
 
 
 def _starting_progress(

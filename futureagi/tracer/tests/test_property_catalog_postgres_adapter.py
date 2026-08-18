@@ -14,6 +14,10 @@ from tracer.services.clickhouse.v2.property_catalog.projection import (
     validate_postgres_adapter,
     validate_postgres_page,
 )
+from tracer.services.clickhouse.v2.property_catalog.source_adapters import (
+    _annotation_definition,
+    _dataset_column_definition,
+)
 
 
 class _StubAdapter:
@@ -45,6 +49,24 @@ def test_postgres_read_budget_rejects_unbounded_values(
 ) -> None:
     with pytest.raises(ValueError):
         PostgresReadBudget(**budget)  # type: ignore[arg-type]
+
+
+def test_postgres_read_budget_extends_only_explicit_initial_backfill_wall() -> None:
+    extended = PostgresReadBudget(
+        wall_timeout_seconds=540.0,
+        initial_backfill=True,
+    )
+
+    assert extended.wall_timeout_seconds == 540.0
+    assert extended.initial_backfill is True
+
+    with pytest.raises(ValueError):
+        PostgresReadBudget(
+            wall_timeout_seconds=540.01,
+            initial_backfill=True,
+        )
+    with pytest.raises(ValueError):
+        PostgresReadBudget(initial_backfill=1)  # type: ignore[arg-type]
 
 
 def test_postgres_snapshot_models_are_metadata_only() -> None:
@@ -102,3 +124,35 @@ def test_postgres_page_is_checked_against_caller_budget() -> None:
             page,
             budget=PostgresReadBudget(max_total_rows=10),
         )
+
+
+@pytest.mark.parametrize("raw_name", [None, "", "   "])
+def test_dataset_column_definition_survives_blank_legacy_name(
+    raw_name: object,
+) -> None:
+    source_id = "33333333-3333-4333-8333-333333333333"
+
+    definition = _dataset_column_definition(
+        {
+            "id": source_id,
+            "name": raw_name,
+            "data_type": "text",
+        }
+    )
+
+    assert definition.display_name == f"Dataset column {source_id}"
+
+
+def test_annotation_definition_survives_blank_legacy_name() -> None:
+    source_id = "44444444-4444-4444-8444-444444444444"
+
+    definition = _annotation_definition(
+        {
+            "id": source_id,
+            "name": "",
+            "type": "numeric",
+            "settings": {},
+        }
+    )
+
+    assert definition.display_name == f"Annotation {source_id}"

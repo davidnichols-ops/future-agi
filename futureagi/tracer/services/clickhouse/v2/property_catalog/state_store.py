@@ -1101,6 +1101,13 @@ class ClickHouseCurrentBindingReader(CurrentBindingReader):
         if at_revision == context.catalog_revision:
             allowed.add((at_revision, build_token, context.projection_version))
         allowed_lineage = tuple(sorted(allowed))
+        # A full repair may legitimately ask for the rev-1 baseline when the
+        # previous initial backfill never activated.  There is no readable
+        # lineage in that case.  Avoid sending an empty tuple set to
+        # ClickHouse: recent analyzers reject it as a zero-width tuple before
+        # they can reduce the predicate to false.
+        if not allowed_lineage:
+            return ()
         _validate_client(self._client, self._database)
         rows = tuple(
             self._client.query(

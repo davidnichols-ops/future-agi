@@ -41,6 +41,14 @@ class Command(BaseCommand):
         parser.add_argument("--target-database")
         parser.add_argument("--ack", dest="acknowledgement")
         parser.add_argument("--initial-backfill-wall-ms", type=int)
+        parser.add_argument(
+            "--repair-expired-incomplete",
+            action="store_true",
+            help=(
+                "Explicitly supersede one expired incomplete revision with a "
+                "fresh revision; never extends or mutates the expired lease."
+            ),
+        )
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument("--status", action="store_true")
         mode.add_argument("--execute", action="store_true")
@@ -70,6 +78,7 @@ def _request(options: dict[str, Any]) -> DevRolloutRequest:
         execute=bool(options.get("execute")),
         status=bool(options.get("status")),
         initial_backfill_wall_ms=options.get("initial_backfill_wall_ms"),
+        repair_expired_incomplete=bool(options.get("repair_expired_incomplete")),
         overrides={
             "acknowledgement": options.get("acknowledgement"),
             "cloud_deployment": options.get("cloud_deployment"),

@@ -407,13 +407,24 @@ class _Coordinator:
         self.allocate_calls += 1
         if self.state.reservation is not None:
             lease = self.state.reservation.lease
-            assert lease.build_token == build_token
-            assert lease.build_plan.source_scope == source_scope
-            assert lease.build_plan.streams == planned_streams
-            return lease
-        revision = (
-            1 if self.state.active is None else self.state.active.catalog_revision + 1
+            if lease.build_token == build_token or lease.expires_at > now:
+                assert lease.build_token == build_token
+                assert lease.build_plan.source_scope == source_scope
+                assert lease.build_plan.streams == planned_streams
+                return lease
+        revision = max(
+            (
+                self.state.reservation.lease.catalog_revision
+                if self.state.reservation is not None
+                else 0
+            ),
+            (
+                self.state.active.catalog_revision
+                if self.state.active is not None
+                else 0
+            ),
         )
+        revision += 1
         plan = RevisionBuildPlan(
             organization_id=organization_id,
             workspace_id=workspace_id,
@@ -436,6 +447,7 @@ class _Coordinator:
             issued_at=now,
             expires_at=now + timedelta(minutes=10),
         )
+        self.state.resumes = ()
         self.state.reservation = PersistedReservation(lease, ReservationStatus.OPEN)
         return lease
 
@@ -873,6 +885,104 @@ def test_fenced_crash_recovers_terminal_revision_without_reopening_sources() -> 
     assert all(value.resume is not None for value in restarted.streams)
     assert len(freezer.calls) == 1
     assert tokens == [TOKEN_B]
+
+
+def test_expired_incomplete_revision_requires_explicit_fresh_revision() -> None:
+    clock = _Clock(INITIAL_UNTIL)
+    state = _State()
+    freezer = _Freezer(clock)
+    tokens = [TOKEN_A, TOKEN_B]
+    lifecycle = _lifecycle(
+        state=state,
+        clock=clock,
+        freezer=freezer,
+        tokens=tokens,
+    )
+    first = lifecycle.prepare(
+        scope=_scope(),
+        mode=LifecycleRunMode.INITIAL_BACKFILL,
+        configured_bounds=_bounds(),
+    )
+    expired_lease = first.lease
+    state.resumes = (_running_checkpoint(first),)
+    clock.current = expired_lease.expires_at + timedelta(seconds=1)
+
+    with pytest.raises(DurableLifecycleError, match="explicit repair"):
+        lifecycle.prepare(
+            scope=_scope(),
+            mode=LifecycleRunMode.INITIAL_BACKFILL,
+            configured_bounds=_bounds(),
+        )
+
+    repaired = lifecycle.prepare(
+        scope=_scope(),
+        mode=LifecycleRunMode.INITIAL_BACKFILL,
+        configured_bounds=_bounds(),
+        allow_expired_repair=True,
+    )
+
+    assert repaired.resumed is False
+    assert repaired.lease.catalog_revision == expired_lease.catalog_revision + 1
+    assert repaired.lease.build_token == TOKEN_B
+    assert repaired.lease != expired_lease
+    assert repaired.streams and all(value.resume is None for value in repaired.streams)
+    assert expired_lease.build_token == TOKEN_A
+    assert expired_lease.expires_at < repaired.lease.issued_at
+    assert tokens == []
+
+    class ReservationReader(ClickHouseLifecycleStateReader):
+        def __init__(self, stale: PersistedReservation) -> None:
+            self.stale = stale
+
+        def _reservations(
+            self, _scope: WorkspaceCatalogScope
+        ) -> tuple[PersistedReservation, ...]:
+            return (self.stale,)
+
+        def _latest_fenced(self, _scope: WorkspaceCatalogScope) -> PersistedReservation:
+            return PersistedReservation(
+                repaired.lease,
+                ReservationStatus.FENCED,
+            )
+
+    stale = PersistedReservation(expired_lease, ReservationStatus.OPEN)
+    selected = ReservationReader(stale).load_nonterminal(_scope())
+    assert selected is not None and selected.lease == repaired.lease
+
+    overlapping = PersistedReservation(
+        replace(
+            expired_lease,
+            expires_at=repaired.lease.issued_at + timedelta(seconds=1),
+        ),
+        ReservationStatus.OPEN,
+    )
+    with pytest.raises(DurableLifecycleError, match="overlapping"):
+        ReservationReader(overlapping).load_nonterminal(_scope())
+
+
+def test_expired_no_active_repair_rejects_implicit_auto_mode() -> None:
+    clock = _Clock(INITIAL_UNTIL)
+    state = _State()
+    lifecycle = _lifecycle(
+        state=state,
+        clock=clock,
+        freezer=_Freezer(clock),
+        tokens=[TOKEN_A, TOKEN_B],
+    )
+    first = lifecycle.prepare(
+        scope=_scope(),
+        mode=LifecycleRunMode.INITIAL_BACKFILL,
+        configured_bounds=_bounds(),
+    )
+    clock.current = first.lease.expires_at + timedelta(seconds=1)
+
+    with pytest.raises(DurableLifecycleError, match="explicit initial-backfill"):
+        lifecycle.prepare(
+            scope=_scope(),
+            mode=LifecycleRunMode.AUTO,
+            configured_bounds=_bounds(),
+            allow_expired_repair=True,
+        )
 
 
 def test_auto_schedule_selects_incremental_then_due_full_repair() -> None:

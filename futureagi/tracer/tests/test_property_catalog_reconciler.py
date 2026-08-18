@@ -303,6 +303,32 @@ def test_many_dataset_columns_split_before_first_wire_publish() -> None:
     assert publisher.chunk_sizes[-1] == ()
 
 
+def test_large_postgres_publish_keeps_revision_snapshot_active() -> None:
+    records = _dataset_column_records(360)
+    adapter = DatasetColumnSourceAdapter(page_loader=lambda **kwargs: records)
+    publisher = _ExactWirePublisher()
+    checkpoints = _CheckpointSink()
+    guard_observations: list[int] = []
+    reconciler = PropertyCatalogReconciler(
+        publisher=publisher,  # type: ignore[arg-type]
+        checkpoint_writer=checkpoints,  # type: ignore[arg-type]
+        current_bindings=_EmptyCurrentBindings(),
+    )
+    request = replace(
+        _dataset_request(),
+        postgres_snapshot_guard=lambda: guard_observations.append(
+            len(publisher.envelopes)
+        ),
+    )
+
+    result = reconciler.reconcile(adapter, request)
+
+    assert result.complete is True
+    assert len(result.envelopes) >= 3
+    assert len(guard_observations) >= len(result.envelopes) + 3
+    assert set(range(len(result.envelopes))).issubset(guard_observations)
+
+
 def test_wire_failure_retains_static_contract_detail_without_advancing_source() -> None:
     records = _dataset_column_records(1)
     adapter = DatasetColumnSourceAdapter(page_loader=lambda **kwargs: records)

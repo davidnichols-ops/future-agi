@@ -1,7 +1,8 @@
 # TH-7247 Unified Property Catalog Design
 
-Status: implemented locally with focused gates green; DEV deployment/backfill
-is pending; no production rollout is authorized.
+Status: implemented and qualified on DEV on 2026-08-18. All 90 eligible DEV
+workspaces are activated in the isolated catalog and the authenticated read
+path is enabled for those workspaces. No production rollout is authorized.
 
 ## 1. Objective
 
@@ -19,12 +20,14 @@ The public contracts remain:
 Property definitions are unified. Large fact/value populations remain in their
 native stores and are reached through a server-owned value adapter.
 
-## 2. Pre-release reset decision
+## 2. Pre-release reset decision and current DEV state
 
 Schemas 025–027 and their six DEV tables were never activated in production.
-The isolated DEV tables were empty and were removed during the pre-release
-reset. The clean unified implementation is now in the working tree; the DEV
-tables have not yet been recreated, backfilled, qualified, or activated.
+The earlier empty DEV tables were removed during the pre-release reset. The
+clean schema was subsequently recreated only in
+`th7247_catalog_dev_kartik_0817j`, backfilled, qualified, and activated for all
+90 eligible DEV workspaces. Canonical ClickHouse and PostgreSQL sources were
+read-only throughout the rollout.
 
 The replacement table inventory is exactly:
 
@@ -249,7 +252,7 @@ The local implementation now has:
 
 ## 9. Implementation and rollout state
 
-Complete locally:
+Complete in code and on DEV:
 
 - clean six-table schemas and exact topology validation;
 - Python/Go canonical codecs, durable spool, Kafka producer/consumer, and
@@ -258,18 +261,26 @@ Complete locally:
   activation lineage, lifecycle recovery, and daily/depth repair selection;
 - single-table definition reader, value reader, signed cursors, unified API,
   frontend hook, and generated contracts;
-- one-workspace, 120-second default-off DEV schedule and dedicated queue.
+- one-workspace-per-sidecar, 120-second default-off DEV schedule and dedicated
+  queue;
+- organization-wide DEV inventory of 90 workspaces and 263 owned projects;
+- bounded initial backfill and activation of all 90 eligible workspaces in the
+  isolated six-table catalog;
+- authenticated unified reads enabled for the same 90-workspace admission set;
+- upper stacked-PR frontend deployed from commit `7aa5c925f` by successful
+  GitHub Actions run `32091720813`.
 
 Still pending and deliberately not claimed:
 
-1. Re-prove the isolated DEV target and unrelated-table fingerprint.
-2. Recreate only the six catalog tables on DEV.
-3. Run the explicit initial backfill with SELECT-only source reads, qualify it,
-   and shadow-activate the allowlisted workspace.
-4. Compare complete legacy/unified pages and run dense Whatfix, sparse
+1. Run the separately approved production deployment/backfill.
+2. Compare complete legacy/unified pages and run dense Whatfix, sparse
    Colektia, Mudflap voice, all nine windows, all filter combinations, and
-   frontend/API latency checks.
-5. Present DEV evidence and code for user review.
+   production-scale frontend/API latency checks.
+3. Observe a non-empty, naturally occurring hot-span delivery after an active
+   incremental revision. The DEV ledger proves the 90-workspace Kafka
+   terminal/drain handshake, but its 91 hot deliveries are zero-data terminal
+   boundaries. No synthetic canonical span was inserted because source writes
+   were outside the DEV safety authorization.
 
 Production catalog schema/data remains untouched until separate user approval
 after DEV evidence and code review. Historical read-only qualification does not
@@ -291,11 +302,11 @@ authorize or qualify a unified-catalog production rollout.
 - Every request below 10 seconds or a truthful typed bounded failure
 - Proof that no legacy PostgreSQL or ClickHouse row was mutated
 
-### Current local evidence
+### Current local and DEV evidence
 
-Latest recorded evidence at the local freeze is:
+Latest recorded evidence is:
 
-- 256 focused Python unified-catalog tests passing;
+- 404 focused Python property/unified-catalog tests passing;
 - five catalog/auth/server/consumer Go packages passing in normal and race
   modes;
 - 278 focused frontend tests passing;
@@ -303,11 +314,26 @@ Latest recorded evidence at the local freeze is:
 - generated-contract validation at 980 paths / 1,325 operations and registry
   coverage at 789/789;
 - changed-source Ruff/format and Python compilation, Prettier/ESLint, Go
-  formatting, and diff checks green.
+  formatting, and diff checks green;
+- 1,585/1,585 changed frontend tests passing in the final stacked-PR gate;
+- exactly six DEV catalog tables: 91 activation rows, 918 checkpoint rows,
+  11,426 delivery rows, 1,104 source-stream rows, 89,894 physical definition
+  rows, and 2,151,977 physical value rows;
+- 90/90 eligible workspaces active, covering the 263-project authorized
+  inventory; 289 legacy projects without a workspace were excluded rather
+  than guessed into a tenant;
+- authenticated DEV definition reads for Trace, Span, Session, User, Voice,
+  and Prompt sources returning HTTP 200 in 1.02–1.17 seconds; category pages
+  retained exact invariant counts and cursor pages were disjoint;
+- an authenticated custom-value read returning 17 values in 1.19 seconds,
+  both reported user-session list shapes returning HTTP 200 in 1.84–1.89
+  seconds, Eval detail/usage returning HTTP 200 in 0.34–0.45 seconds, and the
+  25-row Simulate selector returning HTTP 200 in 1.54 seconds;
+- no PostgreSQL property-catalog tables and no production changes.
 
-This evidence proves the exercised local contracts only. It does not prove DEV
-schema installation, backfill correctness, representative endpoint latency,
-Whatfix/Colektia/Mudflap population coverage, or any production result.
+This evidence proves the exercised local contracts and the named DEV scopes.
+It does not prove Whatfix/Colektia/Mudflap production-population coverage,
+production-scale latency, or any production result.
 
 ## 11. DEV cleanup evidence (2026-08-14)
 
@@ -321,9 +347,9 @@ Whatfix/Colektia/Mudflap population coverage, or any production result.
   before and after cleanup.
 - No production catalog schema or data was changed during cleanup.
 
-Current state: those six DEV tables remain deleted and have not been recreated.
-No DEV backfill, activation, reader enablement, or current live API test has
-occurred after the cleanup.
+Current state: the historical cleanup was followed by the clean 2026-08-18 DEV
+rollout described above. Exactly six catalog tables now exist in the isolated
+DEV database; no property-catalog table exists in PostgreSQL.
 
 Before recreating the clean schema, DEV must also prove there is no pending
 catalog spool or incompatible schema-version record. Any contradiction stops

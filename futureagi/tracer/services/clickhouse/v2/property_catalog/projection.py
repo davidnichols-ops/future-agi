@@ -297,6 +297,7 @@ class PostgresReadBudget:
     wall_timeout_seconds: float = 8.5
     max_rows_per_page: int = 1_000
     max_total_rows: int = 100_000
+    initial_backfill: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -304,12 +305,18 @@ class PostgresReadBudget:
             or not 1 <= self.statement_timeout_ms <= 8_000
         ):
             raise ValueError("statement_timeout_ms must be between 1 and 8000")
+        if type(self.initial_backfill) is not bool:
+            raise ValueError("initial_backfill must be a bool")
+        maximum_wall_seconds = 540.0 if self.initial_backfill else 8.5
         if (
             type(self.wall_timeout_seconds) not in {int, float}
             or isinstance(self.wall_timeout_seconds, bool)
-            or not 0 < self.wall_timeout_seconds <= 8.5
+            or not 0 < self.wall_timeout_seconds <= maximum_wall_seconds
         ):
-            raise ValueError("wall_timeout_seconds must be at most 8.5")
+            raise ValueError(
+                "wall_timeout_seconds exceeds the bounded "
+                f"{'initial-backfill' if self.initial_backfill else 'standard'} wall"
+            )
         if self.statement_timeout_ms >= self.wall_timeout_seconds * 1_000:
             raise ValueError("statement timeout must be below the adapter wall")
         if (

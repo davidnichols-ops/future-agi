@@ -115,6 +115,7 @@ from .source_adapters import (
 from .span_source import (
     CANONICAL_SPAN_QUERY_TIMEOUT_MS,
     DEV_CANONICAL_SPAN_PAGE_ROWS,
+    DEV_INITIAL_BACKFILL_CANONICAL_SPAN_PAGE_ROWS,
     DEV_INITIAL_BACKFILL_CANONICAL_SPAN_QUERY_TIMEOUT_MS,
     MAX_CANONICAL_SPAN_PAGE_ROWS,
     SPAN_AUDIT_CUTOFF_LABEL,
@@ -898,7 +899,7 @@ class DevRuntimeConfig:
             or not 1 <= self.span_page_rows <= MAX_CANONICAL_SPAN_PAGE_ROWS
         ):
             raise PropertyCatalogDevRuntimeError(
-                "canonical span page rows must be in [1, 256]"
+                "canonical span page rows must be in [1, 1024]"
             )
         if type(self.explicit_initial_backfill_wall) is not bool:
             raise PropertyCatalogDevRuntimeError(
@@ -1114,7 +1115,11 @@ class DevRuntimeConfig:
             span_page_rows=_strict_positive_int_setting(
                 settings_object,
                 "PROPERTY_CATALOG_DEV_SPAN_PAGE_ROWS",
-                default=DEV_CANONICAL_SPAN_PAGE_ROWS,
+                default=(
+                    DEV_INITIAL_BACKFILL_CANONICAL_SPAN_PAGE_ROWS
+                    if explicit_initial_wall_ms is not None
+                    else DEV_CANONICAL_SPAN_PAGE_ROWS
+                ),
             ),
             rollout_wall_ms=(
                 explicit_initial_wall_ms
@@ -2548,6 +2553,7 @@ class CheckedInPropertyCatalogDevRuntime:
                 origin=self.config.span_since,
                 initial_until=self.config.span_until,
             ),
+            allow_expired_repair=self.bound_request.repair_expired_incomplete,
         )
         self._validate_prepared_authorization(prepared, authorization)
         build_binding_sha256 = _authorized_build_binding_sha256(
@@ -2856,11 +2862,15 @@ class CheckedInPropertyCatalogDevRuntime:
             raise PropertyCatalogDevRuntimeError(
                 "insufficient shared wall for a source snapshot"
             )
-        postgres_remaining = min(8_500, remaining)
+        postgres_wall_cap_ms = (
+            540_000 if self.config.explicit_initial_backfill_wall else 8_500
+        )
+        postgres_remaining = min(postgres_wall_cap_ms, remaining)
         return SourceReadBudget(
             postgres=PostgresReadBudget(
                 statement_timeout_ms=min(8_000, postgres_remaining - 1),
                 wall_timeout_seconds=postgres_remaining / 1_000,
+                initial_backfill=self.config.explicit_initial_backfill_wall,
             ),
             adapter_wall_timeout_seconds=min(540.0, remaining / 1_000),
             shared_deadline=self.deadline,

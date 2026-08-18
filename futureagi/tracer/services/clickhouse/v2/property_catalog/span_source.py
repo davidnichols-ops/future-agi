@@ -81,13 +81,13 @@ _MAX_WINDOWS = 366 * 24
 _MAX_PROJECTS = 256
 # The canonical payload query inherits the older CH25 backfill's hard
 # 128-MiB result, 768-MiB server-memory, single-thread, and one-million-row
-# read ceilings.  A 256-identity page therefore remains bounded even when a
-# pathological row reaches its per-row projection limit: ClickHouse fails the
-# query at the smaller result/memory envelope instead of returning an
-# unbounded Python object graph.  DEV uses this upper bound to keep the fixed
-# lifecycle wall useful on sparse historical data.
-MAX_CANONICAL_SPAN_PAGE_ROWS = 256
+# read ceilings. The standard 256-identity page remains the scheduled default.
+# An explicitly acknowledged initial backfill may use 1,024 identities; the
+# same 128-MiB result and 768-MiB server-memory ceilings still fail closed
+# before a pathological page can become an unbounded Python object graph.
+MAX_CANONICAL_SPAN_PAGE_ROWS = 1_024
 DEV_CANONICAL_SPAN_PAGE_ROWS = 256
+DEV_INITIAL_BACKFILL_CANONICAL_SPAN_PAGE_ROWS = 1_024
 CANONICAL_SPAN_QUERY_TIMEOUT_MS = 8_500
 DEV_INITIAL_BACKFILL_CANONICAL_SPAN_QUERY_TIMEOUT_MS = 30_000
 
@@ -504,7 +504,7 @@ class CanonicalSpanSourceReader:
             type(page_rows) is not int
             or not 1 <= page_rows <= MAX_CANONICAL_SPAN_PAGE_ROWS
         ):
-            raise ValueError("canonical-span page_rows must be in [1, 256]")
+            raise ValueError("canonical-span page_rows must be in [1, 1024]")
         if type(explicit_initial_backfill) is not bool:
             raise ValueError("explicit_initial_backfill must be a bool")
         timeout_cap_ms = (
@@ -785,8 +785,7 @@ class CanonicalSpanSourceReader:
             window_start = frozen.since
             while window_start < frozen.until:
                 window_end = min(
-                    window_start
-                    + timedelta(hours=CANONICAL_SPAN_SCAN_WINDOW_HOURS),
+                    window_start + timedelta(hours=CANONICAL_SPAN_SCAN_WINDOW_HOURS),
                     frozen.until,
                 )
                 if occupied_hours is not None and not _unit_may_be_occupied(
@@ -2196,6 +2195,7 @@ __all__ = [
     "CANONICAL_SPAN_QUERY_TIMEOUT_MS",
     "CANONICAL_SPAN_SCAN_WINDOW_HOURS",
     "DEV_CANONICAL_SPAN_PAGE_ROWS",
+    "DEV_INITIAL_BACKFILL_CANONICAL_SPAN_PAGE_ROWS",
     "DEV_INITIAL_BACKFILL_CANONICAL_SPAN_QUERY_TIMEOUT_MS",
     "FrozenSpanSource",
     "PropertyCatalogSpanSourceError",
