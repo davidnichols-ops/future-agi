@@ -49,7 +49,7 @@ _TRANSIENT_CLICKHOUSE_ERROR_CODES = {
 _API_READ_UNAVAILABLE_ERROR_CODES = {ErrorCodes.NO_COMMON_TYPE}
 
 _CLICKHOUSE_CONNECT_CODE_RE = re.compile(
-    r"\AReceived ClickHouse exception,\s*code:\s*(\d+)\b",
+    r"\A(?:Received ClickHouse exception,\s*code:|Code:)\s*(\d+)\b",
     flags=re.IGNORECASE,
 )
 _CLICKHOUSE_CONNECT_TRANSPORT_RE = re.compile(

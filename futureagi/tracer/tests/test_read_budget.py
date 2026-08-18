@@ -29,6 +29,11 @@ def test_http_driver_budget_codes_are_classified_from_canonical_prefix() -> None
             "Received ClickHouse exception, code: 159, server response: private"
         )
     )
+    assert is_read_budget_error(
+        ClickHouseConnectDatabaseError(
+            "Code: 159. DB::Exception: Timeout exceeded: private"
+        )
+    )
 
 
 def test_http_driver_arbitrary_code_substring_is_not_classified() -> None:
@@ -46,6 +51,9 @@ def test_non_budget_codes_are_not_classified_for_either_driver() -> None:
         ClickHouseConnectDatabaseError(
             "Received ClickHouse exception, code: 62, server response: private"
         )
+    )
+    assert not is_read_budget_error(
+        ClickHouseConnectDatabaseError("Code: 62. DB::Exception: syntax error")
     )
 
 
