@@ -65,6 +65,7 @@ const TOUCHED_BY_A_TURN = [
   ALK_KEYS.simulations,
   ALK_KEYS.subgoals,
   ALK_KEYS.runs,
+  ALK_KEYS.environments,
 ];
 
 /**

@@ -183,5 +183,7 @@ describe("useAlkConversation", () => {
     const keys = invalidate.mock.calls.map((c) => c[0].queryKey.join("."));
     expect(keys).toContain("alk.status");
     expect(keys).toContain("alk.scenarios");
+    // A turn can build a world, which is what puts a session in the environments list.
+    expect(keys).toContain("alk.environments");
   });
 });

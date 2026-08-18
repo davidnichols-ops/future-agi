@@ -9,6 +9,7 @@ export const ALK_KEYS = {
   world: ["alk", "world"],
   scenarios: ["alk", "scenarios"],
   simulations: ["alk", "simulations"],
+  environments: ["alk", "environments"],
   subgoals: ["alk", "subgoals"],
   runs: ["alk", "runs"],
   simulation: (runId) => ["alk", "simulation", runId],
@@ -49,7 +50,9 @@ export const useAlkSessions = () => {
  */
 const flattenStored = (messages = []) =>
   messages.flatMap((message) => {
-    const said = message.text ? [{ role: message.role || "tester", text: message.text }] : [];
+    const said = message.text
+      ? [{ role: message.role || "tester", text: message.text }]
+      : [];
     // Keyed off what the harness actually writes to chat.jsonl — `failed`, `said` and
     // `arguments`. Read under any other names a refusal came back as a tick, and what the
     // tool was called with and what it answered were dropped, which is the whole reason
@@ -106,6 +109,21 @@ export const useAlkScenarios = (enabled = true) => {
 };
 
 /** The simulator prompt and the sub-goal catalogue, both shown on the Environment tab. */
+/**
+ * Every session that has built a world, newest first. Not wired to the list yet — the
+ * endpoint does not exist on the harness — but the key it caches under is already invalidated
+ * by every session mutation, so swapping the fixtures for this is a one-line change.
+ */
+export const useAlkEnvironments = (enabled = true) => {
+  const query = useQuery({
+    queryKey: ALK_KEYS.environments,
+    queryFn: () => alkAxios.get("/environments").then((r) => r.data),
+    enabled,
+    retry: false,
+  });
+  return { ...query, environments: query.data?.environments ?? [] };
+};
+
 export const useAlkSubgoals = (enabled = true) => {
   const query = useQuery({
     queryKey: ALK_KEYS.subgoals,
@@ -138,7 +156,9 @@ export const fetchScenarioFile = (name, path) =>
   alkAxios
     .get("/scenario-file", { params: { name, path } })
     .then((r) => r.data)
-    .catch((failed) => ({ error: failed?.response?.data?.error || failed.message }));
+    .catch((failed) => ({
+      error: failed?.response?.data?.error || failed.message,
+    }));
 
 export const useAlkSimulations = (enabled = true) => {
   const query = useQuery({
@@ -179,6 +199,10 @@ const useAlkMutation = (mutationFn) => {
         ALK_KEYS.simulations,
         ALK_KEYS.subgoals,
         ALK_KEYS.runs,
+        // Creating or deleting a session adds or removes a row in the environments list.
+        // Nothing reads this key yet — the list is still fixtures — but leaving it out is how
+        // a freshly created environment would fail to appear once the real hook lands.
+        ALK_KEYS.environments,
       ].forEach((queryKey) => queryClient.invalidateQueries({ queryKey }));
     },
   });
@@ -186,14 +210,20 @@ const useAlkMutation = (mutationFn) => {
 
 export const useCreateAlkSession = () =>
   useAlkMutation((agent = "") =>
-    alkAxios.post("/sessions", { agent }).then((r) => r.data)
+    alkAxios.post("/sessions", { agent }).then((r) => r.data),
   );
 
 export const useOpenAlkSession = () =>
-  useAlkMutation((id) => alkAxios.post("/sessions/open", { id }).then((r) => r.data));
+  useAlkMutation((id) =>
+    alkAxios.post("/sessions/open", { id }).then((r) => r.data),
+  );
 
 export const useDeleteAlkSession = () =>
-  useAlkMutation((id) => alkAxios.delete(`/sessions/${id}`).then((r) => r.data));
+  useAlkMutation((id) =>
+    alkAxios.delete(`/sessions/${id}`).then((r) => r.data),
+  );
 
 export const useSetAlkStage = () =>
-  useAlkMutation((stage) => alkAxios.post("/stage", { stage }).then((r) => r.data));
+  useAlkMutation((stage) =>
+    alkAxios.post("/stage", { stage }).then((r) => r.data),
+  );

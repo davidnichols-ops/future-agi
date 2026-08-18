@@ -26,3 +26,19 @@ describe("harness request paths", () => {
     }
   );
 });
+
+/**
+ * Creating or deleting a session changes which environments exist. The list is fixtures for
+ * now, so nothing reads this key — which is exactly how it would go missing unnoticed and
+ * leave a freshly created environment absent from the list once the real hook lands.
+ */
+describe("session mutations refresh the environments list", () => {
+  it("invalidates the environments key", () => {
+    const source = readFileSync(join(here, "..", "alEnvironment.js"), "utf8");
+    const block = source.slice(
+      source.indexOf("const useAlkMutation"),
+      source.indexOf("export const useCreateAlkSession")
+    );
+    expect(block).toContain("ALK_KEYS.environments");
+  });
+});
