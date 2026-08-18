@@ -2914,6 +2914,73 @@ def test_exact_trace_candidate_probe_rejects_structured_only_filter():
 
 
 @pytest.mark.unit
+def test_exact_trace_candidate_probe_uses_negative_annotator_relation():
+    from tracer.services.clickhouse.v2.query_builders.trace_list import (
+        TraceListQueryBuilderV2,
+    )
+
+    start = datetime(2025, 8, 18, 7, 38, 38)
+    end = datetime(2026, 8, 19, 7)
+    annotator_id = "00000000-0000-4000-8000-000000000099"
+    builder = TraceListQueryBuilderV2(
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=[
+            _time_filter(start, end),
+            {
+                "column_id": "duration",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "number",
+                    "filter_op": "greater_than",
+                    "filter_value": 30,
+                },
+            },
+            {
+                "column_id": "annotator",
+                "filter_config": {
+                    "filter_type": "annotator",
+                    "filter_op": "not_equals",
+                    "filter_value": annotator_id,
+                },
+            },
+        ],
+        page_number=0,
+        page_size=200,
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+        bounded_global_span_witnesses=True,
+    )
+
+    probe_sql, probe_params = builder.build_exact_graph_candidate_witness_probe(
+        limit=201
+    )
+    classify_sql, classify_params = (
+        builder.build_filter_identity_match_query_from_seed_rows(
+            [{"trace_id": "annotated-candidate"}]
+        )
+    )
+    compact_probe_sql = " ".join(probe_sql.split())
+    compact_classify_sql = " ".join(classify_sql.split())
+
+    assert "model_hub_score AS s FINAL" in compact_probe_sql
+    assert "s.annotator_id IN (toUUID(%(uid_1)s))" in compact_probe_sql
+    assert "trace_id NOT IN" in compact_probe_sql
+    assert "ORDER BY start_time DESC, trace_id DESC" in compact_probe_sql
+    assert probe_params["uid_1"] == annotator_id
+    assert probe_params["filter_slice_start"] == start
+    assert probe_params["filter_slice_end"] == end
+    assert probe_params["filter_seed_limit"] == 201
+    # The relation probe is only a finite candidate selector. The ordinary
+    # latest-state classifier remains authoritative for both the negative
+    # annotator exclusion and every scalar filter before graph publication.
+    assert "model_hub_score AS s FINAL" in compact_classify_sql
+    assert "trace_id NOT IN" in compact_classify_sql
+    assert classify_params["candidate_trace_ids"] == ("annotated-candidate",)
+
+
+@pytest.mark.unit
 def test_exact_trace_candidate_probe_rejects_sampling():
     from tracer.services.clickhouse.v2.query_builders.trace_list import (
         TraceListQueryBuilderV2,

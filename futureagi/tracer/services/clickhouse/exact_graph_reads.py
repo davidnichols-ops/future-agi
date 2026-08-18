@@ -1084,14 +1084,15 @@ def _enumerate_exact_trace_ids(
 
         classify_rows(candidate_rows)
 
-    # A positive scalar typed-Map equality/IN leaf has an all-time raw witness
-    # that is a necessary superset of exact latest-state membership. Prove that the
+    # A selective typed-Map leaf has an all-time raw witness, while a positive
+    # relational condition can provide request-window canonical roots.  Both
+    # are necessary supersets of exact latest-state membership. Prove that the
     # complete population is smaller than one page, then classify only those
-    # trace identities.  This avoids enumerating and globally classifying every
-    # root in a large tenant when the requested value is sparse.  A full
-    # sentinel or a resource-bounded optional probe falls back to the unchanged
-    # exhaustive root walk; malformed data and programming errors still fail
-    # closed.
+    # trace identities. This avoids enumerating and globally classifying every
+    # root in a large tenant when the requested relation/value is sparse. A
+    # full sentinel or a resource-bounded optional probe falls back to the
+    # unchanged exhaustive root walk; malformed data and programming errors
+    # still fail closed.
     candidate_probe = getattr(
         builder,
         "build_exact_graph_candidate_witness_probe",

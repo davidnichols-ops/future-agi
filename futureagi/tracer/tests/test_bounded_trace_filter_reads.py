@@ -959,7 +959,8 @@ def test_voice_annotator_and_turn_count_use_positive_candidate_seed() -> None:
     assert match_params["candidate_trace_ids"] == ("trace-a", "trace-b")
 
 
-def test_negative_voice_annotator_stays_on_exact_bounded_classifier() -> None:
+def test_negative_voice_annotator_uses_exact_relation_candidate_seed() -> None:
+    annotator_id = "00000000-0000-4000-8000-000000000099"
     builder = VoiceCallListQueryBuilderV2(
         project_id=PROJECT_ID,
         filters=[
@@ -969,13 +970,62 @@ def test_negative_voice_annotator_stays_on_exact_bounded_classifier() -> None:
                 "filter_config": {
                     "filter_type": "annotator",
                     "filter_op": "not_equals",
-                    "filter_value": "00000000-0000-4000-8000-000000000099",
+                    "filter_value": annotator_id,
                 },
             },
         ],
     )
 
-    assert builder.supports_filter_candidate_seed_page() is False
+    sql, params = builder.build_filter_candidate_seed_page(
+        slice_start=START,
+        slice_end=END,
+        limit=26,
+    )
+    compact_sql = " ".join(sql.split())
+
+    assert builder.supports_filter_candidate_seed_page() is True
+    assert "model_hub_score AS s FINAL" in compact_sql
+    assert "SELECT DISTINCT" in compact_sql
+    assert "s.annotator_id IN (toUUID(%(uid_1)s))" in compact_sql
+    assert "trace_id NOT IN" in compact_sql
+    assert "ORDER BY start_time DESC, trace_id DESC" in compact_sql
+    assert params["uid_1"] == annotator_id
+    assert params["filter_seed_limit"] == 26
+
+
+def test_negative_annotator_bulk_selection_uses_relation_seed() -> None:
+    annotator_id = "00000000-0000-4000-8000-000000000099"
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            {
+                "column_id": "annotator",
+                "filter_config": {
+                    "filter_type": "annotator",
+                    "filter_op": "not_equals",
+                    "filter_value": annotator_id,
+                },
+            },
+        ],
+        columns=["trace_id"],
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+    )
+
+    sql, params = builder.build_filter_candidate_seed_page(
+        slice_start=START,
+        slice_end=END,
+        limit=201,
+    )
+    compact_sql = " ".join(sql.split())
+
+    assert builder.supports_filter_candidate_seed_page() is True
+    assert "model_hub_score AS s FINAL" in compact_sql
+    assert "s.annotator_id IN (toUUID(%(uid_1)s))" in compact_sql
+    assert "trace_id NOT IN" in compact_sql
+    assert params["uid_1"] == annotator_id
+    assert params["filter_seed_limit"] == 201
 
 
 def test_raw_annotator_span_attribute_never_uses_score_candidate_seed() -> None:

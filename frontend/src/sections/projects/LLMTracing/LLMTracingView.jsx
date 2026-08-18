@@ -4174,13 +4174,16 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                   !activeFilterMode &&
                   actionId === "annotation-queue"
                 ) {
-                  // Header select-all is on, but the user hasn't opted in
-                  // via the banner yet. Defer the action until they do.
-                  enqueueSnackbar(
-                    "Use the 'Select all matching your filter' banner to add the full set, or deselect 'all' and pick specific rows.",
-                    { variant: "info" },
-                  );
-                  return;
+                  // Choosing the queue action is itself an explicit request
+                  // to operate on the header's inverted select-all set. Move
+                  // directly to the server-side filter contract instead of
+                  // requiring a second banner click (and appearing to do
+                  // nothing). `toggledNodes` remains the exclusion list.
+                  if (selectedTab === "trace") {
+                    setFilterSelectionMode(true);
+                  } else {
+                    setSpanFilterSelectionMode(true);
+                  }
                 }
                 switch (actionId) {
                   case "dataset":

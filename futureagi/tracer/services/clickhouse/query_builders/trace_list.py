@@ -514,11 +514,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         *every* public filter before publishing a row.  Prefer annotator and
         eval-value witnesses over the broader boolean existence relations.
 
-        Negative-existence predicates remain classifier-only because absence
-        has no positive row with which to seed candidates.  Eval value
-        ``not_in``/``not_equals`` are different: their compiler still selects
-        a positive eval row whose value satisfies the negated comparison, so
-        they remain safe necessary seeds.
+        Pure negative-existence predicates remain classifier-only because
+        absence has no positive row with which to seed candidates.  Global
+        annotator ``not_equals``/``not_in`` is different: its public contract
+        requires at least one annotation and excludes traces annotated by the
+        selected users.  The complete Score relation is therefore a safe,
+        usually selective candidate seed; the finite classifier still repeats
+        the exclusion before publication.  Eval value ``not_in``/
+        ``not_equals`` likewise selects a positive eval row whose value
+        satisfies the negated comparison.
 
         Voice calls delegate to this trace builder with one private conversation
         root invariant.  That marker is structural, not a public filter, so it
@@ -577,7 +581,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     continue
                 values = value if isinstance(value, (list, tuple)) else [value]
                 if (
-                    operation in {"equals", "in"}
+                    operation in {"equals", "in", "not_equals", "not_in"}
                     and values
                     and all(isinstance(member, str) and member for member in values)
                 ):
@@ -723,12 +727,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return predicate or "", dict(filter_builder._params)
 
     def supports_filter_candidate_seed_page(self) -> bool:
-        """Use an exact relational candidate set before ordered public roots."""
+        """Use an exact relational candidate before public or bulk roots."""
 
+        public_list_or_bulk_identity = (
+            not self._bounded_identity_only and not self._bounded_bulk_scan
+        ) or (self._bounded_identity_only and self._bounded_bulk_scan)
         return bool(
             not self._bounded_internal_scan
-            and not self._bounded_identity_only
-            and not self._bounded_bulk_scan
+            and public_list_or_bulk_identity
             and not self._bounded_population_proof
             and not self.sort_params
             and (
@@ -1878,7 +1884,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         *,
         limit: int,
     ) -> tuple[str, dict[str, Any]]:
-        """Return a finite all-time superset for a selective exact graph.
+        """Return a finite necessary superset for a selective exact graph.
 
         Positive scalar typed-Map equality/IN predicates have an exhaustive
         raw witness: every latest-live matching span necessarily has a raw
@@ -1888,11 +1894,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         every returned trace through its ordinary latest-state classifier,
         which also verifies the canonical root is inside the request window.
 
-        Child spans have no maximum duration relative to their root.  This
-        probe therefore has no request-window or adjacent-day predicate.  A
-        ``limit`` sentinel lets the caller use the shortcut only when the
-        complete candidate population is demonstrably small; a full sentinel
-        falls back to exhaustive root enumeration without publishing rows.
+        Child spans have no maximum duration relative to their root, so raw
+        span-attribute witnesses are intentionally all-time.  Positive
+        relational witnesses (for example the Score population required by a
+        global negative annotator filter) instead select canonical roots and
+        are safely bounded to the frozen request window.  A ``limit`` sentinel
+        lets the caller use either shortcut only when the complete candidate
+        population is demonstrably small; a full sentinel falls back to
+        exhaustive root enumeration without publishing rows.
         """
 
         if limit <= 1:
@@ -1911,7 +1920,24 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return "", {}
         anchor = self._positive_typed_map_anchor_plan()
         if anchor is None:
-            return "", {}
+            # A global negative annotator filter is not a raw span-attribute
+            # witness, but it does have an exact positive Score population:
+            # traces with at least one project-scoped annotation, minus traces
+            # annotated by the excluded users.  Acquire only canonical roots
+            # in the frozen graph window through that relation.  A full
+            # sentinel still falls back to the exhaustive root walk and every
+            # returned identity still crosses the unchanged latest-state
+            # classifier, so this is a latency optimization only.
+            if self._positive_relational_seed_filter() is None:
+                return "", {}
+            request_start, request_end = self.parse_time_range(self.filters)
+            return TraceListQueryBuilder.build_filter_ordered_seed_page(
+                self,
+                slice_start=request_start,
+                slice_end=request_end,
+                limit=limit,
+                _positive_relation_candidate_first=True,
+            )
         raw_witness_predicate = str(anchor.raw_witness_predicate or "")
         if not raw_witness_predicate:
             return "", {}

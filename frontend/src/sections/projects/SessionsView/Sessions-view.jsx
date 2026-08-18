@@ -806,14 +806,11 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
           },
         });
       } else if (action === "annotation-queue") {
-        // Without filter-mode opt-in under select-all, toggledNodes holds
-        // the *deselected* rows — an enumerated add would be wrong.
+        // Choosing the queue action is an explicit request to operate on the
+        // header's inverted select-all set. Switch to the server-side filter
+        // contract immediately; `toggledNodes` remains the exclusion list.
         if (selectAll && !sessionFilterSelectionMode) {
-          enqueueSnackbar(
-            "Use the 'Select all matching your filter' banner to add the full set, or deselect 'all' and pick specific rows.",
-            { variant: "info" },
-          );
-          return;
+          setSessionFilterSelectionMode(true);
         }
         setQueueAnchorEl(event?.currentTarget || null);
       }
