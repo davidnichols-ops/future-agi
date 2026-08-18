@@ -370,6 +370,36 @@ def test_system_value_floor_failure_keeps_values_from_completed_slices():
     assert read.next_segment_start == NOW - timedelta(seconds=10)
 
 
+def test_system_value_floor_failure_keeps_duplicate_only_slice_progress():
+    duplicate_digest = _value_digest("agent_hangup")
+
+    class Analytics:
+        calls = 0
+
+        def execute_ch_query(self, *_args, **_kwargs):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                return SimpleNamespace(data=[{"val": "agent_hangup"}])
+            raise ReadDeadlineExceeded("dense older system value slice")
+
+    read = read_span_system_filter_value_cursor_page(
+        Analytics(),
+        project_ids=[PROJECT_ID],
+        metric_name="ended_reason",
+        page_size=10,
+        window_start=NOW - timedelta(seconds=10),
+        window_end=NOW,
+        segment_start=NOW - FILTER_VALUE_CURSOR_MIN_SEGMENT,
+        seen_value_digests=(duplicate_digest,),
+    )
+
+    assert read.values == ()
+    assert read.has_more is True
+    assert read.browse_status == "continuation"
+    assert read.next_segment_end == NOW - FILTER_VALUE_CURSOR_MIN_SEGMENT
+    assert read.next_segment_start == NOW - timedelta(seconds=10)
+
+
 def test_system_value_cursor_shares_one_deadline_across_adjacent_slices(monkeypatch):
     class Deadline:
         calls = 0

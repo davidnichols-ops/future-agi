@@ -632,12 +632,14 @@ def read_span_system_filter_value_cursor_page(
             )
             if narrowed_width >= current_end - current_start:
                 # Earlier exact slices in this same request may already have
-                # produced selectable values. Do not discard them merely
-                # because the next, still-unconsumed floor slice is dense.
-                # Return the partial page with a checkpoint at that frontier;
-                # an explicit Load more can retry it with the accumulated
-                # seen-value proof. A first-slice failure still fails loudly.
-                if emitted:
+                # produced selectable values or certified duplicate-only
+                # coverage. Do not discard that progress merely because the
+                # next, still-unconsumed floor slice is dense. Return the
+                # partial page with a checkpoint at that frontier; an explicit
+                # Load more can retry it with the accumulated seen-value proof.
+                # A first-slice failure at the same frontier still fails loudly.
+                progress_state = (current_end, current_start, after)
+                if emitted or progress_state != initial_state:
                     break
                 raise
             width = narrowed_width
