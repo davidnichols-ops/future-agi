@@ -245,6 +245,12 @@ async def list_sessions():
     }
 
 
+@app.get("/api/environments")
+async def environments():
+    """Every session with a built world. Cross-session, so it never touches the open one."""
+    return {"environments": sessions.environments(SESSIONS)}
+
+
 class Started(BaseModel):
     agent: str = ""
 

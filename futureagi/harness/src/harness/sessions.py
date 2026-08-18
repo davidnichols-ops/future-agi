@@ -253,3 +253,52 @@ def history(path: Path) -> list[dict[str, Any]]:
 
 def count_messages(path: Path) -> int:
     return len(history(path))
+
+
+def environments(base: Path | None = None) -> list[dict[str, Any]]:
+    """Every session that has built a world, newest first, one table row each.
+
+    Read off each folder without adopting it, so listing environments can never
+    move the open session. Runs are simulation runs; the legacy chat runs in
+    ``runs.json`` are a different thing and would double-count a session's work.
+    """
+    from .run.simulation import every_run
+
+    found: list[dict[str, Any]] = []
+    for one in every(base):
+        held = one.has()
+        if not held.get("world"):
+            continue
+        contract = _read_json(one.path / "contract.json")
+        manifest = _read_json(one.path / "manifest.json")
+        runs = every_run(one.path)
+        found.append(
+            {
+                "session_id": one.id,
+                "agent": one.agent or contract.get("agent", ""),
+                "title": one.title or one.agent or one.id,
+                "one_liner": contract.get("one_liner", ""),
+                "created": one.created,
+                "updated": one.updated,
+                "tools": len(manifest.get("tools") or []),
+                "sub_goals": held.get("sub_goals", 0),
+                "scenarios": held.get("scenarios", 0),
+                "runs": len(runs),
+                "runs_passed": sum(
+                    1
+                    for run in runs
+                    if run.get("scenarios") and run.get("passed") == run.get("scenarios")
+                ),
+            }
+        )
+    return found
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}

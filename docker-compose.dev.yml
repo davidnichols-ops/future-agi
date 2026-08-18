@@ -6,6 +6,7 @@ x-dev-worker: &dev-worker
     - ./futureagi:/app/backend
   environment:
     FAST_STARTUP: "true"
+    HARNESS_INTERNAL_URL: http://harness:8777
 
 services:
   frontend:
@@ -35,8 +36,11 @@ services:
       - "${FLOWER_PORT:-5555}:5555"
     volumes:
       - ./futureagi:/app/backend
+      - harness-artifacts:/app/harness-artifacts
     environment:
       FAST_STARTUP: "true"
+      HARNESS_INTERNAL_URL: http://harness:8777
+      HARNESS_LINKS_DIR: /app/harness-artifacts/platform-links
 
   # agentcc-gateway, serving, and code-executor are separate services we
   # don't modify in local dev, so they are NOT built from source here —
@@ -159,3 +163,35 @@ services:
     volumes:
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     restart: unless-stopped
+
+  # Agent-testing harness. Internal-only: the backend proxies to it at
+  # /simulate/harness/, so neither port is published to the host. Never
+  # restart it mid-suite — a run in flight is lost.
+  harness:
+    build: ./futureagi/harness
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HARNESS_HOST: 0.0.0.0
+      HARNESS_PORT: 8777
+      HARNESS_WEBHOOK_HOST: 0.0.0.0
+      HARNESS_WEBHOOK_PORT: 8787
+      # Reachable by name inside the network, so no cloudflared tunnel starts.
+      HARNESS_WEBHOOK_URL: http://harness:8787
+      DOCKER_HOST: tcp://docker-proxy:2375
+      # Store containers the harness starts join this network and are
+      # addressed by container name instead of loopback.
+      ALK_DOCKER_NETWORK: ${HARNESS_DOCKER_NETWORK:-futureagi_default}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      # Source of truth for every session, world and recording — not a cache.
+      - harness-artifacts:/app/artifacts
+      # Source edits apply on restart without a rebuild.
+      - ./futureagi/harness:/app
+    depends_on:
+      - docker-proxy
+    restart: unless-stopped
+
+volumes:
+  harness-artifacts:
