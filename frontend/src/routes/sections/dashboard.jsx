@@ -302,6 +302,9 @@ const Personas = lazyWithRetry(
 const AlEnvironment = lazyWithRetry(
   () => import("src/pages/dashboard/al-environment/AlEnvironment"),
 );
+const RlEnvironments = lazyWithRetry(
+  () => import("src/pages/dashboard/rl-environments/RlEnvironments"),
+);
 const CreateScenario = lazyWithRetry(
   () => import("src/pages/dashboard/scenarios/CreateScenario"),
 );
@@ -1368,6 +1371,10 @@ export const dashboardRoutes = (
         },
         {
           path: "rl-environment",
+          element: <RlEnvironments />,
+        },
+        {
+          path: "rl-environment/:sessionId",
           element: <AlEnvironment />,
         },
         {

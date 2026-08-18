@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, userEvent, within } from "src/utils/test-utils";
+import { Route, Routes } from "react-router-dom";
+import { render, renderWithRouter, screen, userEvent, waitFor, within } from "src/utils/test-utils";
 import AlEnvironmentView from "../AlEnvironmentView";
 
 const mutation = () => ({ mutate: vi.fn(), isPending: false });
@@ -29,6 +30,9 @@ vi.mock("src/api/al-environment/alEnvironment", () => hooks);
 // behaviour is covered in useAlkConversation.test.jsx.
 const conversation = vi.hoisted(() => ({ useAlkConversation: vi.fn() }));
 vi.mock("src/api/al-environment/useAlkConversation", () => conversation);
+
+// The snackbar module pulls in the whole notistack provider, which this suite does not mount.
+vi.mock("src/components/snackbar", () => ({ enqueueSnackbar: vi.fn() }));
 
 const openStatus = {
   session: { id: "s1" },
@@ -194,5 +198,79 @@ describe("AlEnvironmentView", () => {
     });
     render(<AlEnvironmentView />);
     expect(screen.getByText(/Network Error/)).toBeInTheDocument();
+  });
+});
+
+describe("AlEnvironmentView, addressed by URL", () => {
+  // test-utils already supplies a BrowserRouter, so the route is matched inside it rather
+  // than nesting a second router.
+  const renderAt = (path) =>
+    renderWithRouter(
+      <Routes>
+        <Route path="/rl-environment/:sessionId" element={<AlEnvironmentView />} />
+      </Routes>,
+      { route: path }
+    );
+
+  it("opens the session the URL names", async () => {
+    const mutate = vi.fn();
+    hooks.useOpenAlkSession.mockReturnValue({ mutate, isPending: false });
+    hooks.useAlkStatus.mockReturnValue({
+      status: { ...openStatus, session: { id: "other" } },
+      isError: false,
+      refetch: vi.fn(),
+    });
+    renderAt("/rl-environment/wanted");
+    await waitFor(() => expect(mutate).toHaveBeenCalledWith("wanted", expect.anything()));
+  });
+
+  it("leaves the session alone when the URL already names it", async () => {
+    const mutate = vi.fn();
+    hooks.useOpenAlkSession.mockReturnValue({ mutate, isPending: false });
+    hooks.useAlkStatus.mockReturnValue({
+      status: { ...openStatus, session: { id: "already" } },
+      isError: false,
+      refetch: vi.fn(),
+    });
+    renderAt("/rl-environment/already");
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeInTheDocument());
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it("waits rather than opening while a stage is running", async () => {
+    const mutate = vi.fn();
+    hooks.useOpenAlkSession.mockReturnValue({ mutate, isPending: false });
+    hooks.useAlkStatus.mockReturnValue({
+      status: { ...openStatus, busy: true, session: { id: "other" } },
+      isError: false,
+      refetch: vi.fn(),
+    });
+    renderAt("/rl-environment/wanted");
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeInTheDocument());
+    // Opening mid-turn is refused with a 409, so it must not even be attempted.
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it("sends you back to the list when the URL names an environment that is gone", async () => {
+    const mutate = vi.fn((id, opts) => opts.onError({ response: { status: 404 } }));
+    hooks.useOpenAlkSession.mockReturnValue({ mutate, isPending: false });
+    hooks.useAlkStatus.mockReturnValue({
+      status: { ...openStatus, session: { id: "other" } },
+      isError: false,
+      refetch: vi.fn(),
+    });
+    renderAt("/rl-environment/ghost");
+    await waitFor(() => expect(mutate).toHaveBeenCalledWith("ghost", expect.anything()));
+    // One attempt only: retrying would repaint the page in a loop.
+    expect(mutate).toHaveBeenCalledTimes(1);
+    expect(window.location.pathname).toBe("/dashboard/simulate/rl-environment");
+  });
+
+  it("offers a way back to the list", () => {
+    renderAt("/rl-environment/s1");
+    expect(screen.getByRole("link", { name: /all environments/i })).toHaveAttribute(
+      "href",
+      "/dashboard/simulate/rl-environment"
+    );
   });
 });

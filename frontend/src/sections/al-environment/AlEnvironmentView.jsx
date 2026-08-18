@@ -1,10 +1,23 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Box, Button, Stack, Tab, Tabs, Typography } from "@mui/material";
 import {
-  useAlkContract, useAlkHistory, useAlkScenarios, useAlkSessions, useAlkSimulation,
-  useAlkRuns, useAlkSimulations, useAlkStatus, useAlkSubgoals, useAlkWorld,
-  useCreateAlkSession, useDeleteAlkSession, useOpenAlkSession, useSetAlkStage,
+  useAlkContract,
+  useAlkHistory,
+  useAlkScenarios,
+  useAlkSessions,
+  useAlkSimulation,
+  useAlkRuns,
+  useAlkSimulations,
+  useAlkStatus,
+  useAlkSubgoals,
+  useAlkWorld,
+  useCreateAlkSession,
+  useDeleteAlkSession,
+  useOpenAlkSession,
+  useSetAlkStage,
 } from "src/api/al-environment/alEnvironment";
+import { useNavigate, useParams } from "react-router-dom";
+import { enqueueSnackbar } from "src/components/snackbar";
 import { RouterLink } from "src/routes/components";
 import { paths } from "src/routes/paths";
 import { alkBaseUrl } from "src/api/al-environment/client";
@@ -24,9 +37,21 @@ import RunsTab from "./tabs/RunsTab";
 
 /** Each tab carries what it holds, so the reader can see where the work has got to. */
 const TABS = [
-  { value: "contract", label: "Contract", count: (s) => (s?.have?.contract ? "✓" : "") },
-  { value: "world", label: "Environment", count: (s) => (s?.have?.world ? "✓" : "") },
-  { value: "scenarios", label: "Scenarios", count: (s) => s?.have?.scenarios || "" },
+  {
+    value: "contract",
+    label: "Contract",
+    count: (s) => (s?.have?.contract ? "✓" : ""),
+  },
+  {
+    value: "world",
+    label: "Environment",
+    count: (s) => (s?.have?.world ? "✓" : ""),
+  },
+  {
+    value: "scenarios",
+    label: "Scenarios",
+    count: (s) => s?.have?.scenarios || "",
+  },
   // Hidden alongside the Runs stage in the roadmap — uncomment to bring the tab back.
   // { value: "runs", label: "Runs", count: (s) => s?.have?.runs || "" },
 ];
@@ -35,8 +60,12 @@ const AlEnvironmentView = () => {
   const [tab, setTab] = useState("contract");
   const [selectedRunId, setSelectedRunId] = useState(null);
 
+  const { sessionId } = useParams();
+  const navigate = useNavigate();
+
   const { status, isError, refetch } = useAlkStatus();
   const hasSession = Boolean(status?.session);
+  const openId = status?.session?.id;
   // Added by the backend proxy at the top level of the status object, beside `busy` — not
   // inside `session`. Absent entirely when talking to the harness directly, hence nullable.
   const runTestId = status?.run_test_id;
@@ -59,8 +88,61 @@ const AlEnvironmentView = () => {
   const setStage = useSetAlkStage();
   const conversation = useAlkConversation();
 
+  /**
+   * The URL is what decides which session is open, so a refresh or a shared link lands on the
+   * same environment. The harness holds one conversation at a time, so arriving at a different
+   * id has to open it — guarded by a ref because status refetches constantly and a second open
+   * mid-flight would be refused with a 409.
+   */
+  const opening = useRef(null);
+  const refused = useRef(null);
+  useEffect(() => {
+    if (!sessionId || !status || status.busy) return;
+    if (openId === sessionId || opening.current === sessionId) return;
+    // Navigating away is asynchronous, so without remembering the id that failed this keeps
+    // firing until the redirect lands — which is the repainting loop it is meant to end.
+    if (refused.current === sessionId) return;
+    opening.current = sessionId;
+    openSession.mutate(sessionId, {
+      onSuccess: conversation.clearLive,
+      // A URL naming a session the harness does not have has nowhere to go. Opening also
+      // invalidates status, so staying here would re-run this effect and retry forever,
+      // repainting the page each time — send them back to the list and say what happened.
+      onError: (failed) => {
+        refused.current = sessionId;
+        enqueueSnackbar(
+          failed?.response?.status === 404
+            ? `That environment no longer exists (${sessionId})`
+            : failed?.response?.data?.error ||
+                "Could not open that environment",
+          { variant: "error" },
+        );
+        navigate(paths.dashboard.simulate.alEnvironment, { replace: true });
+      },
+      onSettled: () => {
+        opening.current = null;
+      },
+    });
+  }, [
+    sessionId,
+    openId,
+    status,
+    openSession,
+    conversation.clearLive,
+    navigate,
+  ]);
+
+  /** Changing session is a navigation; opening it is what the URL change then causes. */
+  const goToSession = (id) =>
+    navigate(paths.dashboard.simulate.alEnvironmentDetail(id));
+
   if (isError) {
-    return <HarnessUnreachable baseUrl={alkBaseUrl(import.meta.env)} onRetry={refetch} />;
+    return (
+      <HarnessUnreachable
+        baseUrl={alkBaseUrl(import.meta.env)}
+        onRetry={refetch}
+      />
+    );
   }
 
   /**
@@ -68,10 +150,13 @@ const AlEnvironmentView = () => {
    * body carries the reason. Show that sentence rather than a generic failure — it is the only
    * thing that tells the operator to simply wait.
    */
-  const refusal = [setStage, createSession, openSession, deleteSession].find((one) => one.error)?.error;
+  const refusal = [setStage, createSession, openSession, deleteSession].find(
+    (one) => one.error,
+  )?.error;
   // Conversation errors are rendered in the thread by TranscriptPane; only refusals from the
   // session and stage controls need saying up here, next to the controls that caused them.
-  const refusalMessage = refusal?.response?.data?.error || refusal?.message || "";
+  const refusalMessage =
+    refusal?.response?.data?.error || refusal?.message || "";
 
   // Stored history plus whatever is still arriving. The harness writes the turn to disk when
   // it finishes, so the live half is dropped as soon as history catches up.
@@ -111,17 +196,51 @@ const AlEnvironmentView = () => {
           position: "relative",
         }}
       >
-        <SessionPicker
-          sessions={sessions}
-          openSessionId={openSessionId}
-          busy={Boolean(status?.busy)}
-          // Each of these changes which conversation is open, so the turn still on screen
-          // belongs to the old one. Stored history refetches itself; the live half has to be
-          // dropped explicitly or the previous session's messages hang around under the new one.
-          onOpen={(id) => openSession.mutate(id, { onSuccess: conversation.clearLive })}
-          onCreate={() => createSession.mutate("", { onSuccess: conversation.clearLive })}
-          onDelete={(id) => deleteSession.mutate(id, { onSuccess: conversation.clearLive })}
-        />
+        {/* The way back sits above the session it belongs to, rather than competing with it
+            for the same row. */}
+        <Stack spacing={0.75} alignItems="flex-start">
+          <Box
+            component={RouterLink}
+            href={paths.dashboard.simulate.alEnvironment}
+            sx={{
+              fontFamily: ALK_MONO,
+              fontSize: 12,
+              color: "text.secondary",
+              textDecoration: "none",
+              whiteSpace: "nowrap",
+              "&:hover": { color: "text.primary" },
+            }}
+          >
+            ‹ all environments
+          </Box>
+
+          <SessionPicker
+            sessions={sessions}
+            openSessionId={openSessionId}
+            busy={Boolean(status?.busy)}
+            // Each of these changes which conversation is open, so the turn still on screen
+            // belongs to the old one. Stored history refetches itself; the live half has to be
+            // dropped explicitly or the previous session's messages hang around under the new one.
+            onOpen={goToSession}
+            onCreate={() =>
+              createSession.mutate("", {
+                onSuccess: (fresh) => {
+                  conversation.clearLive();
+                  if (fresh?.session?.id) goToSession(fresh.session.id);
+                },
+              })
+            }
+            onDelete={(id) =>
+              deleteSession.mutate(id, {
+                onSuccess: () => {
+                  conversation.clearLive();
+                  // The environment this URL named is gone, so there is nothing to come back to.
+                  navigate(paths.dashboard.simulate.alEnvironment);
+                },
+              })
+            }
+          />
+        </Stack>
         <StageRoadmap status={status} onSelectStage={selectStage} />
         <StatusReadout
           model={status?.model}
@@ -186,7 +305,13 @@ const AlEnvironmentView = () => {
         <Box
           data-testid="alk-artifact-pane"
           // flexBasis 0 so the tab content's intrinsic width never feeds back into the split.
-          sx={{ flexGrow: 1, flexBasis: 0, minWidth: 0, display: "flex", flexDirection: "column" }}
+          sx={{
+            flexGrow: 1,
+            flexBasis: 0,
+            minWidth: 0,
+            display: "flex",
+            flexDirection: "column",
+          }}
         >
           <Stack
             direction="row"
@@ -197,50 +322,57 @@ const AlEnvironmentView = () => {
               pr: 2,
             }}
           >
-          <Tabs
-            value={tab}
-            onChange={(event, next) => setTab(next)}
-            // The theme defaults every Tabs to variant="scrollable", which draws ‹ › buttons
-            // even though four tabs always fit.
-            variant="standard"
-            scrollButtons={false}
-            sx={{
-              px: 2,
-              minHeight: 40,
-              flexGrow: 1,
-              // The theme spaces tabs with `&:not(:last-of-type) { marginRight }`, so the
-              // override has to match that selector to win. The reference's tabs sit next to
-              // each other and are spaced by their own padding instead.
-              "& .MuiTab-root:not(:last-of-type)": { marginRight: 0 },
-              "& .MuiTab-root": {
+            <Tabs
+              value={tab}
+              onChange={(event, next) => setTab(next)}
+              // The theme defaults every Tabs to variant="scrollable", which draws ‹ › buttons
+              // even though four tabs always fit.
+              variant="standard"
+              scrollButtons={false}
+              sx={{
+                px: 2,
                 minHeight: 40,
-                minWidth: 0,
-                paddingLeft: "14px",
-                paddingRight: "14px",
-                fontFamily: ALK_MONO,
-                fontSize: 11.8,
-                letterSpacing: "0.04em",
-                textTransform: "none",
-              },
-            }}
-          >
-            {TABS.map((one) => (
-              <Tab
-                key={one.value}
-                value={one.value}
-                label={
-                  <Box component="span" sx={{ display: "inline-flex", gap: 0.6, alignItems: "baseline" }}>
-                    {one.label}
-                    {one.count(status) && (
-                      <Box component="span" sx={{ opacity: 0.55 }}>
-                        {one.count(status)}
-                      </Box>
-                    )}
-                  </Box>
-                }
-              />
-            ))}
-          </Tabs>
+                flexGrow: 1,
+                // The theme spaces tabs with `&:not(:last-of-type) { marginRight }`, so the
+                // override has to match that selector to win. The reference's tabs sit next to
+                // each other and are spaced by their own padding instead.
+                "& .MuiTab-root:not(:last-of-type)": { marginRight: 0 },
+                "& .MuiTab-root": {
+                  minHeight: 40,
+                  minWidth: 0,
+                  paddingLeft: "14px",
+                  paddingRight: "14px",
+                  fontFamily: ALK_MONO,
+                  fontSize: 11.8,
+                  letterSpacing: "0.04em",
+                  textTransform: "none",
+                },
+              }}
+            >
+              {TABS.map((one) => (
+                <Tab
+                  key={one.value}
+                  value={one.value}
+                  label={
+                    <Box
+                      component="span"
+                      sx={{
+                        display: "inline-flex",
+                        gap: 0.6,
+                        alignItems: "baseline",
+                      }}
+                    >
+                      {one.label}
+                      {one.count(status) && (
+                        <Box component="span" sx={{ opacity: 0.55 }}>
+                          {one.count(status)}
+                        </Box>
+                      )}
+                    </Box>
+                  }
+                />
+              ))}
+            </Tabs>
 
             {/* The harness reports the platform run this session belongs to. Until it does,
                 there is nowhere to send anyone, so the button says so rather than guessing. */}
@@ -249,7 +381,13 @@ const AlEnvironmentView = () => {
               variant="contained"
               disabled={!runTestId || !executionId}
               {...(runTestId && executionId
-                ? { component: RouterLink, href: paths.dashboard.simulate.callDetails(runTestId, executionId) }
+                ? {
+                    component: RouterLink,
+                    href: paths.dashboard.simulate.callDetails(
+                      runTestId,
+                      executionId,
+                    ),
+                  }
                 : {})}
               title={
                 runTestId && executionId
@@ -270,7 +408,9 @@ const AlEnvironmentView = () => {
             }}
           >
             {tab === "contract" && <ContractTab contract={contract} />}
-            {tab === "world" && <EnvironmentTab world={world} subgoals={subgoals} />}
+            {tab === "world" && (
+              <EnvironmentTab world={world} subgoals={subgoals} />
+            )}
             {tab === "scenarios" && (
               <ScenariosTab
                 scenarios={scenarios}
