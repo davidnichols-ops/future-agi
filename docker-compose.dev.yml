@@ -38,6 +38,7 @@ services:
       - ./futureagi:/app/backend
     environment:
       FAST_STARTUP: "true"
+      HARNESS_INTERNAL_URL: http://harness:8777
 
   # agentcc-gateway, serving, and code-executor are separate services we
   # don't modify in local dev, so they are NOT built from source here —
@@ -179,7 +180,7 @@ services:
       DOCKER_HOST: tcp://docker-proxy:2375
       # Store containers the harness starts join this network and are
       # addressed by container name instead of loopback.
-      ALK_DOCKER_NETWORK: ${HARNESS_DOCKER_NETWORK:-future-agi_default}
+      ALK_DOCKER_NETWORK: ${HARNESS_DOCKER_NETWORK:-futureagi_default}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
       # Source of truth for every session, world and recording — not a cache.
