@@ -504,7 +504,9 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             # Stats over calendar-aligned buckets. Empty result collapses to
             # (0, 0), a single bucket to (value, 0), and no-token buckets are
             # skipped via nullIf (v2 total_tokens is non-Nullable) — matching
-            # the old Python path.
+            # the old Python path. Buckets are on created_at, so cap it at
+            # end_time: a late-ingested in-window span would otherwise create
+            # a sparse trailing bucket that skews mean/stddev every tick.
             bucket_fn = self.time_bucket_expr(interval_kind or "hour")
             agg = (
                 "countIf(status = 'ERROR')"
@@ -522,6 +524,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                     FROM {SPANS_TABLE}
                     {base_where}
                       {time_win}
+                      AND created_at <= %(end_time)s
                     GROUP BY bucket_ts
                 )
             """

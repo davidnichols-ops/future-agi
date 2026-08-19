@@ -468,19 +468,10 @@ def _get_time_series_data_for_time_aggregated_metrics(
     Groups spans in certain intervals and returns a dictionary of {timestamp: value}.
     `interval_kind` must be one of 'minute', 'hour', 'day', 'week', 'month', 'year'.
 
-    CH25-TODO(blocked-on-reader-extension): this helper is reached from both
-    the CH primary branch (via _get_stats_for_time_aggregated_metrics, when
-    metric_type is COUNT_OF_ERRORS / TOKEN_USAGE / DAILY_TOKENS_SPENT /
-    MONTHLY_TOKENS_SPENT) and the PG fallback branch. The new
-    time_bucket_aggregate(project_id, interval=, since=, until=,
-    observation_type=) reader covers TOKEN_USAGE but cannot serve
-    COUNT_OF_ERRORS (needs status-stratified count) and cannot consume the
-    full parsing_evaltask_filters Q-object (which can include
-    span_attributes_filters → FilterEngine territory). Migrating requires
-    a new reader signature roughly
-    `time_bucket_aggregate_with_filters(project_id, *, interval, since,
-    until, **parsing_evaltask_filters_for_ch_output)` that also emits a
-    status-stratified count column.
+    Only reached from the PG fallback branch now — the CH primary branch
+    serves COUNT_OF_ERRORS / TOKEN_USAGE / DAILY_TOKENS_SPENT /
+    MONTHLY_TOKENS_SPENT via build_historical_stats_query. Removed along
+    with the PG fallbacks later in the stack.
     """
 
     filters = parsing_monitor_filters(monitor.filters)
