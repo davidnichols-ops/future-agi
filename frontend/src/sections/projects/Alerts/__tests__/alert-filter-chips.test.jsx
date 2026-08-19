@@ -1,4 +1,5 @@
 import React from "react";
+import PropTypes from "prop-types";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "src/utils/test-utils";
@@ -17,6 +18,8 @@ const Harness = ({ filters }) => {
     <AlertFilterBar control={control} setValue={setValue} projectId="p1" />
   );
 };
+
+Harness.propTypes = { filters: PropTypes.array };
 
 const renderBar = (filters) =>
   render(
