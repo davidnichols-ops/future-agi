@@ -204,9 +204,12 @@ describe("RunsTab — one run", () => {
     expect(screen.getByText("recording · 2 tracks")).toBeInTheDocument();
     const player = container.querySelector("audio");
     expect(player.getAttribute("src")).toContain("track=mixed");
+    // The proxied base ends where the backend adds /api itself; a doubled
+    // /api/api/ 404s on the platform while passing against a direct harness.
     expect(player.getAttribute("src")).toContain(
-      "/api/recording/run-20260818-101500/unknown_item"
+      "/recording/run-20260818-101500/unknown_item"
     );
+    expect(player.getAttribute("src")).not.toContain("/api/api/");
 
     await userEvent.click(screen.getByRole("button", { name: "caller" }));
     expect(container.querySelector("audio").getAttribute("src")).toContain("track=caller");
