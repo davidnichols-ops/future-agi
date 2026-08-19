@@ -204,9 +204,12 @@ describe("RunsTab — one run", () => {
     expect(screen.getByText("recording · 2 tracks")).toBeInTheDocument();
     const player = container.querySelector("audio");
     expect(player.getAttribute("src")).toContain("track=mixed");
+    // Through the proxy the path carries no /api of its own: the proxy prefixes one, and a
+    // second here produced /api/api/recording, which 404s and leaves a player that cannot play.
     expect(player.getAttribute("src")).toContain(
-      "/api/recording/run-20260818-101500/unknown_item"
+      "/simulate/harness/recording/run-20260818-101500/unknown_item"
     );
+    expect(player.getAttribute("src")).not.toContain("/api/api/");
 
     await userEvent.click(screen.getByRole("button", { name: "caller" }));
     expect(container.querySelector("audio").getAttribute("src")).toContain("track=caller");

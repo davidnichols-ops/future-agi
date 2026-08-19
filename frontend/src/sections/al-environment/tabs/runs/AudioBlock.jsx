@@ -1,14 +1,18 @@
 import { useState } from "react";
 import PropTypes from "prop-types";
 import { Box, Stack, Typography } from "@mui/material";
-import { alkBaseUrl } from "src/api/al-environment/client";
+import { alkBaseUrl, isDirectToHarness } from "src/api/al-environment/client";
 import { ALK_MONO } from "../../alkTokens";
 import Tag from "../../parts/Tag";
 
 const ALK_BASE = alkBaseUrl(import.meta.env);
+// The harness serves this under /api; the proxy adds that prefix itself. Every other call goes
+// through the axios instance, which already carries the distinction, so this is the one URL
+// built by hand and the one place the two bases have to be told apart.
+const ALK_PREFIX = isDirectToHarness(ALK_BASE) ? "/api" : "";
 
 const trackUrl = (runId, scenario, label) =>
-  `${ALK_BASE}/api/recording/${encodeURIComponent(runId)}/${encodeURIComponent(scenario)}` +
+  `${ALK_BASE}${ALK_PREFIX}/recording/${encodeURIComponent(runId)}/${encodeURIComponent(scenario)}` +
   `?track=${encodeURIComponent(label)}`;
 
 /**
