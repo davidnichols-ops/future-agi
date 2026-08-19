@@ -71,6 +71,28 @@ class TestVersionManager:
         default = EvalTemplateVersion.objects.get_default(user_template)
         assert default.id == v1.id
 
+    def test_set_as_default_false_preserves_existing_default(
+        self, user_template, user, organization
+    ):
+        v1 = EvalTemplateVersion.objects.create_version(
+            eval_template=user_template,
+            criteria="V1",
+            user=user,
+            organization=organization,
+        )
+        v2 = EvalTemplateVersion.objects.create_version(
+            eval_template=user_template,
+            criteria="V2",
+            user=user,
+            organization=organization,
+            set_as_default=False,
+        )
+        v1.refresh_from_db()
+        assert v2.version_number == 2
+        assert v2.is_default is False
+        assert v1.is_default is True
+        assert EvalTemplateVersion.objects.get_default(user_template).id == v1.id
+
 
 # =============================================================================
 # E2E: Version List API
@@ -1751,6 +1773,36 @@ class TestMaybePinNewVersion:
         )
 
         assert uem.pinned_version == before  # unchanged
+
+    def test_experiment_scoped_pin_does_not_steal_default(
+        self, organization, workspace, user, user_template
+    ):
+        """set_as_default=False (experiment-scoped edit) must pin the new
+        version without changing the template's default version."""
+        from model_hub.models.evals_metric import EvalTemplateVersion
+        from model_hub.services.eval_version_pinning import maybe_pin_new_version
+
+        v1 = EvalTemplateVersion.objects.create_version(
+            eval_template=user_template,
+            criteria="V1",
+            user=user,
+            organization=organization,
+        )
+        uem = self._make_uem(organization, workspace, user, user_template)
+
+        maybe_pin_new_version(
+            uem,
+            {"config": {"config": {"system_prompt": "experiment-only edit"}}},
+            user=user,
+            organization=organization,
+            workspace=workspace,
+            set_as_default=False,
+        )
+
+        assert uem.pinned_version is not None
+        assert uem.pinned_version.id != v1.id
+        assert uem.pinned_version.is_default is False
+        assert EvalTemplateVersion.objects.get_default(user_template).id == v1.id
 
     def test_explicit_version_switch_pins_target_version(
         self, organization, workspace, user, user_template

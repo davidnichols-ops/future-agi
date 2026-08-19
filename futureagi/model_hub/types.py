@@ -308,6 +308,7 @@ class CreateVersionRequest(BaseModel):
     criteria: str | None = None
     model: str | None = None
     config_snapshot: dict | None = None
+    set_as_default: bool = True
 
 
 class CreateVersionResponse(BaseModel):

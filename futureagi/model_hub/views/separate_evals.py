@@ -2967,6 +2967,7 @@ class EvalTemplateVersionCreateView(APIView):
                 user=request.user,
                 organization=organization,
                 workspace=getattr(template, "workspace", None),
+                set_as_default=req.set_as_default,
             )
 
             # Only set as default if this is the first version (no existing default)

@@ -839,6 +839,9 @@ export const createEvalVersionForExperiment = async (
       config_snapshot: configSnapshot,
       criteria,
       model: evalConfig.model,
+      // Experiment-scoped version: pin it without stealing the
+      // template's default version in the eval workbench.
+      set_as_default: false,
     },
   );
   const versionId = versionData?.result?.id;
