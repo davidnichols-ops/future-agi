@@ -8322,15 +8322,18 @@ class TestMonitorMetricsQueryBuilder:
         assert "avg(output_float)" in query
         assert "stddevPop(output_float)" in query
 
-    def test_historical_stats_aggregated_metrics_return_null(self):
-        """COUNT_OF_ERRORS etc. should return NULL for stats (handled in Python)."""
+    def test_historical_stats_aggregated_metrics_bucket_in_ch(self):
+        """COUNT_OF_ERRORS etc. compute bucketed mean/stddev CH-natively."""
         from datetime import datetime
 
         builder = self._make_builder()
         query, _ = builder.build_historical_stats_query(
             "count_of_errors", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
-        assert "NULL AS mean" in query
+        assert "avg(bucket_value)" in query
+        assert "stddevSamp(bucket_value)" in query
+        assert "countIf(status = 'ERROR')" in query
+        assert "GROUP BY bucket_ts" in query
 
     # -- Time series queries --
 
