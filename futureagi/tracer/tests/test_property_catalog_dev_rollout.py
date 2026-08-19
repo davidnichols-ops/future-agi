@@ -1334,6 +1334,23 @@ def test_workspace_tick_verifies_schema_without_running_ddl_or_initial_backfill(
     }
 
 
+def test_workspace_tick_allows_explicit_incremental_repair() -> None:
+    calls: list[str] = []
+
+    evidence = run_workspace_reconcile(
+        request=_request(
+            execute=True,
+            scheduled_reconcile_wall_ms=1_200_000,
+            repair_expired_incomplete=True,
+        ),
+        runtime=_Runtime(calls),  # type: ignore[arg-type]
+        mode=ReconcileMode.INCREMENTAL,
+    )
+
+    assert calls == ["verify_schema", "workspace:incremental"]
+    assert evidence["mode"] is ReconcileMode.INCREMENTAL
+
+
 def test_workspace_tick_rejects_dry_run_before_runtime_io() -> None:
     calls: list[str] = []
 

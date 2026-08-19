@@ -448,10 +448,6 @@ def run_workspace_reconcile(
         raise DevRolloutError(
             "scheduled workspace reconciliation requires an explicit extended wall"
         )
-    if request.repair_expired_incomplete and mode is not ReconcileMode.FULL_REPAIR:
-        raise DevRolloutError(
-            "expired incomplete scheduled repair requires full-repair mode"
-        )
     if mode not in {ReconcileMode.INCREMENTAL, ReconcileMode.FULL_REPAIR}:
         raise DevRolloutError("workspace reconciliation mode is unsupported")
     schema = _evidence(DevRolloutStage.SCHEMA, runtime.verify_schema(request))
