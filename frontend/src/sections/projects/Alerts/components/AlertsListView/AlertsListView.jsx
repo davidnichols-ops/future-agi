@@ -84,6 +84,19 @@ export default function AlertsListView() {
     [activeFilters],
   );
 
+  // Narrowing the result set can leave the current page out of range, and the
+  // API does not clamp — it returns an empty table with a total that says
+  // otherwise. Adjusted during render rather than in an effect: an effect runs
+  // after commit, so the query would fire once for the stale page before the
+  // reset landed. Keyed on the serialized filters because the panel re-emits
+  // an equal-but-new object when it opens, which must not move the user.
+  const resultSetKey = `${JSON.stringify(extractedFilterObject)}|${debouncedSearchTerm}`;
+  const [prevResultSetKey, setPrevResultSetKey] = useState(resultSetKey);
+  if (resultSetKey !== prevResultSetKey) {
+    setPrevResultSetKey(resultSetKey);
+    setPage(0);
+  }
+
   // Register refresh function in the store
   const refreshFn = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ["alerts-list"] });
