@@ -26,11 +26,12 @@ def is_versioned_template(eval_template):
 
 
 def resolve_pin_for_new_binding(eval_template, pinned_version_id=None):
-    """Return the version a fresh binding should pin, or None.
+    """Version to store on a binding being created or edited.
 
-    A caller-supplied version wins when it exists and belongs to this
-    template; otherwise the template's default version is used. Returns None
-    for system templates, so an explicit pinned_version_id is ignored there.
+    Write path: pinned_version_id arrives on a request and is untrusted, so
+    it is looked up and must belong to this template. Falls back to the
+    template default. Returns None for system templates, so an explicit
+    pinned_version_id is ignored there.
     """
     if not is_versioned_template(eval_template):
         return None
@@ -42,6 +43,25 @@ def resolve_pin_for_new_binding(eval_template, pinned_version_id=None):
         ).first()
         if selected:
             return selected
+    return EvalTemplateVersion.objects.get_default(eval_template)
+
+
+def resolve_version_for_binding(eval_template, pinned_version):
+    """Version that will actually run for a binding.
+
+    Read path: pinned_version is the already-loaded FK, so this issues no
+    query and is safe inside the per-eval runner loop. A live pin wins; a
+    soft-deleted one falls back to the template default. Returns None for
+    system templates, leaving the engine on its own get_default() path.
+
+    Mirrors EvalTemplateVersion.objects.resolve_for_metric, which cannot be
+    reused directly because SimulateEvalConfig names its FK `eval_template`
+    rather than `template`.
+    """
+    if not is_versioned_template(eval_template):
+        return None
+    if pinned_version is not None and not getattr(pinned_version, "deleted", False):
+        return pinned_version
     return EvalTemplateVersion.objects.get_default(eval_template)
 
 
