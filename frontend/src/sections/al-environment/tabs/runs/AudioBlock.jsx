@@ -11,12 +11,6 @@ const ALK_BASE = alkBaseUrl(import.meta.env);
 // built by hand and the one place the two bases have to be told apart.
 const ALK_PREFIX = isDirectToHarness(ALK_BASE) ? "/api" : "";
 
-// The proxied base already ends where /api begins — the backend adds it when it
-// forwards. Only a base that points straight at the harness still needs it, and
-// this is the one URL on the page built by hand rather than through the axios
-// instance whose baseURL encodes that difference.
-const ALK_PREFIX = isDirectToHarness(ALK_BASE) ? "/api" : "";
-
 const trackUrl = (runId, scenario, label) =>
   `${ALK_BASE}${ALK_PREFIX}/recording/${encodeURIComponent(runId)}/${encodeURIComponent(scenario)}` +
   `?track=${encodeURIComponent(label)}`;
