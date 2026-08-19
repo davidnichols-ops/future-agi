@@ -8130,15 +8130,15 @@ class TestMonitorMetricsQueryBuilder:
         assert "countIf(status = 'ERROR')" in query
 
     def test_error_free_session_rates_query(self):
-        """ERROR_FREE_SESSION_RATES should group by session_id."""
+        """ERROR_FREE_SESSION_RATES should group by trace_session_id."""
         from datetime import datetime
 
         builder = self._make_builder()
         query, _ = builder.build_metric_value_query(
             "error_free_session_rates", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
-        assert "session_id" in query
-        assert "GROUP BY session_id" in query
+        assert "trace_session_id" in query
+        assert "GROUP BY trace_session_id" in query
 
     def test_service_provider_error_rates_query(self):
         """SERVICE_PROVIDER_ERROR_RATES should group by provider."""
