@@ -109,17 +109,16 @@ class TestHistoricalStatsRouting:
         captured: dict[str, str] = {}
 
         class _Svc:
-            def execute_ch_query(self, query, params, timeout_ms=None):
+            def execute_ch_query(self, query, params, **kwargs):
                 captured["query"] = query
                 return SimpleNamespace(data=[{"mean": 4.2, "stddev": 1.1}])
 
-        with (
-            mock.patch.object(monitor_utils, "AnalyticsQueryService", _Svc),
-            mock.patch.object(monitor_utils, "ObservationSpan") as pg_spans,
-        ):
+        with mock.patch.object(monitor_utils, "AnalyticsQueryService", _Svc):
             mean, stddev = monitor_utils._get_historical_stats(monitor, START, END)
 
         assert (mean, stddev) == (4.2, 1.1)
         # interval_kind derived from the monitor reaches the bucket function.
         assert f"{bucket_fn}(created_at)" in captured["query"]
-        pg_spans.objects.filter.assert_not_called()
+        # PG path is gone structurally: the module no longer imports the
+        # dropped span table at all.
+        assert not hasattr(monitor_utils, "ObservationSpan")
