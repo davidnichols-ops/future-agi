@@ -10,14 +10,16 @@ import React, {
 import Actions from "./Actions";
 import { StatusCell, TrendChartCell } from "./AlertCells";
 import FilterChipsRenderer from "../../../../common/EvalsTasks/Renderers/FilterChipsRenderer";
-import AlertFilters from "../AlertFilters";
 import { formatDistanceToNow } from "date-fns";
 import SvgColor from "src/components/svg-color";
 import axios, { endpoints } from "src/utils/axios";
 import { useDebounce } from "src/hooks/use-debounce";
 import { Events, PropertyName, trackEvent } from "src/utils/Mixpanel";
 import { useAlertStore } from "../../store/useAlertStore";
-import { useAlertFilterShallow } from "../../store/useAlertFilterStore";
+import {
+  buildAlertFilterParams,
+  useAlertFilterShallow,
+} from "../../store/useAlertFilterStore";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { DataTable, DataTablePagination } from "src/components/data-table";
 import { formatNumberWithCommas } from "../../../UsersView/common";
@@ -50,11 +52,7 @@ export default function AlertsListView() {
   } = useAlertStore();
 
   const debouncedSearchTerm = useDebounce(searchQuery, 300);
-  const {
-    activeFilters,
-    hasValidFilters,
-    showFilterSection: showFilter,
-  } = useAlertFilterShallow();
+  const { activeFilters } = useAlertFilterShallow();
 
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(25);
@@ -80,19 +78,10 @@ export default function AlertsListView() {
     return vis;
   }, [storeColumns]);
 
-  const extractedFilterObject = useMemo(() => {
-    if (!hasValidFilters) return null;
-    const filterObj = activeFilters.reduce((acc, filter) => {
-      const { filterType, filterValue } = filter;
-      if (Array.isArray(filterValue) && filterValue.length > 0) {
-        acc[filterType] = filterValue;
-      } else if (typeof filterValue === "string" && filterValue.trim() !== "") {
-        acc[filterType] = filterValue;
-      }
-      return acc;
-    }, {});
-    return Object.keys(filterObj).length > 0 ? filterObj : null;
-  }, [activeFilters, hasValidFilters]);
+  const extractedFilterObject = useMemo(
+    () => buildAlertFilterParams(activeFilters),
+    [activeFilters],
+  );
 
   // Register refresh function in the store
   const refreshFn = useCallback(() => {
@@ -371,7 +360,6 @@ export default function AlertsListView() {
         }}
       >
         <Actions />
-        {showFilter && <AlertFilters />}
 
         <DataTable
           columns={columns}
