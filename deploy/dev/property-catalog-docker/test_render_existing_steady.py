@@ -79,6 +79,9 @@ class ExistingSteadyRendererTests(unittest.TestCase):
         )
         control = overlay["services"]["property-catalog-control"]
         registrar = overlay["services"]["property-catalog-registrar"]
+        task_queue = (
+            "property_catalog_dev_sidecar_22222222222242228222222222222222"
+        )
         self.assertEqual(
             control["entrypoint"],
             ["python", "manage.py", "start_temporal_worker"],
@@ -93,6 +96,10 @@ class ExistingSteadyRendererTests(unittest.TestCase):
                 environment["PROPERTY_CATALOG_DEV_RECONCILE_ENABLED"], "true"
             )
             self.assertEqual(
+                environment["PROPERTY_CATALOG_DEV_TASK_QUEUE"], task_queue
+            )
+            self.assertEqual(environment["TEMPORAL_TASK_QUEUE"], task_queue)
+            self.assertEqual(
                 environment["PROPERTY_CATALOG_DEV_BOOTSTRAP_ACTIVATION_SHA256"],
                 digest,
             )
@@ -103,6 +110,7 @@ class ExistingSteadyRendererTests(unittest.TestCase):
             )
             self.assertNotIn("ports", service)
             self.assertNotIn("expose", service)
+        self.assertEqual(control["command"][1], task_queue)
 
     def test_rejects_placeholder_or_invalid_activation(self) -> None:
         base = bootstrap.render_compose(_config())

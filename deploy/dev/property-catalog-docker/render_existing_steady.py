@@ -22,9 +22,12 @@ from typing import Any
 import yaml
 
 
-TASK_QUEUE = "property_catalog_dev_sidecar"
+TASK_QUEUE_PREFIX = "property_catalog_dev_sidecar_"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TARGET_RE = re.compile(r"th7247_catalog_dev_[a-z0-9][a-z0-9_]*")
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
 
 
 class SteadyStateRenderError(RuntimeError):
@@ -104,8 +107,21 @@ def _validate_bootstrap_operator(operator: Mapping[str, Any]) -> None:
         raise SteadyStateRenderError("control operator runtime bind drifted")
 
 
+def _workspace_task_queue(operator: Mapping[str, Any]) -> str:
+    environment = _mapping(operator.get("environment"), "operator environment")
+    workspace_id = str(environment.get("PROPERTY_CATALOG_DEV_WORKSPACE_ID", ""))
+    allowlist = str(
+        environment.get("PROPERTY_CATALOG_DEV_WORKSPACE_ALLOWLIST", "")
+    )
+    if _UUID_RE.fullmatch(workspace_id) is None or allowlist != workspace_id:
+        raise SteadyStateRenderError(
+            "steady-state task queue requires one exact workspace UUID"
+        )
+    return TASK_QUEUE_PREFIX + workspace_id.replace("-", "")
+
+
 def _control_service(
-    operator: Mapping[str, Any], *, activation_sha256: str
+    operator: Mapping[str, Any], *, activation_sha256: str, task_queue: str
 ) -> dict[str, Any]:
     control = copy.deepcopy(dict(operator))
     control.pop("profiles", None)
@@ -113,7 +129,7 @@ def _control_service(
     control["entrypoint"] = ["python", "manage.py", "start_temporal_worker"]
     control["command"] = [
         "--task-queue",
-        TASK_QUEUE,
+        task_queue,
         "--max-concurrent-activities",
         "1",
         "--max-concurrent-workflow-tasks",
@@ -124,10 +140,11 @@ def _control_service(
     control["environment"].update(
         {
             "PROPERTY_CATALOG_DEV_RECONCILE_ENABLED": "true",
+            "PROPERTY_CATALOG_DEV_TASK_QUEUE": task_queue,
             "PROPERTY_CATALOG_DEV_BOOTSTRAP_ACTIVATION_SHA256": (activation_sha256),
             "TEMPORAL_HOST": "temporal:7233",
             "TEMPORAL_NAMESPACE": "default",
-            "TEMPORAL_TASK_QUEUE": TASK_QUEUE,
+            "TEMPORAL_TASK_QUEUE": task_queue,
             "TEMPORAL_ALL_QUEUES": "false",
             "TEMPORAL_MAX_CONCURRENT_ACTIVITIES": "1",
             "TEMPORAL_MAX_CONCURRENT_WORKFLOW_TASKS": "1",
@@ -156,7 +173,12 @@ def render_overlay(
     services = _mapping(base.get("services"), "bootstrap services")
     operator = _mapping(services.get("property-catalog-operator"), "bootstrap operator")
     _validate_bootstrap_operator(operator)
-    control = _control_service(operator, activation_sha256=activation_sha256)
+    task_queue = _workspace_task_queue(operator)
+    control = _control_service(
+        operator,
+        activation_sha256=activation_sha256,
+        task_queue=task_queue,
+    )
     registrar = copy.deepcopy(control)
     registrar["restart"] = "no"
     registrar["profiles"] = ["registrar"]
@@ -189,6 +211,7 @@ def validate_overlay(
         "property-catalog-registrar",
     }:
         raise SteadyStateRenderError("steady-state service inventory drifted")
+    task_queue = _workspace_task_queue(operator)
     for name, service_value in services.items():
         service = _mapping(service_value, name)
         if any(
@@ -215,12 +238,13 @@ def validate_overlay(
             or service.get("read_only") is not True
             or service.get("cap_drop") != ["ALL"]
             or environment.get("PROPERTY_CATALOG_DEV_RECONCILE_ENABLED") != "true"
+            or environment.get("PROPERTY_CATALOG_DEV_TASK_QUEUE") != task_queue
             or environment.get("PROPERTY_CATALOG_READ_MODE") != "off"
             or environment.get("PROPERTY_CATALOG_DEV_OTLP_TRAFFIC_AUTHORIZED")
             != "false"
             or environment.get("PROPERTY_CATALOG_DEV_BOOTSTRAP_ACTIVATION_SHA256")
             != activation_sha256
-            or environment.get("TEMPORAL_TASK_QUEUE") != TASK_QUEUE
+            or environment.get("TEMPORAL_TASK_QUEUE") != task_queue
             or labels.get("futureagi.public-routing") != "disabled"
             or labels.get("futureagi.schedule") != "enabled"
         ):
@@ -233,7 +257,7 @@ def validate_overlay(
         or control.get("command")
         != [
             "--task-queue",
-            TASK_QUEUE,
+            task_queue,
             "--max-concurrent-activities",
             "1",
             "--max-concurrent-workflow-tasks",

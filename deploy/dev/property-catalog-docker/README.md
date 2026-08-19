@@ -313,8 +313,11 @@ python deploy/dev/property-catalog-docker/provision_existing_steady.py \
 ```
 
 Next render the second-stage overlay from the exact bootstrap Compose file.
-The renderer adds one worker polling only `property_catalog_dev_sidecar` with
-one activity/workflow slot and one registrar behind the `registrar` profile.
+The renderer adds one worker polling only a workspace-isolated queue named
+`property_catalog_dev_sidecar_<workspace UUID without hyphens>`, with one
+activity/workflow slot and one registrar behind the `registrar` profile. This
+prevents a sidecar for one DEV workspace from consuming another workspace's
+reconciliation activity.
 It preserves loopback-only OTLP, `PROPERTY_CATALOG_READ_MODE=off`, the source
 database, the isolated target, credential split, runtime bind, and all
 container hardening.
