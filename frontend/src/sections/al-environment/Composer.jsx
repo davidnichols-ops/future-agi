@@ -11,15 +11,7 @@ import { shortPath } from "./parts/shortPath";
  * it, so the whole thing reads as one field; the chips above are the shortcuts for the
  * things you would otherwise type out every session.
  */
-const Composer = ({
-  onSay,
-  onRun,
-  onStop,
-  streaming,
-  status,
-  sessionId,
-  artifactsPath,
-}) => {
+const Composer = ({ onSay, onRun, onStop, streaming, status }) => {
   const [text, setText] = useState("");
   const boxRef = useRef(null);
   const hasSession = Boolean(status?.session);
@@ -187,7 +179,6 @@ Composer.propTypes = {
   onStop: PropTypes.func.isRequired,
   streaming: PropTypes.bool,
   status: PropTypes.object,
-  sessionId: PropTypes.string,
 };
 
 export default Composer;
