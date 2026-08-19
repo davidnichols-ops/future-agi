@@ -52,8 +52,7 @@ const TABS = [
     label: "Scenarios",
     count: (s) => s?.have?.scenarios || "",
   },
-  // Hidden alongside the Runs stage in the roadmap — uncomment to bring the tab back.
-  // { value: "runs", label: "Runs", count: (s) => s?.have?.runs || "" },
+  { value: "runs", label: "Runs", count: (s) => s?.have?.runs || "" },
 ];
 
 const AlEnvironmentView = () => {
@@ -161,6 +160,45 @@ const AlEnvironmentView = () => {
         baseUrl={alkBaseUrl(import.meta.env)}
         onRetry={refetch}
       />
+    );
+  }
+
+  /**
+   * The harness holds one conversation at a time and refuses to swap it while a stage is
+   * running, so the URL can name one environment while the server still has another open.
+   * Say so, rather than drawing the open one's contract, world and scenarios underneath a URL
+   * that claims they belong to something else — which reads as this environment's own work.
+   */
+  if (sessionId && openId && sessionId !== openId) {
+    return (
+      <Stack
+        spacing={1}
+        sx={{ height: "100%", alignItems: "center", justifyContent: "center", p: 4 }}
+      >
+        <Typography sx={{ fontFamily: ALK_MONO }}>
+          {status?.busy
+            ? `${openId} is still running`
+            : `${openId} is the open environment`}
+        </Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ textAlign: "center" }}>
+          Only one environment can be open at a time.
+          {status?.busy ? " Wait for it to finish, or stop it, then come back." : ""}
+        </Typography>
+        <Stack direction="row" spacing={1} sx={{ pt: 1 }}>
+          <Button size="small" variant="outlined" onClick={() => goToSession(openId)}>
+            Go to {openId}
+          </Button>
+          {!status?.busy && (
+            <Button
+              size="small"
+              variant="contained"
+              onClick={() => openSession.mutate(sessionId)}
+            >
+              Open this one
+            </Button>
+          )}
+        </Stack>
+      </Stack>
     );
   }
 
@@ -312,6 +350,7 @@ const AlEnvironmentView = () => {
                 messages={transcript}
                 hasSession={hasSession}
                 thinking={conversation.thinking}
+                spentUsd={status?.spent_usd}
               />
             </Box>
             <Composer

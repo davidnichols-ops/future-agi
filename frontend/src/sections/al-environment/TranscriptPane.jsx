@@ -10,7 +10,7 @@ import JsonView from "./JsonView";
  * Read-only in slice 1. Slice 2 appends streamed events to the same `messages` array,
  * so the renderer deliberately knows nothing about where the messages came from.
  */
-const TranscriptPane = ({ messages, hasSession, thinking }) => {
+const TranscriptPane = ({ messages, hasSession, thinking, spentUsd }) => {
   const foot = useRef(null);
 
   // Follow the stream. Without this a long turn writes itself off the bottom of the pane.
@@ -130,7 +130,7 @@ const TranscriptPane = ({ messages, hasSession, thinking }) => {
           )}
         </Box>
       ))}
-      {thinking && <ThinkingStrip label={thinking} />}
+      {thinking && <ThinkingStrip label={thinking} spentUsd={spentUsd} />}
       <Box ref={foot} />
     </Stack>
   );
@@ -140,6 +140,7 @@ TranscriptPane.propTypes = {
   messages: PropTypes.array.isRequired,
   hasSession: PropTypes.bool,
   thinking: PropTypes.string,
+  spentUsd: PropTypes.number,
 };
 
 export default TranscriptPane;

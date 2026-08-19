@@ -272,7 +272,10 @@ describe("AlEnvironmentView, addressed by URL", () => {
       refetch: vi.fn(),
     });
     renderAt("/rl-environment/wanted");
-    await waitFor(() => expect(screen.getByRole("textbox")).toBeInTheDocument());
+    // Says which environment is actually open rather than drawing its work under this URL.
+    await waitFor(() =>
+      expect(screen.getByText(/other is still running/i)).toBeInTheDocument()
+    );
     // Opening mid-turn is refused with a 409, so it must not even be attempted.
     expect(mutate).not.toHaveBeenCalled();
   });

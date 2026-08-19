@@ -8,7 +8,7 @@ import { ALK_MONO } from "./alkTokens";
  * that gap reads as broken. The label follows whatever the stream is doing and the clock
  * keeps counting, so the wait is visibly a wait rather than a hang.
  */
-const ThinkingStrip = ({ label }) => {
+const ThinkingStrip = ({ label, spentUsd }) => {
   const [seconds, setSeconds] = useState(0);
 
   useEffect(() => {
@@ -50,10 +50,23 @@ const ThinkingStrip = ({ label }) => {
       >
         {seconds}s
       </Typography>
+      {/* What the stage has spent so far. The clock alone cannot tell a long turn from a
+          stalled one; a figure that keeps climbing can. */}
+      {spentUsd > 0 && (
+        <Typography
+          component="span"
+          sx={{ fontFamily: ALK_MONO, fontSize: 12.2, color: "inherit", fontVariantNumeric: "tabular-nums" }}
+        >
+          {`· $${spentUsd.toFixed(2)}`}
+        </Typography>
+      )}
     </Stack>
   );
 };
 
-ThinkingStrip.propTypes = { label: PropTypes.string.isRequired };
+ThinkingStrip.propTypes = {
+  label: PropTypes.string.isRequired,
+  spentUsd: PropTypes.number,
+};
 
 export default ThinkingStrip;

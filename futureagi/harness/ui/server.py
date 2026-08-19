@@ -507,9 +507,23 @@ def _report_to_platform(produced, chosen, out, on_event, modality: str = "text")
         )
 
 
+def _folder(session_id: str = "") -> Path | None:
+    """The folder to read from: the one asked for, or the open one.
+
+    Reading a session is not the same as working in one. The harness holds a single live
+    conversation because a conversation has a model behind it, but every artifact it produces
+    is just files on disk. Tying reads to the open session made a whole environment unviewable
+    while any other one was mid-stage, which is most of the time a suite is interesting.
+    """
+    if session_id:
+        found = sessions.load(session_id, SESSIONS)
+        return found.path if found else None
+    return current.path if current else None
+
+
 @app.get("/api/contract")
-async def contract():
-    out = current.path if current else None
+async def contract(session: str = ""):
+    out = _folder(session)
     path = out / "contract.json" if out else None
     if not path or not path.exists():
         return JSONResponse({})
@@ -548,8 +562,8 @@ def _table(name: str, records: Any) -> dict:
 
 
 @app.get("/api/world")
-async def world():
-    out = current.path if current else None
+async def world(session: str = ""):
+    out = _folder(session)
     if not world_saved(out):
         return JSONResponse({"tables": []})
     # Restored rather than read out of a database file, because not every world has one. An agent
@@ -579,7 +593,7 @@ async def world():
 
 
 @app.get("/api/scenarios")
-async def scenarios():
+async def scenarios(session: str = ""):
     """Every scenario, with its files and its three gates re-run.
 
     The gates are re-run rather than remembered. They are milliseconds of pure code, and a
@@ -590,7 +604,7 @@ async def scenarios():
     from harness.folder import folder_for
     from harness.prove import prove
 
-    out = current.path if current else None
+    out = _folder(session)
     if not out:
         return []
     catalogue = load_catalogue(out)
@@ -630,7 +644,7 @@ async def scenarios():
 
 
 @app.get("/api/scenario-file")
-async def scenario_file(name: str, path: str):
+async def scenario_file(name: str, path: str, session: str = ""):
     """One file out of a scenario's folder, so the page can show what will actually run.
 
     Resolved and then checked to be inside that scenario's own folder: the path comes from a
@@ -638,7 +652,7 @@ async def scenario_file(name: str, path: str):
     """
     from harness.folder import folder_for
 
-    out = current.path if current else None
+    out = _folder(session)
     if not out:
         return JSONResponse({"error": "no agent open"}, status_code=404)
     here = folder_for(out, name).resolve()
@@ -649,12 +663,12 @@ async def scenario_file(name: str, path: str):
 
 
 @app.get("/api/subgoals")
-async def subgoals():
+async def subgoals(session: str = ""):
     """The shared catalogue. What every scenario is checked against."""
     from harness.catalogue import load_catalogue
     from harness.simulator import load_simulator_prompt
 
-    out = current.path if current else None
+    out = _folder(session)
     if not out:
         return {"sub_goals": [], "simulator_prompt": ""}
     catalogue = load_catalogue(out)
@@ -674,12 +688,12 @@ async def subgoals():
 
 
 @app.get("/api/runs")
-async def runs():
-    return _runs(current.path if current else None)
+async def runs(session: str = ""):
+    return _runs(_folder(session))
 
 
 @app.get("/api/platform")
-async def platform_link():
+async def platform_link(session: str = ""):
     """Where this session's runs are on the platform, for a page wanting to link there.
 
     Answers before any run has been reported too, so the caller can tell "not wired up" from
@@ -687,7 +701,7 @@ async def platform_link():
     """
     from harness import platform as platform_api
 
-    out = current.path if current else None
+    out = _folder(session)
     return {
         "run_test_id": platform_api.remembered(out) if out else "",
         "url": (
