@@ -290,3 +290,80 @@ describe("re-applying unchanged filters", () => {
     expect(onApply).toHaveBeenCalledTimes(1);
   });
 });
+
+// Reopening used to push one row per array value, so filtering on three
+// projects came back as three identical "Project" rows the user never made.
+describe("hydrating multi-value filters", () => {
+  const FIELDS = [
+    {
+      value: "project_id",
+      label: "Project",
+      type: "enum",
+      choices: ["p1", "p2", "p3"],
+      choiceLabels: { p1: "Alpha", p2: "Beta", p3: "Gamma" },
+    },
+    {
+      value: "status",
+      label: "Status",
+      type: "enum",
+      single: true,
+      choices: ["triggered", "healthy"],
+    },
+    { value: "name", label: "Name", type: "string" },
+  ];
+
+  const openWith = (currentFilters, onApply = vi.fn()) =>
+    render(
+      <FilterPanel
+        anchorEl={document.body}
+        open
+        onClose={vi.fn()}
+        filterFields={FIELDS}
+        currentFilters={currentFilters}
+        onApply={onApply}
+        basicOnly
+      />,
+    );
+
+  const rowLabels = () =>
+    screen.getAllByRole("combobox").map((el) => el.textContent);
+
+  it("keeps three project values in one row", () => {
+    openWith({ project_id: ["p1", "p2", "p3"] });
+
+    expect(rowLabels().filter((l) => l === "Project")).toHaveLength(1);
+    // Two chips render, then a "+1" overflow marker.
+    expect(screen.getByText("Alpha")).toBeInTheDocument();
+    expect(screen.getByText("Beta")).toBeInTheDocument();
+    expect(screen.getByText("+1")).toBeInTheDocument();
+  });
+
+  it("still gives a negated key its own row", () => {
+    openWith({ project_id: ["p1"], project_id_not: ["p2"] });
+
+    expect(rowLabels().filter((l) => l === "Project")).toHaveLength(2);
+  });
+
+  it("keeps one value for a single-value field", () => {
+    openWith({ status: ["triggered", "healthy"] });
+
+    expect(rowLabels().filter((l) => l === "Status")).toHaveLength(1);
+    expect(screen.getByText("triggered")).toBeInTheDocument();
+    expect(screen.queryByText("healthy")).not.toBeInTheDocument();
+  });
+
+  it("still splits a text field, which has nowhere to put a second value", () => {
+    openWith({ name: ["alpha", "beta"] });
+
+    expect(rowLabels().filter((l) => l === "Name")).toHaveLength(2);
+  });
+
+  it("applies the same object it hydrated from", async () => {
+    const onApply = vi.fn();
+    openWith({ project_id: ["p1", "p2", "p3"] }, onApply);
+
+    // The guard compares by value, so an unchanged set stays quiet.
+    await new Promise((r) => setTimeout(r, 800));
+    expect(onApply).not.toHaveBeenCalled();
+  });
+});

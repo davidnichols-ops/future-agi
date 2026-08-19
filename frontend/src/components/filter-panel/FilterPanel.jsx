@@ -1430,13 +1430,24 @@ const FilterPanel = ({
       for (const [key, val] of Object.entries(currentFilters)) {
         const isNeg = key.endsWith("_not");
         const field = isNeg ? key.slice(0, -4) : key;
+        const fieldDef = fieldMap[field];
         if (Array.isArray(val)) {
           const op = isNeg
             ? "is_not"
-            : fieldMap[field]?.type === "enum"
+            : fieldDef?.type === "enum"
               ? "is"
               : "contains";
-          val.forEach((v) => initial.push({ field, operator: op, value: v }));
+          if (fieldDef?.type === "enum") {
+            // An enum row holds the whole set and shows it as chips, so keep
+            // the values together — one row per value would come back as a
+            // pile of identical rows the user never created.
+            const values = fieldDef.single ? val.slice(0, 1) : val;
+            if (values.length > 0)
+              initial.push({ field, operator: op, value: values });
+          } else {
+            // A text row is a single input, so each value needs its own.
+            val.forEach((v) => initial.push({ field, operator: op, value: v }));
+          }
         } else if (val) {
           initial.push({
             field,
