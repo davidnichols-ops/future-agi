@@ -813,12 +813,9 @@ export const createEvalVersionForExperiment = async (
   }
 
   const isCodeEval = evalConfig.evalTemplate?.eval_type === "code";
-  const baseConfig = evalConfig.evalTemplate?.config || evalConfig.config || {};
+  const resolvedConfig = evalConfig.config || evalConfig.evalTemplate?.config || {};
   const configSnapshot = {
-    ...baseConfig,
-    rule_prompt: isCodeEval ? "" : (evalConfig.instructions || ""),
-    code: isCodeEval ? evalConfig.code : undefined,
-    language: isCodeEval ? evalConfig.code_language : undefined,
+    ...resolvedConfig,
     model: evalConfig.model,
     output: evalConfig.outputType,
     pass_threshold: evalConfig.pass_threshold,
@@ -833,11 +830,14 @@ export const createEvalVersionForExperiment = async (
     data_injection: evalConfig.data_injection,
     error_localizer_enabled: evalConfig.error_localizer_enabled,
   };
+  const criteria = isCodeEval
+    ? resolvedConfig.code
+    : resolvedConfig.rule_prompt || evalConfig.instructions;
   const { data: versionData } = await axios.post(
     endpoints.develop.eval.createEvalVersion(evalConfig.templateId),
     {
       config_snapshot: configSnapshot,
-      criteria: isCodeEval ? evalConfig.code : evalConfig.instructions,
+      criteria,
       model: evalConfig.model,
     },
   );

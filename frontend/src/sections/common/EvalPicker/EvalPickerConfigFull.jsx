@@ -207,12 +207,13 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
   const [evalName, setEvalName] = useState("");
   const [dataReady, setDataReady] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
+  const versionSeededRef = useRef(false);
   useEffect(() => {
+    if (versionSeededRef.current) return;
+    versionSeededRef.current = true;
     const pinned = evalData?.pinned_version_id ?? null;
-    if (pinned && pinned !== selectedVersionId && !isDirty) {
-      setSelectedVersionId(pinned);
-    }
-  }, [evalData?.pinned_version_id, selectedVersionId, isDirty]);
+    if (pinned) setSelectedVersionId(pinned);
+  }, [evalData?.pinned_version_id]);
   const [isTesting, setIsTesting] = useState(false);
   const [testPassed, setTestPassed] = useState(false);
   const [testError, setTestError] = useState(null);
@@ -606,14 +607,11 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
         setCode("");
       }
       setCodeLanguage(getEvalCodeLanguage(normalizedFullEval));
-      // Priority: user's saved run-config override → canonical detail
-      // (`fullEval.model`, full form e.g. "turing_small") → list-level
-      // `evalData.model`. The list endpoint returns a stripped form
-      // ("small") for built-in templates while detail returns the full
-      // canonical value, so we intentionally prefer `fullEval.model`
-      // over `evalData.model` to avoid the chip rendering "small".
+      // Priority: user's saved run-config override → per-binding model
+      // (evalData.model, from UserEvalMetric.model in edit mode) →
+      // canonical template detail (`fullEval.model`) → fallback.
       setModel(
-        config?.model || fullEval?.model || evalData?.model || "turing_large",
+        config?.model || evalData?.model || fullEval?.model || "turing_large",
       );
       setOutputType(fullEval.output_type || "pass_fail");
       // Prefer user's saved run_config overrides (edit flow) over template defaults
@@ -1065,6 +1063,13 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
           ? evalName || evalData?.name
           : evalName || fullEval?.name || evalData?.name;
 
+    const resolvedVersionId = isSystemEval
+      ? null
+      : selectedVersionId
+        || versions.find((v) => v.is_default)?.id
+        || versions[0]?.id
+        || null;
+
     if (templateType === "composite") {
       // Composite metrics don't carry prompt/model/output-type/choice-score
       // state — those live on each child template. Emit only the fields
@@ -1080,7 +1085,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
         evalType,
         templateType,
         config: fullEval?.config || evalData?.config,
-        versionId: selectedVersionId,
+        versionId: resolvedVersionId,
         isDirty,
         data_injection: dataInjection,
         error_localizer_enabled: errorLocalizerActive,
@@ -1101,7 +1106,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
       templateType,
       outputType,
       config: resolvedConfig,
-      versionId: selectedVersionId,
+      versionId: resolvedVersionId,
       isDirty,
       instructions,
       messages,
@@ -1153,6 +1158,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
     connectorIds,
     knowledgeBaseIds,
     contextOptions,
+    isDirty,
     isComposite,
     compositeChildWeights,
     errorLocalizerActive,
@@ -1285,7 +1291,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
               Save version
             </LoadingButton>
           )}
-          {versions.length > 0 && (
+          {!isSystemEval && versions.length > 0 && (
             <Select
               size="small"
               value={selectedVersionId || ""}

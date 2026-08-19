@@ -9094,6 +9094,7 @@ export interface UserEvalMutationRequestApi {
   save_as_template?: boolean;
   experiment_id?: string;
   composite_weight_overrides?: UserEvalMutationRequestApiCompositeWeightOverrides;
+  pinned_version_id?: string;
 }
 
 export type UserEvalUpdateRequestApiConfig = { [key: string]: unknown };
@@ -9105,7 +9106,7 @@ export interface UserEvalUpdateRequestApi {
   name?: string;
   /** @maxLength 500 */
   template_id?: string;
-  config: UserEvalUpdateRequestApiConfig;
+  config?: UserEvalUpdateRequestApiConfig;
   kb_id?: string;
   error_localizer?: boolean;
   /** @maxLength 100 */
@@ -10221,6 +10222,7 @@ export interface CompositeEvalUpdateRequestApi {
   child_weights?: CompositeEvalUpdateRequestApiChildWeights;
   child_pinned_versions?: CompositeEvalUpdateRequestApiChildPinnedVersions;
   child_configs?: CompositeEvalUpdateRequestApiChildConfigs;
+  skip_template_update?: boolean;
   composite_child_axis?: CompositeEvalUpdateRequestApiCompositeChildAxis;
 }
 
@@ -10675,6 +10677,7 @@ export interface EvalTemplateVersionCreateRequestApi {
   criteria?: string;
   model?: string;
   config_snapshot?: EvalTemplateVersionCreateRequestApiConfigSnapshot;
+  set_as_default?: boolean;
 }
 
 export interface EvalTemplateVersionResponseResultApi {
@@ -25077,9 +25080,6 @@ export type ModelHubExperimentDetailList200 = {
 };
 
 export type ModelHubExperimentsDataListParams = {
-created_at?: string;
-status?: string;
-dataset_id?: string;
 /**
  * Which field to use when ordering the results.
  */
@@ -25106,9 +25106,6 @@ export type ModelHubExperimentsDataList200 = {
 };
 
 export type ModelHubExperimentsV2ListListParams = {
-created_at?: string;
-status?: string;
-dataset_id?: string;
 /**
  * A search term.
  */
@@ -25281,8 +25278,6 @@ limit?: number;
 };
 
 export type ModelHubOptimisationListParams = {
-optimize_type?: string;
-status?: string;
 /**
  * A search term.
  */
@@ -25460,7 +25455,6 @@ export type ModelHubPromptBaseTemplatesGetAllCategories200 = {
 };
 
 export type ModelHubPromptExecutionsListParams = {
-name?: string;
 /**
  * A search term.
  */
@@ -25505,9 +25499,6 @@ export type ModelHubPromptFoldersList200 = {
 };
 
 export type ModelHubPromptHistoryExecutionsListParams = {
-template_name?: string;
-template_version?: string;
-created_at?: string;
 /**
  * A search term.
  */
@@ -25534,9 +25525,6 @@ export type ModelHubPromptHistoryExecutionsList200 = {
 };
 
 export type ModelHubPromptHistoryExecutionsGetExecutionDetailsParams = {
-template_name?: string;
-template_version?: string;
-created_at?: string;
 /**
  * A search term.
  */
@@ -25617,9 +25605,6 @@ export type ModelHubPromptLabelsTemplateLabels200 = {
 };
 
 export type ModelHubPromptTemplatesListParams = {
-name?: string;
-version?: string;
-created_at?: string;
 /**
  * A search term.
  */
@@ -25646,9 +25631,6 @@ export type ModelHubPromptTemplatesList200 = {
 };
 
 export type ModelHubPromptTemplatesGetTemplateByNameParams = {
-name?: string;
-version?: string;
-created_at?: string;
 /**
  * A search term.
  */

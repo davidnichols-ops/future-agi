@@ -18070,7 +18070,8 @@ export const ModelHubDevelopsAddUserEvalCreateBody = zod.object({
   "experiment_id": zod.string().uuid().optional(),
   "composite_weight_overrides": zod.object({
 
-}).passthrough().optional()
+}).passthrough().optional(),
+  "pinned_version_id": zod.string().uuid().optional()
 })
 
 
@@ -18132,7 +18133,7 @@ export const ModelHubDevelopsEditAndRunUserEvalCreateBody = zod.object({
   "template_id": zod.string().max(modelHubDevelopsEditAndRunUserEvalCreateBodyTemplateIdMax).optional(),
   "config": zod.object({
 
-}).passthrough(),
+}).passthrough().optional(),
   "kb_id": zod.string().uuid().optional(),
   "error_localizer": zod.boolean().default(modelHubDevelopsEditAndRunUserEvalCreateBodyErrorLocalizerDefault),
   "model": zod.string().max(modelHubDevelopsEditAndRunUserEvalCreateBodyModelMax).optional(),
@@ -19679,7 +19680,7 @@ export const ModelHubEvalTemplatesCompositePartialUpdateParams = zod.object({
 export const modelHubEvalTemplatesCompositePartialUpdateBodyNameMax = 255;
 
 
-
+export const modelHubEvalTemplatesCompositePartialUpdateBodySkipTemplateUpdateDefault = false;
 
 export const ModelHubEvalTemplatesCompositePartialUpdateBody = zod.object({
   "name": zod.string().min(1).max(modelHubEvalTemplatesCompositePartialUpdateBodyNameMax).optional(),
@@ -19697,6 +19698,7 @@ export const ModelHubEvalTemplatesCompositePartialUpdateBody = zod.object({
   "child_configs": zod.object({
 
 }).passthrough().optional(),
+  "skip_template_update": zod.boolean().default(modelHubEvalTemplatesCompositePartialUpdateBodySkipTemplateUpdateDefault),
   "composite_child_axis": zod.enum(['', 'pass_fail', 'percentage', 'choices', 'code']).optional()
 })
 
@@ -20267,12 +20269,15 @@ export const ModelHubEvalTemplatesVersionsCreateCreateParams = zod.object({
   "template_id": zod.string()
 })
 
+export const modelHubEvalTemplatesVersionsCreateCreateBodySetAsDefaultDefault = true;
+
 export const ModelHubEvalTemplatesVersionsCreateCreateBody = zod.object({
   "criteria": zod.string().optional(),
   "model": zod.string().optional(),
   "config_snapshot": zod.object({
 
-}).passthrough().optional()
+}).passthrough().optional(),
+  "set_as_default": zod.boolean().default(modelHubEvalTemplatesVersionsCreateCreateBodySetAsDefaultDefault)
 })
 
 export const ModelHubEvalTemplatesVersionsCreateCreateResponse = zod.object({
@@ -20472,9 +20477,6 @@ export const ModelHubExperimentsUpdateResponse = zod.object({
 
 
 export const ModelHubExperimentsDataListQueryParams = zod.object({
-  "created_at": zod.string().optional(),
-  "status": zod.string().optional(),
-  "dataset_id": zod.string().optional(),
   "ordering": zod.string().optional().describe('Which field to use when ordering the results.'),
   "search": zod.string().optional().describe('A search term.'),
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -20614,9 +20616,6 @@ export const ModelHubExperimentsV2CreateResponse = zod.object({
  * V2 experiment list with filtering, search, and pagination.
  */
 export const ModelHubExperimentsV2ListListQueryParams = zod.object({
-  "created_at": zod.string().optional(),
-  "status": zod.string().optional(),
-  "dataset_id": zod.string().optional(),
   "search": zod.string().optional().describe('A search term.'),
   "ordering": zod.string().optional().describe('Which field to use when ordering the results.'),
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -21477,7 +21476,8 @@ export const ModelHubExperimentsAddEvalCreateBody = zod.object({
   "experiment_id": zod.string().uuid().optional(),
   "composite_weight_overrides": zod.object({
 
-}).passthrough().optional()
+}).passthrough().optional(),
+  "pinned_version_id": zod.string().uuid().optional()
 })
 
 
@@ -22909,8 +22909,6 @@ export const ModelHubMetricsByColumnListResponse = zod.object({
 
 
 export const ModelHubOptimisationListQueryParams = zod.object({
-  "optimize_type": zod.string().optional(),
-  "status": zod.string().optional(),
   "search": zod.string().optional().describe('A search term.'),
   "ordering": zod.string().optional().describe('Which field to use when ordering the results.'),
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -24119,7 +24117,6 @@ export const ModelHubPromptBaseTemplatesDeleteParams = zod.object({
 
 
 export const ModelHubPromptExecutionsListQueryParams = zod.object({
-  "name": zod.string().optional(),
   "search": zod.string().optional().describe('A search term.'),
   "ordering": zod.string().optional().describe('Which field to use when ordering the results.'),
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -24313,9 +24310,6 @@ export const ModelHubPromptFoldersDeleteParams = zod.object({
 
 
 export const ModelHubPromptHistoryExecutionsListQueryParams = zod.object({
-  "template_name": zod.string().optional(),
-  "template_version": zod.string().optional(),
-  "created_at": zod.string().optional(),
   "search": zod.string().optional().describe('A search term.'),
   "ordering": zod.string().optional().describe('Which field to use when ordering the results.'),
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -24378,9 +24372,6 @@ export const ModelHubPromptHistoryExecutionsGetExecutionDetailsParams = zod.obje
 })
 
 export const ModelHubPromptHistoryExecutionsGetExecutionDetailsQueryParams = zod.object({
-  "template_name": zod.string().optional(),
-  "template_version": zod.string().optional(),
-  "created_at": zod.string().optional(),
   "search": zod.string().optional().describe('A search term.'),
   "ordering": zod.string().optional().describe('Which field to use when ordering the results.'),
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -24761,9 +24752,6 @@ export const ModelHubPromptLabelsAssignLabelByIdBody = zod.object({
 
 
 export const ModelHubPromptTemplatesListQueryParams = zod.object({
-  "name": zod.string().optional(),
-  "version": zod.string().optional(),
-  "created_at": zod.string().optional(),
   "search": zod.string().optional().describe('A search term.'),
   "ordering": zod.string().optional().describe('Which field to use when ordering the results.'),
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -24959,9 +24947,6 @@ If no version is specified, returns the default version (is_default=True).
 If a version is specified, returns that specific version.
  */
 export const ModelHubPromptTemplatesGetTemplateByNameQueryParams = zod.object({
-  "name": zod.string().optional(),
-  "version": zod.string().optional(),
-  "created_at": zod.string().optional(),
   "search": zod.string().optional().describe('A search term.'),
   "ordering": zod.string().optional().describe('Which field to use when ordering the results.'),
   "page": zod.number().optional().describe('A page number within the paginated result set.'),

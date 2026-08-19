@@ -157,6 +157,7 @@ const EvaluationStepExperimentCreation = ({
           err?.response?.data?.result || err?.message || "Failed to create eval version",
           { variant: "error" },
         );
+        throw err;
       }
     }
 

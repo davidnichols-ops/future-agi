@@ -1067,6 +1067,7 @@ class EvalStructureQuerySerializer(StrictInputSerializer):
     eval_type = serializers.ChoiceField(
         choices=["preset", "user", "previously_configured"]
     )
+    experiment_id = serializers.UUIDField(required=False, default=None)
 
 
 PERFORMANCE_FILTER_TYPES = ("property", "performanceMetric", "performanceTag")
@@ -2346,6 +2347,7 @@ class EvalTemplateVersionCreateRequestSerializer(serializers.Serializer):
     )
     model = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     config_snapshot = serializers.JSONField(required=False, allow_null=True)
+    set_as_default = serializers.BooleanField(required=False, default=True)
 
 
 class EvalTemplateVersionItemSerializer(serializers.Serializer):
@@ -2456,6 +2458,7 @@ class CompositeEvalUpdateRequestSerializer(serializers.Serializer):
         allow_null=True,
         allow_blank=True,
     )
+    skip_template_update = serializers.BooleanField(required=False, default=False)
 
 
 class CompositeEvalExecuteRequestSerializer(serializers.Serializer):
@@ -3098,6 +3101,7 @@ class UserEvalMutationRequestSerializer(serializers.Serializer):
         allow_null=True,
         default=None,
     )
+    pinned_version_id = serializers.UUIDField(required=False, allow_null=True)
 
 
 class UserEvalUpdateRequestSerializer(serializers.Serializer):
@@ -3107,7 +3111,7 @@ class UserEvalUpdateRequestSerializer(serializers.Serializer):
         required=False,
         allow_blank=True,
     )
-    config = serializers.JSONField()
+    config = serializers.JSONField(required=False, default=None)
     kb_id = serializers.UUIDField(required=False)
     error_localizer = serializers.BooleanField(required=False, default=False)
     model = serializers.CharField(max_length=100, required=False, allow_blank=True)
