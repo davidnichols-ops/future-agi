@@ -79,6 +79,7 @@ import {
 import { filtersContentEqual } from "../saved-view-utils";
 import { getDefaultDateRangeForMode } from "../dateRangeDefaults";
 import { useCursorAttributeInventory } from "../LLMTracing/useCursorAttributeInventory";
+import { useWorkspace } from "src/contexts/WorkspaceContext";
 
 // ---------------------------------------------------------------------------
 // Base session filter fields (always available)
@@ -170,6 +171,7 @@ const noopExtraProperties = () => ({});
 
 const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
   const isUserMode = mode === "user";
+  const { currentWorkspaceId } = useWorkspace();
   const { observeId: routeObserveId } = useParams();
   const observeId = isUserMode ? null : routeObserveId;
   const navigate = useNavigate();
@@ -954,10 +956,13 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
   );
   const { attributes, inventoryControlProps } = useCursorAttributeInventory({
     projectId: observeId,
+    workspaceScope: isUserMode,
+    workspaceScopeKey: currentWorkspaceId,
     discoveryMode: "eval_mapping",
     search: customAttributeSearch,
     preservedKeys: preservedCustomAttributeKeys,
-    enabled: Boolean(observeId),
+    enabled:
+      openCustomColumn && Boolean(observeId || (isUserMode && currentWorkspaceId)),
   });
 
   const handleAddCustomColumns = useCallback((newCols) => {

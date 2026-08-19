@@ -224,6 +224,7 @@ function useGraphMetrics(projectId, transportSource, enabled = true) {
   ]);
   const catalog = usePropertyCatalog({
     projectIds: projectId ? [projectId] : [],
+    source: transportSource,
     perEvalConfig: true,
     pageSize: 20,
     enabled: enabled && Boolean(projectId),
@@ -390,7 +391,11 @@ const PrimaryGraph = ({
     hasNextPage: hasNextMetricPage,
     isFetchingNextPage: isFetchingNextMetricPage,
     isFetchNextPageError: isNextMetricPageError,
-  } = useGraphMetrics(effectiveObserveId, graphTransportSource, !staticMetrics);
+  } = useGraphMetrics(
+    effectiveObserveId,
+    graphTransportSource,
+    !staticMetrics && Boolean(pickerAnchor),
+  );
   // Use staticMetrics if provided (for sessions/users), otherwise dynamic
   const metricGroups = staticMetrics || dynamicMetricGroups;
 

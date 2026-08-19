@@ -150,6 +150,12 @@ def _property_row(name, rank):
         "role": definition.role.value,
         "definition_json": definition.definition_json,
         "definition_sha256": definition.definition_sha256,
+        "payload_binding_id": canonical_json_sha256(
+            canonical_json({"binding": name})
+        ),
+        "payload_catalog_revision": 17,
+        "payload_build_token": BUILD_TOKEN,
+        "payload_source_version": 1,
     }
 
 
@@ -157,6 +163,7 @@ class FakeExecutor:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
+        self.page_rows = []
 
     def execute(self, query, params, *, timeout_ms, settings):
         self.calls.append(
@@ -167,6 +174,36 @@ class FakeExecutor:
                 "settings": settings,
             }
         )
+        if "catalog_payload_keys" in params:
+            requested = set(params["catalog_payload_keys"])
+            response = []
+            for row in self.page_rows:
+                key = (
+                    row["property_id"],
+                    row["payload_binding_id"],
+                    row["payload_catalog_revision"],
+                    row["payload_build_token"],
+                    row["payload_source_version"],
+                )
+                if key not in requested:
+                    continue
+                response.append(
+                    {
+                        "property_id": row["property_id"],
+                        "payload_binding_id": row["payload_binding_id"],
+                        "payload_catalog_revision": row[
+                            "payload_catalog_revision"
+                        ],
+                        "payload_build_token": row["payload_build_token"],
+                        "payload_source_version": row["payload_source_version"],
+                        "payload_definition_json": row["definition_json"],
+                        "payload_definition_sha256": row["definition_sha256"],
+                        "payload_variants": 1,
+                        "payload_deleted": 0,
+                    }
+                )
+            return SimpleNamespace(data=response)
+
         response = self.responses.pop(0)
         if (
             "catalog_metadata_only" in query
@@ -176,11 +213,18 @@ class FakeExecutor:
         ):
             metadata = {**response[0], "catalog_metadata_only": 1}
             properties = self.responses.pop(0) if self.responses else []
+            self.page_rows = [
+                {
+                    **property_row,
+                    "payload_catalog_revision": params["catalog_revision"],
+                }
+                for property_row in properties
+            ]
             response = [
                 metadata,
                 *(
                     {**property_row, "catalog_metadata_only": 0}
-                    for property_row in properties
+                    for property_row in self.page_rows
                 ),
             ]
         return SimpleNamespace(data=response)
@@ -215,7 +259,7 @@ def test_catalog_reader_returns_signed_keyset_page(settings):
         "custom_column": 0,
     }
     assert page.category_counts_exact is True
-    assert len(executor.calls) == 2
+    assert len(executor.calls) == 3
     assert executor.calls[0]["params"]["catalog_exact_activation"] == 0
     assert executor.calls[1]["settings"]["max_result_rows"] == 3
     assert " OFFSET " not in executor.calls[1]["query"].upper()
@@ -240,6 +284,11 @@ def test_catalog_reader_returns_signed_keyset_page(settings):
         "`th7247_catalog_dev_test`.`property_definition_catalog`"
         in executor.calls[1]["query"]
     )
+    assert "any(binding.definition_json)" not in executor.calls[1]["query"]
+    assert "property_id IN %(catalog_payload_property_ids)s" in executor.calls[2][
+        "query"
+    ]
+    assert executor.calls[2]["settings"]["max_result_rows"] == 1
 
 
 def test_catalog_reader_rejects_inconsistent_category_counts(settings):
@@ -274,10 +323,10 @@ def test_span_catalog_includes_trace_defined_attributes(settings):
         executor, catalog_database="th7247_catalog_dev_test"
     ).read_page(scope=_scope(), query={**QUERY, "source": "spans"}, page_size=20)
 
-    for call in executor.calls[1:]:
-        assert "%(catalog_source)s = 'spans'" in call["query"]
-        assert "primary_source = 'traces'" in call["query"]
-        assert call["params"]["catalog_source"] == "spans"
+    call = executor.calls[1]
+    assert "%(catalog_source)s = 'spans'" in call["query"]
+    assert "primary_source = 'traces'" in call["query"]
+    assert call["params"]["catalog_source"] == "spans"
 
 
 def test_voice_call_catalog_bridges_shared_and_trace_derived_families(settings):
@@ -294,14 +343,14 @@ def test_voice_call_catalog_bridges_shared_and_trace_derived_families(settings):
         executor, catalog_database="th7247_catalog_dev_test"
     ).read_page(scope=_scope(), query={**QUERY, "source": "voice_calls"}, page_size=20)
 
-    for call in executor.calls[1:]:
-        query = call["query"]
-        assert "%(catalog_source)s = 'voice_calls'" in query
-        assert "primary_source IN ('all', 'both')" in query
-        assert "'annotation_metric'" in query
-        assert "'custom_attribute'" in query
-        assert "primary_source = 'traces'" in query
-        assert call["params"]["catalog_source"] == "voice_calls"
+    call = executor.calls[1]
+    query = call["query"]
+    assert "%(catalog_source)s = 'voice_calls'" in query
+    assert "primary_source IN ('all', 'both')" in query
+    assert "'annotation_metric'" in query
+    assert "'custom_attribute'" in query
+    assert "primary_source = 'traces'" in query
+    assert call["params"]["catalog_source"] == "voice_calls"
 
 
 def test_catalog_reader_scopes_counts_and_page_membership_by_role(settings):
@@ -322,9 +371,9 @@ def test_catalog_reader_scopes_counts_and_page_membership_by_role(settings):
         page_size=20,
     )
 
-    for call in executor.calls[1:]:
-        assert call["params"]["catalog_role"] == "dimension"
-        assert "role = %(catalog_role)s" in call["query"]
+    call = executor.calls[1]
+    assert call["params"]["catalog_role"] == "dimension"
+    assert "role = %(catalog_role)s" in call["query"]
 
 
 def test_catalog_reader_rejects_pages_above_cursor_contract(settings):

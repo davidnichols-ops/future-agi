@@ -231,6 +231,7 @@ import {
 } from "src/api/project/saved-views";
 import { getDefaultDateRangeForMode } from "../dateRangeDefaults";
 import { useCursorAttributeInventory } from "./useCursorAttributeInventory";
+import { useWorkspace } from "src/contexts/WorkspaceContext";
 
 const USER_DETAIL_TAB_TYPE = "user_detail";
 
@@ -637,6 +638,7 @@ const slotKeyFromColumnState = (columnState, fallbackSlotKey) => {
 
 const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   const isUserMode = mode === "user";
+  const { currentWorkspaceId } = useWorkspace();
   const { role } = useAuthContext();
   const navigate = useNavigate();
   const [selectedGraph, setSelectedGraph] = useUrlState(
@@ -1410,10 +1412,13 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   );
   const { attributes, inventoryControlProps } = useCursorAttributeInventory({
     projectId: observeId,
+    workspaceScope: isUserMode,
+    workspaceScopeKey: currentWorkspaceId,
     discoveryMode: "eval_mapping",
     search: customAttributeSearch,
     preservedKeys: preservedCustomAttributeKeys,
-    enabled: Boolean(observeId),
+    enabled:
+      openCustomColumn && Boolean(observeId || (isUserMode && currentWorkspaceId)),
   });
 
   const handleAgentNodeClick = useCallback(

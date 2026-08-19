@@ -115,6 +115,10 @@ describe("PrimaryGraph", () => {
     );
 
     await waitFor(() => expect(axios.post).toHaveBeenCalled());
+    expect(axios.get).not.toHaveBeenCalled();
+
+    fireEvent.click(await screen.findByText("Latency"));
+    await waitFor(() => expect(axios.get).toHaveBeenCalled());
 
     expect(axios.get).toHaveBeenCalledWith("/dashboard/metrics/", {
       params: {

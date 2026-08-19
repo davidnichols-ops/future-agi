@@ -349,8 +349,10 @@ WITH lineage_versioned AS
         any(binding.sort_name_folded) AS sort_name_folded,
         any(binding.search_text_folded) AS search_text_folded,
         any(binding.role) AS role,
-        any(binding.definition_json) AS definition_json,
         any(binding.definition_sha256) AS definition_sha256,
+        any(binding.catalog_revision) AS payload_catalog_revision,
+        any(toString(binding.build_token)) AS payload_build_token,
+        any(binding.source_version) AS payload_source_version,
         any(binding.is_deleted) AS is_deleted,
         uniqExact(binding.state_sha256) AS state_variants,
         -- definition_sha256 binds the canonical definition_json without
@@ -412,9 +414,15 @@ WITH lineage_versioned AS
         anyIf(binding.search_text_folded, binding.binding_is_live)
             AS search_text_folded,
         anyIf(binding.role, binding.binding_is_live) AS role,
-        anyIf(binding.definition_json, binding.binding_is_live) AS definition_json,
         anyIf(binding.definition_sha256, binding.binding_is_live)
             AS definition_sha256,
+        anyIf(binding.binding_id, binding.binding_is_live) AS payload_binding_id,
+        anyIf(binding.payload_catalog_revision, binding.binding_is_live)
+            AS payload_catalog_revision,
+        anyIf(binding.payload_build_token, binding.binding_is_live)
+            AS payload_build_token,
+        anyIf(binding.payload_source_version, binding.binding_is_live)
+            AS payload_source_version,
         countIf(binding.binding_is_conflicted) AS binding_conflicts,
         countIf(binding.binding_is_live) AS live_binding_count,
         -- The canonical JSON digest is the definition payload identity; keep
@@ -578,8 +586,11 @@ _PAGE_SQL_SUFFIX = _PROPERTY_SUMMARY_CTE + """
         sort_name_folded,
         search_text_folded,
         role,
-        definition_json,
         definition_sha256,
+        payload_binding_id,
+        payload_catalog_revision,
+        payload_build_token,
+        payload_source_version,
         binding_conflicts,
         live_binding_count,
         definition_variants,
@@ -605,8 +616,11 @@ _PAGE_SQL_SUFFIX = _PROPERTY_SUMMARY_CTE + """
         '' AS sort_name_folded,
         '' AS search_text_folded,
         'dimension' AS role,
-        '{}' AS definition_json,
         repeat('0', 64) AS definition_sha256,
+        repeat('0', 64) AS payload_binding_id,
+        toUInt64(0) AS payload_catalog_revision,
+        '' AS payload_build_token,
+        toUInt64(0) AS payload_source_version,
         toUInt64(0) AS binding_conflicts,
         toUInt64(0) AS live_binding_count,
         toUInt64(0) AS definition_variants,
@@ -681,8 +695,11 @@ SELECT
     sort_name_folded,
     search_text_folded,
     role,
-    definition_json,
     definition_sha256,
+    payload_binding_id,
+    payload_catalog_revision,
+    payload_build_token,
+    payload_source_version,
     catalog_metadata_only,
     activation_state_conflicts,
     activation_lineage_conflicts,
@@ -726,6 +743,48 @@ ORDER BY
     name ASC,
     property_id ASC
 LIMIT %(catalog_result_limit)s
+"""
+
+
+_PAYLOAD_SQL = """
+SELECT
+    property_id,
+    toString(binding_id) AS payload_binding_id,
+    catalog_revision AS payload_catalog_revision,
+    toString(build_token) AS payload_build_token,
+    source_version AS payload_source_version,
+    any(definition_json) AS payload_definition_json,
+    any(definition_sha256) AS payload_definition_sha256,
+    uniqExact(tuple(
+        property_id,
+        definition_json,
+        definition_sha256,
+        state_sha256,
+        is_deleted
+    )) AS payload_variants,
+    max(is_deleted) AS payload_deleted
+FROM __CATALOG_DATABASE__.property_definition_catalog
+PREWHERE organization_id = %(catalog_organization_id)s
+  AND workspace_id = %(catalog_workspace_id)s
+  AND catalog_epoch = %(catalog_epoch)s
+  AND projection_version = %(catalog_projection_version)s
+  -- The property bloom filter and exact immutable binding tuple keep the
+  -- large JSON column bounded by the requested page instead of reading it
+  -- while resolving every visible definition and category count.
+  AND property_id IN %(catalog_payload_property_ids)s
+  AND tuple(
+      property_id,
+      toString(binding_id),
+      catalog_revision,
+      toString(build_token),
+      source_version
+  ) IN %(catalog_payload_keys)s
+GROUP BY
+    property_id,
+    binding_id,
+    catalog_revision,
+    build_token,
+    source_version
 """
 
 
@@ -828,6 +887,10 @@ class PropertyCatalogReader:
         self._activation_sql = _qualified_activation_sql(self._database)
         self._conflict_sql = ctes + _CONFLICT_SQL_SUFFIX
         self._page_sql = ctes + _PAGE_SQL_SUFFIX
+        self._payload_sql = _PAYLOAD_SQL.replace(
+            "__CATALOG_DATABASE__.property_definition_catalog",
+            f"`{self._database}`.`property_definition_catalog`",
+        )
 
     def read_page(
         self,
@@ -940,6 +1003,12 @@ class PropertyCatalogReader:
         ]
         has_more = len(rows) > page_size
         published_rows = rows[:page_size]
+        published_rows = self._hydrate_definition_payloads(
+            rows=published_rows,
+            scope=checked_scope,
+            activation=activation,
+            budget=budget,
+        )
         metrics = tuple(self._metric(row) for row in published_rows)
         if len({metric["property_id"] for metric in metrics}) != len(metrics):
             raise PropertyCatalogUnavailable("duplicate_property")
@@ -967,6 +1036,113 @@ class PropertyCatalogReader:
             category_counts=category_counts,
             category_counts_exact=True,
         )
+
+    def _hydrate_definition_payloads(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        scope: dict[str, Any],
+        activation: PropertyCatalogActivation,
+        budget: _ReadBudget,
+    ) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+
+        expected_by_key: dict[tuple[str, str, int, str, int], dict[str, Any]] = {}
+        ordered_keys: list[tuple[str, str, int, str, int]] = []
+        for row in rows:
+            property_id = str(row.get("property_id") or "")
+            binding_id = str(row.get("payload_binding_id") or "")
+            catalog_revision = _strict_uint(
+                row.get("payload_catalog_revision"), "payload_catalog_revision"
+            )
+            build_token = _uuid(row.get("payload_build_token"), "payload_build_token")
+            source_version = _strict_uint(
+                row.get("payload_source_version"), "payload_source_version"
+            )
+            if (
+                not property_id
+                or _SHA256_RE.fullmatch(binding_id) is None
+                or catalog_revision < activation.lineage_anchor_revision
+                or catalog_revision > activation.catalog_revision
+            ):
+                raise PropertyCatalogUnavailable("definition_payload_identity_invalid")
+            key = (
+                property_id,
+                binding_id,
+                catalog_revision,
+                build_token,
+                source_version,
+            )
+            if key in expected_by_key:
+                raise PropertyCatalogUnavailable("definition_payload_identity_conflict")
+            expected_by_key[key] = row
+            ordered_keys.append(key)
+
+        payload_rows = self._execute(
+            self._payload_sql,
+            {
+                "catalog_organization_id": scope["organization_id"],
+                "catalog_workspace_id": scope["workspace_id"],
+                "catalog_epoch": activation.catalog_epoch,
+                "catalog_projection_version": activation.projection_version,
+                "catalog_payload_property_ids": tuple(
+                    key[0] for key in ordered_keys
+                ),
+                "catalog_payload_keys": tuple(ordered_keys),
+            },
+            max_result_rows=len(ordered_keys),
+            budget=budget,
+        )
+
+        payload_by_key: dict[tuple[str, str, int, str, int], dict[str, Any]] = {}
+        for payload in payload_rows:
+            key = (
+                str(payload.get("property_id") or ""),
+                str(payload.get("payload_binding_id") or ""),
+                _strict_uint(
+                    payload.get("payload_catalog_revision"),
+                    "payload_catalog_revision",
+                ),
+                _uuid(payload.get("payload_build_token"), "payload_build_token"),
+                _strict_uint(
+                    payload.get("payload_source_version"),
+                    "payload_source_version",
+                ),
+            )
+            if (
+                key not in expected_by_key
+                or key in payload_by_key
+                or _strict_uint(payload.get("payload_variants"), "payload_variants")
+                != 1
+                or _strict_uint(payload.get("payload_deleted"), "payload_deleted")
+                != 0
+            ):
+                raise PropertyCatalogUnavailable("definition_payload_conflict")
+            expected_digest = str(
+                expected_by_key[key].get("definition_sha256") or ""
+            )
+            if (
+                str(payload.get("payload_definition_sha256") or "")
+                != expected_digest
+            ):
+                raise PropertyCatalogUnavailable("definition_payload_digest_mismatch")
+            payload_by_key[key] = payload
+
+        if set(payload_by_key) != set(expected_by_key):
+            raise PropertyCatalogUnavailable("definition_payload_missing")
+        return [
+            {
+                **expected_by_key[key],
+                "definition_json": payload_by_key[key].get(
+                    "payload_definition_json"
+                ),
+                "definition_sha256": payload_by_key[key].get(
+                    "payload_definition_sha256"
+                ),
+            }
+            for key in ordered_keys
+        ]
 
     def _activation(
         self,
