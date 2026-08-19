@@ -1,5 +1,6 @@
 import { useState } from "react";
 import PropTypes from "prop-types";
+import { useParams } from "react-router-dom";
 import { Box, Stack, Typography } from "@mui/material";
 import { alkBaseUrl, isDirectToHarness } from "src/api/al-environment/client";
 import { ALK_MONO } from "../../alkTokens";
@@ -11,9 +12,12 @@ const ALK_BASE = alkBaseUrl(import.meta.env);
 // built by hand and the one place the two bases have to be told apart.
 const ALK_PREFIX = isDirectToHarness(ALK_BASE) ? "/api" : "";
 
-const trackUrl = (runId, scenario, label) =>
+// The session rides along because the harness serves recordings out of the session the URL
+// names, not only the one it happens to have open — a run outlives its session being open.
+const trackUrl = (runId, scenario, label, session) =>
   `${ALK_BASE}${ALK_PREFIX}/recording/${encodeURIComponent(runId)}/${encodeURIComponent(scenario)}` +
-  `?track=${encodeURIComponent(label)}`;
+  `?track=${encodeURIComponent(label)}` +
+  (session ? `&session=${encodeURIComponent(session)}` : "");
 
 /**
  * Every recording that exists, with the best selected. Several tracks are written and any of
@@ -24,6 +28,7 @@ const trackUrl = (runId, scenario, label) =>
  * fastest way to understand a failure is to listen to it.
  */
 const AudioBlock = ({ runId, scenario, tracks }) => {
+  const { sessionId } = useParams();
   const list = tracks || [];
   const [chosen, setChosen] = useState(list[0]?.label || "");
 
@@ -62,7 +67,7 @@ const AudioBlock = ({ runId, scenario, tracks }) => {
             controls
             preload="none"
             data-testid="alk-audio"
-            src={chosen ? trackUrl(runId, scenario, chosen) : undefined}
+            src={chosen ? trackUrl(runId, scenario, chosen, sessionId) : undefined}
             sx={{ width: "100%", height: 34, display: "block" }}
           />
           <Stack direction="row" spacing={1.4} flexWrap="wrap" useFlexGap sx={{ mt: 1.6 }}>
