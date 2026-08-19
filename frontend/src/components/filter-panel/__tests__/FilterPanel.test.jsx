@@ -10,6 +10,19 @@ import {
 
 import FilterPanel from "../FilterPanel";
 
+const popoverSpy = vi.fn();
+vi.mock("@mui/material", async (importOriginal) => {
+  const actual = await importOriginal();
+  const { createElement } = await import("react");
+  return {
+    ...actual,
+    Popover: (props) => {
+      popoverSpy(props);
+      return createElement(actual.Popover, props);
+    },
+  };
+});
+
 // A `single` field carries exactly one value, so a second row pointing at it
 // would be merged away on apply while the UI kept showing it as active.
 const SINGLE_FIELDS = [
@@ -33,7 +46,7 @@ const SINGLE_FIELDS = [
   },
 ];
 
-const renderPanel = (fields = SINGLE_FIELDS, onApply = vi.fn()) =>
+const renderPanel = (fields = SINGLE_FIELDS, onApply = vi.fn(), props = {}) =>
   render(
     <FilterPanel
       anchorEl={document.body}
@@ -43,6 +56,7 @@ const renderPanel = (fields = SINGLE_FIELDS, onApply = vi.fn()) =>
       currentFilters={null}
       onApply={onApply}
       basicOnly
+      {...props}
     />,
   );
 
@@ -127,5 +141,89 @@ describe("FilterPanel — single-value fields", () => {
         expect(onApply).toHaveBeenLastCalledWith({ project_id: ["p1", "p2"] }),
       { timeout: 2000 },
     );
+  });
+});
+
+describe("FilterPanel — the opt-in props", () => {
+  it("basicOnly hides the tab strip, the AI box and the caption", () => {
+    const { unmount } = renderPanel();
+    expect(
+      screen.queryByRole("tab", { name: /basic/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("tab", { name: /query/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/basic filter/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByPlaceholderText(/ask ai|e\.g\./i),
+    ).not.toBeInTheDocument();
+    unmount();
+
+    // Without it, all three come back — otherwise this asserts nothing.
+    renderPanel(SINGLE_FIELDS, vi.fn(), { basicOnly: false });
+    expect(screen.getByRole("tab", { name: /basic/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /query/i })).toBeInTheDocument();
+    expect(screen.getByText(/basic filter/i)).toBeInTheDocument();
+  });
+
+  it("placement maps to the popover's horizontal origins", () => {
+    // jsdom has no layout, so both placements compute identical styles —
+    // assert the props MUI is handed rather than the rendered position.
+    const origins = (placement) => {
+      popoverSpy.mockClear();
+      const { unmount } = renderPanel(SINGLE_FIELDS, vi.fn(), { placement });
+      // The value pickers render their own Popovers; only the panel is open.
+      const props = popoverSpy.mock.calls.map(([p]) => p).find((p) => p.open);
+      unmount();
+      return [props.anchorOrigin.horizontal, props.transformOrigin.horizontal];
+    };
+
+    expect(origins("bottom-end")).toEqual(["right", "right"]);
+    expect(origins("bottom-start")).toEqual(["left", "left"]);
+    expect(origins(undefined)).toEqual(["left", "left"]);
+  });
+
+  it("choiceLabels drives search, so a raw key finds nothing", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    const picker = await openValuePicker(user, 0);
+
+    await user.type(
+      screen.getByPlaceholderText("Search values..."),
+      "Span resp",
+    );
+    expect(picker.getByText("Span response time")).toBeInTheDocument();
+
+    await user.clear(screen.getByPlaceholderText("Search values..."));
+    await user.type(
+      screen.getByPlaceholderText("Search values..."),
+      "span_response",
+    );
+    expect(picker.queryByText("Span response time")).not.toBeInTheDocument();
+  });
+
+  it("choiceLabels suppresses the custom-value row", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await openValuePicker(user, 0);
+    await user.type(
+      screen.getByPlaceholderText("Search values..."),
+      "whatever",
+    );
+    // A typed string can never be a valid value when the choices are opaque keys.
+    expect(screen.queryByText(/^Specify:/)).not.toBeInTheDocument();
+  });
+
+  it("offers the custom-value row when a field has no choiceLabels", async () => {
+    const user = userEvent.setup();
+    renderPanel([
+      { value: "name", label: "Name", type: "enum", choices: ["alpha"] },
+    ]);
+    await openValuePicker(user, 0);
+    await user.type(
+      screen.getByPlaceholderText("Search values..."),
+      "whatever",
+    );
+    expect(screen.getByText(/Specify:/)).toBeInTheDocument();
   });
 });
