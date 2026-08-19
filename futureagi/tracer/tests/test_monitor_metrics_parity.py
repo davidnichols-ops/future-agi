@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from tracer.services.clickhouse.query_builders import monitor_metrics as mm
+from tracer.models.monitor import MonitorMetricTypeChoices
 from tracer.services.clickhouse.query_builders.monitor_metrics import (
     MonitorMetricsQueryBuilder,
 )
@@ -19,18 +19,18 @@ START = datetime(2026, 8, 1, tzinfo=UTC)
 END = datetime(2026, 8, 8, tzinfo=UTC)
 
 TIME_AGGREGATED = [
-    mm.COUNT_OF_ERRORS,
-    mm.TOKEN_USAGE,
-    mm.DAILY_TOKENS_SPENT,
-    mm.MONTHLY_TOKENS_SPENT,
+    MonitorMetricTypeChoices.COUNT_OF_ERRORS,
+    MonitorMetricTypeChoices.TOKEN_USAGE,
+    MonitorMetricTypeChoices.DAILY_TOKENS_SPENT,
+    MonitorMetricTypeChoices.MONTHLY_TOKENS_SPENT,
 ]
 PER_ROW_HISTORICAL = [
-    mm.ERROR_RATES_FOR_FUNCTION_CALLING,
-    mm.ERROR_FREE_SESSION_RATES,
-    mm.SERVICE_PROVIDER_ERROR_RATES,
-    mm.LLM_API_FAILURE_RATES,
-    mm.SPAN_RESPONSE_TIME,
-    mm.LLM_RESPONSE_TIME,
+    MonitorMetricTypeChoices.ERROR_RATES_FOR_FUNCTION_CALLING,
+    MonitorMetricTypeChoices.ERROR_FREE_SESSION_RATES,
+    MonitorMetricTypeChoices.SERVICE_PROVIDER_ERROR_RATES,
+    MonitorMetricTypeChoices.LLM_API_FAILURE_RATES,
+    MonitorMetricTypeChoices.SPAN_RESPONSE_TIME,
+    MonitorMetricTypeChoices.LLM_RESPONSE_TIME,
 ]
 
 
@@ -72,18 +72,18 @@ def test_time_aggregated_historical_buckets_calendar(
 
 def test_time_aggregated_historical_agg_per_metric() -> None:
     sql_err, _ = _builder().build_historical_stats_query(
-        mm.COUNT_OF_ERRORS, START, END, interval_kind="hour"
+        MonitorMetricTypeChoices.COUNT_OF_ERRORS, START, END, interval_kind="hour"
     )
     assert "countIf(status = 'ERROR') AS bucket_value" in sql_err
     sql_tok, _ = _builder().build_historical_stats_query(
-        mm.TOKEN_USAGE, START, END, interval_kind="hour"
+        MonitorMetricTypeChoices.TOKEN_USAGE, START, END, interval_kind="hour"
     )
     # No-token buckets excluded (v2 total_tokens is non-Nullable, PG NULL -> 0).
     assert "nullIf(sum(total_tokens), 0) AS bucket_value" in sql_tok
 
 
 def test_time_aggregated_historical_defaults_to_hour() -> None:
-    sql, _ = _builder().build_historical_stats_query(mm.COUNT_OF_ERRORS, START, END)
+    sql, _ = _builder().build_historical_stats_query(MonitorMetricTypeChoices.COUNT_OF_ERRORS, START, END)
     assert "toStartOfHour(start_time) AS bucket_ts" in sql
 
 
@@ -99,7 +99,7 @@ def test_per_row_historical_uses_population_stddev(metric_type: str) -> None:
 
 def test_eval_stats_use_population_stddev() -> None:
     sql, _ = _builder(eval_output_type="SCORE").build_historical_stats_query(
-        mm.EVALUATION_METRICS, START, END
+        MonitorMetricTypeChoices.EVALUATION_METRICS, START, END
     )
     assert "stddevPop(" in sql
     assert "stddevSamp" not in sql
@@ -110,7 +110,7 @@ def test_eval_stats_use_population_stddev() -> None:
 
 @pytest.mark.parametrize(
     "metric_type",
-    [mm.TOKEN_USAGE, mm.DAILY_TOKENS_SPENT, mm.MONTHLY_TOKENS_SPENT],
+    [MonitorMetricTypeChoices.TOKEN_USAGE, MonitorMetricTypeChoices.DAILY_TOKENS_SPENT, MonitorMetricTypeChoices.MONTHLY_TOKENS_SPENT],
 )
 def test_token_value_null_on_empty_window(metric_type: str) -> None:
     sql, _ = _builder().build_metric_value_query(metric_type, START, END)
@@ -124,13 +124,13 @@ def test_token_value_null_on_empty_window(metric_type: str) -> None:
 def test_provider_guard_excludes_empty_string_only() -> None:
     for sql, _ in (
         _builder().build_metric_value_query(
-            mm.SERVICE_PROVIDER_ERROR_RATES, START, END
+            MonitorMetricTypeChoices.SERVICE_PROVIDER_ERROR_RATES, START, END
         ),
         _builder().build_historical_stats_query(
-            mm.SERVICE_PROVIDER_ERROR_RATES, START, END
+            MonitorMetricTypeChoices.SERVICE_PROVIDER_ERROR_RATES, START, END
         ),
         _builder().build_time_series_query(
-            mm.SERVICE_PROVIDER_ERROR_RATES, START, END, 3600
+            MonitorMetricTypeChoices.SERVICE_PROVIDER_ERROR_RATES, START, END, 3600
         ),
     ):
         assert "provider != ''" in sql
@@ -142,7 +142,7 @@ def test_provider_guard_excludes_empty_string_only() -> None:
 
 def test_eval_choices_no_output_str_fallback() -> None:
     sql, _ = _builder(eval_output_type="CHOICES").build_metric_value_query(
-        mm.EVALUATION_METRICS, START, END
+        MonitorMetricTypeChoices.EVALUATION_METRICS, START, END
     )
     assert "has(JSONExtract(output_str_list, 'Array(String)'), %(choice_val)s)" in sql
     assert "OR output_str" not in sql
@@ -159,10 +159,10 @@ class TestHistoricalStatsRouting:
     @pytest.mark.parametrize(
         ("metric_type", "frequency", "bucket_fn"),
         [
-            (mm.COUNT_OF_ERRORS, 60, "toStartOfHour"),
-            (mm.TOKEN_USAGE, 5, "toStartOfMinute"),
-            (mm.DAILY_TOKENS_SPENT, 60, "toStartOfDay"),
-            (mm.MONTHLY_TOKENS_SPENT, 60, "toStartOfMonth"),
+            (MonitorMetricTypeChoices.COUNT_OF_ERRORS, 60, "toStartOfHour"),
+            (MonitorMetricTypeChoices.TOKEN_USAGE, 5, "toStartOfMinute"),
+            (MonitorMetricTypeChoices.DAILY_TOKENS_SPENT, 60, "toStartOfDay"),
+            (MonitorMetricTypeChoices.MONTHLY_TOKENS_SPENT, 60, "toStartOfMonth"),
         ],
     )
     def test_ch_route_passes_interval_kind_and_skips_pg(

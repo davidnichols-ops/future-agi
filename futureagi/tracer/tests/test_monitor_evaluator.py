@@ -234,6 +234,16 @@ def test_invalid_filters_are_non_retryable(user_alert_monitor) -> None:
     assert UserAlertMonitorLog.objects.count() == 0
 
 
+def test_invalid_observation_type_filter_raises_config_error(
+    user_alert_monitor,
+) -> None:
+    # Non-list/non-str observation_type is a permanent misconfig: the builder's
+    # ValueError must surface as MonitorConfigError, not silently drop the filter.
+    user_alert_monitor.filters = {"observation_type": 123}
+    with pytest.raises(MonitorConfigError):
+        build_monitor_ch_builder(user_alert_monitor)
+
+
 def test_deleted_monitor_returns_quietly() -> None:
     task_fn = process_monitor_task._original_func
     with _patch_ch([]):  # no CH call may happen for a missing monitor

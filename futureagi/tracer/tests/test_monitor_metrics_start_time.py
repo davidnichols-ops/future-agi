@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from tracer.services.clickhouse.query_builders import monitor_metrics as mm
+from tracer.models.monitor import MonitorMetricTypeChoices
 from tracer.services.clickhouse.query_builders.monitor_metrics import (
     MonitorMetricsQueryBuilder,
 )
@@ -30,24 +30,24 @@ EXACT_HALF_OPEN = "start_time >= %(start_time)s AND start_time < %(end_time)s"
 SKEW_GUARD = "created_at >= %(start_time)s - INTERVAL 1 DAY"
 
 SPANS_METRICS = [
-    mm.COUNT_OF_ERRORS,
-    mm.ERROR_RATES_FOR_FUNCTION_CALLING,
-    mm.ERROR_FREE_SESSION_RATES,
-    mm.SERVICE_PROVIDER_ERROR_RATES,
-    mm.LLM_API_FAILURE_RATES,
-    mm.SPAN_RESPONSE_TIME,
-    mm.LLM_RESPONSE_TIME,
-    mm.TOKEN_USAGE,
-    mm.DAILY_TOKENS_SPENT,
-    mm.MONTHLY_TOKENS_SPENT,
+    MonitorMetricTypeChoices.COUNT_OF_ERRORS,
+    MonitorMetricTypeChoices.ERROR_RATES_FOR_FUNCTION_CALLING,
+    MonitorMetricTypeChoices.ERROR_FREE_SESSION_RATES,
+    MonitorMetricTypeChoices.SERVICE_PROVIDER_ERROR_RATES,
+    MonitorMetricTypeChoices.LLM_API_FAILURE_RATES,
+    MonitorMetricTypeChoices.SPAN_RESPONSE_TIME,
+    MonitorMetricTypeChoices.LLM_RESPONSE_TIME,
+    MonitorMetricTypeChoices.TOKEN_USAGE,
+    MonitorMetricTypeChoices.DAILY_TOKENS_SPENT,
+    MonitorMetricTypeChoices.MONTHLY_TOKENS_SPENT,
 ]
 HISTORICAL_SPANS = [
-    mm.ERROR_RATES_FOR_FUNCTION_CALLING,
-    mm.ERROR_FREE_SESSION_RATES,
-    mm.SERVICE_PROVIDER_ERROR_RATES,
-    mm.LLM_API_FAILURE_RATES,
-    mm.SPAN_RESPONSE_TIME,
-    mm.LLM_RESPONSE_TIME,
+    MonitorMetricTypeChoices.ERROR_RATES_FOR_FUNCTION_CALLING,
+    MonitorMetricTypeChoices.ERROR_FREE_SESSION_RATES,
+    MonitorMetricTypeChoices.SERVICE_PROVIDER_ERROR_RATES,
+    MonitorMetricTypeChoices.LLM_API_FAILURE_RATES,
+    MonitorMetricTypeChoices.SPAN_RESPONSE_TIME,
+    MonitorMetricTypeChoices.LLM_RESPONSE_TIME,
 ]
 
 
@@ -99,7 +99,7 @@ def test_eval_value_query_windows_span_time() -> None:
     # after their spans); the eval table keeps only a loose created_at lower
     # bound (its sole partition prune).
     sql, _ = _builder(eval_output_type="SCORE").build_metric_value_query(
-        mm.EVALUATION_METRICS, START, END
+        MonitorMetricTypeChoices.EVALUATION_METRICS, START, END
     )
     subq = sql.split("INNER JOIN (", 1)[1]
     assert EXACT_HALF_OPEN in subq
@@ -113,7 +113,7 @@ def test_eval_time_series_buckets_span_start_time() -> None:
     # Eval graphs chart the user's application timeline: buckets come from
     # the joined span's start_time, never the eval row's created_at.
     sql, _ = _builder(eval_output_type="SCORE").build_time_series_query(
-        mm.EVALUATION_METRICS, START, END, 3600
+        MonitorMetricTypeChoices.EVALUATION_METRICS, START, END, 3600
     )
     assert "toUInt32(sp.start_time)" in sql
     assert "toUInt32(created_at)" not in sql

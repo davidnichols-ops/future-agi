@@ -40,19 +40,6 @@ from tracer.services.clickhouse.v2.id_remap_sql import (
 
 logger = structlog.get_logger(__name__)
 
-# Mirror of MonitorMetricTypeChoices values
-COUNT_OF_ERRORS = "count_of_errors"
-ERROR_RATES_FOR_FUNCTION_CALLING = "error_rates_for_function_calling"
-ERROR_FREE_SESSION_RATES = "error_free_session_rates"
-SERVICE_PROVIDER_ERROR_RATES = "service_provider_error_rates"
-LLM_API_FAILURE_RATES = "llm_api_failure_rates"
-SPAN_RESPONSE_TIME = "span_response_time"
-LLM_RESPONSE_TIME = "llm_response_time"
-TOKEN_USAGE = "token_usage"
-DAILY_TOKENS_SPENT = "daily_tokens_spent"
-MONTHLY_TOKENS_SPENT = "monthly_tokens_spent"
-EVALUATION_METRICS = "evaluation_metrics"
-
 SPANS_TABLE = "spans"
 SESSION_REMAP_TABLE = "trace_session_id_remap"
 
@@ -146,18 +133,16 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             self._filter_params = {}
             return
 
-        # Every build method binds ``%(start_date)s`` (= start_time), so opt in
-        # to the shared date-scoping seams. ``span_date_scope`` bounds the
-        # ``trace_id IN (SELECT … FROM spans)`` membership subqueries emitted
-        # for span-attribute filters — without it they scan the project's
-        # ENTIRE span history (24-47s at 241M spans, at/over the 30s monitor
-        # timeout; sub-second bounded). ``score_date_scope`` does the same for
-        # annotation/score subqueries. Both fragments are opt-in on the shared
-        # builder, so dashboard SQL is untouched.
+        # QUERY_MODE_SPAN: attr filters apply to the span row itself (PG
+        # parity; alerts count only matching spans) as inline predicates —
+        # unlike the dashboard's trace-scoped membership subquery. The
+        # date-scope seams stay on for the subqueries some filter types
+        # (end-user, score) still emit; %(start_date)s is bound per build.
         fb = ClickHouseFilterBuilder(
             table=SPANS_TABLE,
             score_date_scope=True,
             span_date_scope=True,
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_SPAN,
             project_id=self.project_id,
             project_ids=self.project_ids,
         )
@@ -180,9 +165,15 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 elif isinstance(value, str):
                     params[pname] = value
                     ch_conditions.append(f"observation_type = %({pname})s")
+                else:
+                    raise ValueError(
+                        f"Invalid value for observation_type filter: {value!r}"
+                    )
             elif key == "project_id":
                 # Already handled by project_where()
                 pass
+            else:
+                logger.info("monitor_filter_key_ignored", key=key)
 
         self._filter_clause = " AND ".join(ch_conditions) if ch_conditions else ""
         self._filter_params = params
@@ -220,7 +211,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         base_where = self._spans_base_where()
         time_win = f"AND {_pruned_window('start_time', 'end_time')}"
 
-        if metric_type == COUNT_OF_ERRORS:
+        if metric_type == MonitorMetricTypeChoices.COUNT_OF_ERRORS:
             query = f"""
                 SELECT count() AS value
                 FROM {SPANS_TABLE}
@@ -229,7 +220,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                   AND status = 'ERROR'
             """
 
-        elif metric_type == ERROR_RATES_FOR_FUNCTION_CALLING:
+        elif metric_type == MonitorMetricTypeChoices.ERROR_RATES_FOR_FUNCTION_CALLING:
             query = f"""
                 SELECT
                     CASE WHEN count() = 0 THEN NULL
@@ -241,7 +232,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                   AND observation_type = 'tool'
             """
 
-        elif metric_type == ERROR_FREE_SESSION_RATES:
+        elif metric_type == MonitorMetricTypeChoices.ERROR_FREE_SESSION_RATES:
             # Resolve session ids through the remap before grouping so old/new
             # aliases of one logical session count once (see session_analytics).
             remap_join = remap_left_join("rs.trace_session_id", SESSION_REMAP_TABLE)
@@ -267,7 +258,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 )
             """
 
-        elif metric_type == SERVICE_PROVIDER_ERROR_RATES:
+        elif metric_type == MonitorMetricTypeChoices.SERVICE_PROVIDER_ERROR_RATES:
             query = f"""
                 SELECT
                     CASE WHEN uniq(provider) = 0 THEN NULL
@@ -285,7 +276,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 )
             """
 
-        elif metric_type == LLM_API_FAILURE_RATES:
+        elif metric_type == MonitorMetricTypeChoices.LLM_API_FAILURE_RATES:
             query = f"""
                 SELECT
                     CASE WHEN count() = 0 THEN NULL
@@ -297,7 +288,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                   AND observation_type = 'llm'
             """
 
-        elif metric_type == SPAN_RESPONSE_TIME:
+        elif metric_type == MonitorMetricTypeChoices.SPAN_RESPONSE_TIME:
             query = f"""
                 SELECT ifNotFinite(avg(latency_ms), NULL) AS value
                 FROM {SPANS_TABLE}
@@ -305,7 +296,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                   {time_win}
             """
 
-        elif metric_type == LLM_RESPONSE_TIME:
+        elif metric_type == MonitorMetricTypeChoices.LLM_RESPONSE_TIME:
             query = f"""
                 SELECT ifNotFinite(avg(latency_ms), NULL) AS value
                 FROM {SPANS_TABLE}
@@ -314,7 +305,11 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                   AND observation_type = 'llm'
             """
 
-        elif metric_type in (TOKEN_USAGE, DAILY_TOKENS_SPENT, MONTHLY_TOKENS_SPENT):
+        elif metric_type in (
+            MonitorMetricTypeChoices.TOKEN_USAGE,
+            MonitorMetricTypeChoices.DAILY_TOKENS_SPENT,
+            MonitorMetricTypeChoices.MONTHLY_TOKENS_SPENT,
+        ):
             # No token data must yield NULL (PG Sum parity), not 0 — a 0 would
             # falsely fire LESS_THAN spend monitors. v2 total_tokens is
             # non-Nullable (PG NULL → 0), so "no data" = no nonzero rows.
@@ -421,7 +416,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         base_where = self._spans_base_where()
         time_win = f"AND {_pruned_window('start_time', 'end_time')}"
 
-        if metric_type == ERROR_RATES_FOR_FUNCTION_CALLING:
+        if metric_type == MonitorMetricTypeChoices.ERROR_RATES_FOR_FUNCTION_CALLING:
             query = f"""
                 SELECT
                     ifNotFinite(avg(is_error), NULL) AS mean,
@@ -436,7 +431,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 )
             """
 
-        elif metric_type == ERROR_FREE_SESSION_RATES:
+        elif metric_type == MonitorMetricTypeChoices.ERROR_FREE_SESSION_RATES:
             remap_join = remap_left_join("rs.trace_session_id", SESSION_REMAP_TABLE)
             resolved_ts = resolved_id_expr("rs.trace_session_id")
             query = f"""
@@ -458,7 +453,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 )
             """
 
-        elif metric_type == SERVICE_PROVIDER_ERROR_RATES:
+        elif metric_type == MonitorMetricTypeChoices.SERVICE_PROVIDER_ERROR_RATES:
             query = f"""
                 SELECT
                     ifNotFinite(avg(is_error_free), NULL) AS mean,
@@ -474,7 +469,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 )
             """
 
-        elif metric_type == LLM_API_FAILURE_RATES:
+        elif metric_type == MonitorMetricTypeChoices.LLM_API_FAILURE_RATES:
             query = f"""
                 SELECT
                     ifNotFinite(avg(is_error), NULL) AS mean,
@@ -489,7 +484,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 )
             """
 
-        elif metric_type == SPAN_RESPONSE_TIME:
+        elif metric_type == MonitorMetricTypeChoices.SPAN_RESPONSE_TIME:
             query = f"""
                 SELECT
                     ifNotFinite(avg(latency_ms), NULL) AS mean,
@@ -499,7 +494,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                   {time_win}
             """
 
-        elif metric_type == LLM_RESPONSE_TIME:
+        elif metric_type == MonitorMetricTypeChoices.LLM_RESPONSE_TIME:
             query = f"""
                 SELECT
                     ifNotFinite(avg(latency_ms), NULL) AS mean,
@@ -514,10 +509,10 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             query, params = self._build_eval_stats_query(params)
 
         elif metric_type in (
-            COUNT_OF_ERRORS,
-            TOKEN_USAGE,
-            DAILY_TOKENS_SPENT,
-            MONTHLY_TOKENS_SPENT,
+            MonitorMetricTypeChoices.COUNT_OF_ERRORS,
+            MonitorMetricTypeChoices.TOKEN_USAGE,
+            MonitorMetricTypeChoices.DAILY_TOKENS_SPENT,
+            MonitorMetricTypeChoices.MONTHLY_TOKENS_SPENT,
         ):
             # Stats over calendar-aligned buckets. Empty result collapses to
             # (0, 0), a single bucket to (value, 0), and no-token buckets are
@@ -527,7 +522,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             bucket_fn = self.time_bucket_expr(interval_kind or "hour")
             agg = (
                 "countIf(status = 'ERROR')"
-                if metric_type == COUNT_OF_ERRORS
+                if metric_type == MonitorMetricTypeChoices.COUNT_OF_ERRORS
                 else "nullIf(sum(total_tokens), 0)"
             )
             query = f"""
@@ -635,7 +630,11 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         base_where = self._spans_base_where()
         time_filter = f"AND {_pruned_window('start_time', 'end_time')}"
 
-        if metric_type in (TOKEN_USAGE, DAILY_TOKENS_SPENT, MONTHLY_TOKENS_SPENT):
+        if metric_type in (
+            MonitorMetricTypeChoices.TOKEN_USAGE,
+            MonitorMetricTypeChoices.DAILY_TOKENS_SPENT,
+            MonitorMetricTypeChoices.MONTHLY_TOKENS_SPENT,
+        ):
             query = f"""
                 SELECT
                     {bucket_expr} AS timestamp,
@@ -647,7 +646,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 ORDER BY timestamp
             """
 
-        elif metric_type == COUNT_OF_ERRORS:
+        elif metric_type == MonitorMetricTypeChoices.COUNT_OF_ERRORS:
             query = f"""
                 SELECT
                     {bucket_expr} AS timestamp,
@@ -659,7 +658,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 ORDER BY timestamp
             """
 
-        elif metric_type == SPAN_RESPONSE_TIME:
+        elif metric_type == MonitorMetricTypeChoices.SPAN_RESPONSE_TIME:
             query = f"""
                 SELECT
                     {bucket_expr} AS timestamp,
@@ -671,7 +670,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 ORDER BY timestamp
             """
 
-        elif metric_type == LLM_RESPONSE_TIME:
+        elif metric_type == MonitorMetricTypeChoices.LLM_RESPONSE_TIME:
             query = f"""
                 SELECT
                     {bucket_expr} AS timestamp,
@@ -684,9 +683,14 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 ORDER BY timestamp
             """
 
-        elif metric_type in (ERROR_RATES_FOR_FUNCTION_CALLING, LLM_API_FAILURE_RATES):
+        elif metric_type in (
+            MonitorMetricTypeChoices.ERROR_RATES_FOR_FUNCTION_CALLING,
+            MonitorMetricTypeChoices.LLM_API_FAILURE_RATES,
+        ):
             obs_type = (
-                "tool" if metric_type == ERROR_RATES_FOR_FUNCTION_CALLING else "llm"
+                "tool"
+                if metric_type == MonitorMetricTypeChoices.ERROR_RATES_FOR_FUNCTION_CALLING
+                else "llm"
             )
             params["obs_type_ts"] = obs_type
             query = f"""
@@ -703,7 +707,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 ORDER BY timestamp
             """
 
-        elif metric_type == ERROR_FREE_SESSION_RATES:
+        elif metric_type == MonitorMetricTypeChoices.ERROR_FREE_SESSION_RATES:
             remap_join = remap_left_join("rs.trace_session_id", SESSION_REMAP_TABLE)
             resolved_ts = resolved_id_expr("rs.trace_session_id")
             query = f"""
@@ -731,7 +735,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                 ORDER BY timestamp
             """
 
-        elif metric_type == SERVICE_PROVIDER_ERROR_RATES:
+        elif metric_type == MonitorMetricTypeChoices.SERVICE_PROVIDER_ERROR_RATES:
             query = f"""
                 SELECT
                     timestamp,

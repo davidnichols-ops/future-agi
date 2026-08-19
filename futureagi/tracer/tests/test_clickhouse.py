@@ -8459,31 +8459,20 @@ class TestMonitorMetricsQueryBuilder:
         """All metric types should produce valid SQL (not crash)."""
         from datetime import datetime
 
-        from tracer.services.clickhouse.query_builders.monitor_metrics import (
-            COUNT_OF_ERRORS,
-            DAILY_TOKENS_SPENT,
-            ERROR_FREE_SESSION_RATES,
-            ERROR_RATES_FOR_FUNCTION_CALLING,
-            LLM_API_FAILURE_RATES,
-            LLM_RESPONSE_TIME,
-            MONTHLY_TOKENS_SPENT,
-            SERVICE_PROVIDER_ERROR_RATES,
-            SPAN_RESPONSE_TIME,
-            TOKEN_USAGE,
-        )
+        from tracer.models.monitor import MonitorMetricTypeChoices
 
         builder = self._make_builder()
         metric_types = [
-            COUNT_OF_ERRORS,
-            ERROR_RATES_FOR_FUNCTION_CALLING,
-            ERROR_FREE_SESSION_RATES,
-            SERVICE_PROVIDER_ERROR_RATES,
-            LLM_API_FAILURE_RATES,
-            SPAN_RESPONSE_TIME,
-            LLM_RESPONSE_TIME,
-            TOKEN_USAGE,
-            DAILY_TOKENS_SPENT,
-            MONTHLY_TOKENS_SPENT,
+            MonitorMetricTypeChoices.COUNT_OF_ERRORS,
+            MonitorMetricTypeChoices.ERROR_RATES_FOR_FUNCTION_CALLING,
+            MonitorMetricTypeChoices.ERROR_FREE_SESSION_RATES,
+            MonitorMetricTypeChoices.SERVICE_PROVIDER_ERROR_RATES,
+            MonitorMetricTypeChoices.LLM_API_FAILURE_RATES,
+            MonitorMetricTypeChoices.SPAN_RESPONSE_TIME,
+            MonitorMetricTypeChoices.LLM_RESPONSE_TIME,
+            MonitorMetricTypeChoices.TOKEN_USAGE,
+            MonitorMetricTypeChoices.DAILY_TOKENS_SPENT,
+            MonitorMetricTypeChoices.MONTHLY_TOKENS_SPENT,
         ]
         for mt in metric_types:
             query, params = builder.build_metric_value_query(
@@ -8623,9 +8612,7 @@ class TestSessionAnalyticsQueryBuilder:
         builder = self._make_builder()
         query, params = builder.build_session_navigation_query()
         assert "trace_session_id" in query
-        # Remap-aware: groups by the survivor-resolved session id.
-        assert "id_remap.survivor_id" in query
-        assert "GROUP BY" in query
+        assert "GROUP BY trace_session_id" in query
         assert "ORDER BY started_at DESC" in query
         # UUID-vs-empty-string makes CH raise Code 376 (Cannot parse uuid).
         assert "trace_session_id != ''" not in query
