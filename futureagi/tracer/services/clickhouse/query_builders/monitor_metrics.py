@@ -48,9 +48,10 @@ EVALUATION_METRICS = "evaluation_metrics"
 SPANS_TABLE = "spans"
 EVAL_TABLE = "tracer_eval_logger"
 
-# Time-series bucket expressions: floor the time column to the frequency window.
-# Spans are partitioned/keyed on ``start_time``; the eval table has no
-# ``start_time`` column, so it must bucket on ``created_at``.
+# Time-series buckets: to epoch seconds, integer-divide by the frequency to
+# floor to the bucket boundary, back to DateTime (300s: 12:07:43 -> 12:05:00).
+# Works for any frequency, unlike toStartOfHour/-FiveMinutes. Spans bucket on
+# ``start_time`` (event time); the eval table has none, so ``created_at``.
 _SPANS_BUCKET_EXPR = (
     "toDateTime(intDiv(toUInt32(start_time), %(freq_seconds)s) * %(freq_seconds)s)"
 )
@@ -164,13 +165,15 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         self._filter_params = params
 
     def _spans_time_window(self) -> str:
-        """Spans time-window predicate.
+        """Spans time-window predicate — event-time semantics.
 
-        Filters on ``start_time`` (the partition + primary-key column) so CH
-        prunes partitions, plus a padded ``created_at`` companion lower bound.
-        A ``created_at``-only filter prunes nothing on the v2 spans table
-        (``PARTITION BY toDate(start_time)``, no ``created_at`` index). Mirrors
-        ``DashboardQueryBuilder._build_where_clauses``.
+        Deliberate change from pre-CH behavior: windows evaluate on
+        ``start_time`` (event time, the partition key, so CH prunes), not
+        ``created_at`` (ingest time, unindexed, full scan). Blind spot: spans
+        ingested after their window was evaluated are never counted.
+        TODO: offset evaluation windows by ingest lag. The padded
+        ``created_at`` companion only guards against clock-skewed future
+        ``start_time``. Mirrors ``DashboardQueryBuilder``.
         """
         return (
             "start_time BETWEEN %(start_time)s AND %(end_time)s "
