@@ -16,10 +16,11 @@ import axios, { endpoints } from "src/utils/axios";
 import { useDebounce } from "src/hooks/use-debounce";
 import { Events, PropertyName, trackEvent } from "src/utils/Mixpanel";
 import { useAlertStore } from "../../store/useAlertStore";
+import { useAlertFilterShallow } from "../../store/useAlertFilterStore";
 import {
-  buildAlertFilterParams,
-  useAlertFilterShallow,
-} from "../../store/useAlertFilterStore";
+  ALERT_LIST_MULTI_VALUE_FIELDS,
+  buildFilterParams,
+} from "../../store/alertFilterState";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { DataTable, DataTablePagination } from "src/components/data-table";
 import { formatNumberWithCommas } from "../../../UsersView/common";
@@ -79,7 +80,7 @@ export default function AlertsListView() {
   }, [storeColumns]);
 
   const extractedFilterObject = useMemo(
-    () => buildAlertFilterParams(activeFilters),
+    () => buildFilterParams(activeFilters, ALERT_LIST_MULTI_VALUE_FIELDS),
     [activeFilters],
   );
 

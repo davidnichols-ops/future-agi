@@ -13,13 +13,17 @@ vi.mock("src/utils/axios", () => ({
 
 const Harness = ({ filters }) => {
   const { control, setValue } = useForm({ defaultValues: { filters } });
-  return <AlertFilterBar control={control} setValue={setValue} projectId="p1" />;
+  return (
+    <AlertFilterBar control={control} setValue={setValue} projectId="p1" />
+  );
 };
 
 const renderBar = (filters) =>
   render(
     <QueryClientProvider
-      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
     >
       <Harness filters={filters} />
     </QueryClientProvider>,
@@ -33,12 +37,20 @@ describe("alert filter chips", () => {
       {
         property: "observationType",
         propertyId: "",
-        filterConfig: { filterType: "text", filterOp: "equals", filterValue: "llm" },
+        filterConfig: {
+          filterType: "text",
+          filterOp: "equals",
+          filterValue: "llm",
+        },
       },
       {
         property: "attributes",
         propertyId: "deployment_env",
-        filterConfig: { filterType: "text", filterOp: "equals", filterValue: "agent" },
+        filterConfig: {
+          filterType: "text",
+          filterOp: "equals",
+          filterValue: "agent",
+        },
       },
     ]);
 
