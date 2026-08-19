@@ -3,15 +3,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-from voice_cases import CASES, build_inputs, missing_env
-
 from fi.alk import simulate
 from fi.simulate.evaluation import evaluate_agent_report
 from fi.simulate.runtime import new_run_id
+from voice_cases import CASES, build_inputs, missing_env
 
 
 def main() -> int:
@@ -40,6 +40,10 @@ def main() -> int:
 
     run_id = new_run_id()
     inputs = build_inputs(case.case_id, run_id)
+    min_turn_messages = int(os.environ.get("VOICE_MIN_TURN_MESSAGES", "6"))
+    agent_first_silence = float(
+        os.environ.get("VOICE_AGENT_FIRST_SILENCE_SECONDS", "30")
+    )
     output_dir = Path(args.output_root).expanduser().resolve() / run_id / case.case_id
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = simulate.build_voice_run_manifest(
@@ -53,13 +57,13 @@ def main() -> int:
         record_audio=True,
         recording_root=output_dir / "recordings",
         recording_case_directory=output_dir / "recordings",
-        min_turn_messages=6,
+        min_turn_messages=min_turn_messages,
         max_seconds=inputs.max_seconds,
         connect_timeout=60,
         readiness_timeout=120,
         cleanup_timeout=30,
         conversation_direction=inputs.conversation_direction,
-        agent_first_silence_timeout_seconds=30,
+        agent_first_silence_timeout_seconds=agent_first_silence,
     )
     manifest_path = simulate.write_manifest_file(
         manifest,
@@ -93,13 +97,13 @@ def main() -> int:
                 record_audio=True,
                 recording_root=output_dir / "recordings",
                 recording_case_directory=output_dir / "recordings",
-                min_turn_messages=6,
+                min_turn_messages=min_turn_messages,
                 max_seconds=inputs.max_seconds,
                 connect_timeout=60,
                 readiness_timeout=120,
                 cleanup_timeout=30,
                 conversation_direction=inputs.conversation_direction,
-                agent_first_silence_timeout_seconds=30,
+                agent_first_silence_timeout_seconds=agent_first_silence,
             )
         )
         evaluation = evaluate_agent_report(report, attach=True)

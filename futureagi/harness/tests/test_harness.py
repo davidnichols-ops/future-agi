@@ -2524,6 +2524,44 @@ def test_two_goes_at_the_same_agent_are_two_sessions(tmp_path):
     assert {one.id for one in sessions.every(tmp_path)} == {first.id, second.id}
 
 
+def test_a_native_webrtc_campaign_is_visible_as_session_runs(tmp_path):
+    from harness import sessions
+
+    one = sessions.create(agent="voice", base=tmp_path)
+    campaign = one.path / "webrtc-runs" / "run_20260819_121907"
+    campaign.mkdir(parents=True)
+    (campaign / "results.json").write_text(
+        json.dumps(
+            [
+                {
+                    "scenario": "book-a-ride",
+                    "passed": True,
+                    "voice_status": "completed",
+                    "deterministic_met": 2,
+                    "deterministic_of": 2,
+                    "tool_calls": [
+                        {
+                            "name": "book_ride",
+                            "arguments": {"confirmed": True},
+                            "ok": True,
+                        }
+                    ],
+                    "transcript": "customer: book it\nagent: your ride is booked",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert one.has()["runs"] == 1
+    assert one.has()["runs_passed"] == 1
+    run = sessions._runs(one.path)[0]
+    assert run["scenario"] == "book-a-ride"
+    assert run["met"] == run["of"] == 2
+    assert run["calls"] == ['book_ride({"confirmed": true}) -> ok']
+    assert "your ride is booked" in run["transcript"]
+
+
 def test_the_conversation_is_kept_in_the_session_folder(tmp_path):
     """A refresh must not lose what was said."""
     from harness import sessions
@@ -2831,6 +2869,21 @@ def test_emptying_a_store_is_something_restore_can_reproduce():
     assert store.state() == {"orders": []}
     # The group itself survives, because the agent's own code indexes into it.
     assert store.data == {"orders": {}}
+
+
+def test_postgres_can_bind_to_an_external_scenario_database(monkeypatch):
+    from harness.world.stores.postgres import PostgresStore
+
+    external = "postgresql://alk@127.0.0.1:55432/alk"
+    monkeypatch.setenv("ALK_POSTGRES_DSN", external)
+    assert PostgresStore().dsn() == external
+
+
+def test_postgres_preserves_native_arrays_when_writing_rows():
+    from harness.world.stores.postgres import _adapt
+
+    values = ["uberx", "comfort", "uberxl"]
+    assert _adapt(values, "ARRAY") is values
 
 
 def test_saving_a_world_that_already_lives_in_the_saved_file_does_not_hang(tmp_path):

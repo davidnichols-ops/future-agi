@@ -99,7 +99,9 @@ class Session:
             "contract": (self.path / "contract.json").exists(),
             "world": world_saved(self.path),
             "simulator_prompt": (self.path / "simulator_prompt.md").exists(),
-            "sub_goals": len(load_catalogue(self.path).sub_goals) if self.path.exists() else 0,
+            "sub_goals": len(load_catalogue(self.path).sub_goals)
+            if self.path.exists()
+            else 0,
             "scenarios": len(scenarios),
             "validated": None,  # filled in by whoever wants to pay for proving them
             "runs": len(runs),
@@ -111,15 +113,58 @@ class Session:
 def _runs(path: Path) -> list[dict[str, Any]]:
     found = path / "runs.json"
     if not found.exists():
-        return []
+        # Native WebRTC campaigns preserve richer per-case artifacts in timestamped folders.
+        # Show the newest completed campaign in the same Runs tab instead of making a
+        # successful external call campaign look as though nothing has ever run.
+        batches = sorted((path / "webrtc-runs").glob("run_*/results.json"))
+        if not batches:
+            return []
+        found = batches[-1]
     try:
         loaded = json.loads(found.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, list) else []
+        if not isinstance(loaded, list):
+            return []
+        if found.name == "runs.json":
+            return loaded
+        return [_webrtc_run(one) for one in loaded if isinstance(one, dict)]
     except json.JSONDecodeError:
         return []
 
 
-def create(agent: str = "", source: str = "", kind: str = "repo", base: Path | None = None) -> Session:
+def _webrtc_run(record: dict[str, Any]) -> dict[str, Any]:
+    """Present a native WebRTC result in the live-run shape the UI already renders."""
+    calls = []
+    for call in record.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        arguments = json.dumps(
+            call.get("arguments") or {}, ensure_ascii=False, sort_keys=True
+        )
+        outcome = "ok" if call.get("ok") else "crashed"
+        calls.append(f"{call.get('name', 'unknown')}({arguments}) -> {outcome}")
+    problems = []
+    status = str(record.get("voice_status") or "")
+    if status and status != "completed":
+        problems.append(f"WebRTC call ended with voice status: {status}")
+    if record.get("error"):
+        problems.append(str(record["error"]))
+    return {
+        "scenario": record.get("scenario") or "unknown",
+        "passed": bool(record.get("passed")),
+        "met": int(record.get("deterministic_met") or 0),
+        "of": int(record.get("deterministic_of") or 0),
+        "settled": record.get("settled") or [],
+        "judged": record.get("judged") or [],
+        "calls": calls,
+        "problems": problems,
+        "transcript": record.get("transcript") or "",
+        "ended": status,
+    }
+
+
+def create(
+    agent: str = "", source: str = "", kind: str = "repo", base: Path | None = None
+) -> Session:
     """Start a new conversation, with its own folder."""
     identifier = new_id(agent, base)
     path = root(base) / identifier
@@ -287,7 +332,8 @@ def environments(base: Path | None = None) -> list[dict[str, Any]]:
                 "runs_passed": sum(
                     1
                     for run in runs
-                    if run.get("scenarios") and run.get("passed") == run.get("scenarios")
+                    if run.get("scenarios")
+                    and run.get("passed") == run.get("scenarios")
                 ),
             }
         )
