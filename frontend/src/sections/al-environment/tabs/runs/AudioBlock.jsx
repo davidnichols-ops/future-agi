@@ -1,21 +1,15 @@
-import { useState } from "react";
+import React, { useEffect, useState } from "react";
 import PropTypes from "prop-types";
 import { useParams } from "react-router-dom";
 import { Box, Stack, Typography } from "@mui/material";
-import { alkBaseUrl, isDirectToHarness } from "src/api/al-environment/client";
+import alkAxios from "src/api/al-environment/client";
 import { ALK_MONO } from "../../alkTokens";
 import Tag from "../../parts/Tag";
 
-const ALK_BASE = alkBaseUrl(import.meta.env);
-// The harness serves this under /api; the proxy adds that prefix itself. Every other call goes
-// through the axios instance, which already carries the distinction, so this is the one URL
-// built by hand and the one place the two bases have to be told apart.
-const ALK_PREFIX = isDirectToHarness(ALK_BASE) ? "/api" : "";
-
 // The session rides along because the harness serves recordings out of the session the URL
 // names, not only the one it happens to have open — a run outlives its session being open.
-const trackUrl = (runId, scenario, label, session) =>
-  `${ALK_BASE}${ALK_PREFIX}/recording/${encodeURIComponent(runId)}/${encodeURIComponent(scenario)}` +
+export const trackPath = (runId, scenario, label, session) =>
+  `/recording/${encodeURIComponent(runId)}/${encodeURIComponent(scenario)}` +
   `?track=${encodeURIComponent(label)}` +
   (session ? `&session=${encodeURIComponent(session)}` : "");
 
@@ -31,6 +25,37 @@ const AudioBlock = ({ runId, scenario, tracks }) => {
   const { sessionId } = useParams();
   const list = tracks || [];
   const [chosen, setChosen] = useState(list[0]?.label || "");
+  // Fetched through the axios instance rather than pointed at by src: the platform proxy is
+  // authenticated, and the audio element's own request carries no Authorization header — every
+  // recording 401ed while the same URL answered a curl with a token. The blob rides in with
+  // auth and the player gets an object URL instead.
+  const [src, setSrc] = useState(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (!chosen) return undefined;
+    let dead = false;
+    let held = null;
+    setFailed(false);
+    setSrc(null);
+    alkAxios
+      .get(trackPath(runId, scenario, chosen, sessionId), { responseType: "blob" })
+      .then((got) => {
+        held = URL.createObjectURL(got.data);
+        if (dead) {
+          URL.revokeObjectURL(held);
+        } else {
+          setSrc(held);
+        }
+      })
+      .catch(() => {
+        if (!dead) setFailed(true);
+      });
+    return () => {
+      dead = true;
+      if (held) URL.revokeObjectURL(held);
+    };
+  }, [runId, scenario, chosen, sessionId]);
 
   return (
     <Box
@@ -62,14 +87,20 @@ const AudioBlock = ({ runId, scenario, tracks }) => {
           >
             {`recording · ${list.length} tracks`}
           </Typography>
-          <Box
-            component="audio"
-            controls
-            preload="none"
-            data-testid="alk-audio"
-            src={chosen ? trackUrl(runId, scenario, chosen, sessionId) : undefined}
-            sx={{ width: "100%", height: 34, display: "block" }}
-          />
+          {failed ? (
+            <Typography variant="body2" color="text.secondary">
+              this track could not be fetched
+            </Typography>
+          ) : (
+            <Box
+              component="audio"
+              controls
+              data-testid="alk-audio"
+              data-track={chosen || undefined}
+              src={src || undefined}
+              sx={{ width: "100%", height: 34, display: "block" }}
+            />
+          )}
           <Stack direction="row" spacing={1.4} flexWrap="wrap" useFlexGap sx={{ mt: 1.6 }}>
             {list.map((track) => (
               <Box

@@ -1,6 +1,21 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeAll } from "vitest";
+import { waitFor } from "@testing-library/react";
 import { render, screen, userEvent } from "src/utils/test-utils";
 import RunsTab from "../tabs/RunsTab";
+
+// The player fetches its track through the axios instance so the request carries auth —
+// the audio element's own request never does, which 401ed on the platform proxy.
+const fetchedTrack = vi.hoisted(() => vi.fn(() => Promise.resolve({ data: "wav-bytes" })));
+vi.mock("src/api/al-environment/client", async (importOriginal) => {
+  const real = await importOriginal();
+  return { ...real, default: { ...real.default, get: fetchedTrack } };
+});
+
+beforeAll(() => {
+  // jsdom has no object URLs; the component only needs them to exist.
+  global.URL.createObjectURL = vi.fn(() => "blob:mock");
+  global.URL.revokeObjectURL = vi.fn();
+});
 
 /**
  * Shapes taken from the harness itself (run/simulation.py): `every_run` writes a summary whose
@@ -199,20 +214,25 @@ describe("RunsTab — one run", () => {
     expect(screen.getByText("what the run measured (1 scored, 0 clean, 0 n/a)")).toBeInTheDocument();
   });
 
-  it("plays a chosen recording track without folding the player away", async () => {
+  it("fetches the chosen track with auth and hands the player a blob", async () => {
+    fetchedTrack.mockClear();
     const { container } = open();
     expect(screen.getByText("recording · 2 tracks")).toBeInTheDocument();
-    const player = container.querySelector("audio");
-    expect(player.getAttribute("src")).toContain("track=mixed");
-    // The proxied base ends where the backend adds /api itself; a doubled
-    // /api/api/ 404s on the platform while passing against a direct harness.
-    expect(player.getAttribute("src")).toContain(
-      "/recording/run-20260818-101500/unknown_item"
+    await waitFor(() => expect(fetchedTrack).toHaveBeenCalled());
+    // Relative to the axios base, which already ends where /api begins — a hand-built
+    // absolute URL is how the platform got /api/api/ and 404s.
+    const asked = fetchedTrack.mock.calls[0][0];
+    expect(asked).toContain("/recording/run-20260818-101500/unknown_item");
+    expect(asked).toContain("track=mixed");
+    expect(asked).not.toContain("/api/");
+    await waitFor(() =>
+      expect(container.querySelector("audio").getAttribute("src")).toBe("blob:mock")
     );
-    expect(player.getAttribute("src")).not.toContain("/api/api/");
 
     await userEvent.click(screen.getByRole("button", { name: "caller" }));
-    expect(container.querySelector("audio").getAttribute("src")).toContain("track=caller");
+    await waitFor(() =>
+      expect(fetchedTrack.mock.calls.at(-1)[0]).toContain("track=caller")
+    );
     expect(screen.getByRole("button", { name: "caller" })).toHaveAttribute("aria-pressed", "true");
   });
 
