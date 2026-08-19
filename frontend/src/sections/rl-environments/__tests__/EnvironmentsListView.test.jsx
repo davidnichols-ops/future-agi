@@ -55,8 +55,12 @@ const rows = [
   },
 ];
 
+// Scoped to the chip: the count it shows can legitimately equal another column's number,
+// so a document-wide text lookup would match the wrong cell.
 const chipTone = (label) =>
-  screen.getByText(label).closest("[data-testid='runs-chip']")?.dataset.tone;
+  screen
+    .getAllByTestId("runs-chip")
+    .find((chip) => chip.textContent.trim() === String(label))?.dataset.tone;
 
 describe("EnvironmentsListView", () => {
   it("offers only one way to create when there is nothing yet", () => {
@@ -93,7 +97,12 @@ describe("EnvironmentsListView", () => {
       .closest("[role='row']");
     expect(within(row).getByText("7")).toBeInTheDocument(); // tools
     expect(within(row).getByText("5")).toBeInTheDocument(); // sub-goals
-    expect(within(row).getByText("14")).toBeInTheDocument(); // scenarios
+    // Scoped away from the runs chip, which can carry the same number.
+    expect(
+      within(row)
+        .getAllByText("14")
+        .some((el) => !el.closest("[data-testid='runs-chip']")),
+    ).toBe(true); // scenarios
   });
 
   it("keeps the full description available as a tooltip", () => {
@@ -104,14 +113,17 @@ describe("EnvironmentsListView", () => {
     ).toHaveAttribute("title", "Takes burger orders at the window.");
   });
 
-  it("colours the runs chip by outcome", () => {
+  it("shows how many runs there are, coloured by outcome", () => {
     render(<EnvironmentsListView environments={rows} />);
 
-    expect(chipTone("14/14")).toBe("pass");
+    // The chip counts runs; a fraction here could only ever describe one of them.
+    expect(chipTone("14")).toBe("pass");
     // Some passed, some did not — progress, not failure, so it must not wear the failure
     // colour. Only an environment where nothing passed has actually failed.
-    expect(chipTone("21/26")).toBe("partial");
+    expect(chipTone("26")).toBe("partial");
     expect(chipTone("No runs")).toBe("neutral");
+    expect(screen.queryByText("14/14")).not.toBeInTheDocument();
+    expect(screen.queryByText("21/26")).not.toBeInTheDocument();
   });
 
   it("renders the updated time as a relative distance", () => {

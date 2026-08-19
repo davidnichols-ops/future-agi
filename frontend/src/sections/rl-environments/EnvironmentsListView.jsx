@@ -111,7 +111,10 @@ function RunsCell({ row }) {
       }}
     >
       <Typography variant="caption" sx={{ fontWeight: 500, color }}>
-        {runs === 0 ? "No runs" : `${runsPassed}/${runs}`}
+        {/* How many runs there are. A pass fraction here can only describe one of them, and an
+            environment with several runs that went differently has no single honest fraction.
+            The colour still carries the outcome; the per-run results are a click away. */}
+        {runs === 0 ? "No runs" : runs}
       </Typography>
     </Box>
   );
