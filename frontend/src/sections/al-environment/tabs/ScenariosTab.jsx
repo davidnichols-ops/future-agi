@@ -10,7 +10,6 @@ import XCard from "../parts/XCard";
 import CodeBlock, { languageOf } from "../parts/CodeBlock";
 import DataTable from "../parts/DataTable";
 import { ALK_MONO } from "../alkTokens";
-import { shortPath } from "../parts/shortPath";
 
 /**
  * Three states, not two. `null` means the gates could not be run at all because no world
@@ -191,6 +190,10 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
             fontSize: 11.7,
             color: "accent.fail",
             bgcolor: (theme) => alpha(theme.palette.error.main, 0.1),
+            // A gate's explanation arrives with its own line breaks and can quote a
+            // long unbroken token; both have to wrap rather than push the card wide.
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
           }}
         >
           {scenario.why}

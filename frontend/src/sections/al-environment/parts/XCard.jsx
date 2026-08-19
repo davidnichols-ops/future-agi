@@ -33,7 +33,11 @@ const XCard = ({ title, tags, meta, open, children }) => (
         py: 0.9,
         display: "flex",
         alignItems: "center",
+        // A generated use-case can be a sentence; clipping it hides the one line
+        // that says what the scenario is about, so the row wraps instead.
+        flexWrap: "wrap",
         gap: 1,
+        rowGap: 0.5,
         "&:hover": { bgcolor: "action.hover" },
       }}
     >

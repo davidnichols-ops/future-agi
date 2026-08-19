@@ -32,7 +32,9 @@ const Tag = ({ kind = "soft", children, title, dim, keepCase }) => {
   return (
     <Box
       component="span"
-      title={title}
+      // A chip that gets ellipsized still has to be readable somewhere, and the
+      // full text on hover costs nothing when it already fits.
+      title={title ?? (typeof children === "string" ? children : undefined)}
       sx={{
         display: "inline-block",
         px: 0.55,
@@ -45,6 +47,10 @@ const Tag = ({ kind = "soft", children, title, dim, keepCase }) => {
         // look like two different things in two places.
         textTransform: keepCase ? "none" : "uppercase",
         whiteSpace: "nowrap",
+        maxWidth: "100%",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        verticalAlign: "bottom",
         color: (theme) => tone(theme.palette),
         bgcolor: (theme) => theme.palette.action.hover,
         opacity: dim ? 0.45 : 1,
