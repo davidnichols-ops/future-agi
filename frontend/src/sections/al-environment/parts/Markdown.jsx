@@ -131,7 +131,13 @@ const Markdown = ({ text }) => {
         index += 1;
       }
       blocks.push(
-        <Box key={blocks.length} component={ordered ? "ol" : "ul"} sx={{ m: 0, pl: 2.5 }}>
+        <Box
+          key={blocks.length}
+          component={ordered ? "ol" : "ul"}
+          // Same size as the paragraphs around it — a bare li inherits the root 16px
+          // and reads as a different document.
+          sx={{ m: 0, pl: 2.5, typography: "body2" }}
+        >
           {items.map((item) => (
             <li key={item}>{inline(item)}</li>
           ))}

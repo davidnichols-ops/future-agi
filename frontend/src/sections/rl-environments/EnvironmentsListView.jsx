@@ -12,14 +12,33 @@ const environmentName = (env) =>
   env?.agent || env?.title || env?.session_id || "-";
 
 function NameCell({ row }) {
+  const building = row.original?.state === "building";
   return (
-    <Typography
-      variant="body2"
-      noWrap
-      sx={{ fontWeight: 500, color: "text.primary" }}
-    >
-      {environmentName(row.original)}
-    </Typography>
+    <Stack direction="row" alignItems="center" spacing={1} sx={{ minWidth: 0 }}>
+      <Typography
+        variant="body2"
+        noWrap
+        sx={{ fontWeight: 500, color: "text.primary" }}
+      >
+        {environmentName(row.original)}
+      </Typography>
+      {building && (
+        <Box
+          sx={{
+            px: 0.75,
+            borderRadius: "6px",
+            border: "1px solid",
+            borderColor: "warning.main",
+            color: "warning.main",
+            fontSize: 11,
+            lineHeight: "18px",
+            whiteSpace: "nowrap",
+          }}
+        >
+          building…
+        </Box>
+      )}
+    </Stack>
   );
 }
 

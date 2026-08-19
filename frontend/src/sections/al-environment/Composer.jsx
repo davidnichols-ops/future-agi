@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import PropTypes from "prop-types";
-import { Box, Button, Stack, Typography } from "@mui/material";
+import { Box, Button, IconButton, Stack, Typography } from "@mui/material";
+import Iconify from "src/components/iconify";
 import { ALK_MONO } from "./alkTokens";
 import { quickChips } from "./quickChips";
 
@@ -9,7 +10,7 @@ import { quickChips } from "./quickChips";
  * it, so the whole thing reads as one field; the chips above are the shortcuts for the
  * things you would otherwise type out every session.
  */
-const Composer = ({ onSay, onRun, onStop, streaming, status, sessionId, artifactsPath }) => {
+const Composer = ({ onSay, onRun, onStop, streaming, status, sessionId }) => {
   const [text, setText] = useState("");
   const boxRef = useRef(null);
   const hasSession = Boolean(status?.session);
@@ -34,6 +35,14 @@ const Composer = ({ onSay, onRun, onStop, streaming, status, sessionId, artifact
     if (!ready) return;
     onSay(text.trim());
     setText("");
+    if (boxRef.current) boxRef.current.style.height = "auto";
+  };
+
+  // One line at rest, growing with the text until the cap; past it the field scrolls.
+  // Empty keeps the browser's own single-line height — scrollHeight overshoots it.
+  const grow = (element) => {
+    element.style.height = "auto";
+    if (element.value) element.style.height = `${element.scrollHeight}px`;
   };
 
   const chips = hasSession ? quickChips(status) : [];
@@ -102,10 +111,13 @@ const Composer = ({ onSay, onRun, onStop, streaming, status, sessionId, artifact
         <Box
           component="textarea"
           ref={boxRef}
-          rows={2}
+          rows={1}
           value={text}
-          placeholder="Tell it what you want…  ( / to focus )"
-          onChange={(event) => setText(event.target.value)}
+          placeholder="Describe your agent, or ask for the next step…  ( / to focus )"
+          onChange={(event) => {
+            setText(event.target.value);
+            grow(event.target);
+          }}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
@@ -123,30 +135,26 @@ const Composer = ({ onSay, onRun, onStop, streaming, status, sessionId, artifact
             fontFamily: (theme) => theme.typography.fontFamily,
             fontSize: 14.5,
             lineHeight: 1.45,
-            maxHeight: "9em",
+            // Seven lines, the agreed ceiling; the field scrolls past it.
+            maxHeight: "10.2em",
+            overflowY: "auto",
           }}
         />
-        {streaming && (
+        {(streaming || busy) && !text.trim() ? (
           <Button size="small" variant="outlined" color="error" onClick={onStop}>
             Stop
           </Button>
+        ) : (
+          <IconButton
+            aria-label="send"
+            disabled={!ready}
+            onClick={send}
+            sx={{ p: 0.5, color: "text.primary", "&:disabled": { color: "text.disabled" } }}
+          >
+            <Iconify icon="mdi:keyboard-return" width={20} />
+          </IconButton>
         )}
-        <Button size="small" variant="contained" disabled={!ready} onClick={send}>
-          {streaming ? "…" : "Send"}
-        </Button>
       </Box>
-
-      <Typography
-        sx={{
-          mt: 0.6,
-          fontFamily: ALK_MONO,
-          fontSize: 11,
-          color: "text.secondary",
-          overflowWrap: "anywhere",
-        }}
-      >
-        {hasSession && sessionId ? `${sessionId}  ·  ${artifactsPath || ""}` : "no session"}
-      </Typography>
     </Box>
   );
 };
@@ -158,7 +166,6 @@ Composer.propTypes = {
   streaming: PropTypes.bool,
   status: PropTypes.object,
   sessionId: PropTypes.string,
-  artifactsPath: PropTypes.string,
 };
 
 export default Composer;

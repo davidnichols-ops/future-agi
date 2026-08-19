@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Box, Button, Stack, Tab, Tabs, Typography } from "@mui/material";
+import { Box, Button, IconButton, Stack, Tab, Tabs, Typography } from "@mui/material";
 import {
   useAlkContract,
   useAlkHistory,
@@ -207,9 +207,10 @@ const AlEnvironmentView = () => {
    * body carries the reason. Show that sentence rather than a generic failure — it is the only
    * thing that tells the operator to simply wait.
    */
-  const refusal = [setStage, createSession, openSession, deleteSession].find(
+  const refusalSource = [setStage, createSession, openSession, deleteSession].find(
     (one) => one.error,
-  )?.error;
+  );
+  const refusal = refusalSource?.error;
   // Conversation errors are rendered in the thread by TranscriptPane; only refusals from the
   // session and stage controls need saying up here, next to the controls that caused them.
   const refusalMessage =
@@ -244,88 +245,76 @@ const AlEnvironmentView = () => {
           flexWrap: "wrap",
           gap: 1,
           bgcolor: "background.paper",
-          // The rule is inset to the same 24px as the content it separates; run edge to edge
-          // it sticks out past everything and reads as belonging to the sidebar.
-          "&::after": {
-            content: '""',
-            position: "absolute",
-            left: 24,
-            right: 24,
-            bottom: 0,
-            borderBottom: "1px solid",
-            borderColor: "divider",
-          },
-          position: "relative",
+          // Edge to edge like every other rule on the page, so the header and the
+          // tabs row read as one system instead of two.
+          borderBottom: "1px solid",
+          borderColor: "divider",
         }}
       >
-        {/* The way back sits above the session it belongs to, rather than competing with it
-            for the same row. */}
-        <Stack spacing={0.75} alignItems="flex-start">
+        <Stack direction="row" spacing={1.5} alignItems="center">
           <Box
             component={RouterLink}
             href={paths.dashboard.simulate.alEnvironment}
+            aria-label="all environments"
             sx={{
               fontFamily: ALK_MONO,
-              fontSize: 12,
+              fontSize: 26,
+              lineHeight: 1,
               color: "text.secondary",
               textDecoration: "none",
-              whiteSpace: "nowrap",
+              display: "flex",
+              alignItems: "center",
               "&:hover": { color: "text.primary" },
             }}
           >
-            ‹ all environments
+            ‹
           </Box>
 
           <SessionPicker
             sessions={sessions}
             openSessionId={openSessionId}
             busy={Boolean(status?.busy)}
-            // Each of these changes which conversation is open, so the turn still on screen
+            // Opening changes which conversation is open, so the turn still on screen
             // belongs to the old one. Stored history refetches itself; the live half has to be
             // dropped explicitly or the previous session's messages hang around under the new one.
             onOpen={goToSession}
-            onCreate={() =>
-              createSession.mutate("", {
-                onSuccess: (fresh) => {
-                  conversation.clearLive();
-                  if (fresh?.session?.id) goToSession(fresh.session.id);
-                },
-              })
-            }
-            onDelete={(id) =>
-              deleteSession.mutate(id, {
-                onSuccess: () => {
-                  conversation.clearLive();
-                  // The environment this URL named is gone, so there is nothing to come back to.
-                  navigate(paths.dashboard.simulate.alEnvironment);
-                },
-              })
-            }
           />
         </Stack>
         <StageRoadmap status={status} onSelectStage={selectStage} />
         <StatusReadout
-          model={status?.model}
           spentUsd={status?.spent_usd}
           busy={Boolean(status?.busy)}
         />
       </Stack>
 
       {refusalMessage && (
-        <Typography
+        <Stack
+          direction="row"
+          alignItems="center"
+          spacing={1}
           sx={{
             mx: 2,
             my: 1,
             pl: 1.25,
-            fontFamily: ALK_MONO,
-            fontSize: 12.5,
-            color: "error.main",
             borderLeft: "2px solid",
             borderColor: "error.main",
           }}
         >
-          {refusalMessage}
-        </Typography>
+          <Typography
+            sx={{ fontFamily: ALK_MONO, fontSize: 12.5, color: "error.main", flexGrow: 1 }}
+          >
+            {refusalMessage}
+          </Typography>
+          <IconButton
+            size="small"
+            aria-label="dismiss"
+            // Resetting the mutation clears its stored error, which is all the banner reads.
+            onClick={() => refusalSource?.reset()}
+            sx={{ color: "error.main", p: 0.25 }}
+          >
+            <Box component="span" sx={{ fontSize: 14, lineHeight: 1 }}>✕</Box>
+          </IconButton>
+        </Stack>
       )}
 
       <Stack direction="row" sx={{ flexGrow: 1, minHeight: 0 }}>
@@ -351,6 +340,7 @@ const AlEnvironmentView = () => {
                 hasSession={hasSession}
                 thinking={conversation.thinking}
                 spentUsd={status?.spent_usd}
+                onDismissError={conversation.dismissLive}
               />
             </Box>
             <Composer
@@ -360,7 +350,6 @@ const AlEnvironmentView = () => {
               streaming={conversation.streaming}
               status={status}
               sessionId={status?.session?.id}
-              artifactsPath={status?.out}
             />
           </Stack>
         </Box>

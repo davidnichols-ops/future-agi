@@ -61,7 +61,7 @@ const XCard = ({ title, tags, meta, open, children }) => (
     </Box>
     {/* Explicit px, matching the reference's .body padding. Without a top gap the summary's
         hover wash butts straight against the content and the card reads as one block. */}
-    <Stack spacing={1.25} sx={{ pt: "13px", pr: "16px", pb: "15px", pl: "30px" }}>
+    <Stack spacing={2.25} sx={{ pt: "13px", pr: "16px", pb: "15px", pl: "30px" }}>
       {children}
     </Stack>
   </Box>
