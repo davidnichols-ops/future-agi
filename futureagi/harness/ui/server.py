@@ -767,7 +767,7 @@ async def simulation(run_id: str):
 
 
 @app.get("/api/recording/{run_id}/{scenario}")
-async def recording(run_id: str, scenario: str, track: str = ""):
+async def recording(run_id: str, scenario: str, track: str = "", session: str = ""):
     """The audio for one scenario in one run, when there is any.
 
     Served from the run folder rather than by absolute path, so a recording can only ever be
@@ -775,9 +775,10 @@ async def recording(run_id: str, scenario: str, track: str = ""):
     """
     from harness.run.simulation import run_root
 
-    if current is None:
+    out = _folder(session)
+    if out is None:
         return JSONResponse({"error": "no session open"}, status_code=404)
-    folder = run_root(current.path, run_id) / scenario
+    folder = run_root(out, run_id) / scenario
     if not folder.exists():
         return JSONResponse({"error": "no recording for this run"}, status_code=404)
     # A named track when one is asked for, and otherwise whichever is best of those that exist.
