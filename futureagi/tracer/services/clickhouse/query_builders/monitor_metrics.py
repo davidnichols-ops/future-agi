@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
+from tracer.models.observation_span import EvalEntryStatus
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder, _parse_dt
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
@@ -56,6 +57,12 @@ _SPANS_BUCKET_EXPR = (
 )
 _EVAL_BUCKET_EXPR = (
     "toDateTime(intDiv(toUInt32(created_at), %(freq_seconds)s) * %(freq_seconds)s)"
+)
+
+# Statuses whose rows carry no real value (NULL outputs). NOT IN keeps legacy
+# empty/NULL-status rows counted as completed (mirrors span_list.py).
+_EVAL_NON_VALUE_STATUSES = ", ".join(
+    f"'{s.value}'" for s in EvalEntryStatus if s is not EvalEntryStatus.COMPLETED
 )
 
 
@@ -706,8 +713,8 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         column). Window membership comes from the span subquery, so a
         late-computed eval for an in-window span lands in the bucket of its
         computation time.
-        # TODO: bucket by span time (needs a spans join) for graph fidelity.
         """
+        # TODO: bucket by span time (needs a spans join) for graph fidelity.
         if not self.eval_config_id:
             return "SELECT NULL AS timestamp, NULL AS value WHERE 1 = 0", params
 
@@ -762,21 +769,14 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         ``not_deleted`` comes from the same ``eval_logger_source()`` call that
         resolved the table, so the pair stays consistent.
 
-        The metric window is applied to the SPAN's ``created_at`` (when the
-        activity happened), NOT the eval row's ``created_at`` (when the score
-        was computed) — evals run asynchronously after their spans, so a
-        window on eval time measures the wrong thing. Windowing the span
-        subquery also keeps the IN-set a window's worth of ids instead of the
-        whole project (an unbounded set explodes on busy projects).
-
-        The eval-side ``created_at`` keeps only a loose lower bound: an eval
-        row is written after its span, so eval time >= span time >= window
-        start (1-day pad for skew). It is correctness-neutral (the span
-        subquery alone determines the result) but it is the eval table's ONLY
-        prune — the table is PARTITION BY toYYYYMM(created_at) with sort key
-        (trace_id, config_id, id), so without it every tick full-scans all
-        partitions + FINAL-merges them. Drop it only if evals are ever
-        backfilled with created_at stamps predating their spans by >1 day.
+        The window lives on the SPAN's ``created_at`` (ingest time — late
+        spans land in the current tick), not the eval row's — evals run async
+        after their spans, and the bounded subquery keeps the IN-set small.
+        The eval-side ``created_at`` lower bound (1-day skew pad) is
+        correctness-neutral but is the eval table's only partition prune
+        (toYYYYMM(created_at)); the v2 sort key also prunes granules with it.
+        Only completed, non-errored rows count — pending/errored rows carry
+        NULL outputs that would read as failures.
         """
         filter_extra = ""
         if self._filter_clause:
@@ -785,6 +785,9 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         return (
             f"WHERE custom_eval_config_id = toUUID(%(eval_config_id)s) "
             f"AND {not_deleted} "
+            f"AND error = 0 "
+            f"AND ifNull(output_str, '') != 'ERROR' "
+            f"AND status NOT IN ({_EVAL_NON_VALUE_STATUSES}) "
             f"AND created_at >= %(start_time)s - INTERVAL 1 DAY "
             f"AND observation_span_id IN ("
             f"  SELECT id FROM {SPANS_TABLE} "

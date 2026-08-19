@@ -13,7 +13,7 @@ No real ClickHouse is hit — only the generated SQL string is asserted.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -24,8 +24,8 @@ from tracer.services.clickhouse.query_builders.monitor_metrics import (
 
 PROJECT_ID = "11111111-1111-1111-1111-111111111111"
 EVAL_CONFIG_ID = "22222222-2222-2222-2222-222222222222"
-START = datetime(2026, 8, 1, tzinfo=timezone.utc)
-END = datetime(2026, 8, 8, tzinfo=timezone.utc)
+START = datetime(2026, 8, 1, tzinfo=UTC)
+END = datetime(2026, 8, 8, tzinfo=UTC)
 
 COMPANION = "created_at >= %(start_time)s - INTERVAL 1 DAY"
 BETWEEN_START = "start_time BETWEEN %(start_time)s AND %(end_time)s"

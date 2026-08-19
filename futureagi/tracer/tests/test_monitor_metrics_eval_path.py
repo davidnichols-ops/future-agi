@@ -5,8 +5,7 @@ Pure SQL-string assertions, no ClickHouse."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import List, Type
+from datetime import UTC, datetime
 
 import pytest
 from django.test import override_settings
@@ -21,8 +20,8 @@ from tracer.services.clickhouse.v2.query_builders.monitor_metrics import (
 
 PROJECT_ID = "11111111-1111-1111-1111-111111111111"
 EVAL_CONFIG_ID = "22222222-2222-2222-2222-222222222222"
-START = datetime(2026, 8, 1, tzinfo=timezone.utc)
-END = datetime(2026, 8, 8, tzinfo=timezone.utc)
+START = datetime(2026, 8, 1, tzinfo=UTC)
+END = datetime(2026, 8, 8, tzinfo=UTC)
 
 LEGACY_ND = "(deleted = 0 OR deleted IS NULL)"
 ATTR_FILTER = {
@@ -41,7 +40,7 @@ ATTR_FILTER = {
 
 
 def _builder(
-    cls: Type[MonitorMetricsQueryBuilder] = MonitorMetricsQueryBuilder,
+    cls: type[MonitorMetricsQueryBuilder] = MonitorMetricsQueryBuilder,
     output_type: str = "SCORE",
     filters=None,
 ) -> MonitorMetricsQueryBuilder:
@@ -54,9 +53,9 @@ def _builder(
 
 
 def _eval_sqls(
-    cls: Type[MonitorMetricsQueryBuilder] = MonitorMetricsQueryBuilder,
+    cls: type[MonitorMetricsQueryBuilder] = MonitorMetricsQueryBuilder,
     filters=None,
-) -> List[str]:
+) -> list[str]:
     b = _builder(cls, filters=filters)
     return [
         b.build_metric_value_query(mm.EVALUATION_METRICS, START, END)[0],
@@ -116,11 +115,26 @@ def test_eval_table_window_is_loose_lower_bound_only() -> None:
         assert "created_at BETWEEN" not in sql
 
 
+def test_eval_rows_exclude_non_completed_statuses() -> None:
+    # Pending/running/skipped/errored work items carry NULL outputs that
+    # would read as failures (a burst of newly-enqueued evals must not
+    # depress the pass rate). Mirrors span_list.py / filters.py.
+    for sql in _eval_sqls():
+        head = sql.split("observation_span_id IN (", 1)[0]
+        assert "error = 0" in head
+        assert "ifNull(output_str, '') != 'ERROR'" in head
+        for status in ("pending", "running", "skipped", "errored"):
+            assert status in head
+        assert "'completed'" not in head  # NOT-IN keeps empty/NULL status rows
+
+
 def test_v1_eval_filter_emits_legacy_span_attr_token() -> None:
     # Sanity: the spliced filter fragment uses v1 map columns pre-rewrite.
     b = _builder(filters=ATTR_FILTER)
     assert b._filter_clause, "attr filter should compile to a clause"
-    assert "span_attr" in b.build_metric_value_query(mm.EVALUATION_METRICS, START, END)[0]
+    assert (
+        "span_attr" in b.build_metric_value_query(mm.EVALUATION_METRICS, START, END)[0]
+    )
 
 
 def test_v2_eval_filter_fragment_is_rewritten() -> None:
@@ -143,10 +157,16 @@ def test_eval_empty_window_yields_null_for_all_output_types() -> None:
             eval_output_type=output_type,
             threshold_metric_value="Passed" if output_type != "SCORE" else None,
         )
-        assert "ifNotFinite(" in b.build_metric_value_query(mm.EVALUATION_METRICS, START, END)[0]
-        assert b.build_historical_stats_query(mm.EVALUATION_METRICS, START, END)[0].count(
+        assert (
             "ifNotFinite("
-        ) >= 2
+            in b.build_metric_value_query(mm.EVALUATION_METRICS, START, END)[0]
+        )
+        assert (
+            b.build_historical_stats_query(mm.EVALUATION_METRICS, START, END)[0].count(
+                "ifNotFinite("
+            )
+            >= 2
+        )
 
 
 @pytest.mark.parametrize("output_type", ["SCORE", "PASS_FAIL", "CHOICES"])
