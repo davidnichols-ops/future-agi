@@ -100,7 +100,7 @@ def test_time_series_buckets_and_filters_start_time(metric_type):
     _assert_spans_pruned(sql)
 
 
-def test_session_and_date_range_filters_use_start_time():
+def test_date_range_and_created_at_filters_use_start_time():
     filters = {
         "date_range": [START.isoformat(), END.isoformat()],
         "created_at": START.isoformat(),
