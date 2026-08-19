@@ -1,20 +1,6 @@
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 
-// FilterPanel `filterFields` for the issues table. `choices` hold the values
-// the API expects; `choiceLabels` map them to what the user sees.
-export const ISSUE_FILTER_FIELDS = [
-  {
-    value: "type",
-    label: "Trigger Type",
-    type: "enum",
-    operators: ["is"],
-    single: true,
-    choices: ["critical", "warning"],
-    choiceLabels: { critical: "Critical", warning: "Warning" },
-  },
-];
-
 const hasAnyValue = (filters) =>
   !!filters && Object.values(filters).some((v) => v?.length > 0);
 

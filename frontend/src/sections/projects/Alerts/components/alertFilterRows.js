@@ -1,7 +1,7 @@
 import { AllowedEvalSpanTypes } from "src/utils/constant";
 import { getRandomId } from "src/utils/utils";
 
-const OBSERVATION_TYPE_FIELD = "observation_type";
+export const OBSERVATION_TYPE_FIELD = "observation_type";
 
 // The form stores one row per selected span type; the panel shows them as a
 // single multi-value row.
