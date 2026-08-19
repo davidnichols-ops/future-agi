@@ -13,8 +13,8 @@ vi.mock("src/api/al-environment/client", async (importOriginal) => {
 
 beforeAll(() => {
   // jsdom has no object URLs; the component only needs them to exist.
-  global.URL.createObjectURL = vi.fn(() => "blob:mock");
-  global.URL.revokeObjectURL = vi.fn();
+  globalThis.URL.createObjectURL = vi.fn(() => "blob:mock");
+  globalThis.URL.revokeObjectURL = vi.fn();
 });
 
 /**
@@ -218,6 +218,9 @@ describe("RunsTab — one run", () => {
     fetchedTrack.mockClear();
     const { container } = open();
     expect(screen.getByText("recording · 2 tracks")).toBeInTheDocument();
+    // Nothing downloads until asked — a run page mounts one player per scenario.
+    expect(fetchedTrack).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: /load recording/ }));
     await waitFor(() => expect(fetchedTrack).toHaveBeenCalled());
     // Relative to the axios base, which already ends where /api begins — a hand-built
     // absolute URL is how the platform got /api/api/ and 404s.

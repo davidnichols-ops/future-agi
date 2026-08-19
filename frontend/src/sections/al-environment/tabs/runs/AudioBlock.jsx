@@ -31,9 +31,13 @@ const AudioBlock = ({ runId, scenario, tracks }) => {
   // auth and the player gets an object URL instead.
   const [src, setSrc] = useState(null);
   const [failed, setFailed] = useState(false);
+  // Nothing downloads until asked. A run page mounts one of these per scenario, and a
+  // suite's worth of WAVs fetched eagerly is megabytes nobody may listen to — the old
+  // element said preload="none" for the same reason.
+  const [wanted, setWanted] = useState(false);
 
   useEffect(() => {
-    if (!chosen) return undefined;
+    if (!wanted || !chosen) return undefined;
     let dead = false;
     let held = null;
     setFailed(false);
@@ -55,7 +59,7 @@ const AudioBlock = ({ runId, scenario, tracks }) => {
       dead = true;
       if (held) URL.revokeObjectURL(held);
     };
-  }, [runId, scenario, chosen, sessionId]);
+  }, [wanted, runId, scenario, chosen, sessionId]);
 
   return (
     <Box
@@ -91,10 +95,32 @@ const AudioBlock = ({ runId, scenario, tracks }) => {
             <Typography variant="body2" color="text.secondary">
               this track could not be fetched
             </Typography>
+          ) : !wanted ? (
+            <Box
+              component="button"
+              type="button"
+              onClick={() => setWanted(true)}
+              sx={{
+                width: "100%",
+                height: 34,
+                border: "1px dashed",
+                borderColor: "divider",
+                borderRadius: "17px",
+                background: "none",
+                color: "text.secondary",
+                fontFamily: ALK_MONO,
+                fontSize: 11.5,
+                cursor: "pointer",
+                "&:hover": { color: "text.primary", borderColor: "text.secondary" },
+              }}
+            >
+              ▶ load recording
+            </Box>
           ) : (
             <Box
               component="audio"
               controls
+              autoPlay={false}
               data-testid="alk-audio"
               data-track={chosen || undefined}
               src={src || undefined}
@@ -111,7 +137,10 @@ const AudioBlock = ({ runId, scenario, tracks }) => {
                 // of them: the room's mix, the caller alone, the agent alone, and the
                 // provider's own copy of each.
                 aria-pressed={track.label === chosen}
-                onClick={() => setChosen(track.label)}
+                onClick={() => {
+                  setChosen(track.label);
+                  setWanted(true);
+                }}
                 sx={{ p: 0, border: 0, background: "none", cursor: "pointer" }}
               >
                 <Tag kind={track.label === chosen ? "pass" : "soft"}>{track.label}</Tag>
