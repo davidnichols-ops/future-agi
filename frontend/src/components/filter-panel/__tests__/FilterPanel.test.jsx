@@ -227,3 +227,66 @@ describe("FilterPanel — the opt-in props", () => {
     expect(screen.getByText(/Specify:/)).toBeInTheDocument();
   });
 });
+
+// Opening the panel rebuilds the applied object from scratch. Callers that key
+// off its identity — Issues.jsx hands it to an AG Grid datasource, which drops
+// its cache and refetches from row 0 — paid a round trip per funnel click.
+describe("re-applying unchanged filters", () => {
+  const FIELDS = [
+    {
+      value: "status",
+      label: "Status",
+      type: "enum",
+      operators: ["is"],
+      choices: ["open", "closed"],
+    },
+  ];
+
+  const panel = (props) => (
+    <FilterPanel
+      anchorEl={document.body}
+      onClose={() => {}}
+      filterFields={FIELDS}
+      basicOnly
+      {...props}
+    />
+  );
+
+  it("stays quiet when the panel is opened and nothing is touched", async () => {
+    const onApply = vi.fn();
+    const currentFilters = { status: ["open"] };
+    const { rerender } = render(
+      panel({ open: false, currentFilters, onApply }),
+    );
+
+    rerender(panel({ open: true, currentFilters, onApply }));
+
+    await new Promise((r) => setTimeout(r, 800));
+    expect(onApply).not.toHaveBeenCalled();
+  });
+
+  it("still applies once the user actually changes a row", async () => {
+    const user = userEvent.setup();
+    const onApply = vi.fn();
+    const currentFilters = { status: ["open"] };
+    render(panel({ open: true, currentFilters, onApply }));
+
+    // The row hydrates with "open" already picked, so the trigger shows a
+    // chip rather than the placeholder; clicking it bubbles to the picker.
+    await user.click(screen.getByText("open"));
+    const row = within(
+      screen
+        .getByPlaceholderText("Search values...")
+        .closest(".MuiPopover-paper"),
+    );
+    await user.click(row.getByText("closed"));
+    await user.keyboard("{Escape}");
+
+    await waitFor(
+      () =>
+        expect(onApply).toHaveBeenCalledWith({ status: ["open", "closed"] }),
+      { timeout: 2000 },
+    );
+    expect(onApply).toHaveBeenCalledTimes(1);
+  });
+});
