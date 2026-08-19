@@ -1820,6 +1820,9 @@ def test_a_live_run_is_refused_before_it_costs_anything(monkeypatch):
     reports a failure that says nothing about the agent."""
     from harness.run.tools import missing_prerequisites
 
+    # Which credentials are wanted follows the case, so the case is set rather than inherited:
+    # a 1.x case reaches a LiveKit worker and would not ask for these at all.
+    monkeypatch.setenv("HARNESS_VOICE_CASE", "2.1.2")
     monkeypatch.delenv("VAPI_API_KEY", raising=False)
     monkeypatch.delenv("VAPI_ASSISTANT_ID", raising=False)
     problems = missing_prerequisites()
@@ -1828,6 +1831,29 @@ def test_a_live_run_is_refused_before_it_costs_anything(monkeypatch):
     monkeypatch.setenv("VAPI_API_KEY", "x")
     monkeypatch.setenv("VAPI_ASSISTANT_ID", "y")
     monkeypatch.setenv("HARNESS_WEBHOOK_URL", "https://example.invalid")
+    assert missing_prerequisites() == []
+
+
+def test_a_livekit_case_asks_for_its_own_credentials_and_no_tunnel(monkeypatch):
+    """A worker we run ourselves is reached over LiveKit and calls the world on the network it
+    shares with us. Demanding a hosted assistant's credentials, or a way to expose the webhook
+    publicly, reports a working setup as broken."""
+    from harness.run.tools import missing_prerequisites
+
+    monkeypatch.setenv("HARNESS_VOICE_CASE", "1.1.2")
+    monkeypatch.delenv("VAPI_API_KEY", raising=False)
+    monkeypatch.delenv("VAPI_ASSISTANT_ID", raising=False)
+    monkeypatch.delenv("HARNESS_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("LIVEKIT_API_KEY", raising=False)
+
+    problems = missing_prerequisites()
+    assert any("LIVEKIT_API_KEY" in problem for problem in problems)
+    assert not any("VAPI" in problem for problem in problems)
+    assert not any("cloudflared" in problem for problem in problems)
+
+    monkeypatch.setenv("LIVEKIT_API_KEY", "x")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "y")
+    monkeypatch.setenv("LIVEKIT_TARGET_AGENT_NAME", "an-agent")
     assert missing_prerequisites() == []
 
 
@@ -3596,7 +3622,7 @@ def test_a_second_run_joins_the_same_test_rather_than_starting_another():
             self.provisioned = 0
             self.started = 0
 
-        def provision(self, name, personas):
+        def provision(self, name, personas, modality="text"):
             self.provisioned += 1
             return {"run_test_id": "rt-1"}
 
@@ -3624,7 +3650,7 @@ def test_reporting_says_when_the_platform_allocated_too_few_calls():
     from harness import platform
 
     class Short:
-        def provision(self, name, personas):
+        def provision(self, name, personas, modality="text"):
             return {"run_test_id": "rt-1"}
 
         def start(self, run_test_id):

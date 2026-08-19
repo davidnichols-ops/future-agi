@@ -1,10 +1,15 @@
 import { describe, it, expect } from "vitest";
-import { alkBaseUrl, isDirectToHarness, applyAuth, ALK_DEFAULT_BASE } from "../client";
+import { alkBaseUrl, isDirectToHarness, applyAuth, ALK_PROXY_PATH } from "../client";
 
 describe("alkBaseUrl", () => {
-  it("defaults to the backend proxy, which is how the platform reaches the harness", () => {
-    expect(alkBaseUrl({})).toBe("/simulate/harness");
-    expect(ALK_DEFAULT_BASE).toBe("/simulate/harness");
+  it("defaults to the proxy on the API host, which is a different origin from ours", () => {
+    expect(alkBaseUrl({}, "http://localhost:8000")).toBe(
+      "http://localhost:8000/simulate/harness"
+    );
+    expect(alkBaseUrl({}, "https://dev.api.futureagi.com")).toBe(
+      "https://dev.api.futureagi.com/simulate/harness"
+    );
+    expect(ALK_PROXY_PATH).toBe("/simulate/harness");
   });
 
   it("can be pointed straight at a local harness for development", () => {
@@ -20,18 +25,24 @@ describe("alkBaseUrl", () => {
   });
 
   it("ignores a blank value rather than producing an empty base", () => {
-    expect(alkBaseUrl({ VITE_ALK_API_BASE: "   " })).toBe("/simulate/harness");
+    expect(alkBaseUrl({ VITE_ALK_API_BASE: "   " }, "http://localhost:8000")).toBe(
+      "http://localhost:8000/simulate/harness"
+    );
   });
 });
 
 describe("isDirectToHarness", () => {
-  it("recognises an absolute base as a direct connection", () => {
+  it("recognises a base that bypasses our backend", () => {
     expect(isDirectToHarness("http://localhost:8777/api")).toBe(true);
     expect(isDirectToHarness("https://harness.internal/api")).toBe(true);
   });
 
-  it("treats the proxy path as going through our backend", () => {
+  it("treats the proxy as going through our backend, absolute or not", () => {
     expect(isDirectToHarness("/simulate/harness")).toBe(false);
+    // The one that matters: the real default is absolute, and reading the scheme would strip
+    // the auth headers off every proxied call.
+    expect(isDirectToHarness("http://localhost:8000/simulate/harness")).toBe(false);
+    expect(isDirectToHarness("https://dev.api.futureagi.com/simulate/harness")).toBe(false);
   });
 });
 

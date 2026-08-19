@@ -7,7 +7,6 @@ import { DataTable, DataTablePagination } from "src/components/data-table";
 import FormSearchField from "src/components/FormSearchField/FormSearchField";
 import Iconify from "src/components/iconify";
 
-import { ENVIRONMENT_FIXTURES } from "./environmentFixtures";
 
 const environmentName = (env) =>
   env?.agent || env?.title || env?.session_id || "-";
@@ -144,7 +143,7 @@ function EmptyState({ title, description, action }) {
 }
 
 const EnvironmentsListView = ({
-  environments = ENVIRONMENT_FIXTURES,
+  environments = [],
   isLoading = false,
   onAdd,
   onOpen,

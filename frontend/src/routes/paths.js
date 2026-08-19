@@ -90,6 +90,7 @@ export const paths = {
         `${ROOTS.DASHBOARD}/simulate/rl-environment/${sessionId}`,
       callDetails: (testId, executionId) =>
         `${ROOTS.DASHBOARD}/simulate/test/${testId}/${executionId}/call-details`,
+      testRuns: (testId) => `${ROOTS.DASHBOARD}/simulate/test/${testId}/runs`,
       simulatorAgent: `${ROOTS.DASHBOARD}/simulate/simulator-agent`,
       test: `${ROOTS.DASHBOARD}/simulate/test`,
     },

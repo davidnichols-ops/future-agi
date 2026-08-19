@@ -25,18 +25,29 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from .. import platform
 from ..catalogue import load_catalogue
 from ..scenario_tools import load_scenarios
 from ..tools import schema
-from .call import place_the_call
+from .call import CASE, place_the_call
 from .live import LiveRun, grade, wire
 
 RUN_SERVER = "runs"
 RESULTS = "runs.json"
 
-# What a hosted agent needs before a call can be placed at all. Checked up front rather than
+# What a call needs before it can be placed at all, per transport. Checked up front rather than
 # three minutes in, because the failure otherwise arrives after the expensive part.
-REQUIRED = ("VAPI_API_KEY", "VAPI_ASSISTANT_ID")
+#
+# Which transport is in play is decided by the case: the 1.x cases reach a LiveKit worker, the
+# 2.x cases a hosted Vapi assistant. Asking for the other one's credentials is how a working
+# setup gets reported as broken.
+REQUIRED_VAPI = ("VAPI_API_KEY", "VAPI_ASSISTANT_ID")
+REQUIRED_LIVEKIT = ("LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "LIVEKIT_TARGET_AGENT_NAME")
+
+
+def _livekit_case() -> bool:
+    """Whether the case being run reaches a LiveKit worker rather than a hosted assistant."""
+    return os.environ.get("HARNESS_VOICE_CASE", CASE).strip().startswith("1.")
 
 
 def _ok(text: str) -> dict[str, Any]:
@@ -50,14 +61,21 @@ def _err(text: str) -> dict[str, Any]:
 def missing_prerequisites() -> list[str]:
     """What would stop a live call, in the words of what to do about it."""
     problems: list[str] = []
-    absent = [name for name in REQUIRED if not os.environ.get(name)]
+    livekit = _livekit_case()
+    absent = [
+        name
+        for name in (REQUIRED_LIVEKIT if livekit else REQUIRED_VAPI)
+        if not os.environ.get(name)
+    ]
     if absent:
         problems.append(
-            f"{', '.join(absent)} not set. The assistant already exists with the agent's own "
-            "tools; without these there is no way to reach it. Load the env file first:\n"
-            "    set -a; . ./.env.acceptance; set +a"
+            f"{', '.join(absent)} not set, so there is no way to reach the agent. Load the env "
+            "file first:\n    set -a; . ./.env.acceptance; set +a"
         )
-    if not os.environ.get("HARNESS_WEBHOOK_URL") and not shutil.which("cloudflared"):
+    # A LiveKit worker we run ourselves calls the world directly on the network we share with it,
+    # so there is nothing to expose. Only a hosted assistant has to reach in from outside.
+    exposed = os.environ.get("HARNESS_WEBHOOK_URL") or shutil.which("cloudflared")
+    if not livekit and not exposed:
         problems.append(
             "no way to expose the webhook publicly. A hosted agent cannot reach loopback, so "
             "either install cloudflared (brew install cloudflared) or set HARNESS_WEBHOOK_URL "
@@ -244,6 +262,9 @@ def run_tools(
             return _err("no contract is loaded, so there is no agent to run against")
         if not written:
             return _err("there are no scenarios to run")
+        # Kept as they finish, because reporting needs the graded results themselves and the
+        # summary carries only their rendering.
+        produced: list[Any] = []
         summary = await simulate(
             list(written),
             contract,
@@ -251,6 +272,7 @@ def run_tools(
             destination=destination,
             model=str(args.get("model") or "") or None,
             concurrency=max(1, int(args.get("concurrency") or 1)),
+            on_case_done=produced.append,
         )
         results[:] = load_results(destination)
         lines = [
@@ -265,6 +287,13 @@ def run_tools(
             lines.append(
                 f"  {mark}  {one['scenario']}  {one['met']}/{one['of']}{audio}{note}"
             )
+        # Reported here too, not only from the run button: a run that reaches the platform only
+        # when it was started one particular way leaves the page an unreliable record of what
+        # has been run.
+        _, said = platform.deliver(
+            produced, list(written), destination, modality=contract.modality or "text"
+        )
+        lines += ["", *said]
         lines += [
             "",
             "read_run gives any one of these in full: the conversation, every tool call with "

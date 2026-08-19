@@ -448,7 +448,7 @@ async def _spoken_to(
     from .conversation import Exchange, Transcript
     from .grade import checkpoints, grade_sub_goals, judge, judge_suite_evals
     from .live import wire
-    from .evidence import measured, newest_report, tracks_in
+    from .evidence import measured, newest_report, spoken_times, tracks_in
     from .tools import missing_prerequisites
 
     stopping = missing_prerequisites()
@@ -530,8 +530,7 @@ async def _spoken_to(
         turns=len([line for line in spoken.splitlines() if line.strip()]),
         calls=len(world.calls),
         transcript=spoken,
-        exchanges=[{"speaker": turn.speaker, "text": turn.text}
-                   for turn in spoken_transcript.exchanges],
+        exchanges=_timed_exchanges(spoken_transcript.exchanges, spoken_times(case)),
         recording=(kept[0]["path"] if kept else ""),
     )
     result.tracks = kept
@@ -544,6 +543,25 @@ async def _spoken_to(
             f"the voice runner exited {code} and no tool call reached the world"
         )
     return result
+
+
+def _timed_exchanges(exchanges: list[Any], times: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The conversation with each turn's speech times attached, where they were measured.
+
+    Paired by position, and only when the two agree on how many turns there were. They come
+    from the same call but by different routes, so a mismatch means one of them dropped a turn
+    -- and pairing them anyway would hang every turn's timing on the wrong words.
+    """
+    spoken = [{"speaker": turn.speaker, "text": turn.text} for turn in exchanges]
+    if len(times) != len(spoken):
+        return spoken
+    for turn, when in zip(spoken, times):
+        if when.get("start_time_ms") is None:
+            continue
+        turn["start_time_ms"] = when["start_time_ms"]
+        if when.get("end_time_ms") is not None:
+            turn["end_time_ms"] = when["end_time_ms"]
+    return spoken
 
 
 def _keep_tracks(found: list[dict[str, str]], folder: Path) -> list[dict[str, str]]:

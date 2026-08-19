@@ -31,11 +31,20 @@ from .live import grade, wire
 CASE = os.environ.get("HARNESS_VOICE_CASE", "2.1.2")
 
 
+# The voice cases ship beside the package, so a call works wherever it is installed rather than
+# only from a checkout's root. Overridable for a runner kept somewhere else.
+VOICE_DIR = Path(__file__).resolve().parents[3] / "voice"
+
+
 def place_the_call(case: str, dry_run: bool = False) -> int:
     """Hand over to ALK's voice case, which owns everything about placing a call."""
-    runner = Path("oss/simulation-acceptance/run_voice_case.py")
+    named = os.environ.get("HARNESS_VOICE_RUNNER", "").strip()
+    runner = Path(named) if named else VOICE_DIR / "run_voice_case.py"
     if not runner.exists():
-        raise RuntimeError(f"no voice runner at {runner}; run from the repo root")
+        raise RuntimeError(
+            f"no voice runner at {runner}. It ships beside the package; set "
+            "HARNESS_VOICE_RUNNER if it lives somewhere else."
+        )
     command = [sys.executable, str(runner), case] + (["--dry-run"] if dry_run else [])
     return subprocess.call(command)
 

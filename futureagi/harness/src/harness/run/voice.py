@@ -112,9 +112,27 @@ def _handler_for(owner: "WorldWebhook"):
                 payload = json.loads(raw or b"{}")
             except json.JSONDecodeError:
                 payload = {}
+
+            calls = tool_calls(payload)
+            if not calls:
+                # An agent whose tools are its own HTTP API asks differently: the tool is the
+                # path and the body is the arguments, with the answer expected back plainly.
+                # Serving both shapes is what lets a world stand in for such an API without the
+                # agent being changed to suit us.
+                name = self.path.strip("/").split("?")[0]
+                if name:
+                    answer = owner.respond(name, payload if isinstance(payload, dict) else {})
+                    plain = json.dumps(_as_body(answer)).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(plain)))
+                    self.end_headers()
+                    self.wfile.write(plain)
+                    return
+
             results = [
                 {"toolCallId": call_id, "result": owner.respond(name, arguments)}
-                for call_id, name, arguments in tool_calls(payload)
+                for call_id, name, arguments in calls
             ]
             body = json.dumps({"results": results}).encode()
             self.send_response(200)
@@ -124,6 +142,20 @@ def _handler_for(owner: "WorldWebhook"):
             self.wfile.write(body)
 
     return Handler
+
+
+def _as_body(answer: str) -> Any:
+    """A tool's answer as a JSON body, keeping structure when the handler produced any.
+
+    Handlers return text because that is what a spoken agent hears. An HTTP tool API expects an
+    object, so a JSON answer is passed through as itself and anything else is wrapped, rather
+    than a caller having to parse a string out of a string.
+    """
+    try:
+        parsed = json.loads(answer)
+    except (json.JSONDecodeError, TypeError):
+        return {"result": answer}
+    return parsed if isinstance(parsed, (dict, list)) else {"result": parsed}
 
 
 def tool_calls(payload: Mapping[str, Any]) -> list[tuple[str, str, dict[str, Any]]]:

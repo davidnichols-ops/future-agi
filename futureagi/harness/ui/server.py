@@ -34,10 +34,11 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
+from harness import platform as platform_api  # noqa: E402
 from harness import sessions  # noqa: E402
 from harness.chat import Conversation  # noqa: E402
 from harness.config import chosen_model, credentials_hint  # noqa: E402
-from harness.run import run_suite  # noqa: E402
+from harness.run.simulation import simulate  # noqa: E402
 from harness.scenarios import load as load_scenarios  # noqa: E402
 from harness.understand import load as load_contract  # noqa: E402
 from harness.world.snapshot import restore as restore_world  # noqa: E402
@@ -149,6 +150,7 @@ def _status() -> dict:
             "out": None,
             "busy": busy.locked(),
         }
+    reported = platform_api.reported_to(current.path)
     return {
         "session": current.meta(),
         "stage": conversation.stage_name,
@@ -165,6 +167,10 @@ def _status() -> dict:
         ),
         "have": current.has(),
         "out": str(current.path),
+        # Where this session's runs landed on the platform. The page offers a way through to
+        # them, and without these it has nowhere to send anyone however many runs were reported.
+        "run_test_id": reported.get("run_test_id", ""),
+        "execution_id": reported.get("test_execution_id", ""),
         # A refresh must be able to tell that work is still going on. Without this the page comes
         # back looking idle, and the next thing typed is rejected for no visible reason.
         "busy": busy.locked(),
@@ -449,12 +455,16 @@ async def run_scenarios(said: Said):
     chosen = [s for s in scenarios if s.name in only] if only else scenarios
 
     async def run(on_event):
-        def exchange(spoken):
+        def started(scenario):
+            # The suite runs inside ALK now, which reports a scenario when it finishes rather
+            # than turn by turn. Without this the page sits silent for the length of a call.
             on_event(type("E", (), {
-                "kind": "exchange", "text": spoken.text, "tool": "",
-                "detail": {"speaker": spoken.speaker}})())
+                "kind": "text", "text": f"running {scenario.name}", "tool": "", "detail": {}})())
+
+        produced: list[Any] = []
 
         def result(one):
+            produced.append(one)
             on_event(type("E", (), {
                 "kind": "result_card", "text": one.line(), "tool": "",
                 "detail": {
@@ -466,51 +476,35 @@ async def run_scenarios(said: Said):
                 }})())
 
         async with busy:
-            produced = await run_suite(
-                chosen, contract, out, on_result=result, on_exchange=exchange
-            )
-        _report_to_platform(produced, chosen, out, on_event)
+            # simulate(), not run_suite(): only this one asks the contract whether the agent is
+            # spoken to, and a voice agent's scenario is placed as a real call against the agent
+            # itself. run_suite always reconstructs the agent locally, so a voice suite driven
+            # through it silently tests a replica and never reaches the thing under test.
+            await simulate(chosen, contract, out, on_case_start=started, on_case_done=result)
+        _report_to_platform(
+            produced, chosen, out, on_event, modality=(contract.modality or "text")
+        )
 
     return StreamingResponse(_stream_turn(run), media_type="text/event-stream")
 
 
-def _report_to_platform(produced, chosen, out, on_event) -> None:
-    """Put this run where every other run on the platform already is.
-
-    Never fails a run. The suite has finished and its results are on disk by the time this is
-    called; a platform that is unreachable is worth saying out loud, not worth throwing away a
-    completed run over.
-    """
-    from harness import platform as platform_api  # noqa: PLC0415 - optional path
+def _report_to_platform(produced, chosen, out, on_event, modality: str = "text") -> None:
+    """Put this run where every other run on the platform already is, and stream what happened."""
 
     def say(kind: str, text: str, detail: dict | None = None) -> None:
         on_event(type("E", (), {"kind": kind, "text": text, "tool": "", "detail": detail or {}})())
 
-    blocked = platform_api.configured()
-    if blocked:
-        say("text", f"not reported to the platform: {blocked}")
-        return
-    try:
-        reported = platform_api.report(
-            produced,
-            chosen,
-            name=(out.name if out else "harness run"),
-            run_test_id=platform_api.remembered(out) if out else "",
+    reported, said = platform_api.deliver(produced, chosen, out, modality=modality)
+    for line in said[:-1] if reported else said:
+        say("text", line)
+    if reported:
+        say(
+            "platform_run",
+            said[-1],
+            {"run_test_id": reported.run_test_id,
+             "test_execution_id": reported.test_execution_id,
+             "url": reported.url},
         )
-    except platform_api.PlatformError as failed:
-        say("text", f"the run finished, but reporting it to the platform failed: {failed}")
-        return
-    if out:
-        platform_api.remember(out, reported)
-    for problem in reported.problems:
-        say("text", f"partly reported: {problem}")
-    say(
-        "platform_run",
-        f"reported to the platform: {reported.url}",
-        {"run_test_id": reported.run_test_id,
-         "test_execution_id": reported.test_execution_id,
-         "url": reported.url},
-    )
 
 
 @app.get("/api/contract")

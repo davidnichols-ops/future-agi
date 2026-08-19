@@ -25,6 +25,20 @@ COPY src ./src
 COPY ui ./ui
 RUN pip install --no-cache-dir -e .[ui,postgres]
 
+# The Agent Learning Kit SDK, for voice only: a spoken run hands off to a case under voice/,
+# and those import fi.simulate and fi.alk. Installed from a local wheel because the package is
+# on no index -- build it first with ./scripts/build-alk-wheel.sh at the repository root.
+# Pinned with the SDK's own lock: an unconstrained livekit-agents resolves 1.6.x, whose native
+# local-inference module crashes in linux/amd64 containers under emulation.
+ARG ALK_WHEEL=agent_learning_kit-0.1.0-py3-none-any.whl
+ARG LIVEKIT_AGENTS_VERSION=1.5.17
+COPY ${ALK_WHEEL} /tmp/alk/${ALK_WHEEL}
+RUN pip install --no-cache-dir "/tmp/alk/${ALK_WHEEL}[livekit]" \
+        "livekit-agents==${LIVEKIT_AGENTS_VERSION}" \
+    && rm -rf /tmp/alk
+
+COPY voice ./voice
+
 ENV HARNESS_HOST=0.0.0.0
 EXPOSE 8777 8787
 CMD ["python", "ui/server.py"]

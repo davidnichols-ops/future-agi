@@ -112,6 +112,34 @@ def metrics_in(report: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def spoken_times(case: dict[str, Any]) -> list[dict[str, Any]]:
+    """When each turn was actually spoken, as milliseconds from the start of the call.
+
+    The runner times its own speech but only records when the agent's words arrived, so a turn
+    it did not measure carries no times rather than guessed ones. Everything downstream treats
+    a missing time as unknown and a present one as observed, and the difference matters: a
+    fabricated millisecond is indistinguishable from a measured one once it has been averaged.
+    """
+    messages = case.get("messages") or []
+    starts = [m.get("started_speaking_at") for m in messages if m.get("started_speaking_at")]
+    if not starts:
+        return []
+    origin = min(float(one) for one in starts)
+
+    def offset(at: Any) -> int | None:
+        return None if not at else max(0, int((float(at) - origin) * 1000))
+
+    return [
+        {
+            "role": str(one.get("role") or ""),
+            "start_time_ms": offset(one.get("started_speaking_at")),
+            "end_time_ms": offset(one.get("stopped_speaking_at")),
+            "interrupted": bool(one.get("interrupted")),
+        }
+        for one in messages
+    ]
+
+
 def measured(case: dict[str, Any]) -> dict[str, Any]:
     """What ALK measured about this call, in the shape the page reads.
 

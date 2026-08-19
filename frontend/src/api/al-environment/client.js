@@ -1,5 +1,6 @@
 import axios from "axios";
 import appAxios from "src/utils/axios";
+import { HOST_API } from "src/config-global";
 
 /**
  * On the platform the harness is reached through our own backend, which authenticates the
@@ -8,18 +9,25 @@ import appAxios from "src/utils/axios";
  *
  * One config value covers both, because the base replaces the prefix rather than sitting in
  * front of it — everything after it is byte-identical:
- *   platform  VITE_ALK_API_BASE unset  → /simulate/harness
+ *   platform  VITE_ALK_API_BASE unset  → <api host>/simulate/harness
  *   local     VITE_ALK_API_BASE=http://localhost:8777/api
  */
-export const ALK_DEFAULT_BASE = "/simulate/harness";
+export const ALK_PROXY_PATH = "/simulate/harness";
 
-export const alkBaseUrl = (env = {}) => {
-  const configured = (env.VITE_ALK_API_BASE || "").trim();
-  return (configured || ALK_DEFAULT_BASE).replace(/\/+$/, "");
-};
+/**
+ * The proxy lives on the API host, not on ours. Every deployment serves the two from different
+ * origins — dev.futureagi.com against dev.api.futureagi.com, and localhost:3000 against
+ * localhost:8000 — so a bare path would resolve against the page and never reach the backend.
+ */
+export const alkBaseUrl = (env = {}, host = HOST_API) =>
+  ((env.VITE_ALK_API_BASE || "").trim() || `${host || ""}${ALK_PROXY_PATH}`).replace(/\/+$/, "");
 
-/** An absolute base means we are talking to the harness directly, which needs no auth. */
-export const isDirectToHarness = (base) => /^https?:\/\//i.test(base);
+/**
+ * Whether this base bypasses our backend. Decided by where it points rather than by whether it
+ * is absolute: the proxied base is absolute too, and reading the scheme instead would strip the
+ * auth headers off exactly the calls that need them.
+ */
+export const isDirectToHarness = (base) => !String(base || "").includes(ALK_PROXY_PATH);
 
 /** The headers the app maintains for every authenticated call. */
 export const AUTH_HEADERS = ["Authorization", "X-Organization-Id", "X-Workspace-Id"];

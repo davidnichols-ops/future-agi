@@ -119,9 +119,16 @@ class HarnessProxyView(APIView):
             self._attach(one, one.get(key))
 
     def _attach(self, target, session_id):
+        # A session opened from the platform was told which run test it belongs to, and that
+        # link wins. A session started on the harness was not, but it reports where its own
+        # runs went — so fall back to that rather than overwriting it with nothing, which is
+        # how a session with runs behind it ends up looking like one that has never been run.
         link = harness_links.lookup(session_id)
-        target["run_test_id"] = link.get("run_test_id")
-        target["execution_id"] = link.get("execution_id")
+        for field in ("run_test_id", "execution_id"):
+            if link.get(field):
+                target[field] = link[field]
+            else:
+                target.setdefault(field, None)
 
     def _stream(self, url, body):
         # No read timeout: a stage or a suite legitimately streams for minutes.

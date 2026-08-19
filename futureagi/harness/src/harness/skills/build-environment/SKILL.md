@@ -133,10 +133,22 @@ Use `db.one` when you want a single row and `db.query` when you want several.
 Use the argument names exactly as the contract gives them. A handler that reads a name the tool
 does not pass finds nothing, quietly does nothing, and reports success.
 
-## Take the agent's store before you fill one yourself
+## Take the agent's own data before you fill anything yourself
 
-If the agent ships or builds a store of its own, **`adopt_store` it**. One call takes the whole
-thing: its schema, its keys, its indexes, and every row, exactly as the agent has them.
+The agent loads its data from somewhere. Find that, and take it whole. There are two shapes and
+the contract tells you which:
+
+- **A store it ships or builds** — a `.db`, `.sqlite`, `.dump`. **`adopt_store` it.** One call
+  takes the schema, the keys, the indexes and every row, exactly as the agent has them.
+- **A loader in its own code** — files read at startup, a `load_data()`, a fixtures module.
+  **`adopt_state` it**, naming that module and callable. One call gets everything the agent
+  gets. `data_store.configured_by` in the contract usually names the function outright; when it
+  says something like "loaded at construction via load_data() in package/data/__init__.py",
+  that string *is* the argument you need.
+
+`adopt_state` is not only for tools that take state as an argument. It is how the world gets the
+agent's real data whenever that data lives behind code rather than in a file you can point at.
+Reach for it before you consider writing rows yourself.
 
 This matters more than it looks. Seeding by hand means retyping somebody's data through a model,
 and what comes out is smaller and tidier than what went in: a few hundred rows instead of
@@ -144,9 +156,15 @@ thousands, the awkward ones quietly dropped, the accented names spelled the easy
 queries were written against the real thing. A test against the tidied copy is a test of a
 different database.
 
-So the order is: adopt the store if there is one, and only seed what the adopted store does not
-already hold. `create_schema` and `seed` are for an agent with no store to take, or for the parts
-a scenario needs that the agent's own data has no example of.
+So the order is: adopt the agent's data if it can be reached at all — store or loader — and only
+seed what the adopted data does not already hold. `create_schema` and `seed` are for an agent
+with nothing to take, or for the parts a scenario needs that the agent's own data has no example
+of.
+
+**Check the size afterwards, and say the number.** Compare what the world now holds against what
+the source holds. If the agent reads a thousand orders and the world has eight, the data was not
+adopted -- it was retyped, and every scenario written against it will look for records that do
+not exist. That is a failure to report, not a smaller world to carry on with.
 
 If the store is empty, or is built on first run, or lives somewhere you cannot reach, **say so and
 ask**. Do not fill the gap with data you made up.
@@ -162,7 +180,12 @@ Seed enough that every branch a handler has can actually be reached. If a tool r
 that has already shipped, there has to be an order that has already shipped, or that refusal can
 never be tested.
 
-Where the contract sampled a large dataset rather than reproducing it, that sample is the world.
+**A sample in the contract is not the world.** The contract carries a handful of records so that
+you can see the shape; it is not the dataset, and copying those rows in is not seeding. When the
+contract sampled rather than reproduced, that is the signal to go and adopt the real thing from
+where the agent reads it. Only if it genuinely cannot be reached does the sample stand in -- and
+then say so plainly, because every scenario after this will be limited to those few records.
+
 Ask the person for values wherever the contract carries none.
 
 Leave it in its natural starting state: empty carts, no in-flight work. Scenarios add what they
@@ -417,9 +440,10 @@ Never work around a contract you believe is wrong. Everything after you inherits
 
 ## How to work
 
-1. `adopt_store` if the agent has a store of its own. Otherwise `create_schema` with the whole
-   schema.
-2. `seed` whatever the adopted store does not already hold, from the contract's data.
+1. Take the agent's own data: `adopt_store` for a store it ships, `adopt_state` for a loader in
+   its code. Only when neither can be reached, `create_schema` with the whole schema.
+2. `seed` whatever the adopted data does not already hold, from the contract's data. Then compare
+   the world's size against the source's and say the number.
 3. `define_handler` for each tool, one at a time. Each runs the moment you define it — read what
    comes back.
 4. `run_tool` to try the refusals yourself. Call something with an identifier that was never

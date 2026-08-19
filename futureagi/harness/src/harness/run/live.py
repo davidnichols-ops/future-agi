@@ -192,13 +192,22 @@ def wire(
     scenario's world up once and grades what that same world is left holding, so preparing a
     second one here would answer the agent's calls in a world nobody afterwards looks at.
     """
-    assistant_id = assistant_id or os.environ.get("VAPI_ASSISTANT_ID", "")
-    api_key = api_key or os.environ.get("VAPI_API_KEY", "")
-    if not assistant_id or not api_key:
-        raise RuntimeError(
-            "VAPI_ASSISTANT_ID and VAPI_API_KEY have to be set. The assistant already exists "
-            "with the agent's own tools; the harness only changes where those calls are sent."
-        )
+    # How the agent is reached decides what has to be arranged here. A hosted assistant lives
+    # somewhere we do not control, so its tools have to be repointed at a URL it can reach from
+    # outside. An agent we run ourselves already reads where its tools are from its own
+    # environment and shares a network with us, so there is nothing to repoint and nothing to
+    # expose -- and doing either would fail for want of credentials we have no reason to hold.
+    reachable = os.environ.get("HARNESS_WEBHOOK_URL", "").strip()
+    ours = bool(reachable)
+
+    if not ours:
+        assistant_id = assistant_id or os.environ.get("VAPI_ASSISTANT_ID", "")
+        api_key = api_key or os.environ.get("VAPI_API_KEY", "")
+        if not assistant_id or not api_key:
+            raise RuntimeError(
+                "VAPI_ASSISTANT_ID and VAPI_API_KEY have to be set, or HARNESS_WEBHOOK_URL "
+                "given for an agent that already knows where to find its tools."
+            )
 
     if world is None:
         world, instruction = prepare(scenario, world_root)
@@ -207,8 +216,12 @@ def wire(
     webhook = WorldWebhook().start()
     webhook.bind(world)
     try:
-        url, tunnel = public_url(webhook.port)
-        moved = repoint_assistant(assistant_id, api_key, url)
+        if ours:
+            # The agent was started pointing here, so this is where its tools already go.
+            url, tunnel, moved = reachable, None, []
+        else:
+            url, tunnel = public_url(webhook.port)
+            moved = repoint_assistant(assistant_id, api_key, url)
     except Exception:
         webhook.stop()
         world.close()

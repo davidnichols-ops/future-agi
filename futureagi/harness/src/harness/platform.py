@@ -108,8 +108,13 @@ class Platform:
         # The platform wraps every answer; unwrap it here so callers read the payload itself.
         return body.get("result", body) if isinstance(body, dict) else {}
 
-    def provision(self, name: str, personas: list[dict[str, Any]]) -> dict[str, Any]:
-        return self._call("/run-tests/provision/", {"name": name, "personas": personas})
+    def provision(
+        self, name: str, personas: list[dict[str, Any]], modality: str = "text"
+    ) -> dict[str, Any]:
+        return self._call(
+            "/run-tests/provision/",
+            {"name": name, "personas": personas, "modality": modality},
+        )
 
     def start(self, run_test_id: str) -> dict[str, Any]:
         return self._call(f"/run-tests/{run_test_id}/test-executions/", {})
@@ -119,6 +124,38 @@ class Platform:
 
     def result(self, call_execution_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self._call(f"/call-executions/{call_execution_id}/result/", payload, method="PATCH")
+
+    def recording(self, call_execution_id: str, audio: Path) -> dict[str, Any]:
+        """Send one call's audio, as the multipart upload the endpoint expects.
+
+        Built by hand rather than with a library: this is the only multipart request the harness
+        makes, and a dependency for one boundary string is not worth carrying.
+        """
+        edge = "----harness" + os.urandom(8).hex()
+        head = (
+            f"--{edge}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{audio.name}"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+        ).encode()
+        tail = f"\r\n--{edge}--\r\n".encode()
+        body = head + audio.read_bytes() + tail
+        request = urllib.request.Request(
+            f"{self.base}{INGESTION}/call-executions/{call_execution_id}/recording/",
+            data=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={edge}",
+                "X-Api-Key": self.key,
+                "X-Secret-Key": self.secret,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as answer:
+                return json.loads(answer.read().decode() or "{}")
+        except urllib.error.HTTPError as refused:
+            detail = refused.read().decode(errors="replace")[:300]
+            raise PlatformError(f"recording upload failed ({refused.code}): {detail}") from refused
+        except Exception as unreachable:  # noqa: BLE001 - reported, not handled
+            raise PlatformError(f"recording could not be sent: {unreachable}") from unreachable
 
 
 def persona_of(scenario: Any) -> dict[str, Any]:
@@ -159,19 +196,23 @@ def segments_of(result: Any) -> list[dict[str, Any]]:
     """A run's conversation as transcript rows, tool calls included.
 
     No timings are invented. A typed run has none to give, and a made-up millisecond would be
-    indistinguishable from a measured one to everything downstream that averages them.
+    indistinguishable from a measured one to everything downstream that averages them. A spoken
+    turn the runner timed carries those times through, because the platform derives duration,
+    silence, talk ratio and latency from them and can derive none of it from zeros.
     """
     rows: list[dict[str, Any]] = []
     for turn in getattr(result, "exchanges", None) or []:
         said = str(turn.get("text") or "").strip()
         if not said:
             continue
-        rows.append(
-            {
-                "speaker_role": SPEAKERS.get(str(turn.get("speaker", "")).lower(), "user"),
-                "content": said,
-            }
-        )
+        row = {
+            "speaker_role": SPEAKERS.get(str(turn.get("speaker", "")).lower(), "user"),
+            "content": said,
+        }
+        for when in ("start_time_ms", "end_time_ms"):
+            if turn.get(when) is not None:
+                row[when] = int(turn[when])
+        rows.append(row)
     for call in getattr(result, "calls_detail", None) or []:
         rows.append(
             {
@@ -187,6 +228,38 @@ def segments_of(result: Any) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def evaluations_of(result: Any) -> list[dict[str, Any]]:
+    """Everything this run judged, as one list the platform can render per call.
+
+    Two kinds arrive from different places and mean different things, so both are named and
+    kept apart rather than averaged into a verdict. A sub-goal is deterministic: the world was
+    left in a state, or it was not. A metric is scored: the run placed it somewhere between
+    nothing and everything. Reporting only the first is what made a scored run look unjudged.
+    """
+    judged: list[dict[str, Any]] = []
+    for check in getattr(result, "checkpoints", None) or []:
+        judged.append(
+            {
+                "name": getattr(check, "name", ""),
+                "kind": getattr(check, "kind", "") or "checkpoint",
+                "passed": bool(getattr(check, "passed", False)),
+                "reason": str(getattr(check, "detail", ""))[:2000],
+            }
+        )
+    for metric in (getattr(result, "measured", None) or {}).get("metrics") or []:
+        if not metric.get("applicable", True):
+            continue
+        judged.append(
+            {
+                "name": str(metric.get("name", "")),
+                "kind": "metric",
+                "score": float(metric.get("score", 0.0) or 0.0),
+                "reason": str(metric.get("reason", ""))[:2000],
+            }
+        )
+    return [one for one in judged if one["name"]]
 
 
 def result_of(result: Any) -> dict[str, Any]:
@@ -213,6 +286,7 @@ def result_of(result: Any) -> dict[str, Any]:
         "ended_reason": (getattr(result, "ended", "") or "")[:10000],
         "call_summary": (getattr(result, "line", lambda: "")() or "")[:2000],
         "transcript": segments_of(result),
+        "evaluations": evaluations_of(result),
         "call_metadata": {
             "harness_scenario": getattr(result, "scenario", ""),
             "harness_passed": bool(getattr(result, "passed", False)),
@@ -233,18 +307,24 @@ def report(
     *,
     name: str,
     run_test_id: str = "",
+    modality: str = "text",
     platform: Platform | None = None,
 ) -> Reported:
     """Report one suite run, and say where it landed.
 
     ``run_test_id`` is reused when the session already has one, so a second run adds a second
     execution to the same test rather than a second test with one run in it.
+
+    ``modality`` decides how the run is rendered: a spoken call reported as text lands in the
+    chat view, with no player and no audio, whatever actually happened on it.
     """
     api = platform or Platform()
     reported = Reported(run_test_id=run_test_id)
 
     if not run_test_id:
-        provisioned = api.provision(name, [persona_of(one) for one in scenarios])
+        provisioned = api.provision(
+            name, [persona_of(one) for one in scenarios], modality=modality
+        )
         reported.run_test_id = str(provisioned.get("run_test_id", ""))
     if not reported.run_test_id:
         raise PlatformError("the platform returned no run test to report against")
@@ -261,6 +341,14 @@ def report(
         try:
             api.result(call_execution_id, result_of(result))
             reported.calls[getattr(result, "scenario", "")] = call_execution_id
+            # The audio, where the run left any. Reported after the result so a call that has
+            # already landed is not lost to an upload that fails.
+            audio = str(getattr(result, "recording", "") or "")
+            if audio and Path(audio).exists():
+                try:
+                    api.recording(call_execution_id, Path(audio))
+                except PlatformError as refused:
+                    reported.problems.append(f"recording not sent: {refused}")
         except PlatformError as failed:
             reported.problems.append(f"{getattr(result, 'scenario', '?')}: {failed}")
     if len(ids) < len(results):
@@ -269,6 +357,43 @@ def report(
             "so the rest were not reported"
         )
     return reported
+
+
+def deliver(
+    results: list[Any],
+    scenarios: list[Any],
+    destination: Path | None,
+    *,
+    modality: str = "text",
+) -> tuple[Reported | None, list[str]]:
+    """Report a finished run, and say what happened, without ever failing the run.
+
+    Shared by every way a suite can be started, because a run that only appears on the platform
+    when it was started from one particular button is worse than one that never appears: which
+    runs exist then depends on how they were launched, and nobody can tell that from the page.
+
+    The suite has finished and its results are on disk by the time this is called, so an
+    unreachable platform is worth saying out loud and not worth throwing a completed run away
+    over. Returns what was reported, if anything, and the lines to show whoever asked.
+    """
+    blocked = configured()
+    if blocked:
+        return None, [f"not reported to the platform: {blocked}"]
+    try:
+        reported = report(
+            results,
+            scenarios,
+            name=(destination.name if destination else "harness run"),
+            run_test_id=remembered(destination) if destination else "",
+            modality=modality,
+        )
+    except PlatformError as failed:
+        return None, [f"the run finished, but reporting it to the platform failed: {failed}"]
+    if destination:
+        remember(destination, reported)
+    said = [f"partly reported: {problem}" for problem in reported.problems]
+    said.append(f"reported to the platform: {reported.url}")
+    return reported, said
 
 
 def remember(destination: Path, reported: Reported) -> None:
@@ -286,12 +411,22 @@ def remember(destination: Path, reported: Reported) -> None:
     )
 
 
+def reported_to(destination: Path | None) -> dict[str, str]:
+    """Where this session's runs have been reported, or nothing.
+
+    Read rather than held in memory, because a session outlives the process that reported it:
+    reopening one has to be able to find the run it already has.
+    """
+    kept = Path(destination) / "platform.json" if destination else None
+    if kept is None or not kept.exists():
+        return {}
+    try:
+        found = json.loads(kept.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a damaged file just means provisioning again
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
 def remembered(destination: Path) -> str:
     """The run test this session already has, or an empty string."""
-    kept = Path(destination) / "platform.json"
-    if not kept.exists():
-        return ""
-    try:
-        return str(json.loads(kept.read_text(encoding="utf-8")).get("run_test_id", ""))
-    except Exception:  # noqa: BLE001 - a damaged file just means provisioning again
-        return ""
+    return str(reported_to(destination).get("run_test_id", ""))

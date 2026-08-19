@@ -200,8 +200,6 @@ const useAlkMutation = (mutationFn) => {
         ALK_KEYS.subgoals,
         ALK_KEYS.runs,
         // Creating or deleting a session adds or removes a row in the environments list.
-        // Nothing reads this key yet — the list is still fixtures — but leaving it out is how
-        // a freshly created environment would fail to appear once the real hook lands.
         ALK_KEYS.environments,
       ].forEach((queryKey) => queryClient.invalidateQueries({ queryKey }));
     },

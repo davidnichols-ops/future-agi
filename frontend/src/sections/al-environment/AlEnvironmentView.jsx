@@ -69,7 +69,6 @@ const AlEnvironmentView = () => {
   // Added by the backend proxy at the top level of the status object, beside `busy` — not
   // inside `session`. Absent entirely when talking to the harness directly, hence nullable.
   const runTestId = status?.run_test_id;
-  const executionId = status?.execution_id;
 
   const { sessions, openSessionId } = useAlkSessions();
   const { messages } = useAlkHistory(hasSession);
@@ -404,23 +403,20 @@ const AlEnvironmentView = () => {
             <Button
               size="small"
               variant="contained"
-              disabled={!runTestId || !executionId}
-              {...(runTestId && executionId
+              disabled={!runTestId}
+              {...(runTestId
                 ? {
                     component: RouterLink,
-                    href: paths.dashboard.simulate.callDetails(
-                      runTestId,
-                      executionId,
-                    ),
+                    href: paths.dashboard.simulate.testRuns(runTestId),
                   }
                 : {})}
               title={
-                runTestId && executionId
-                  ? "Open this session's simulation run"
-                  : "Available once this session has a simulation run"
+                runTestId
+                  ? "Open this session's simulation runs on the platform"
+                  : "Available once this session has reported a run"
               }
             >
-              Run Simulation
+              View Simulations
             </Button>
           </Stack>
           <Box

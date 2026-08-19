@@ -144,22 +144,22 @@ describe("AlEnvironmentView", () => {
     expect(clearLive).toHaveBeenCalledTimes(1);
   });
 
-  it("cannot open a simulation run until the harness names one", () => {
+  it("cannot open the simulation runs until the harness names one", () => {
     render(<AlEnvironmentView />);
-    expect(screen.getByRole("button", { name: /run simulation/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /view simulations/i })).toBeDisabled();
   });
 
-  it("links to the platform run once the harness reports its ids", () => {
+  it("links to every run of the test, not one execution of it", () => {
     hooks.useAlkStatus.mockReturnValue({
       status: { ...openStatus, run_test_id: "test-uuid", execution_id: "exec-uuid" },
       isError: false,
       refetch: vi.fn(),
     });
     render(<AlEnvironmentView />);
-    const link = screen.getByRole("link", { name: /run simulation/i });
+    const link = screen.getByRole("link", { name: /view simulations/i });
     expect(link).toHaveAttribute(
       "href",
-      "/dashboard/simulate/test/test-uuid/exec-uuid/call-details"
+      "/dashboard/simulate/test/test-uuid/runs"
     );
   });
 

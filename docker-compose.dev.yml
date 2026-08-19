@@ -197,6 +197,16 @@ services:
       HARNESS_PLATFORM_URL: ${HARNESS_PLATFORM_URL:-http://backend:80}
       HARNESS_PLATFORM_API_KEY: ${HARNESS_PLATFORM_API_KEY:-}
       HARNESS_PLATFORM_SECRET_KEY: ${HARNESS_PLATFORM_SECRET_KEY:-}
+      # Voice. 1.1.2 reaches a LiveKit worker over WebRTC; the caller and the agent must be
+      # on the same LiveKit instance, so this is the agent's project, not the EU one.
+      HARNESS_VOICE_CASE: ${HARNESS_VOICE_CASE:-1.1.2}
+      LIVEKIT_URL: ${LIVEKIT_URL:-}
+      ACCEPTANCE_LIVEKIT_URL: ${ACCEPTANCE_LIVEKIT_URL:-${LIVEKIT_URL:-}}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      LIVEKIT_TARGET_AGENT_NAME: ${LIVEKIT_TARGET_AGENT_NAME:-}
+      LIVEKIT_TARGET_SYSTEM_PROMPT: ${LIVEKIT_TARGET_SYSTEM_PROMPT:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
       # .env names the credentials by a path relative to the host checkout, which resolves to
       # nothing in here. Mounted below at a fixed location and repointed, or every stage fails
       # at its first model call.

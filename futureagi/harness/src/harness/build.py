@@ -33,13 +33,27 @@ from .world.tools import TOOL_NAMES, WORLD_SERVER, world_tools
 SKILL = "build-environment"
 
 
+def turns_for(contract: AgentContract) -> int:
+    """A turn budget that grows with the agent being built for.
+
+    A fixed ceiling silently truncates the work. Sixteen tools ran out at sixty turns having
+    declared its tables, its sequence, the simulator prompt, thirteen sub-goals and four world
+    checks -- and not one handler, which is the part the whole stage exists to produce. The
+    stage reported a failure, but what it left behind looked like a partial success.
+
+    Every tool needs a handler and a probe that exercises it, so the budget follows the tool
+    count rather than a number that happened to fit the first agent tried.
+    """
+    return max(80, len(contract.tools or []) * 8 + 40)
+
+
 def open_stage(
     contract: AgentContract,
     *,
     out: Path | None = None,
     ask: Callable[..., Any] | None = None,
     source_root: str = "",
-    max_turns: int = 60,
+    max_turns: int = 0,
 ) -> tuple[Stage, Path]:
     """A live build-the-world stage, and where it will write."""
     destination = out or artifact_dir(contract.agent)
@@ -62,7 +76,7 @@ def open_stage(
         permission_mode="default",
         cwd=str(destination.parent if destination.parent.exists() else Path.cwd()),
         setting_sources=[],
-        max_turns=max_turns,
+        max_turns=max_turns or turns_for(contract),
         model=chosen_model(),
         env=provider_env(),
     )
@@ -89,7 +103,7 @@ async def build(
     follow_ups: list[str] | None = None,
     on_event: Callable[..., Any] | None = None,
     ask: Callable[..., Any] | None = None,
-    max_turns: int = 60,
+    max_turns: int = 0,
 ) -> Path | None:
     """Run the stage start to finish. Returns where the world was written, or None."""
     stage, destination = open_stage(contract, out=out, ask=ask, max_turns=max_turns)
