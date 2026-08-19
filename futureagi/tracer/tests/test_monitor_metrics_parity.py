@@ -4,8 +4,7 @@ guard, and eval CHOICES containment. Pure SQL-string assertions."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 import pytest
 
@@ -16,8 +15,8 @@ from tracer.services.clickhouse.query_builders.monitor_metrics import (
 
 PROJECT_ID = "11111111-1111-1111-1111-111111111111"
 EVAL_CONFIG_ID = "22222222-2222-2222-2222-222222222222"
-START = datetime(2026, 8, 1, tzinfo=timezone.utc)
-END = datetime(2026, 8, 8, tzinfo=timezone.utc)
+START = datetime(2026, 8, 1, tzinfo=UTC)
+END = datetime(2026, 8, 8, tzinfo=UTC)
 
 TIME_AGGREGATED = [
     mm.COUNT_OF_ERRORS,
@@ -35,7 +34,7 @@ PER_ROW_HISTORICAL = [
 ]
 
 
-def _builder(eval_output_type: Optional[str] = None) -> MonitorMetricsQueryBuilder:
+def _builder(eval_output_type: str | None = None) -> MonitorMetricsQueryBuilder:
     return MonitorMetricsQueryBuilder(
         project_id=PROJECT_ID,
         eval_config_id=EVAL_CONFIG_ID if eval_output_type else None,
@@ -63,7 +62,8 @@ def test_time_aggregated_historical_buckets_calendar(
     sql, _ = _builder().build_historical_stats_query(
         metric_type, START, END, interval_kind=interval_kind
     )
-    assert f"{bucket_fn}(created_at) AS bucket_ts" in sql
+    # Event time: buckets share the window's axis, so no out-of-window bucket.
+    assert f"{bucket_fn}(start_time) AS bucket_ts" in sql
     assert "GROUP BY bucket_ts" in sql
     # Sample stddev here (old path used statistics.stdev), collapsed to 0.
     assert "stddevSamp(bucket_value)" in sql
@@ -84,7 +84,7 @@ def test_time_aggregated_historical_agg_per_metric() -> None:
 
 def test_time_aggregated_historical_defaults_to_hour() -> None:
     sql, _ = _builder().build_historical_stats_query(mm.COUNT_OF_ERRORS, START, END)
-    assert "toStartOfHour(created_at) AS bucket_ts" in sql
+    assert "toStartOfHour(start_time) AS bucket_ts" in sql
 
 
 # --- stddevPop for per-row + eval stats (PG StdDev is population) -------------
@@ -146,3 +146,53 @@ def test_eval_choices_no_output_str_fallback() -> None:
     )
     assert "has(JSONExtract(output_str_list, 'Array(String)'), %(choice_val)s)" in sql
     assert "OR output_str" not in sql
+
+
+# --- Evaluator routing: CH serves these metrics, PG is never touched ----------
+
+
+class TestHistoricalStatsRouting:
+    """Pin the _get_historical_stats routing hunk: the four time-aggregated
+    metrics are served by the CH builder with the monitor's interval_kind,
+    and ObservationSpan (the dropped span table) is never queried."""
+
+    @pytest.mark.parametrize(
+        ("metric_type", "frequency", "bucket_fn"),
+        [
+            (mm.COUNT_OF_ERRORS, 60, "toStartOfHour"),
+            (mm.TOKEN_USAGE, 5, "toStartOfMinute"),
+            (mm.DAILY_TOKENS_SPENT, 60, "toStartOfDay"),
+            (mm.MONTHLY_TOKENS_SPENT, 60, "toStartOfMonth"),
+        ],
+    )
+    def test_ch_route_passes_interval_kind_and_skips_pg(
+        self, metric_type: str, frequency: int, bucket_fn: str
+    ) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from tracer.models.monitor import UserAlertMonitor
+        from tracer.utils import monitor as monitor_utils
+
+        monitor = UserAlertMonitor(
+            project_id=PROJECT_ID,
+            metric_type=metric_type,
+            alert_frequency=frequency,
+            filters={},
+        )
+        captured: dict[str, str] = {}
+
+        class _Svc:
+            def execute_ch_query(self, query, params, **kwargs):
+                captured["query"] = query
+                return SimpleNamespace(data=[{"mean": 4.2, "stddev": 1.1}])
+
+        with mock.patch.object(monitor_utils, "AnalyticsQueryService", _Svc):
+            mean, stddev = monitor_utils._get_historical_stats(monitor, START, END)
+
+        assert (mean, stddev) == (4.2, 1.1)
+        # interval_kind derived from the monitor reaches the bucket function.
+        assert f"{bucket_fn}(start_time)" in captured["query"]
+        # PG path is gone structurally: the module no longer imports the
+        # dropped span table at all.
+        assert not hasattr(monitor_utils, "ObservationSpan")

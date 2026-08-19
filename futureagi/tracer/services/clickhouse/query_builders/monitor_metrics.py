@@ -28,10 +28,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
+from tracer.models.monitor import MonitorMetricTypeChoices
+from tracer.models.observation_span import EvalEntryStatus
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder, _parse_dt
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
-from tracer.models.monitor import MonitorMetricTypeChoices
 from tracer.services.clickhouse.v2.id_remap_sql import (
     remap_left_join,
     resolved_id_expr,
@@ -55,27 +56,42 @@ EVALUATION_METRICS = "evaluation_metrics"
 SPANS_TABLE = "spans"
 SESSION_REMAP_TABLE = "trace_session_id_remap"
 
-# Time-series bucket: floor created_at to the frequency window (parity with the
-# pre-migration ORM bucketing; pruning comes from the WHERE, not the bucket).
+# Time-series buckets: to epoch seconds, integer-divide by the frequency to
+# floor to the bucket boundary, back to DateTime (300s: 12:07:43 -> 12:05:00).
+# Both bucket on span ``start_time`` (event time — when it happened in the
+# user's system); the eval table has no span-time column, so its series joins
+# spans (alias ``sp``).
 _TIME_BUCKET_EXPR = (
-    "toDateTime(intDiv(toUInt32(created_at), %(freq_seconds)s) * %(freq_seconds)s)"
+    "toDateTime(intDiv(toUInt32(start_time), %(freq_seconds)s) * %(freq_seconds)s)"
+)
+_EVAL_SPAN_BUCKET_EXPR = (
+    "toDateTime(intDiv(toUInt32(sp.start_time), %(freq_seconds)s) * %(freq_seconds)s)"
+)
+
+# Statuses whose rows carry no real value (NULL outputs). NOT IN keeps legacy
+# empty/NULL-status rows counted as completed (mirrors span_list.py).
+_EVAL_NON_VALUE_STATUSES = ", ".join(
+    f"'{s.value}'" for s in EvalEntryStatus if s is not EvalEntryStatus.COMPLETED
 )
 
 
 
 def _pruned_window(start_param: str, end_param: str) -> str:
-    """Half-open exact created_at window ``[start, end)`` + padded start_time bounds.
+    """Half-open exact start_time window ``[start, end)`` + padded created_at guard.
 
-    Half-open (``>= start AND < end``) so a span on the boundary is never claimed
-    by two adjacent windows (matters for trailing spend sums; harmless elsewhere).
-    Partitioning is by toDate(start_time), so the start_time pads (±1 day
-    ingest-lag allowance) drive partition pruning; the created_at minmax skip
-    index (v2 schema 024) only helps at the part level.
+    Event-time semantics: alerts, graphs and baselines all measure when the
+    activity happened in the user's system (``start_time`` — also the partition
+    key, so the exact window prunes directly), never ingest time. Half-open
+    (``>= start AND < end``) so a span on the boundary is never claimed by two
+    adjacent windows (matters for trailing spend sums; harmless elsewhere).
+    The padded ``created_at`` lower bound only guards against clock-skewed
+    producers reporting future ``start_time``. Blind spot: a span ingested
+    after its window was evaluated is never counted.
+    TODO: offset evaluation windows by ingest lag.
     """
     return (
-        f"created_at >= %({start_param})s AND created_at < %({end_param})s "
-        f"AND start_time >= %({start_param})s - INTERVAL 1 DAY "
-        f"AND start_time < %({end_param})s + INTERVAL 1 DAY"
+        f"start_time >= %({start_param})s AND start_time < %({end_param})s "
+        f"AND created_at >= %({start_param})s - INTERVAL 1 DAY"
     )
 
 
@@ -338,7 +354,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         params["eval_config_id"] = self.eval_config_id
 
         eval_table, eval_nd = eval_logger_source()
-        eval_where = self._eval_base_where(eval_nd)
+        eval_where = self._eval_membership(eval_nd)
 
         if self.eval_output_type == "SCORE":
             query = f"""
@@ -506,7 +522,8 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             # Stats over calendar-aligned buckets. Empty result collapses to
             # (0, 0), a single bucket to (value, 0), and no-token buckets are
             # skipped via nullIf (v2 total_tokens is non-Nullable) — matching
-            # the old Python path.
+            # the old Python path. Buckets are on start_time (event time), the
+            # same axis as the window — no out-of-window trailing bucket.
             bucket_fn = self.time_bucket_expr(interval_kind or "hour")
             agg = (
                 "countIf(status = 'ERROR')"
@@ -519,7 +536,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                     coalesce(ifNotFinite(stddevSamp(bucket_value), 0), 0) AS stddev
                 FROM (
                     SELECT
-                        {bucket_fn}(created_at) AS bucket_ts,
+                        {bucket_fn}(start_time) AS bucket_ts,
                         {agg} AS bucket_value
                     FROM {SPANS_TABLE}
                     {base_where}
@@ -542,7 +559,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
 
         params["eval_config_id"] = self.eval_config_id
         eval_table, eval_nd = eval_logger_source()
-        eval_where = self._eval_base_where(eval_nd)
+        eval_where = self._eval_membership(eval_nd)
 
         if self.eval_output_type == "SCORE":
             query = f"""
@@ -701,7 +718,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
                         {resolved_ts} AS trace_session_id,
                         countIf(rs.status = 'ERROR') AS error_count
                     FROM (
-                        SELECT trace_session_id, status, created_at
+                        SELECT trace_session_id, status, start_time
                         FROM {SPANS_TABLE}
                         {base_where}
                           {time_filter}
@@ -750,19 +767,18 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
     ) -> Tuple[str, Dict[str, Any]]:
         """Build eval metric time-series query.
 
-        Buckets on the eval row's ``created_at`` (the table has no span-time
-        column). Window membership comes from the span subquery, so a
-        late-computed eval for an in-window span lands in the bucket of its
-        computation time.
-        # TODO: bucket by span time (needs a spans join) for graph fidelity.
+        Buckets on the joined SPAN's ``start_time`` (the user's application
+        timeline): a low score must chart when the activity happened, not
+        when the eval was computed — and late-computed evals must not emit
+        buckets past the requested window.
         """
         if not self.eval_config_id:
             return "SELECT NULL AS timestamp, NULL AS value WHERE 1 = 0", params
 
         params["eval_config_id"] = self.eval_config_id
         eval_table, eval_nd = eval_logger_source()
-        eval_where = self._eval_base_where(eval_nd)
-        bucket_expr = _TIME_BUCKET_EXPR
+        eval_where = self._eval_membership(eval_nd, "id, start_time")
+        bucket_expr = _EVAL_SPAN_BUCKET_EXPR
 
         if self.eval_output_type == "SCORE":
             agg = "avg(output_float)"
@@ -804,46 +820,42 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             clause += f" AND {self._filter_clause}"
         return clause
 
-    def _eval_base_where(self, not_deleted: str) -> str:
-        """Eval-config scope + span-time window via bounded span membership.
+    def _eval_membership(self, not_deleted: str, span_cols: str = "id") -> str:
+        """Span-windowed membership (JOIN) + eval-row guards.
 
         ``not_deleted`` comes from the same ``eval_logger_source()`` call that
         resolved the table, so the pair stays consistent.
 
-        The metric window is applied to the SPAN's ``created_at`` (when the
-        activity happened), NOT the eval row's ``created_at`` (when the score
-        was computed) — evals run asynchronously after their spans, so a
-        window on eval time measures the wrong thing (proven at prod scale:
-        8,577 vs 400 evals for the same busy hour). Windowing the span
-        subquery also keeps the IN-set a window's worth of ids instead of the
-        whole project (an unbounded set hit 105M ids / 1.69 GB →
-        SET_SIZE_LIMIT_EXCEEDED at 241M spans).
-
-        The eval-side ``created_at`` keeps only a loose lower bound: an eval
-        row is written after its span, so eval time >= span time >= window
-        start (1-day pad for skew). It is correctness-neutral (the span
-        subquery alone determines the result) but it is the eval table's ONLY
-        prune — the table is PARTITION BY toYYYYMM(created_at) with sort key
-        (trace_id, config_id, id), so without it every tick full-scans all
-        partitions + FINAL-merges them (51K vs 1.55M rows read at prod today;
-        the gap grows with table age). Drop it only if evals are ever
-        backfilled with created_at stamps predating their spans by >1 day.
+        The window lives on the SPAN's ``start_time`` (event time — the
+        user's timeline), not the eval row's ``created_at`` — evals run async
+        after their spans (8,577 vs 400 evals for the same busy hour when
+        windowed on eval time). A JOIN (vs ``IN``) streams the span set
+        instead of materializing it in memory (~100M ids overflowed
+        ``max_bytes_in_set`` at prod scale).
+        The eval-side ``created_at`` lower bound (1-day skew pad) is
+        correctness-neutral but is the eval table's only partition prune
+        (toYYYYMM(created_at)); the v2 sort key also prunes granules with it.
+        Only completed, non-errored rows count — pending/errored rows carry
+        NULL outputs that would read as failures.
         """
-        filter_extra = ""
-        if self._filter_clause:
-            filter_extra = f" AND {self._filter_clause}"
-
         return (
+            f"INNER JOIN ({self._bounded_spans_subquery(span_cols)}) AS sp "
+            f"ON observation_span_id = sp.id "
             f"WHERE custom_eval_config_id = toUUID(%(eval_config_id)s) "
             f"AND {not_deleted} "
-            f"AND created_at >= %(start_time)s - INTERVAL 1 DAY "
-            f"AND observation_span_id IN ("
-            f"  SELECT id FROM {SPANS_TABLE} "
-            f"  WHERE {self.project_filter_sql()} "
-            f"  AND is_deleted = 0 "
-            f"  AND created_at >= %(start_time)s AND created_at < %(end_time)s "
-            f"  AND start_time >= %(start_time)s - INTERVAL 1 DAY "
-            f"  AND start_time < %(end_time)s + INTERVAL 1 DAY"
-            f"  {filter_extra}"
-            f")"
+            f"AND error = 0 "
+            f"AND ifNull(output_str, '') != 'ERROR' "
+            f"AND status NOT IN ({_EVAL_NON_VALUE_STATUSES}) "
+            f"AND created_at >= %(start_time)s - INTERVAL 1 DAY"
+        )
+
+    def _bounded_spans_subquery(self, select_cols: str = "id") -> str:
+        """Metric-window-bounded spans subquery for eval membership."""
+        filter_extra = f" AND {self._filter_clause}" if self._filter_clause else ""
+        return (
+            f"SELECT {select_cols} FROM {SPANS_TABLE} "
+            f"WHERE {self.project_filter_sql()} "
+            f"AND is_deleted = 0 "
+            f"AND {_pruned_window('start_time', 'end_time')}"
+            f"{filter_extra}"
         )

@@ -8130,15 +8130,17 @@ class TestMonitorMetricsQueryBuilder:
         assert "countIf(status = 'ERROR')" in query
 
     def test_error_free_session_rates_query(self):
-        """ERROR_FREE_SESSION_RATES should group by session_id."""
+        """ERROR_FREE_SESSION_RATES should group by trace_session_id."""
         from datetime import datetime
 
         builder = self._make_builder()
         query, _ = builder.build_metric_value_query(
             "error_free_session_rates", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
-        assert "session_id" in query
-        assert "GROUP BY session_id" in query
+        assert "trace_session_id" in query
+        # Remap-aware: groups by the survivor-resolved session id.
+        assert "id_remap.survivor_id" in query
+        assert "GROUP BY" in query
 
     def test_service_provider_error_rates_query(self):
         """SERVICE_PROVIDER_ERROR_RATES should group by provider."""
@@ -8257,7 +8259,8 @@ class TestMonitorMetricsQueryBuilder:
             "evaluation_metrics", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
         assert "JSONExtract(output_str_list, 'Array(String)')" in query
-        assert "OR output_str =" in query
+        # List-containment only: choice evals write output_str_list exclusively.
+        assert "OR output_str =" not in query
         assert params["choice_val"] == "Good"
 
     def test_evaluation_metrics_no_config_returns_null(self):
@@ -8304,8 +8307,10 @@ class TestMonitorMetricsQueryBuilder:
         query, _ = builder.build_historical_stats_query(
             "span_response_time", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
-        assert "avg(latency_ms) AS mean" in query
-        assert "stddevSamp(latency_ms) AS stddev" in query
+        # NaN -> NULL so empty windows suppress alerts instead of firing.
+        assert "ifNotFinite(avg(latency_ms), NULL) AS mean" in query
+        # Population stddev (PG StdDev default) with NaN -> NULL guard.
+        assert "ifNotFinite(stddevPop(latency_ms), NULL) AS stddev" in query
 
     def test_historical_stats_eval_score(self):
         """Historical stats for EVALUATION_METRICS SCORE should use output_float."""
@@ -8319,17 +8324,20 @@ class TestMonitorMetricsQueryBuilder:
             "evaluation_metrics", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
         assert "avg(output_float)" in query
-        assert "stddevSamp(output_float)" in query
+        assert "stddevPop(output_float)" in query
 
-    def test_historical_stats_aggregated_metrics_return_null(self):
-        """COUNT_OF_ERRORS etc. should return NULL for stats (handled in Python)."""
+    def test_historical_stats_aggregated_metrics_bucket_in_ch(self):
+        """COUNT_OF_ERRORS etc. compute bucketed mean/stddev CH-natively."""
         from datetime import datetime
 
         builder = self._make_builder()
         query, _ = builder.build_historical_stats_query(
             "count_of_errors", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
-        assert "NULL AS mean" in query
+        assert "avg(bucket_value)" in query
+        assert "stddevSamp(bucket_value)" in query
+        assert "countIf(status = 'ERROR')" in query
+        assert "GROUP BY bucket_ts" in query
 
     # -- Time series queries --
 
@@ -8584,7 +8592,9 @@ class TestSessionAnalyticsQueryBuilder:
         builder = self._make_builder()
         query, params = builder.build_session_metrics_query(["sess-1", "sess-2"])
         assert "trace_session_id" in query
-        assert "GROUP BY trace_session_id" in query
+        # Remap-aware: groups by the survivor-resolved session id.
+        assert "id_remap.survivor_id" in query
+        assert "GROUP BY" in query
         assert "count(DISTINCT trace_id)" in query
         assert "sum(total_tokens)" in query
         assert "sum(cost)" in query
@@ -8613,7 +8623,9 @@ class TestSessionAnalyticsQueryBuilder:
         builder = self._make_builder()
         query, params = builder.build_session_navigation_query()
         assert "trace_session_id" in query
-        assert "GROUP BY trace_session_id" in query
+        # Remap-aware: groups by the survivor-resolved session id.
+        assert "id_remap.survivor_id" in query
+        assert "GROUP BY" in query
         assert "ORDER BY started_at DESC" in query
         # UUID-vs-empty-string makes CH raise Code 376 (Cannot parse uuid).
         assert "trace_session_id != ''" not in query
