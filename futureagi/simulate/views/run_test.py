@@ -4793,6 +4793,11 @@ class GetEvalConfigStructureView(APIView):
                     template.config.get("config_params_option", {})
                 ),
                 "api_key_available": api_key_available,
+                "pinned_version_id": (
+                    str(eval_config.pinned_version_id)
+                    if eval_config.pinned_version_id
+                    else None
+                ),
             }
 
             return self._gm.success_response({"eval": eval_data})
