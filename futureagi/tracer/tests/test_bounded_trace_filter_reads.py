@@ -2687,6 +2687,20 @@ def test_long_window_voice_error_status_forwards_global_indexed_anchor() -> None
     assert params["filter_anchor_limit"] == 64
 
 
+def test_voice_custom_attribute_filter_skips_temporal_trace_anchor() -> None:
+    builder = VoiceCallListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(END - timedelta(minutes=5), END),
+            _attribute_filter("attempt", 7, filter_type="number"),
+        ],
+        page_size=25,
+    )
+
+    assert builder.filter_anchor_probe_proves_complete_population() is False
+    assert builder.supports_filter_anchor_probe() is False
+
+
 def test_long_window_voice_empty_error_anchor_completes_in_one_query() -> None:
     filters = [_time_filter(), _system_filter("status", "ERROR")]
     builder = VoiceCallListQueryBuilderV2(

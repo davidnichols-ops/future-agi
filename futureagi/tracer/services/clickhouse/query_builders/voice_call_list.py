@@ -287,18 +287,24 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         return self._bounded_delegate().allow_filter_anchor_probe_for_initial_continuation()
 
     def supports_filter_anchor_probe(self) -> bool:
-        """Expose indexed trace witnesses to the shared bounded selector.
+        """Expose only complete-population trace witnesses to voice pages.
 
         Voice pages delegate membership to ``TraceListQueryBuilder`` but used
         to omit its anchor capability hooks.  A long-range ``status=ERROR``
         request therefore walked the complete window in resumable time slices
         even when the indexed global error witness was empty.  Forwarding the
-        full capability contract lets that safe population proof terminate the
-        voice page while the normal finite classifier still enforces the
-        conversation-root invariant whenever candidates exist.
+        global error witness lets that safe population proof terminate the
+        voice page.  Ordinary temporal attribute anchors are only positive
+        accelerators and cannot prove voice result order; running one before
+        the canonical root seed adds a redundant ClickHouse scan before the
+        normal finite classifier enforces the conversation-root invariant.
         """
 
-        return self._bounded_delegate().supports_filter_anchor_probe()
+        delegate = self._bounded_delegate()
+        return bool(
+            delegate.supports_filter_anchor_probe()
+            and delegate.filter_anchor_probe_proves_complete_population()
+        )
 
     def filter_anchor_probe_proves_complete_population(self) -> bool:
         return self._bounded_delegate().filter_anchor_probe_proves_complete_population()
