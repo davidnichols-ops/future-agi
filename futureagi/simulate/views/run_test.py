@@ -24,8 +24,11 @@ from rest_framework.views import APIView
 
 from model_hub.models.api_key import ApiKey
 from model_hub.models.develop_dataset import Cell, Column, Row
-from model_hub.models.evals_metric import EvalTemplate
-from model_hub.services.eval_version_pinning import resolve_pin_for_new_binding
+from model_hub.models.evals_metric import EvalTemplate, EvalTemplateVersion
+from model_hub.services.eval_version_pinning import (
+    is_versioned_template,
+    resolve_pin_for_new_binding,
+)
 from model_hub.utils.function_eval_params import (
     normalize_eval_runtime_config,
     params_with_defaults_for_response,
@@ -4970,6 +4973,29 @@ class UpdateEvalConfigView(APIView):
             # is validated against the new template's schema.
             if new_template:
                 eval_config.eval_template = new_template
+                # A pin belongs to the template it came from; carrying it across
+                # a switch would run a version of the wrong eval.
+                eval_config.pinned_version = None
+
+            # Version creation lives in the frontend, which saves a new
+            # EvalTemplateVersion on config change and sends its id here.
+            # Passing null unpins and falls back to the template default.
+            if "pinned_version_id" in validated:
+                selected_version_id = validated.get("pinned_version_id")
+                if not is_versioned_template(eval_config.eval_template):
+                    # System evals never hold a pin; ignore whatever was sent.
+                    eval_config.pinned_version = None
+                elif selected_version_id:
+                    selected_version = EvalTemplateVersion.objects.filter(
+                        id=selected_version_id,
+                        eval_template=eval_config.eval_template,
+                        deleted=False,
+                    ).first()
+                    if not selected_version:
+                        return self._gm.bad_request("Selected version not found")
+                    eval_config.pinned_version = selected_version
+                else:
+                    eval_config.pinned_version = None
 
             # Save the eval config
             eval_config.save()
