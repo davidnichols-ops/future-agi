@@ -87,19 +87,29 @@ def test_eval_v2_table_uses_is_deleted() -> None:
             )
 
 
-def test_eval_span_subquery_windowed_on_span_time() -> None:
-    # The metric window lives on the SPAN's created_at inside the membership
-    # subquery (evals run async after their spans), with the same ±1-day
-    # start_time pruning pads as every other spans query. An unbounded (or
-    # 30-day) span set exploded to 105M ids at prod scale.
-    for sql in _eval_sqls():
-        subq = sql.split("observation_span_id IN (", 1)[1]
-        assert "SELECT id FROM spans" in subq
+def test_eval_membership_is_windowed_span_join() -> None:
+    # Membership is a JOIN on a span subquery windowed on the SPAN's
+    # created_at (evals run async after their spans), with the ±1-day
+    # start_time pruning pads. A JOIN streams the span set — the old IN
+    # materialized it in memory (105M ids / 30d at prod scale). The series
+    # additionally selects start_time to bucket on.
+    value_sql, stats_sql, ts_sql = _eval_sqls()
+    for sql in (value_sql, stats_sql, ts_sql):
+        subq = sql.split("INNER JOIN (", 1)[1]
+        assert "ON observation_span_id = sp.id" in subq
         assert "created_at >= %(start_time)s AND created_at < %(end_time)s" in subq
         assert "start_time >= %(start_time)s - INTERVAL 1 DAY" in subq
         assert "start_time < %(end_time)s + INTERVAL 1 DAY" in subq
         assert "project_id = %(project_id)s" in subq
+        assert "observation_span_id IN" not in sql
         assert "INTERVAL 30 DAY" not in sql
+    assert "SELECT id FROM spans" in value_sql
+    assert "SELECT id, start_time FROM spans" in ts_sql
+
+
+def _eval_guards(sql: str) -> str:
+    # Eval-row conditions live in the WHERE after the membership join.
+    return sql.split("ON observation_span_id = sp.id", 1)[1]
 
 
 def test_eval_table_window_is_loose_lower_bound_only() -> None:
@@ -109,9 +119,9 @@ def test_eval_table_window_is_loose_lower_bound_only() -> None:
     # upper eval-time window — that measured "evals computed recently", not
     # "quality of recent activity" (8,577 vs 400 evals for the same hour).
     for sql in _eval_sqls():
-        head = sql.split("observation_span_id IN (", 1)[0]
-        assert "created_at >= %(start_time)s - INTERVAL 1 DAY" in head
-        assert "created_at < %(end_time)s" not in head
+        guards = _eval_guards(sql)
+        assert "created_at >= %(start_time)s - INTERVAL 1 DAY" in guards
+        assert "created_at < %(end_time)s" not in guards
         assert "created_at BETWEEN" not in sql
 
 
@@ -120,12 +130,12 @@ def test_eval_rows_exclude_non_completed_statuses() -> None:
     # would read as failures (a burst of newly-enqueued evals must not
     # depress the pass rate). Mirrors span_list.py / filters.py.
     for sql in _eval_sqls():
-        head = sql.split("observation_span_id IN (", 1)[0]
-        assert "error = 0" in head
-        assert "ifNull(output_str, '') != 'ERROR'" in head
+        guards = _eval_guards(sql)
+        assert "error = 0" in guards
+        assert "ifNull(output_str, '') != 'ERROR'" in guards
         for status in ("pending", "running", "skipped", "errored"):
-            assert status in head
-        assert "'completed'" not in head  # NOT-IN keeps empty/NULL status rows
+            assert status in guards
+        assert "'completed'" not in guards  # NOT-IN keeps empty/NULL rows
 
 
 def test_v1_eval_filter_emits_legacy_span_attr_token() -> None:

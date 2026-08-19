@@ -5,8 +5,8 @@ The v2 spans table is ``PARTITION BY toDate(start_time)`` with
 ``toStartOfHour(start_time)`` in the primary key and no index on
 ``created_at``. Filtering ``created_at`` prunes nothing → full-history scans.
 These tests assert the COMPILED SQL filters/buckets spans on ``start_time``
-(with a padded ``created_at`` companion bound), while the eval-table queries
-stay on ``created_at`` (that table has no ``start_time`` column).
+(with a padded ``created_at`` companion bound); eval-table queries window and
+bucket via their joined span (the eval table has no ``start_time`` column).
 
 No real ClickHouse is hit — only the generated SQL string is asserted.
 """
@@ -113,28 +113,29 @@ def test_session_and_date_range_filters_use_start_time():
     assert "created_at BETWEEN %(mf_dr_start)s" not in sql
 
 
-# --- Eval-table queries must stay on created_at (no start_time column) --------
+# --- Eval-table queries window/bucket via the joined span, not created_at ----
 
 
 def test_eval_value_query_windows_span_time():
-    # The metric window lives on the SPAN membership subquery (evals run async
+    # The metric window lives on the SPAN membership join (evals run async
     # after their spans); the eval table keeps only a loose created_at lower
     # bound (its sole partition prune).
     sql, _ = _builder(eval_output_type="SCORE").build_metric_value_query(
         mm.EVALUATION_METRICS, START, END
     )
-    subq = sql.split("observation_span_id IN (", 1)[1]
+    subq = sql.split("INNER JOIN (", 1)[1]
     assert "created_at >= %(start_time)s AND created_at < %(end_time)s" in subq
-    assert "start_time >= %(start_time)s - INTERVAL 1 DAY" in subq
-    head = sql.split("observation_span_id IN (", 1)[0]
-    assert "created_at >= %(start_time)s - INTERVAL 1 DAY" in head
-    # No spans-style bucket on the eval table itself.
-    assert "toUInt32(start_time)" not in sql
+    guards = sql.split("ON observation_span_id = sp.id", 1)[1]
+    assert "created_at >= %(start_time)s - INTERVAL 1 DAY" in guards
+    # No bucket expression in a scalar query.
+    assert "toUInt32(" not in sql
 
 
-def test_eval_time_series_buckets_created_at():
+def test_eval_time_series_buckets_span_start_time():
+    # Eval graphs chart the user's application timeline: buckets come from
+    # the joined span's start_time, never the eval row's created_at.
     sql, _ = _builder(eval_output_type="SCORE").build_time_series_query(
         mm.EVALUATION_METRICS, START, END, 3600
     )
-    assert "toUInt32(created_at)" in sql
-    assert "toUInt32(start_time)" not in sql
+    assert "toUInt32(sp.start_time)" in sql
+    assert "toUInt32(created_at)" not in sql

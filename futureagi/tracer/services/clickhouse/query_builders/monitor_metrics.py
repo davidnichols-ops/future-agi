@@ -50,13 +50,13 @@ EVALUATION_METRICS = "evaluation_metrics"
 SPANS_TABLE = "spans"
 
 # Time-series bucket expressions: floor the time column to the frequency window.
-# Spans are partitioned/keyed on ``start_time``; the eval table has no
-# ``start_time`` column, so it must bucket on ``created_at``.
+# Both bucket on span ``start_time`` (event time — the user's timeline); the
+# eval table has no span-time column, so its series joins spans (alias ``sp``).
 _SPANS_BUCKET_EXPR = (
     "toDateTime(intDiv(toUInt32(start_time), %(freq_seconds)s) * %(freq_seconds)s)"
 )
-_EVAL_BUCKET_EXPR = (
-    "toDateTime(intDiv(toUInt32(created_at), %(freq_seconds)s) * %(freq_seconds)s)"
+_EVAL_SPAN_BUCKET_EXPR = (
+    "toDateTime(intDiv(toUInt32(sp.start_time), %(freq_seconds)s) * %(freq_seconds)s)"
 )
 
 # Statuses whose rows carry no real value (NULL outputs). NOT IN keeps legacy
@@ -341,7 +341,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         params["eval_config_id"] = self.eval_config_id
 
         eval_table, eval_nd = eval_logger_source()
-        eval_where = self._eval_base_where(eval_nd)
+        eval_where = self._eval_membership(eval_nd)
 
         if self.eval_output_type == "SCORE":
             query = f"""
@@ -509,7 +509,7 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
 
         params["eval_config_id"] = self.eval_config_id
         eval_table, eval_nd = eval_logger_source()
-        eval_where = self._eval_base_where(eval_nd)
+        eval_where = self._eval_membership(eval_nd)
 
         if self.eval_output_type == "SCORE":
             query = f"""
@@ -709,19 +709,18 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
     ) -> Tuple[str, Dict[str, Any]]:
         """Build eval metric time-series query.
 
-        Buckets on the eval row's ``created_at`` (the table has no span-time
-        column). Window membership comes from the span subquery, so a
-        late-computed eval for an in-window span lands in the bucket of its
-        computation time.
+        Buckets on the joined SPAN's ``start_time`` (the user's application
+        timeline): a low score must chart when the activity happened, not
+        when the eval was computed — and late-computed evals must not emit
+        buckets past the requested window.
         """
-        # TODO: bucket by span time (needs a spans join) for graph fidelity.
         if not self.eval_config_id:
             return "SELECT NULL AS timestamp, NULL AS value WHERE 1 = 0", params
 
         params["eval_config_id"] = self.eval_config_id
         eval_table, eval_nd = eval_logger_source()
-        eval_where = self._eval_base_where(eval_nd)
-        bucket_expr = _EVAL_BUCKET_EXPR
+        eval_where = self._eval_membership(eval_nd, "id, start_time")
+        bucket_expr = _EVAL_SPAN_BUCKET_EXPR
 
         if self.eval_output_type == "SCORE":
             agg = "avg(output_float)"
@@ -763,39 +762,43 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             clause += f" AND {self._filter_clause}"
         return clause
 
-    def _eval_base_where(self, not_deleted: str) -> str:
-        """Eval-config scope + span-time window via bounded span membership.
+    def _eval_membership(self, not_deleted: str, span_cols: str = "id") -> str:
+        """Span-windowed membership (JOIN) + eval-row guards.
 
         ``not_deleted`` comes from the same ``eval_logger_source()`` call that
         resolved the table, so the pair stays consistent.
 
         The window lives on the SPAN's ``created_at`` (ingest time — late
         spans land in the current tick), not the eval row's — evals run async
-        after their spans, and the bounded subquery keeps the IN-set small.
+        after their spans. A JOIN (vs ``IN``) streams the span set instead of
+        materializing it in memory: a 30-day graph window on a busy project
+        overflows ``max_bytes_in_set`` as an IN-set (~100M ids).
         The eval-side ``created_at`` lower bound (1-day skew pad) is
         correctness-neutral but is the eval table's only partition prune
         (toYYYYMM(created_at)); the v2 sort key also prunes granules with it.
         Only completed, non-errored rows count — pending/errored rows carry
         NULL outputs that would read as failures.
         """
-        filter_extra = ""
-        if self._filter_clause:
-            filter_extra = f" AND {self._filter_clause}"
-
         return (
+            f"INNER JOIN ({self._bounded_spans_subquery(span_cols)}) AS sp "
+            f"ON observation_span_id = sp.id "
             f"WHERE custom_eval_config_id = toUUID(%(eval_config_id)s) "
             f"AND {not_deleted} "
             f"AND error = 0 "
             f"AND ifNull(output_str, '') != 'ERROR' "
             f"AND status NOT IN ({_EVAL_NON_VALUE_STATUSES}) "
-            f"AND created_at >= %(start_time)s - INTERVAL 1 DAY "
-            f"AND observation_span_id IN ("
-            f"  SELECT id FROM {SPANS_TABLE} "
-            f"  WHERE {self.project_filter_sql()} "
-            f"  AND is_deleted = 0 "
-            f"  AND created_at >= %(start_time)s AND created_at < %(end_time)s "
-            f"  AND start_time >= %(start_time)s - INTERVAL 1 DAY "
-            f"  AND start_time < %(end_time)s + INTERVAL 1 DAY"
-            f"  {filter_extra}"
-            f")"
+            f"AND created_at >= %(start_time)s - INTERVAL 1 DAY"
+        )
+
+    def _bounded_spans_subquery(self, select_cols: str = "id") -> str:
+        """Metric-window-bounded spans subquery for eval membership."""
+        filter_extra = f" AND {self._filter_clause}" if self._filter_clause else ""
+        return (
+            f"SELECT {select_cols} FROM {SPANS_TABLE} "
+            f"WHERE {self.project_filter_sql()} "
+            f"AND is_deleted = 0 "
+            f"AND created_at >= %(start_time)s AND created_at < %(end_time)s "
+            f"AND start_time >= %(start_time)s - INTERVAL 1 DAY "
+            f"AND start_time < %(end_time)s + INTERVAL 1 DAY"
+            f"{filter_extra}"
         )
