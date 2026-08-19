@@ -25,6 +25,7 @@ from rest_framework.views import APIView
 from model_hub.models.api_key import ApiKey
 from model_hub.models.develop_dataset import Cell, Column, Row
 from model_hub.models.evals_metric import EvalTemplate
+from model_hub.services.eval_version_pinning import resolve_pin_for_new_binding
 from model_hub.utils.function_eval_params import (
     normalize_eval_runtime_config,
     params_with_defaults_for_response,
@@ -514,6 +515,10 @@ class CreateRunTestView(APIView):
                                     model=eval_config_data.get("model", None),
                                     eval_group_id=eval_config_data.get(
                                         "eval_group", None
+                                    ),
+                                    pinned_version=resolve_pin_for_new_binding(
+                                        eval_template,
+                                        eval_config_data.get("pinned_version_id"),
                                     ),
                                 )
                             except EvalTemplate.DoesNotExist:
@@ -4545,6 +4550,10 @@ class AddEvalConfigView(APIView):
                         filters=eval_config_data.get("filters", []),
                         error_localizer=eval_config_data.get("error_localizer", False),
                         model=eval_config_data.get("model", None),
+                        pinned_version=resolve_pin_for_new_binding(
+                            eval_template,
+                            eval_config_data.get("pinned_version_id"),
+                        ),
                     )
 
                     # Add the new name to existing_names to prevent duplicates within the same request

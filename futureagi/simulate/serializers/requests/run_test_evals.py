@@ -59,6 +59,13 @@ class EvalConfigDefinitionSerializer(StrictInputSerializer):
         default=None,
         help_text="Eval group that created this evaluation config.",
     )
+    pinned_version_id = serializers.UUIDField(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text="Eval template version to pin for runtime. Ignored for system "
+        "evals. When omitted, a custom eval pins the template's default version.",
+    )
 
 
 class AddEvalConfigsRequestSerializer(StrictInputSerializer):
