@@ -11677,8 +11677,11 @@ export const modelHubAnnotationQueuesListResponseResultsItemLabelsItemOrderMax =
 export const modelHubAnnotationQueuesListResponseResultsItemAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesListResponseResultsItemAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesListResponseResultsItemAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesListResponse = zod.object({
@@ -11715,7 +11718,7 @@ export const ModelHubAnnotationQueuesListResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesListResponseResultsItemAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesListResponseResultsItemAnnotatorIdsDefault),
@@ -11728,8 +11731,8 @@ export const ModelHubAnnotationQueuesListResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 }))
@@ -11905,8 +11908,11 @@ export const modelHubAnnotationQueuesReadResponseLabelsItemOrderMax = 2147483647
 export const modelHubAnnotationQueuesReadResponseAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesReadResponseAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesReadResponseAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesReadResponse = zod.object({
@@ -11939,7 +11945,7 @@ export const ModelHubAnnotationQueuesReadResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesReadResponseAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesReadResponseAnnotatorIdsDefault),
@@ -11952,8 +11958,8 @@ export const ModelHubAnnotationQueuesReadResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
@@ -12012,8 +12018,11 @@ export const modelHubAnnotationQueuesUpdateResponseLabelsItemOrderMax = 21474836
 export const modelHubAnnotationQueuesUpdateResponseAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesUpdateResponseAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesUpdateResponseAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesUpdateResponse = zod.object({
@@ -12046,7 +12055,7 @@ export const ModelHubAnnotationQueuesUpdateResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesUpdateResponseAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesUpdateResponseAnnotatorIdsDefault),
@@ -12059,8 +12068,8 @@ export const ModelHubAnnotationQueuesUpdateResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
@@ -12116,8 +12125,11 @@ export const modelHubAnnotationQueuesPartialUpdateResponseLabelsItemOrderMax = 2
 export const modelHubAnnotationQueuesPartialUpdateResponseAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesPartialUpdateResponseAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesPartialUpdateResponseAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesPartialUpdateResponse = zod.object({
@@ -12150,7 +12162,7 @@ export const ModelHubAnnotationQueuesPartialUpdateResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesPartialUpdateResponseAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesPartialUpdateResponseAnnotatorIdsDefault),
@@ -12163,8 +12175,8 @@ export const ModelHubAnnotationQueuesPartialUpdateResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
@@ -12527,8 +12539,11 @@ export const modelHubAnnotationQueuesRestoreResponseResultLabelsItemOrderMax = 2
 export const modelHubAnnotationQueuesRestoreResponseResultAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesRestoreResponseResultAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesRestoreResponseResultAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesRestoreResponse = zod.object({
@@ -12563,7 +12578,7 @@ export const ModelHubAnnotationQueuesRestoreResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesRestoreResponseResultAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesRestoreResponseResultAnnotatorIdsDefault),
@@ -12576,8 +12591,8 @@ export const ModelHubAnnotationQueuesRestoreResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
@@ -12611,8 +12626,11 @@ export const modelHubAnnotationQueuesUpdateStatusResponseResultLabelsItemOrderMa
 export const modelHubAnnotationQueuesUpdateStatusResponseResultAnnotatorsItemRoleDefault = `annotator`;
 
 
+
 export const modelHubAnnotationQueuesUpdateStatusResponseResultAnnotatorIdsDefault = [];
 export const modelHubAnnotationQueuesUpdateStatusResponseResultAnnotatorRolesDefault = {  };
+
+
 
 
 export const ModelHubAnnotationQueuesUpdateStatusResponse = zod.object({
@@ -12647,7 +12665,7 @@ export const ModelHubAnnotationQueuesUpdateStatusResponse = zod.object({
   "name": zod.string().min(1).optional(),
   "email": zod.string().email().min(1).optional(),
   "role": zod.string().min(1).default(modelHubAnnotationQueuesUpdateStatusResponseResultAnnotatorsItemRoleDefault),
-  "roles": zod.string().optional()
+  "roles": zod.array(zod.string().min(1)).optional()
 })).optional(),
   "label_ids": zod.array(zod.string().uuid()).min(1),
   "annotator_ids": zod.array(zod.string().uuid()).default(modelHubAnnotationQueuesUpdateStatusResponseResultAnnotatorIdsDefault),
@@ -12660,8 +12678,8 @@ export const ModelHubAnnotationQueuesUpdateStatusResponse = zod.object({
   "completed_count": zod.number().optional(),
   "created_by": zod.string().uuid().optional(),
   "created_by_name": zod.string().min(1).optional(),
-  "viewer_role": zod.string().optional(),
-  "viewer_roles": zod.string().optional(),
+  "viewer_role": zod.string().min(1).optional(),
+  "viewer_roles": zod.array(zod.string().min(1)).optional(),
   "deleted": zod.boolean().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
@@ -13113,6 +13131,8 @@ export const modelHubAnnotationQueuesItemsListResponseResultsItemOrderMax = 2147
 
 
 
+
+
 export const modelHubAnnotationQueuesItemsListResponseResultsItemReviewStatusMax = 20;
 
 
@@ -13137,7 +13157,11 @@ export const ModelHubAnnotationQueuesItemsListResponse = zod.object({
 }).passthrough().optional(),
   "assigned_to": zod.string().uuid().optional(),
   "assigned_to_name": zod.string().min(1).optional(),
-  "assigned_users": zod.string().optional(),
+  "assigned_users": zod.array(zod.object({
+  "id": zod.string().uuid(),
+  "name": zod.string().min(1),
+  "email": zod.string().email().min(1)
+})).optional(),
   "reserved_by": zod.string().uuid().optional(),
   "reserved_by_name": zod.string().min(1).optional(),
   "reservation_expires_at": zod.string().datetime({"offset":true}).optional(),
@@ -13146,9 +13170,11 @@ export const ModelHubAnnotationQueuesItemsListResponse = zod.object({
   "reviewed_by_name": zod.string().min(1).optional(),
   "reviewed_at": zod.string().datetime({"offset":true}).optional(),
   "review_notes": zod.string().optional(),
-  "source_preview": zod.string().optional(),
-  "comment_count": zod.string().optional(),
-  "open_feedback_count": zod.string().optional(),
+  "source_preview": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "comment_count": zod.number().optional(),
+  "open_feedback_count": zod.number().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 }))
 })
@@ -13375,6 +13401,8 @@ export const modelHubAnnotationQueuesItemsReadResponseOrderMax = 2147483647;
 
 
 
+
+
 export const modelHubAnnotationQueuesItemsReadResponseReviewStatusMax = 20;
 
 
@@ -13395,7 +13423,11 @@ export const ModelHubAnnotationQueuesItemsReadResponse = zod.object({
 }).passthrough().optional(),
   "assigned_to": zod.string().uuid().optional(),
   "assigned_to_name": zod.string().min(1).optional(),
-  "assigned_users": zod.string().optional(),
+  "assigned_users": zod.array(zod.object({
+  "id": zod.string().uuid(),
+  "name": zod.string().min(1),
+  "email": zod.string().email().min(1)
+})).optional(),
   "reserved_by": zod.string().uuid().optional(),
   "reserved_by_name": zod.string().min(1).optional(),
   "reservation_expires_at": zod.string().datetime({"offset":true}).optional(),
@@ -13404,9 +13436,11 @@ export const ModelHubAnnotationQueuesItemsReadResponse = zod.object({
   "reviewed_by_name": zod.string().min(1).optional(),
   "reviewed_at": zod.string().datetime({"offset":true}).optional(),
   "review_notes": zod.string().optional(),
-  "source_preview": zod.string().optional(),
-  "comment_count": zod.string().optional(),
-  "open_feedback_count": zod.string().optional(),
+  "source_preview": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "comment_count": zod.number().optional(),
+  "open_feedback_count": zod.number().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
 
@@ -13454,6 +13488,8 @@ export const modelHubAnnotationQueuesItemsUpdateResponseOrderMax = 2147483647;
 
 
 
+
+
 export const modelHubAnnotationQueuesItemsUpdateResponseReviewStatusMax = 20;
 
 
@@ -13474,7 +13510,11 @@ export const ModelHubAnnotationQueuesItemsUpdateResponse = zod.object({
 }).passthrough().optional(),
   "assigned_to": zod.string().uuid().optional(),
   "assigned_to_name": zod.string().min(1).optional(),
-  "assigned_users": zod.string().optional(),
+  "assigned_users": zod.array(zod.object({
+  "id": zod.string().uuid(),
+  "name": zod.string().min(1),
+  "email": zod.string().email().min(1)
+})).optional(),
   "reserved_by": zod.string().uuid().optional(),
   "reserved_by_name": zod.string().min(1).optional(),
   "reservation_expires_at": zod.string().datetime({"offset":true}).optional(),
@@ -13483,9 +13523,11 @@ export const ModelHubAnnotationQueuesItemsUpdateResponse = zod.object({
   "reviewed_by_name": zod.string().min(1).optional(),
   "reviewed_at": zod.string().datetime({"offset":true}).optional(),
   "review_notes": zod.string().optional(),
-  "source_preview": zod.string().optional(),
-  "comment_count": zod.string().optional(),
-  "open_feedback_count": zod.string().optional(),
+  "source_preview": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "comment_count": zod.number().optional(),
+  "open_feedback_count": zod.number().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
 
@@ -13533,6 +13575,8 @@ export const modelHubAnnotationQueuesItemsPartialUpdateResponseOrderMax = 214748
 
 
 
+
+
 export const modelHubAnnotationQueuesItemsPartialUpdateResponseReviewStatusMax = 20;
 
 
@@ -13553,7 +13597,11 @@ export const ModelHubAnnotationQueuesItemsPartialUpdateResponse = zod.object({
 }).passthrough().optional(),
   "assigned_to": zod.string().uuid().optional(),
   "assigned_to_name": zod.string().min(1).optional(),
-  "assigned_users": zod.string().optional(),
+  "assigned_users": zod.array(zod.object({
+  "id": zod.string().uuid(),
+  "name": zod.string().min(1),
+  "email": zod.string().email().min(1)
+})).optional(),
   "reserved_by": zod.string().uuid().optional(),
   "reserved_by_name": zod.string().min(1).optional(),
   "reservation_expires_at": zod.string().datetime({"offset":true}).optional(),
@@ -13562,9 +13610,11 @@ export const ModelHubAnnotationQueuesItemsPartialUpdateResponse = zod.object({
   "reviewed_by_name": zod.string().min(1).optional(),
   "reviewed_at": zod.string().datetime({"offset":true}).optional(),
   "review_notes": zod.string().optional(),
-  "source_preview": zod.string().optional(),
-  "comment_count": zod.string().optional(),
-  "open_feedback_count": zod.string().optional(),
+  "source_preview": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "comment_count": zod.number().optional(),
+  "open_feedback_count": zod.number().optional(),
   "created_at": zod.string().datetime({"offset":true}).optional()
 })
 
@@ -15722,6 +15772,7 @@ export const ModelHubDatasetOptimizationListResponse = zod.object({
   "trial_count": zod.string().optional(),
   "optimizer_algorithm": zod.enum(['random_search', 'bayesian', 'metaprompt', 'protegi', 'promptwizard', 'gepa']).optional(),
   "optimizer_model_id": zod.string().optional(),
+  "model_deprecated": zod.boolean().optional(),
   "column_id": zod.string().uuid().optional(),
   "status": zod.enum(['not_started', 'pending', 'running', 'completed', 'failed', 'cancelled']).optional(),
   "error_message": zod.string().optional(),
@@ -15785,6 +15836,7 @@ export const ModelHubDatasetOptimizationReadResponse = zod.object({
   "optimiser_name": zod.string().min(1).optional(),
   "optimiser_type": zod.string().min(1).optional(),
   "model": zod.string().min(1).optional(),
+  "model_deprecated": zod.boolean().optional(),
   "provider_logo": zod.string().min(1).optional(),
   "configuration": zod.object({
 
@@ -27602,6 +27654,7 @@ export const SimulateAgentDefinitionsListResponseItem = zod.object({
   "agent_type": zod.enum(['voice', 'text']).optional(),
   "contact_number": zod.string().min(1).optional().describe('Phone number associated with the AI agent'),
   "inbound": zod.boolean().optional().describe('Whether the agent handles inbound calls'),
+  "target_speaks_first": zod.boolean().optional().describe('Whether the target agent speaks first (greets) in a hosted voice simulation. True: the simulator waits for the target\'s greeting; False: the simulator opens the conversation; null: derive from inbound\/outbound. Retell targets always let the simulator open (SDK limitation).'),
   "description": zod.string().min(1).optional().describe('Detailed description of the AI agent\'s purpose and capabilities'),
   "assistant_id": zod.string().min(1).optional().describe('External identifier for the assistant'),
   "provider": zod.string().min(1).optional().describe('Provider of the AI agent'),
@@ -27657,6 +27710,7 @@ export const simulateAgentDefinitionsCreateCreateBodyDescriptionDefault = ``;
 export const simulateAgentDefinitionsCreateCreateBodyObservabilityEnabledDefault = false;
 export const simulateAgentDefinitionsCreateCreateBodyLivekitUrlMax = 500;
 
+export const simulateAgentDefinitionsCreateCreateBodyLivekitMaxConcurrencyMax = 25;
 
 
 
@@ -27665,6 +27719,7 @@ export const SimulateAgentDefinitionsCreateCreateBody = zod.object({
   "agent_type": zod.enum(['voice', 'text']).describe('The type of agent. One of: voice, text.'),
   "commit_message": zod.string().min(1),
   "inbound": zod.boolean().default(simulateAgentDefinitionsCreateCreateBodyInboundDefault),
+  "target_speaks_first": zod.boolean().optional(),
   "description": zod.string().default(simulateAgentDefinitionsCreateCreateBodyDescriptionDefault),
   "provider": zod.string().optional(),
   "api_key": zod.string().optional(),
@@ -27691,7 +27746,7 @@ export const SimulateAgentDefinitionsCreateCreateBody = zod.object({
   "livekit_config_json": zod.object({
 
 }).passthrough().optional(),
-  "livekit_max_concurrency": zod.number().min(1).optional()
+  "livekit_max_concurrency": zod.number().min(1).max(simulateAgentDefinitionsCreateCreateBodyLivekitMaxConcurrencyMax).optional()
 })
 
 
@@ -27717,6 +27772,7 @@ export const SimulateAgentDefinitionsReadResponse = zod.object({
   "agent_type": zod.enum(['voice', 'text']).optional(),
   "contact_number": zod.string().min(1).optional().describe('Phone number associated with the AI agent'),
   "inbound": zod.boolean().optional().describe('Whether the agent handles inbound calls'),
+  "target_speaks_first": zod.boolean().optional().describe('Whether the target agent speaks first (greets) in a hosted voice simulation. True: the simulator waits for the target\'s greeting; False: the simulator opens the conversation; null: derive from inbound\/outbound. Retell targets always let the simulator open (SDK limitation).'),
   "description": zod.string().min(1).optional().describe('Detailed description of the AI agent\'s purpose and capabilities'),
   "assistant_id": zod.string().min(1).optional().describe('External identifier for the assistant'),
   "provider": zod.string().min(1).optional().describe('Provider of the AI agent'),
@@ -27773,6 +27829,7 @@ export const simulateAgentDefinitionsEditUpdateBodyAgentNameMax = 255;
 
 export const simulateAgentDefinitionsEditUpdateBodyLivekitUrlMax = 500;
 
+export const simulateAgentDefinitionsEditUpdateBodyLivekitMaxConcurrencyMax = 25;
 
 
 
@@ -27788,6 +27845,7 @@ export const SimulateAgentDefinitionsEditUpdateBody = zod.object({
   "languages": zod.array(zod.string().min(1)).optional(),
   "contact_number": zod.string().optional(),
   "inbound": zod.boolean().optional(),
+  "target_speaks_first": zod.boolean().optional(),
   "knowledge_base": zod.string().uuid().optional(),
   "model": zod.string().optional(),
   "model_details": zod.object({
@@ -27804,7 +27862,7 @@ export const SimulateAgentDefinitionsEditUpdateBody = zod.object({
   "livekit_config_json": zod.object({
 
 }).passthrough().optional(),
-  "livekit_max_concurrency": zod.number().min(1).optional()
+  "livekit_max_concurrency": zod.number().min(1).max(simulateAgentDefinitionsEditUpdateBodyLivekitMaxConcurrencyMax).optional()
 })
 
 
@@ -27825,6 +27883,7 @@ export const SimulateAgentDefinitionsEditUpdateResponse = zod.object({
   "agent_type": zod.enum(['voice', 'text']).optional(),
   "contact_number": zod.string().min(1).optional().describe('Phone number associated with the AI agent'),
   "inbound": zod.boolean().optional().describe('Whether the agent handles inbound calls'),
+  "target_speaks_first": zod.boolean().optional().describe('Whether the target agent speaks first (greets) in a hosted voice simulation. True: the simulator waits for the target\'s greeting; False: the simulator opens the conversation; null: derive from inbound\/outbound. Retell targets always let the simulator open (SDK limitation).'),
   "description": zod.string().min(1).optional().describe('Detailed description of the AI agent\'s purpose and capabilities'),
   "assistant_id": zod.string().min(1).optional().describe('External identifier for the assistant'),
   "provider": zod.string().min(1).optional().describe('Provider of the AI agent'),
@@ -27905,6 +27964,7 @@ export const simulateAgentDefinitionsVersionsCreateCreateBodyLivekitApiSecretMax
 
 export const simulateAgentDefinitionsVersionsCreateCreateBodyLivekitAgentNameMax = 255;
 
+export const simulateAgentDefinitionsVersionsCreateCreateBodyLivekitMaxConcurrencyMax = 25;
 
 export const simulateAgentDefinitionsVersionsCreateCreateBodyCommitMessageDefault = ``;
 export const simulateAgentDefinitionsVersionsCreateCreateBodyObservabilityEnabledDefault = false;
@@ -27921,6 +27981,7 @@ export const SimulateAgentDefinitionsVersionsCreateCreateBody = zod.object({
   "languages": zod.array(zod.string().min(1)).optional(),
   "contact_number": zod.string().optional(),
   "inbound": zod.boolean().optional(),
+  "target_speaks_first": zod.boolean().optional(),
   "knowledge_base": zod.string().uuid().optional(),
   "model": zod.string().optional(),
   "model_details": zod.object({
@@ -27933,7 +27994,7 @@ export const SimulateAgentDefinitionsVersionsCreateCreateBody = zod.object({
   "livekit_config_json": zod.object({
 
 }).passthrough().optional(),
-  "livekit_max_concurrency": zod.number().min(1).optional(),
+  "livekit_max_concurrency": zod.number().min(1).max(simulateAgentDefinitionsVersionsCreateCreateBodyLivekitMaxConcurrencyMax).optional(),
   "commit_message": zod.string().default(simulateAgentDefinitionsVersionsCreateCreateBodyCommitMessageDefault),
   "observability_enabled": zod.boolean().default(simulateAgentDefinitionsVersionsCreateCreateBodyObservabilityEnabledDefault)
 })
@@ -28277,6 +28338,7 @@ export const SimulateApiAgentDefinitionOperationsListResponse = zod.object({
   "agent_type": zod.enum(['voice', 'text']).optional(),
   "contact_number": zod.string().min(1).optional().describe('Phone number associated with the AI agent'),
   "inbound": zod.boolean().optional().describe('Whether the agent handles inbound calls'),
+  "target_speaks_first": zod.boolean().optional().describe('Whether the target agent speaks first (greets) in a hosted voice simulation. True: the simulator waits for the target\'s greeting; False: the simulator opens the conversation; null: derive from inbound\/outbound. Retell targets always let the simulator open (SDK limitation).'),
   "description": zod.string().min(1).optional().describe('Detailed description of the AI agent\'s purpose and capabilities'),
   "assistant_id": zod.string().min(1).optional().describe('External identifier for the assistant'),
   "provider": zod.string().min(1).optional().describe('Provider of the AI agent'),
@@ -28333,6 +28395,7 @@ export const SimulateApiAgentDefinitionOperationsCreateBody = zod.object({
   "agent_type": zod.enum(['voice', 'text']).optional(),
   "contact_number": zod.string().max(simulateApiAgentDefinitionOperationsCreateBodyContactNumberMax).optional().describe('Phone number associated with the AI agent'),
   "inbound": zod.boolean().describe('Whether the agent handles inbound calls'),
+  "target_speaks_first": zod.boolean().optional().describe('Whether the target agent speaks first (greets) in a hosted voice simulation. True: the simulator waits for the target\'s greeting; False: the simulator opens the conversation; null: derive from inbound\/outbound. Retell targets always let the simulator open (SDK limitation).'),
   "description": zod.string().min(1).describe('Detailed description of the AI agent\'s purpose and capabilities'),
   "assistant_id": zod.string().max(simulateApiAgentDefinitionOperationsCreateBodyAssistantIdMax).optional().describe('External identifier for the assistant'),
   "provider": zod.string().max(simulateApiAgentDefinitionOperationsCreateBodyProviderMax).optional().describe('Provider of the AI agent'),
@@ -28405,6 +28468,7 @@ export const SimulateApiAgentDefinitionOperationsReadResponse = zod.object({
   "agent_type": zod.enum(['voice', 'text']).optional(),
   "contact_number": zod.string().min(1).optional().describe('Phone number associated with the AI agent'),
   "inbound": zod.boolean().optional().describe('Whether the agent handles inbound calls'),
+  "target_speaks_first": zod.boolean().optional().describe('Whether the target agent speaks first (greets) in a hosted voice simulation. True: the simulator waits for the target\'s greeting; False: the simulator opens the conversation; null: derive from inbound\/outbound. Retell targets always let the simulator open (SDK limitation).'),
   "description": zod.string().min(1).optional().describe('Detailed description of the AI agent\'s purpose and capabilities'),
   "assistant_id": zod.string().min(1).optional().describe('External identifier for the assistant'),
   "provider": zod.string().min(1).optional().describe('Provider of the AI agent'),
@@ -28464,6 +28528,7 @@ export const SimulateApiAgentDefinitionOperationsUpdateBody = zod.object({
   "agent_type": zod.enum(['voice', 'text']).optional(),
   "contact_number": zod.string().max(simulateApiAgentDefinitionOperationsUpdateBodyContactNumberMax).optional().describe('Phone number associated with the AI agent'),
   "inbound": zod.boolean().describe('Whether the agent handles inbound calls'),
+  "target_speaks_first": zod.boolean().optional().describe('Whether the target agent speaks first (greets) in a hosted voice simulation. True: the simulator waits for the target\'s greeting; False: the simulator opens the conversation; null: derive from inbound\/outbound. Retell targets always let the simulator open (SDK limitation).'),
   "description": zod.string().min(1).describe('Detailed description of the AI agent\'s purpose and capabilities'),
   "assistant_id": zod.string().max(simulateApiAgentDefinitionOperationsUpdateBodyAssistantIdMax).optional().describe('External identifier for the assistant'),
   "provider": zod.string().max(simulateApiAgentDefinitionOperationsUpdateBodyProviderMax).optional().describe('Provider of the AI agent'),
@@ -28512,6 +28577,7 @@ export const SimulateApiAgentDefinitionOperationsUpdateResponse = zod.object({
   "agent_type": zod.enum(['voice', 'text']).optional(),
   "contact_number": zod.string().max(simulateApiAgentDefinitionOperationsUpdateResponseContactNumberMax).optional().describe('Phone number associated with the AI agent'),
   "inbound": zod.boolean().describe('Whether the agent handles inbound calls'),
+  "target_speaks_first": zod.boolean().optional().describe('Whether the target agent speaks first (greets) in a hosted voice simulation. True: the simulator waits for the target\'s greeting; False: the simulator opens the conversation; null: derive from inbound\/outbound. Retell targets always let the simulator open (SDK limitation).'),
   "description": zod.string().min(1).describe('Detailed description of the AI agent\'s purpose and capabilities'),
   "assistant_id": zod.string().max(simulateApiAgentDefinitionOperationsUpdateResponseAssistantIdMax).optional().describe('External identifier for the assistant'),
   "provider": zod.string().max(simulateApiAgentDefinitionOperationsUpdateResponseProviderMax).optional().describe('Provider of the AI agent'),
@@ -28569,6 +28635,7 @@ export const SimulateApiAgentDefinitionOperationsPartialUpdateBody = zod.object(
   "agent_type": zod.enum(['voice', 'text']).optional(),
   "contact_number": zod.string().max(simulateApiAgentDefinitionOperationsPartialUpdateBodyContactNumberMax).optional().describe('Phone number associated with the AI agent'),
   "inbound": zod.boolean().describe('Whether the agent handles inbound calls'),
+  "target_speaks_first": zod.boolean().optional().describe('Whether the target agent speaks first (greets) in a hosted voice simulation. True: the simulator waits for the target\'s greeting; False: the simulator opens the conversation; null: derive from inbound\/outbound. Retell targets always let the simulator open (SDK limitation).'),
   "description": zod.string().min(1).describe('Detailed description of the AI agent\'s purpose and capabilities'),
   "assistant_id": zod.string().max(simulateApiAgentDefinitionOperationsPartialUpdateBodyAssistantIdMax).optional().describe('External identifier for the assistant'),
   "provider": zod.string().max(simulateApiAgentDefinitionOperationsPartialUpdateBodyProviderMax).optional().describe('Provider of the AI agent'),
@@ -28617,6 +28684,7 @@ export const SimulateApiAgentDefinitionOperationsPartialUpdateResponse = zod.obj
   "agent_type": zod.enum(['voice', 'text']).optional(),
   "contact_number": zod.string().max(simulateApiAgentDefinitionOperationsPartialUpdateResponseContactNumberMax).optional().describe('Phone number associated with the AI agent'),
   "inbound": zod.boolean().describe('Whether the agent handles inbound calls'),
+  "target_speaks_first": zod.boolean().optional().describe('Whether the target agent speaks first (greets) in a hosted voice simulation. True: the simulator waits for the target\'s greeting; False: the simulator opens the conversation; null: derive from inbound\/outbound. Retell targets always let the simulator open (SDK limitation).'),
   "description": zod.string().min(1).describe('Detailed description of the AI agent\'s purpose and capabilities'),
   "assistant_id": zod.string().max(simulateApiAgentDefinitionOperationsPartialUpdateResponseAssistantIdMax).optional().describe('External identifier for the assistant'),
   "provider": zod.string().max(simulateApiAgentDefinitionOperationsPartialUpdateResponseProviderMax).optional().describe('Provider of the AI agent'),
@@ -29099,6 +29167,245 @@ export const SimulateApiAgentPromptOptimiserTrialTrialScenariosResponse = zod.ob
   "name": zod.string().min(1).optional(),
   "is_visible": zod.boolean().optional()
 })).optional()
+})
+})
+
+
+/**
+ * Accept a multipart audio upload and hand it to the shared voice
+storage helper (``upload_audio_to_s3``). Matches the pattern the
+LiveKit and Vapi voice services already use for their recordings.
+ */
+export const SimulateApiAlkSimulateCallExecutionsRecordingUploadParams = zod.object({
+  "call_execution_id": zod.string()
+})
+
+export const SimulateApiAlkSimulateCallExecutionsRecordingUploadBody = zod.object({
+  "file": zod.instanceof(File),
+  "filename": zod.string().optional()
+})
+
+export const simulateApiAlkSimulateCallExecutionsRecordingUploadResponseStatusDefault = true;
+export const simulateApiAlkSimulateCallExecutionsRecordingUploadResponseResultRecordingUrlMax = 1024;
+
+
+
+
+export const SimulateApiAlkSimulateCallExecutionsRecordingUploadResponse = zod.object({
+  "status": zod.boolean().default(simulateApiAlkSimulateCallExecutionsRecordingUploadResponseStatusDefault),
+  "result": zod.object({
+  "recording_url": zod.string().url().min(1).max(simulateApiAlkSimulateCallExecutionsRecordingUploadResponseResultRecordingUrlMax),
+  "object_key": zod.string().min(1)
+})
+})
+
+
+/**
+ * Views here are intentionally minimal: they resolve the tenant-scoped
+target row, hand the parsed payload to
+`simulate.services.alk_simulate_ingestion`, and format the response.
+ * @summary Single view surface for all LiveKit sim ingestion HTTP endpoints.
+ */
+export const SimulateApiAlkSimulateCallExecutionsResultParams = zod.object({
+  "call_execution_id": zod.string()
+})
+
+export const simulateApiAlkSimulateCallExecutionsResultBodyDurationSecondsMin = 0;
+
+export const simulateApiAlkSimulateCallExecutionsResultBodyEndedReasonMax = 10000;
+
+export const simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemStartTimeMsDefault = 0;
+export const simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemStartTimeMsMin = 0;
+
+export const simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemEndTimeMsDefault = 0;
+export const simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemEndTimeMsMin = 0;
+
+export const simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemConfidenceScoreMin = 0;
+export const simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemConfidenceScoreMax = 1;
+
+export const simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemLatencyMsMin = 0;
+
+export const simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemToolCallIdMax = 255;
+
+export const simulateApiAlkSimulateCallExecutionsResultBodyRecordingUrlMax = 500;
+
+export const simulateApiAlkSimulateCallExecutionsResultBodyStereoRecordingUrlMax = 500;
+
+
+
+export const SimulateApiAlkSimulateCallExecutionsResultBody = zod.object({
+  "status": zod.enum(['completed', 'failed', 'cancelled']),
+  "started_at": zod.string().datetime({"offset":true}).optional(),
+  "ended_at": zod.string().datetime({"offset":true}).optional(),
+  "duration_seconds": zod.number().min(simulateApiAlkSimulateCallExecutionsResultBodyDurationSecondsMin).optional(),
+  "ended_reason": zod.string().max(simulateApiAlkSimulateCallExecutionsResultBodyEndedReasonMax).optional(),
+  "error_message": zod.string().optional(),
+  "call_summary": zod.string().optional(),
+  "transcript": zod.array(zod.object({
+  "speaker_role": zod.enum(['user', 'assistant', 'system', 'tool_calls', 'tool_call_result', 'unknown']),
+  "content": zod.string(),
+  "start_time_ms": zod.number().min(simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemStartTimeMsMin).default(simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemStartTimeMsDefault),
+  "end_time_ms": zod.number().min(simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemEndTimeMsMin).default(simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemEndTimeMsDefault),
+  "confidence_score": zod.number().min(simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemConfidenceScoreMin).max(simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemConfidenceScoreMax).optional(),
+  "latency_ms": zod.number().min(simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemLatencyMsMin).optional(),
+  "tool_calls": zod.object({
+
+}).passthrough().optional(),
+  "tool_call_id": zod.string().max(simulateApiAlkSimulateCallExecutionsResultBodyTranscriptItemToolCallIdMax).optional()
+})).optional(),
+  "recording_url": zod.string().url().max(simulateApiAlkSimulateCallExecutionsResultBodyRecordingUrlMax).optional(),
+  "stereo_recording_url": zod.string().url().max(simulateApiAlkSimulateCallExecutionsResultBodyStereoRecordingUrlMax).optional(),
+  "costs": zod.object({
+  "stt_cost_cents": zod.number().optional(),
+  "llm_cost_cents": zod.number().optional(),
+  "tts_cost_cents": zod.number().optional(),
+  "storage_cost_cents": zod.number().optional(),
+  "cost_cents": zod.number().optional()
+}).optional(),
+  "provider_call_data": zod.object({
+
+}).passthrough().optional(),
+  "call_metadata": zod.object({
+
+}).passthrough().optional()
+})
+
+export const simulateApiAlkSimulateCallExecutionsResultResponseStatusDefault = true;
+
+
+export const SimulateApiAlkSimulateCallExecutionsResultResponse = zod.object({
+  "status": zod.boolean().default(simulateApiAlkSimulateCallExecutionsResultResponseStatusDefault),
+  "result": zod.object({
+  "call_execution_id": zod.string().uuid(),
+  "status": zod.string().min(1),
+  "eval_dispatched": zod.boolean()
+})
+})
+
+
+/**
+ * Non-terminal per-call status ping (currently only ``ongoing``): the
+SDK marks a pre-created PENDING row ONGOING the moment its call starts,
+so the UI shows progress instead of PENDING → terminal. PENDING-gated in
+the service, so a late ping never clobbers a result that already landed.
+ */
+export const SimulateApiAlkSimulateCallExecutionsStatusParams = zod.object({
+  "call_execution_id": zod.string()
+})
+
+export const SimulateApiAlkSimulateCallExecutionsStatusBody = zod.object({
+  "status": zod.enum(['ongoing'])
+})
+
+export const simulateApiAlkSimulateCallExecutionsStatusResponseStatusDefault = true;
+
+export const SimulateApiAlkSimulateCallExecutionsStatusResponse = zod.object({
+  "status": zod.boolean().default(simulateApiAlkSimulateCallExecutionsStatusResponseStatusDefault),
+  "result": zod.object({
+  "updated": zod.boolean()
+})
+})
+
+
+/**
+ * Stand up a chat RunTest + scenario-of-record from SDK personas so an
+SDK-first run has somewhere to post — without the native UI's async
+scenario generation. See ``provision_alk_sim_run_test``.
+ */
+export const simulateApiAlkSimulateRunTestsProvisionRunTestBodyNameMax = 255;
+
+export const simulateApiAlkSimulateRunTestsProvisionRunTestBodyPersonasItemNameMax = 255;
+
+export const simulateApiAlkSimulateRunTestsProvisionRunTestBodyPersonasItemRoleMax = 255;
+
+export const simulateApiAlkSimulateRunTestsProvisionRunTestBodyAgentNameMax = 255;
+
+
+
+export const SimulateApiAlkSimulateRunTestsProvisionRunTestBody = zod.object({
+  "name": zod.string().min(1).max(simulateApiAlkSimulateRunTestsProvisionRunTestBodyNameMax),
+  "description": zod.string().optional(),
+  "personas": zod.array(zod.object({
+  "name": zod.string().max(simulateApiAlkSimulateRunTestsProvisionRunTestBodyPersonasItemNameMax).optional(),
+  "role": zod.string().max(simulateApiAlkSimulateRunTestsProvisionRunTestBodyPersonasItemRoleMax).optional(),
+  "situation": zod.string().optional(),
+  "outcome": zod.string().optional(),
+  "persona": zod.object({
+
+}).passthrough().optional()
+})).optional(),
+  "scenario_ids": zod.array(zod.string().uuid()).optional(),
+  "agent_definition_id": zod.string().uuid().optional(),
+  "agent_name": zod.string().max(simulateApiAlkSimulateRunTestsProvisionRunTestBodyAgentNameMax).optional()
+})
+
+export const simulateApiAlkSimulateRunTestsProvisionRunTestResponseStatusDefault = true;
+
+export const SimulateApiAlkSimulateRunTestsProvisionRunTestResponse = zod.object({
+  "status": zod.boolean().default(simulateApiAlkSimulateRunTestsProvisionRunTestResponseStatusDefault),
+  "result": zod.object({
+  "run_test_id": zod.string().uuid(),
+  "scenario_ids": zod.array(zod.string().uuid()),
+  "agent_definition_id": zod.string().uuid()
+})
+})
+
+
+/**
+ * Views here are intentionally minimal: they resolve the tenant-scoped
+target row, hand the parsed payload to
+`simulate.services.alk_simulate_ingestion`, and format the response.
+ * @summary Single view surface for all LiveKit sim ingestion HTTP endpoints.
+ */
+export const SimulateApiAlkSimulateRunTestsStartTestExecutionParams = zod.object({
+  "run_test_id": zod.string()
+})
+
+export const SimulateApiAlkSimulateRunTestsStartTestExecutionBody = zod.object({
+  "scenario_ids": zod.array(zod.string().uuid()).optional(),
+  "simulator_agent_id": zod.string().uuid().optional()
+})
+
+export const simulateApiAlkSimulateRunTestsStartTestExecutionResponseStatusDefault = true;
+
+
+export const SimulateApiAlkSimulateRunTestsStartTestExecutionResponse = zod.object({
+  "status": zod.boolean().default(simulateApiAlkSimulateRunTestsStartTestExecutionResponseStatusDefault),
+  "result": zod.object({
+  "test_execution_id": zod.string().uuid(),
+  "run_test_id": zod.string().uuid(),
+  "scenario_ids": zod.array(zod.string().uuid()),
+  "total_scenarios": zod.number(),
+  "status": zod.string().min(1)
+})
+})
+
+
+/**
+ * Views here are intentionally minimal: they resolve the tenant-scoped
+target row, hand the parsed payload to
+`simulate.services.alk_simulate_ingestion`, and format the response.
+ * @summary Single view surface for all LiveKit sim ingestion HTTP endpoints.
+ */
+export const SimulateApiAlkSimulateTestExecutionsBatchParams = zod.object({
+  "test_execution_id": zod.string()
+})
+
+
+
+
+export const SimulateApiAlkSimulateTestExecutionsBatchBody = zod.object({
+  "count": zod.number().min(1).optional()
+})
+
+export const simulateApiAlkSimulateTestExecutionsBatchResponseStatusDefault = true;
+
+export const SimulateApiAlkSimulateTestExecutionsBatchResponse = zod.object({
+  "status": zod.boolean().default(simulateApiAlkSimulateTestExecutionsBatchResponseStatusDefault),
+  "result": zod.object({
+  "call_execution_ids": zod.array(zod.string().uuid()),
+  "has_more": zod.boolean(),
+  "batched_scenarios": zod.array(zod.string().uuid())
 })
 })
 
@@ -31641,19 +31948,25 @@ export const SimulateRunTestsListQueryParams = zod.object({
 
 
 
-export const simulateRunTestsListResponseDatasetRowIdsItemMax = 255;
 
 
-export const simulateRunTestsListResponseSimulateEvalConfigsDetailItemFiltersDefault = [];
+export const simulateRunTestsListResponseResultsItemDatasetRowIdsItemMax = 255;
 
 
-
-export const simulateRunTestsListResponseEvalsDetailItemFiltersDefault = [];
-
+export const simulateRunTestsListResponseResultsItemSimulateEvalConfigsDetailItemFiltersDefault = [];
 
 
 
-export const SimulateRunTestsListResponseItem = zod.object({
+export const simulateRunTestsListResponseResultsItemEvalsDetailItemFiltersDefault = [];
+
+
+
+
+export const SimulateRunTestsListResponse = zod.object({
+  "count": zod.number().optional(),
+  "next": zod.string().min(1).optional(),
+  "previous": zod.string().min(1).optional(),
+  "results": zod.array(zod.object({
   "id": zod.string().uuid().optional(),
   "name": zod.string().min(1).optional().describe('Name of the test run'),
   "description": zod.string().optional(),
@@ -31678,7 +31991,7 @@ export const SimulateRunTestsListResponseItem = zod.object({
   "scenarios_detail": zod.array(zod.object({
 
 }).passthrough()).optional(),
-  "dataset_row_ids": zod.array(zod.string().min(1).max(simulateRunTestsListResponseDatasetRowIdsItemMax)).optional().describe('IDs of dataset rows to run evaluations on'),
+  "dataset_row_ids": zod.array(zod.string().min(1).max(simulateRunTestsListResponseResultsItemDatasetRowIdsItemMax)).optional().describe('IDs of dataset rows to run evaluations on'),
   "simulator_agent": zod.string().uuid().optional().describe('Simulator agent for this test run (derived from scenarios)'),
   "simulator_agent_detail": zod.object({
 
@@ -31700,7 +32013,7 @@ export const SimulateRunTestsListResponseItem = zod.object({
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
   "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
 })
-})).default(simulateRunTestsListResponseSimulateEvalConfigsDetailItemFiltersDefault),
+})).default(simulateRunTestsListResponseResultsItemSimulateEvalConfigsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
   "model": zod.string().min(1).optional(),
   "status": zod.string().min(1).optional(),
@@ -31723,7 +32036,7 @@ export const SimulateRunTestsListResponseItem = zod.object({
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
   "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
 })
-})).default(simulateRunTestsListResponseEvalsDetailItemFiltersDefault),
+})).default(simulateRunTestsListResponseResultsItemEvalsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
   "model": zod.string().min(1).optional(),
   "status": zod.string().min(1).optional(),
@@ -31737,8 +32050,10 @@ export const SimulateRunTestsListResponseItem = zod.object({
   "last_run_at": zod.string().datetime({"offset":true}).optional(),
   "deleted": zod.boolean().optional(),
   "deleted_at": zod.string().datetime({"offset":true}).optional()
+})).optional(),
+  "total_pages": zod.number().optional(),
+  "current_page": zod.number().optional()
 })
-export const SimulateRunTestsListResponse = zod.array(SimulateRunTestsListResponseItem)
 
 
 /**
