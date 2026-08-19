@@ -737,6 +737,11 @@ def test_system_hot_property_requires_exact_active_manifest_binding(settings):
 
     assert [item.value for item in page.values] == ["gpt-5"]
     assert executor.calls[-1]["params"]["catalog_source_kind"] == "system_attribute"
+    definition_sql = executor.calls[1]["query"]
+    assert "AND (\n        rows.visibility_scope = 'always'" in definition_sql
+    assert definition_sql.index("rows.visibility_scope = 'always'") < (
+        definition_sql.index("), binding_maxima AS")
+    )
 
 
 def test_query_failure_is_sanitized_and_never_publishes_partial_values(settings):

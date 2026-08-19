@@ -214,6 +214,33 @@ describe("TraceFilterPanel workspace property scope", () => {
       }),
     );
   });
+
+  it("does not read property inventories for a mounted but closed panel", () => {
+    propertyCatalogMock.mockReturnValue({
+      metrics: [],
+      legacyFallbackRequired: false,
+      usesUnifiedCatalog: true,
+    });
+    propertyCatalogMock.mockClear();
+    exactAttributePropertiesMock.mockClear();
+
+    renderPanel({
+      open: false,
+      projectId: "project-closed-filter",
+      source: "traces",
+    });
+
+    expect(
+      propertyCatalogMock.mock.calls.some(
+        ([request]) => request.enabled === true,
+      ),
+    ).toBe(false);
+    expect(
+      exactAttributePropertiesMock.mock.calls.some(
+        ([request]) => request.enabled === true,
+      ),
+    ).toBe(false);
+  });
 });
 
 const selectQueryPhaseOption = async (typed, nextPlaceholder) => {
@@ -2053,6 +2080,10 @@ describe("exact manual attribute fallback", () => {
 
     expect(screen.getByText("Loading properties…")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Property" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    expect(
+      screen.getByPlaceholderText("Search properties..."),
+    ).toBeInTheDocument();
     expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
       expect.objectContaining({
         projectId: "project-whatfix",
@@ -2061,11 +2092,6 @@ describe("exact manual attribute fallback", () => {
         enabled: true,
       }),
     );
-
-    fireEvent.click(screen.getByRole("button", { name: "Property" }));
-    expect(
-      screen.getByPlaceholderText("Search properties..."),
-    ).toBeInTheDocument();
 
     resolveCatalog({ data: { result: { metrics: [] } } });
     await waitFor(() =>

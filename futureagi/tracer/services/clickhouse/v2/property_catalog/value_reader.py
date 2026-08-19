@@ -307,16 +307,18 @@ WITH lineage_versioned AS
       AND rows.catalog_epoch = %(catalog_epoch)s
       AND rows.catalog_revision >= %(catalog_lineage_anchor_revision)s
       AND rows.catalog_revision <= %(catalog_revision)s
-    WHERE
-        visibility_scope = 'always'
-        OR visibility_scope = 'workspace_default'
+      -- Reject unrelated project bindings before reading definition_json.
+      AND (
+        rows.visibility_scope = 'always'
+        OR rows.visibility_scope = 'workspace_default'
         OR (
-            visibility_scope = 'project'
+            rows.visibility_scope = 'project'
             AND (
                 %(catalog_include_all_projects)s = 1
-                OR toString(visibility_id) IN %(catalog_project_ids)s
+                OR toString(rows.visibility_id) IN %(catalog_project_ids)s
             )
         )
+      )
 ), binding_maxima AS
 (
     SELECT

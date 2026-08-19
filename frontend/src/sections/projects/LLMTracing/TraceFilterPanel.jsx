@@ -1581,7 +1581,12 @@ function PropertyPicker({
     projectId,
     search,
     source,
-    enabled: enableExactAttributeLookup && open,
+    // The activated unified catalog already owns category browsing, text
+    // search, and pagination. Running the retained-attribute hook alongside
+    // it issues a second category=custom_attribute request every time the
+    // picker opens and can make the UI look stuck behind the slower request.
+    // Keep this hook exclusively as the rolling-deploy fallback.
+    enabled: enableExactAttributeLookup && open && !unifiedCatalogActive,
   });
   const hasSettledExactAttributeError = Boolean(
     search.trim() &&
@@ -1612,7 +1617,7 @@ function PropertyPicker({
   }, [open, search, category, projectId, source]);
 
   const usesRetainedAttributePages = shouldUseRetainedAttributePages({
-    enabled: enableExactAttributeLookup,
+    enabled: enableExactAttributeLookup && !unifiedCatalogActive,
     source,
     readState: exactAttributeReadState,
     attributes: exactAttributeProperties,
@@ -3640,7 +3645,10 @@ const TraceFilterPanel = ({
     categoryCountsExact: dynamicPropertyCategoryCountsExact,
     usesUnifiedCatalog,
   } = useTraceFilterProperties(observeId, {
-    enabled: !skipDynamicProperties,
+    // Several pages keep trace/session/voice filter panels mounted at once.
+    // Only the visible panel should read the catalog; otherwise one click can
+    // fan out into multiple project, source, and attribute requests.
+    enabled: !skipDynamicProperties && open,
     isSimulator,
     // Definition pages, category counts, and category continuations must keep
     // one source identity for the lifetime of the picker.
@@ -3650,20 +3658,6 @@ const TraceFilterPanel = ({
   const unifiedPropertyCatalogActive = Boolean(
     !skipDynamicProperties && usesUnifiedCatalog,
   );
-  // The retained attribute endpoint is only a rolling-deploy fallback. Once
-  // the activated catalog answers, every definition and continuation comes
-  // from that single catalog API.
-  useExactTraceAttributeProperties({
-    projectId: observeId,
-    search: "",
-    source: exactAttributeSource,
-    enabled: Boolean(
-      !unifiedPropertyCatalogActive &&
-        open &&
-        observeId &&
-        (exactAttributeSource === "traces" || exactAttributeSource === "spans"),
-    ),
-  });
   // Merge: static trace fields + dynamic dashboard properties + any extra static fields
   const properties = useMemo(() => {
     if (propertiesOverride) {

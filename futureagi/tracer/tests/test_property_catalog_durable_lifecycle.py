@@ -1023,6 +1023,46 @@ def test_expired_no_active_repair_rejects_implicit_auto_mode() -> None:
         )
 
 
+def test_expired_full_repair_can_fall_back_to_fresh_incremental() -> None:
+    clock = _Clock(INITIAL_UNTIL)
+    state = _State()
+    freezer = _Freezer(clock)
+    lifecycle = _lifecycle(
+        state=state,
+        clock=clock,
+        freezer=freezer,
+        tokens=[TOKEN_A, TOKEN_B, TOKEN_C],
+    )
+    initial = lifecycle.prepare(
+        scope=_scope(),
+        mode=LifecycleRunMode.INITIAL_BACKFILL,
+        configured_bounds=_bounds(),
+    )
+    state.activate(initial, at=clock.current)
+    clock.current += timedelta(minutes=2)
+    failed_repair = lifecycle.prepare(
+        scope=_scope(),
+        mode=LifecycleRunMode.FULL_REPAIR,
+        configured_bounds=_bounds(),
+    )
+    clock.current = failed_repair.lease.expires_at + timedelta(seconds=1)
+
+    recovered = lifecycle.prepare(
+        scope=_scope(),
+        mode=LifecycleRunMode.AUTO,
+        configured_bounds=_bounds(),
+        allow_expired_repair=True,
+    )
+
+    assert recovered.mode is LifecycleRunMode.INCREMENTAL
+    assert recovered.resumed is False
+    assert recovered.lease.catalog_revision == (
+        failed_repair.lease.catalog_revision + 1
+    )
+    assert recovered.cutoffs.span_window.since == initial.cutoffs.span_window.until
+    assert recovered.prior_active == state.active
+
+
 def test_auto_schedule_selects_incremental_then_due_full_repair() -> None:
     clock = _Clock(INITIAL_UNTIL)
     state = _State()

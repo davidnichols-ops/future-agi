@@ -627,3 +627,8 @@ def test_catalog_reader_hides_workspace_defaults_for_project_scope(settings):
     assert params["catalog_include_workspace_default"] == 0
     assert params["catalog_include_all_projects"] == 0
     assert params["catalog_project_ids"] == (PROJECT_ID,)
+    sql = executor.calls[1]["query"]
+    assert "AND (\n        rows.visibility_scope = 'always'" in sql
+    assert sql.index("rows.visibility_scope = 'always'") < sql.index(
+        "), binding_maxima AS"
+    )

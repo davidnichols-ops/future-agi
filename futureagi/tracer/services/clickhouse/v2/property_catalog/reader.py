@@ -285,31 +285,35 @@ WITH lineage_versioned AS
       AND rows.catalog_epoch = %(catalog_epoch)s
       AND rows.catalog_revision >= %(catalog_lineage_anchor_revision)s
       AND rows.catalog_revision <= %(catalog_revision)s
-    WHERE
-        visibility_scope = 'always'
+      -- Visibility is authorization-owned and uses only narrow scalar
+      -- columns. Apply it in PREWHERE so ClickHouse does not read the large
+      -- definition_json payload for every unrelated project in a workspace.
+      AND (
+        rows.visibility_scope = 'always'
         OR (
-            visibility_scope = 'workspace_default'
+            rows.visibility_scope = 'workspace_default'
             AND %(catalog_include_workspace_default)s = 1
         )
         OR (
-            visibility_scope = 'project'
+            rows.visibility_scope = 'project'
             AND (
                 %(catalog_include_all_projects)s = 1
-                OR toString(visibility_id) IN %(catalog_project_ids)s
+                OR toString(rows.visibility_id) IN %(catalog_project_ids)s
             )
         )
         OR (
-            visibility_scope = 'agent_definition'
+            rows.visibility_scope = 'agent_definition'
             AND %(catalog_agent_definition_id)s != ''
-            AND toString(visibility_id) = %(catalog_agent_definition_id)s
+            AND toString(rows.visibility_id) = %(catalog_agent_definition_id)s
         )
         OR (
-            visibility_scope = 'dataset'
+            rows.visibility_scope = 'dataset'
             AND (
                 %(catalog_dataset_id)s = ''
-                OR toString(visibility_id) = %(catalog_dataset_id)s
+                OR toString(rows.visibility_id) = %(catalog_dataset_id)s
             )
         )
+      )
 ), binding_maxima AS
 (
     SELECT

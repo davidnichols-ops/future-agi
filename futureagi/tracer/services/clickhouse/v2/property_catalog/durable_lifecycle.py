@@ -997,11 +997,22 @@ class DurableWorkspaceCatalogLifecycle:
                     )
                 repair_mode = LifecycleRunMode.INITIAL_BACKFILL
             else:
-                if requested_mode is not LifecycleRunMode.FULL_REPAIR:
+                if requested_mode is LifecycleRunMode.INITIAL_BACKFILL:
                     raise DurableLifecycleError(
-                        "expired active repair requires explicit full-repair mode"
+                        "expired active repair cannot use initial-backfill mode"
                     )
-                repair_mode = LifecycleRunMode.FULL_REPAIR
+                # The explicit repair flag authorizes abandoning only the
+                # expired, never-activated build. Re-resolve AUTO against the
+                # last qualified active revision instead of inheriting the
+                # failed build's mode. This lets a bounded incremental run
+                # catch up from the active upper watermark after a large daily
+                # full repair exhausts its wall, while stale anchors still
+                # resolve back to FULL_REPAIR and remain fail-closed.
+                repair_mode = _resolve_requested_mode(
+                    requested=requested_mode,
+                    active=active,
+                    observed_at=observed_at,
+                )
             return self._reserve(
                 scope=scope,
                 mode=repair_mode,
