@@ -16,11 +16,13 @@ from tracer.services.clickhouse.v2.property_catalog.dev_rollout import (
     DevRolloutRequest,
     configured_dev_rollout_request,
     run_configured_dev_rollout,
+    run_workspace_reconcile,
 )
 from tracer.services.clickhouse.v2.property_catalog.dev_runtime import (
     CHECKED_IN_DEV_RUNTIME_FACTORY_PATH,
     require_checked_in_property_catalog_dev_runtime,
 )
+from tracer.services.clickhouse.v2.property_catalog.reconciler import ReconcileMode
 
 _RUNTIME_FACTORY_SETTING = "PROPERTY_CATALOG_DEV_RUNTIME_FACTORY"
 
@@ -41,6 +43,7 @@ class Command(BaseCommand):
         parser.add_argument("--target-database")
         parser.add_argument("--ack", dest="acknowledgement")
         parser.add_argument("--initial-backfill-wall-ms", type=int)
+        parser.add_argument("--scheduled-reconcile-wall-ms", type=int)
         parser.add_argument(
             "--repair-expired-incomplete",
             action="store_true",
@@ -52,15 +55,36 @@ class Command(BaseCommand):
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument("--status", action="store_true")
         mode.add_argument("--execute", action="store_true")
+        mode.add_argument(
+            "--scheduled-reconcile",
+            choices=(
+                ReconcileMode.INCREMENTAL.value,
+                ReconcileMode.FULL_REPAIR.value,
+            ),
+            help=(
+                "Run only one bounded scheduled revision; schema DDL and initial "
+                "backfill remain disabled."
+            ),
+        )
 
     def handle(self, *args: Any, **options: Any) -> str:
         try:
             request = _request(options)
             runtime = _runtime(request) if request.execute or request.status else None
-            result = run_configured_dev_rollout(request=request, runtime=runtime)
+            scheduled_mode = options.get("scheduled_reconcile")
+            if scheduled_mode:
+                assert runtime is not None
+                result: Any = run_workspace_reconcile(
+                    request=request,
+                    runtime=runtime,
+                    mode=ReconcileMode(str(scheduled_mode)),
+                )
+            else:
+                result = run_configured_dev_rollout(request=request, runtime=runtime)
         except (DevRolloutError, TypeError, ValueError, ImportError) as exc:
             raise CommandError(str(exc)) from exc
-        output = canonical_json(result.as_dict(), max_bytes=4 * 1024 * 1024)
+        payload = result if isinstance(result, dict) else result.as_dict()
+        output = canonical_json(payload, max_bytes=4 * 1024 * 1024)
         return output
 
 
@@ -71,13 +95,24 @@ def _request(options: dict[str, Any]) -> DevRolloutRequest:
     workspace_id = options.get("workspace_id") or getattr(
         settings, "PROPERTY_CATALOG_DEV_WORKSPACE_ID", ""
     )
+    scheduled_mode = options.get("scheduled_reconcile")
+    scheduled_wall_ms = options.get("scheduled_reconcile_wall_ms")
+    if scheduled_mode and scheduled_wall_ms is None:
+        scheduled_wall_ms = getattr(
+            settings,
+            "PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS",
+            1_200_000,
+        )
     return configured_dev_rollout_request(
         organization_id=str(organization_id),
         workspace_id=str(workspace_id),
         settings_object=settings,
-        execute=bool(options.get("execute")),
+        execute=bool(options.get("execute") or scheduled_mode),
         status=bool(options.get("status")),
         initial_backfill_wall_ms=options.get("initial_backfill_wall_ms"),
+        scheduled_reconcile_wall_ms=(
+            int(scheduled_wall_ms) if scheduled_mode else None
+        ),
         repair_expired_incomplete=bool(options.get("repair_expired_incomplete")),
         overrides={
             "acknowledgement": options.get("acknowledgement"),

@@ -423,6 +423,38 @@ def test_management_command_maps_explicit_initial_backfill_wall() -> None:
     assert request.repair_expired_incomplete is True
 
 
+@override_settings(
+    PROPERTY_CATALOG_DEV_ORGANIZATION_ID=ORG,
+    PROPERTY_CATALOG_DEV_WORKSPACE_ID=WORKSPACE,
+    PROPERTY_CATALOG_DEV_ENVIRONMENT="development",
+    PROPERTY_CATALOG_DEV_CLOUD_DEPLOYMENT="DEV",
+    PROPERTY_CATALOG_DEV_IDENTITY="dev:unit-local",
+    PROPERTY_CATALOG_DEV_SOURCE_DATABASE="source_ch25",
+    PROPERTY_CATALOG_DEV_TARGET_DATABASE="th7247_catalog_dev_unit",
+    PROPERTY_CATALOG_DEV_ACKNOWLEDGEMENT=DEV_ROLLOUT_ACK,
+    PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS=1_200_000,
+)
+def test_management_command_maps_explicit_scheduled_full_repair() -> None:
+    from tracer.management.commands.ch25_property_catalog_dev_rollout import (
+        _request as command_request,
+    )
+
+    request = command_request(
+        {
+            "execute": False,
+            "status": False,
+            "scheduled_reconcile": ReconcileMode.FULL_REPAIR.value,
+            "scheduled_reconcile_wall_ms": None,
+            "repair_expired_incomplete": True,
+        }
+    )
+
+    assert request.mode is DevRolloutMode.EXECUTE
+    assert request.initial_backfill_wall_ms is None
+    assert request.scheduled_reconcile_wall_ms == 1_200_000
+    assert request.repair_expired_incomplete is True
+
+
 def test_management_command_status_uses_checked_in_factory_with_fake_clients(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
