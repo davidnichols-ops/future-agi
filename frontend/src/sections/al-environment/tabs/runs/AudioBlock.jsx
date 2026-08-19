@@ -6,6 +6,10 @@ import { ALK_MONO } from "../../alkTokens";
 import Tag from "../../parts/Tag";
 
 const ALK_BASE = alkBaseUrl(import.meta.env);
+// The harness serves this under /api; the proxy adds that prefix itself. Every other call goes
+// through the axios instance, which already carries the distinction, so this is the one URL
+// built by hand and the one place the two bases have to be told apart.
+const ALK_PREFIX = isDirectToHarness(ALK_BASE) ? "/api" : "";
 
 // The proxied base already ends where /api begins — the backend adds it when it
 // forwards. Only a base that points straight at the harness still needs it, and
