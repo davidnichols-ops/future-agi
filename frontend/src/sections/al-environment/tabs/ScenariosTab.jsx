@@ -7,10 +7,9 @@ import Pane from "../parts/Pane";
 import Field from "../parts/Field";
 import Tag from "../parts/Tag";
 import XCard from "../parts/XCard";
-import CodeBlock from "../parts/CodeBlock";
+import CodeBlock, { languageOf } from "../parts/CodeBlock";
 import DataTable from "../parts/DataTable";
 import { ALK_MONO } from "../alkTokens";
-import { shortPath } from "../parts/shortPath";
 
 /**
  * Three states, not two. `null` means the gates could not be run at all because no world
@@ -83,7 +82,7 @@ GateLamp.propTypes = {
 };
 
 /** The chip shape the harness uses for any "open this" affordance. */
-const Chip = ({ onClick, children }) => (
+const Chip = ({ onClick, active, children }) => (
   <Box
     component="button"
     type="button"
@@ -92,10 +91,11 @@ const Chip = ({ onClick, children }) => (
       px: 1.25,
       py: 0.4,
       border: "1px solid",
-      borderColor: "divider",
+      borderColor: active ? "text.secondary" : "divider",
       borderRadius: 20,
       background: "none",
-      color: "text.secondary",
+      bgcolor: active ? "action.selected" : "transparent",
+      color: active ? "text.primary" : "text.secondary",
       fontFamily: ALK_MONO,
       fontSize: 12,
       cursor: "pointer",
@@ -108,6 +108,7 @@ const Chip = ({ onClick, children }) => (
 
 Chip.propTypes = {
   onClick: PropTypes.func.isRequired,
+  active: PropTypes.bool,
   children: PropTypes.node,
 };
 
@@ -123,6 +124,10 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
   const files = scenario.files || [];
 
   const openFile = async (path) => {
+    if (opened?.path === path) {
+      setOpened(null);
+      return;
+    }
     const got = await fetchScenarioFile(scenario.name, path);
     setOpened({ path, text: got?.source || got?.error || "(empty)" });
   };
@@ -155,8 +160,14 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
           )}
         </>
       }
-      meta={`${solution.length}-step solution · ${checks.length} checks`}
     >
+      <Typography
+        component="div"
+        sx={{ fontFamily: ALK_MONO, fontSize: 12, color: "text.secondary" }}
+      >
+        {`${solution.length}-step solution · ${checks.length} checks`}
+      </Typography>
+
       <Field label="validation">
         <Stack direction="row" flexWrap="wrap" useFlexGap spacing={1.5}>
           {GATES.map(([key, label]) => (
@@ -179,6 +190,10 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
             fontSize: 11.7,
             color: "accent.fail",
             bgcolor: (theme) => alpha(theme.palette.error.main, 0.1),
+            // A gate's explanation arrives with its own line breaks and can quote a
+            // long unbroken token; both have to wrap rather than push the card wide.
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
           }}
         >
           {scenario.why}
@@ -241,21 +256,62 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
             "& li::marker": { color: "text.secondary", fontSize: 10.5 },
           }}
         >
-          {solution.map((step, index) => (
-            // Steps are ordered and unnamed, so their position is the only stable key.
-            // eslint-disable-next-line react/no-array-index-key
-            <Box component="li" key={index}>
-              <Box component="span" sx={{ color: "text.primary" }}>
-                {step.tool}
-              </Box>{" "}
-              <Box
-                component="span"
-                sx={{ color: "text.secondary", overflowWrap: "anywhere" }}
-              >
-                {JSON.stringify(step.arguments || {})}
+          {solution.map((step, index) => {
+            const args = Object.keys(step.arguments || {});
+            return (
+              // Steps are ordered and unnamed, so their position is the only stable key.
+              // eslint-disable-next-line react/no-array-index-key
+              <Box component="li" key={index}>
+                {args.length === 0 ? (
+                  <Box component="span" sx={{ color: "text.primary" }}>
+                    {step.tool}
+                  </Box>
+                ) : (
+                  <Box
+                    component="details"
+                    sx={{ "&[open] .alk-step-mark": { transform: "rotate(90deg)" } }}
+                  >
+                    <Box
+                      component="summary"
+                      sx={{
+                        listStyle: "none",
+                        "&::-webkit-details-marker": { display: "none" },
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "baseline",
+                        gap: 0.75,
+                        "&:hover": { bgcolor: "action.hover" },
+                      }}
+                    >
+                      <Box
+                        className="alk-step-mark"
+                        component="span"
+                        aria-hidden
+                        sx={{
+                          color: "text.secondary",
+                          fontSize: 10,
+                          transition: "transform 120ms",
+                        }}
+                      >
+                        ▸
+                      </Box>
+                      <Box component="span" sx={{ color: "text.primary" }}>
+                        {step.tool}
+                      </Box>
+                      <Box component="span" sx={{ color: "text.disabled", fontSize: 10.5 }}>
+                        {args.length === 1 ? args[0] : `${args.length} arguments`}
+                      </Box>
+                    </Box>
+                    <Box sx={{ py: 0.5 }}>
+                      <CodeBlock language="json" wrap>
+                        {JSON.stringify(step.arguments, null, 2)}
+                      </CodeBlock>
+                    </Box>
+                  </Box>
+                )}
               </Box>
-            </Box>
-          ))}
+            );
+          })}
         </Box>
       </Field>
 
@@ -275,21 +331,10 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
       </Field>
 
       {files.length > 0 && (
-        <Field label="its folder">
-          <Box
-            sx={{
-              fontFamily: ALK_MONO,
-              fontSize: 11.5,
-              color: "text.secondary",
-              overflowWrap: "anywhere",
-              mb: 0.5,
-            }}
-          >
-            {shortPath(scenario.folder)}
-          </Box>
+        <Field label="its files">
           <Stack direction="row" flexWrap="wrap" useFlexGap spacing={0.5}>
             {files.map((path) => (
-              <Chip key={path} onClick={() => openFile(path)}>
+              <Chip key={path} active={opened?.path === path} onClick={() => openFile(path)}>
                 {path}
               </Chip>
             ))}
@@ -299,7 +344,7 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
 
       {opened && (
         <Field label={opened.path}>
-          <CodeBlock>{opened.text}</CodeBlock>
+          <CodeBlock language={languageOf(opened.path)}>{opened.text}</CodeBlock>
         </Field>
       )}
 

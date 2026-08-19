@@ -99,7 +99,7 @@ const EnvironmentTab = ({ world, subgoals }) => {
                   refusals === 1 ? "" : "s"
                 }`}
               >
-                <CodeBlock>{handler.source}</CodeBlock>
+                <CodeBlock language="python">{handler.source}</CodeBlock>
               </XCard>
             );
           })}
@@ -209,7 +209,7 @@ const EnvironmentTab = ({ world, subgoals }) => {
                 </Field>
                 {goal.check && (
                   <Field label="the check, in code">
-                    <CodeBlock>{goal.check}</CodeBlock>
+                    <CodeBlock language="python">{goal.check}</CodeBlock>
                   </Field>
                 )}
                 {goal.judged && (

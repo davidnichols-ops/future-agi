@@ -174,7 +174,17 @@ class Held:
         root.mkdir(parents=True, exist_ok=True)
         frozen = self.freeze()  # type: ignore[attr-defined]
         (root / SAVED).write_text(
-            json.dumps({"rows": frozen.rows, "counters": frozen.counters}, indent=2, default=str),
+            json.dumps(
+                {
+                    # The schema as the scripts that made it, because the rows alone cannot
+                    # come back: a fresh engine has no tables to put them in.
+                    "schema": list(getattr(self, "applied", [])),
+                    "rows": frozen.rows,
+                    "counters": frozen.counters,
+                },
+                indent=2,
+                default=str,
+            ),
             encoding="utf-8",
         )
 
@@ -185,6 +195,8 @@ class Held:
         if not held.exists():
             raise StoreError(f"no saved store at {held}")
         kept = json.loads(held.read_text(encoding="utf-8"))
+        for script in kept.get("schema") or []:
+            self.apply(script)  # type: ignore[attr-defined]
         self.restore(Snapshot(rows=kept.get("rows") or {}, counters=kept.get("counters") or {}))  # type: ignore[attr-defined]
 
     def close(self) -> None:

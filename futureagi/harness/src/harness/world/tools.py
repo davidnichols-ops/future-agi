@@ -16,6 +16,7 @@ Three habits throughout, for the same reason:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -270,8 +271,15 @@ def world_tools(
     )
     async def create_schema(args: dict[str, Any]) -> dict[str, Any]:
         try:
-            world.connection.executescript(args["sql"])
-            world.connection.commit()
+            applies = getattr(world.store, "apply", None)
+            if applies is not None:
+                # A store-backed world speaks through its own engine — the
+                # sqlite-era connection only exists for worlds that are files.
+                # Off the loop: first touch boots the store's container.
+                await asyncio.to_thread(applies, args["sql"])
+            else:
+                world.connection.executescript(args["sql"])
+                world.connection.commit()
         except Exception as failed:
             return _err(f"schema rejected: {failed}")
         tables = sorted(world.state())
@@ -433,7 +441,9 @@ def world_tools(
                 "downloads its store on first run, say so and ask rather than inventing data."
             )
         try:
-            world.store.take(found)
+            # Off the event loop: taking a store can pull an image and boot a
+            # container, and the API must stay answerable meanwhile.
+            await asyncio.to_thread(world.store.take, found)
         except AttributeError:
             return _err(
                 f"a {world.store.engine} store cannot take another one yet. Seed it instead, or "
@@ -894,7 +904,9 @@ def world_tools(
     async def run_env_command(args: dict[str, Any]) -> dict[str, Any]:
         from .workspace import run
 
-        code, output = run(destination, str(args["command"]))
+        # Off the event loop: a docker build takes minutes, and run synchronously
+        # it deafens every API endpoint this server has until it finishes.
+        code, output = await asyncio.to_thread(run, destination, str(args["command"]))
         shown = output if len(output) <= 2500 else output[:1200] + "\n...\n" + output[-1200:]
         if code != 0:
             return _err(f"exit {code}\n{shown or '(no output)'}")

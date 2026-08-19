@@ -171,5 +171,12 @@ export const useAlkConversation = () => {
   /** Live messages are folded into stored history once the turn is saved server-side. */
   const clearLive = useCallback(() => setLive([]), []);
 
-  return { live, streaming, thinking, error, say, runScenarios, stop, clearLive };
+  /** Error lines are ours alone and never reach stored history, so dismissing one is
+   * dropping it from `live` — identity is enough, the objects are never recreated. */
+  const dismissLive = useCallback(
+    (message) => setLive((all) => all.filter((one) => one !== message)),
+    [],
+  );
+
+  return { live, streaming, thinking, error, say, runScenarios, stop, clearLive, dismissLive };
 };

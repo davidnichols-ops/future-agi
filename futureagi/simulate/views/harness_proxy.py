@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -12,6 +13,8 @@ from simulate.services.harness_client import NON_STREAMING_TIMEOUT, resolve_harn
 
 # SSE responses; everything else is JSON (or a recording, passed through as-is).
 STREAMING_PATHS = frozenset({"say", "run"})
+# Well under the shortest idle timeout of any hop in front of this response.
+HEARTBEAT_SECONDS = 15
 
 
 class _PassthroughNegotiation(BaseContentNegotiation):
@@ -149,28 +152,48 @@ class HarnessProxyView(APIView):
                 content_type=upstream.headers.get("content-type", "application/json"),
             )
 
-        chunks = upstream.iter_bytes()
         done = object()
 
-        def pull():
+        def read_all(push):
             try:
-                return next(chunks)
-            except StopIteration:
-                return done
-
-        def close():
-            stream.__exit__(None, None, None)
-            client.close()
+                for chunk in upstream.iter_bytes():
+                    push(chunk)
+            finally:
+                push(done)
+                stream.__exit__(None, None, None)
+                client.close()
 
         async def relay():
-            # Chunk pulls run off the thread-sensitive executor, so one long
-            # suite cannot serialize every other request on the worker.
-            step = sync_to_async(pull, thread_sensitive=False)
+            # A dedicated reader feeds a queue so the relay can wake up on its
+            # own clock: a long tool call emits nothing for minutes, and any
+            # hop's idle timer would kill the quiet stream. The heartbeat is an
+            # SSE comment — every parser ignores it, every timer resets.
+            queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def push(item):
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+
+            # Off the thread-sensitive executor, so one long suite cannot
+            # serialize every other request on the worker.
+            reader = asyncio.ensure_future(
+                sync_to_async(read_all, thread_sensitive=False)(push)
+            )
             try:
-                while (chunk := await step()) is not done:
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(queue.get(), HEARTBEAT_SECONDS)
+                    except asyncio.TimeoutError:
+                        yield b": keep-alive\n\n"
+                        continue
+                    if chunk is done:
+                        break
                     yield chunk
             finally:
-                await sync_to_async(close, thread_sensitive=False)()
+                # Closing the response unblocks a reader mid-iter_bytes; its own
+                # finally then releases the stream and the client.
+                await sync_to_async(upstream.close, thread_sensitive=False)()
+                reader.cancel()
 
         response = StreamingHttpResponse(relay(), content_type="text/event-stream")
         # A buffering reverse proxy in front would reintroduce exactly the

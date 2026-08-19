@@ -81,6 +81,10 @@ class PostgresStore(ContainerStore):
             return
         with self._connect() as connection:
             connection.execute(script)
+        # Remembered because the snapshot holds rows, not DDL. A restore into a fresh
+        # container finds no tables, and restoring rows into a schema that is not there
+        # quietly restores nothing.
+        self.applied.append(script)
 
     def _tables(self, connection: Any) -> list[str]:
         rows = connection.execute(

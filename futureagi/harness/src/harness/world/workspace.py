@@ -17,6 +17,7 @@ commands.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -104,6 +105,17 @@ def run(destination: Path, command: str, *, patience: int = PATIENCE) -> tuple[i
     blocked = available()
     if blocked:
         return 1, blocked
+    # When the daemon is remote (DOCKER_HOST at a socket proxy), a bind mount
+    # names a path on the daemon's host — this container's own filesystem is
+    # invisible to it. The mount comes up empty and the failure reads as a
+    # missing file three steps later, so it is refused here with the reason.
+    if os.environ.get("DOCKER_HOST") and (" -v " in f" {command} " or "--volume" in command):
+        return 1, (
+            "bind mounts cannot work in this deployment: the docker daemon runs "
+            "outside this container and does not see these paths. Run the script "
+            "inline instead (sh -c '<script>'), or COPY files into an image with "
+            "a Dockerfile — build contexts do transfer."
+        )
     try:
         done = subprocess.run(
             words,

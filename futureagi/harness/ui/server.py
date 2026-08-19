@@ -41,6 +41,7 @@ from harness.config import chosen_model, credentials_hint  # noqa: E402
 from harness.run.simulation import simulate  # noqa: E402
 from harness.scenarios import load as load_scenarios  # noqa: E402
 from harness.understand import load as load_contract  # noqa: E402
+from harness.world.snapshot import read_manifest  # noqa: E402
 from harness.world.snapshot import restore as restore_world  # noqa: E402
 from harness.world.snapshot import saved as world_saved  # noqa: E402
 
@@ -566,30 +567,43 @@ async def world(session: str = ""):
     out = _folder(session)
     if not world_saved(out):
         return JSONResponse({"tables": []})
-    # Restored rather than read out of a database file, because not every world has one. An agent
-    # whose state lives in services and files saves a world with collections and no SQLite, and
-    # opening it by filename showed an empty page for a world that was really there.
-    held = restore_world(out)
-    try:
-        tables = [_table(name, records) for name, records in sorted(held.state().items())]
-        manifest = {}
-        manifest_path = out / "manifest.json"
-        if manifest_path.exists():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        handlers = [
-            {"name": source.stem, "source": source.read_text(encoding="utf-8")}
-            for source in sorted((out / "handlers").glob("*.py"))
-        ] if (out / "handlers").exists() else []
-        return {
-            "tables": tables,
-            "tools": manifest.get("tools", []),
-            "tool_specs": manifest.get("tool_specs", []),
-            "handlers": handlers,
-            "sequences": manifest.get("sequences", []),
-            "notes": manifest.get("notes", ""),
-        }
-    finally:
-        held.close()
+    snapshot_file = out / "store.json"
+    if snapshot_file.exists():
+        # A container store's snapshot already holds every row as JSON. Reading it beats
+        # restoring: a restore boots a whole engine container just to draw a page, and tears
+        # it down again on close.
+        state = dict(json.loads(snapshot_file.read_text(encoding="utf-8")).get("rows") or {})
+        state_file = out / "state.json"
+        if state_file.exists():
+            for key, value in json.loads(state_file.read_text(encoding="utf-8")).items():
+                state.setdefault(str(key), value)
+        tables = [_table(name, records) for name, records in sorted(state.items())]
+    else:
+        # Restored rather than read out of a database file, because not every world has one. An
+        # agent whose state lives in services and files saves a world with collections and no
+        # SQLite, and opening it by filename showed an empty page for a world that was really
+        # there.
+        held = restore_world(out)
+        try:
+            tables = [_table(name, records) for name, records in sorted(held.state().items())]
+        finally:
+            held.close()
+    manifest = {}
+    manifest_path = out / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    handlers = [
+        {"name": source.stem, "source": source.read_text(encoding="utf-8")}
+        for source in sorted((out / "handlers").glob("*.py"))
+    ] if (out / "handlers").exists() else []
+    return {
+        "tables": tables,
+        "tools": manifest.get("tools", []),
+        "tool_specs": manifest.get("tool_specs", []),
+        "handlers": handlers,
+        "sequences": manifest.get("sequences", []),
+        "notes": manifest.get("notes", ""),
+    }
 
 
 @app.get("/api/scenarios")
@@ -609,6 +623,12 @@ async def scenarios(session: str = ""):
         return []
     catalogue = load_catalogue(out)
     built = world_saved(out)
+    cheap_gates = False
+    if built:
+        try:
+            cheap_gates = str(read_manifest(out).get("store") or "sqlite") in ("sqlite", "in_process")
+        except Exception:
+            cheap_gates = False
     found = []
     for one in load_scenarios(out):
         body = one.model_dump()
@@ -630,11 +650,19 @@ async def scenarios(session: str = ""):
             }
             for name in one.sub_goals
         ]
-        if built:
+        if built and cheap_gates:
             proof = prove(one, catalogue, out)
             body["gates"] = proof.gates()
             body["validated"] = proof.holds
             body["why"] = "" if proof.holds else proof.why()
+        elif built:
+            # A container-store world boots an engine per restore, and prove restores the
+            # world three times per scenario — re-run per poll, that takes the whole service
+            # down. A scenario is only saved after all three gates passed, so the listing
+            # reports that verdict rather than re-earning it.
+            body["gates"] = {}
+            body["validated"] = True
+            body["why"] = ""
         else:
             body["gates"] = {}
             body["validated"] = None
