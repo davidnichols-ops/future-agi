@@ -95,6 +95,9 @@ class ContainerStore(Held):
         self.host = "127.0.0.1"
         self.port: int | None = None
         self._started = False
+        # Every script `apply` has run, in order. Saved beside the rows so a restore into a
+        # fresh container can stand the schema up before putting the rows back.
+        self.applied: list[str] = []
 
     # -- lifecycle -------------------------------------------------------------------
 
@@ -190,6 +193,11 @@ class ContainerStore(Held):
         return {variable: self.dsn()}
 
     def address(self) -> tuple[str, int]:
+        # Started on first demand: nothing else owns the moment a store becomes
+        # needed, and a world whose store never comes up refuses every schema,
+        # seed and handler with an address error nothing in the stage explains.
+        if not self._started:
+            self.start()
         if not self._started or self.port is None:
             raise StoreError("the store has not been started, so it has no address yet")
         return self.host, self.port

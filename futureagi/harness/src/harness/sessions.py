@@ -256,18 +256,21 @@ def count_messages(path: Path) -> int:
 
 
 def environments(base: Path | None = None) -> list[dict[str, Any]]:
-    """Every session that has built a world, newest first, one table row each.
+    """Every session with at least a contract, newest first, one table row each.
 
     Read off each folder without adopting it, so listing environments can never
-    move the open session. Runs are simulation runs; the legacy chat runs in
-    ``runs.json`` are a different thing and would double-count a session's work.
+    move the open session. A session appears as soon as its contract is written
+    — an hour-long build that shows nothing until its last artifact reads as an
+    empty product — and ``state`` says whether the world is there yet. Runs are
+    simulation runs; the legacy chat runs in ``runs.json`` are a different
+    thing and would double-count a session's work.
     """
     from .run.simulation import every_run
 
     found: list[dict[str, Any]] = []
     for one in every(base):
         held = one.has()
-        if not held.get("world"):
+        if not held.get("contract"):
             continue
         contract = _read_json(one.path / "contract.json")
         manifest = _read_json(one.path / "manifest.json")
@@ -275,6 +278,7 @@ def environments(base: Path | None = None) -> list[dict[str, Any]]:
         found.append(
             {
                 "session_id": one.id,
+                "state": "ready" if held.get("world") else "building",
                 "agent": one.agent or contract.get("agent", ""),
                 "title": one.title or one.agent or one.id,
                 "one_liner": contract.get("one_liner", ""),
