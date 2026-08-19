@@ -10,6 +10,7 @@ import XCard from "../parts/XCard";
 import CodeBlock, { languageOf } from "../parts/CodeBlock";
 import DataTable from "../parts/DataTable";
 import { ALK_MONO } from "../alkTokens";
+import { shortPath } from "../parts/shortPath";
 
 /**
  * Three states, not two. `null` means the gates could not be run at all because no world
@@ -17,7 +18,8 @@ import { ALK_MONO } from "../alkTokens";
  */
 const verdictOf = (validated) => {
   if (validated === true) return { kind: "pass", label: "validated" };
-  if (validated === null || validated === undefined) return { kind: "soft", label: "unchecked" };
+  if (validated === null || validated === undefined)
+    return { kind: "soft", label: "unchecked" };
   return { kind: "fail", label: "not ready" };
 };
 
@@ -36,7 +38,7 @@ const GATES = [
 const GateLamp = ({ held, label }) => {
   const on = held === true;
   const off = held === false;
-  const tone = on ? "success.main" : "error.main";
+  const tone = on ? "accent.pass" : "accent.fail";
   return (
     <Stack
       direction="row"
@@ -63,7 +65,9 @@ const GateLamp = ({ held, label }) => {
           borderStyle: on || off ? "solid" : "dashed",
           borderColor: on || off ? tone : "divider",
           bgcolor: (theme) =>
-            on || off ? alpha(theme.palette[on ? "success" : "error"].main, 0.14) : "transparent",
+            on || off
+              ? alpha(theme.palette[on ? "success" : "error"].main, 0.14)
+              : "transparent",
         }}
       >
         {on ? "✓" : off ? "✗" : "?"}
@@ -73,7 +77,10 @@ const GateLamp = ({ held, label }) => {
   );
 };
 
-GateLamp.propTypes = { held: PropTypes.bool, label: PropTypes.string.isRequired };
+GateLamp.propTypes = {
+  held: PropTypes.bool,
+  label: PropTypes.string.isRequired,
+};
 
 /** The chip shape the harness uses for any "open this" affordance. */
 const Chip = ({ onClick, active, children }) => (
@@ -137,12 +144,21 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
         <>
           <Typography
             component="span"
-            sx={{ fontFamily: ALK_MONO, fontSize: 13, fontWeight: 600, color: "text.primary" }}
+            sx={{
+              fontFamily: ALK_MONO,
+              fontSize: 13,
+              fontWeight: 600,
+              color: "text.primary",
+            }}
           >
             {scenario.name}
           </Typography>
           {scenario.use_case && <Tag kind="soft">{scenario.use_case}</Tag>}
-          {ran && <Tag kind={ran.passed ? "pass" : "fail"}>{ran.passed ? "ran: pass" : "ran: fail"}</Tag>}
+          {ran && (
+            <Tag kind={ran.passed ? "pass" : "fail"}>
+              {ran.passed ? "ran: pass" : "ran: fail"}
+            </Tag>
+          )}
         </>
       }
     >
@@ -156,7 +172,11 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
       <Field label="validation">
         <Stack direction="row" flexWrap="wrap" useFlexGap spacing={1.5}>
           {GATES.map(([key, label]) => (
-            <GateLamp key={key} held={(scenario.gates || {})[key]} label={label} />
+            <GateLamp
+              key={key}
+              held={(scenario.gates || {})[key]}
+              label={label}
+            />
           ))}
         </Stack>
       </Field>
@@ -169,7 +189,7 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
             borderRadius: "3px",
             fontFamily: ALK_MONO,
             fontSize: 11.7,
-            color: "error.main",
+            color: "accent.fail",
             bgcolor: (theme) => alpha(theme.palette.error.main, 0.1),
           }}
         >
@@ -196,7 +216,9 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
 
       {scenario.tests && (
         <Field label="what this tests">
-          <Typography sx={{ fontStyle: "italic", fontSize: 13, color: "text.secondary" }}>
+          <Typography
+            sx={{ fontStyle: "italic", fontSize: 13, color: "text.secondary" }}
+          >
             {scenario.tests}
           </Typography>
         </Field>
@@ -295,8 +317,9 @@ const ScenarioCard = ({ scenario, ran, onSeeRun }) => {
           {checks.map((check) => (
             <Tag
               key={check.name}
-              kind={check.settled_by === "code" ? "code" : "judge"}
+              kind={check.settled_by === "code" ? "code" : "evalHarness"}
               title={check.what || ""}
+              keepCase
             >
               {check.name}
             </Tag>
@@ -344,8 +367,8 @@ const ScenariosTab = ({ scenarios, runs, onSay, hasWorld, onSeeRun }) => {
       <Box>
         <Pane title="Scenarios">
           <Typography sx={{ fontSize: 13.5, color: "text.secondary" }}>
-            None written yet. Each one owns a folder: what it changes, whether the world is ready
-            for it, and one runnable file per check.
+            None written yet. Each one owns a folder: what it changes, whether
+            the world is ready for it, and one runnable file per check.
           </Typography>
           {/* Asking for scenarios before a world exists only produces scenarios nothing can check. */}
           {hasWorld && onSay && (

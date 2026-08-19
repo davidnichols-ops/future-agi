@@ -3,7 +3,9 @@ import traceback
 from datetime import datetime, timedelta
 
 import structlog
+from django.core.exceptions import PermissionDenied
 from django.db.models import Count, Exists, Max, OuterRef, Q
+from django.http import Http404
 from django.utils import timezone
 from drf_yasg.utils import swagger_auto_schema
 from rest_framework.decorators import action
@@ -44,6 +46,7 @@ from tracer.serializers.monitor import (
     UserAlertMonitorSerializer,
 )
 from tracer.utils.helper import get_sort_query
+from tracer.utils.monitor import MonitorConfigError
 from tracer.utils.monitor_graphs import get_graph_data
 
 logger = structlog.get_logger(__name__)
@@ -247,11 +250,16 @@ class UserAlertMonitorView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             }
 
             return self._gm.success_response(data)
+        except (Http404, PermissionDenied):
+            raise
         except UserAlertMonitor.DoesNotExist:
             return self._gm.not_found(get_error_message("MONITOR_NOT_FOUND"))
         except Exception as e:
+            # Server-side failure: 5xx, not a 400 that reads as a client bug.
             logger.error(f"Failed to get monitor details: {e}", exc_info=True)
-            return self._gm.bad_request(get_error_message("FAILED_TO_GET_MONITOR"))
+            return self._gm.internal_server_error_response(
+                get_error_message("FAILED_TO_GET_MONITOR")
+            )
 
     def delete(self, request, *args, **kwargs):
         try:
@@ -294,11 +302,18 @@ class UserAlertMonitorView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                 f"Error occurred while deleting User Alerts: {str(e)}"
             )
 
+    # Operational / audit / soft-delete fields the server owns; a client must
+    # not set them via create/update (e.g. PATCH last_checked_at to silently
+    # stop a monitor, or deleted=true to bypass the delete endpoint).
+    _SERVER_OWNED_FIELDS = ("last_checked_at", "logs", "deleted", "deleted_at")
+
     def _scope_safe_update_data(self, request, instance, *, partial):
         data = request.data.copy()
         data.pop("organization", None)
         data.pop("workspace", None)
         data.pop("created_by", None)
+        for field in self._SERVER_OWNED_FIELDS:
+            data.pop(field, None)
         if not partial:
             data["organization"] = str(instance.organization_id)
             if instance.workspace_id:
@@ -467,17 +482,25 @@ class UserAlertMonitorView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
 
             response["table"] = table_data
 
+            page_size_int = int(page_size)
             response["metadata"] = {
                 "total_rows": total_records,
-                "total_pages": math.ceil(total_records / int(page_size)),
+                "total_pages": (
+                    math.ceil(total_records / page_size_int) if page_size_int > 0 else 0
+                ),
             }
 
             return self._gm.success_response(response)
 
         except Exception as e:
-            traceback.print_exc()
-            logger.info(f"Error occurred while fetching monitors list: {str(e)}")
-            return self._gm.bad_request(f"error fetching the monitors list {str(e)}")
+            # Server-side failure: log the detail, return a generic 5xx (a 400
+            # with raw str(e) both misclassifies it and leaks internals).
+            logger.error(
+                "monitor_list_failed", error=str(e), exc_info=True
+            )
+            return self._gm.internal_server_error_response(
+                "Failed to fetch monitors list"
+            )
 
     @validated_request(
         request_serializer=UserAlertMonitorSerializer,
@@ -499,6 +522,9 @@ class UserAlertMonitorView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
 
         try:
             data = request.data.copy()
+            # Strip client-supplied server-owned fields before seeding our own.
+            for field in self._SERVER_OWNED_FIELDS:
+                data.pop(field, None)
             data["organization"] = (
                 getattr(request, "organization", None) or request.user.organization
             ).id
@@ -699,10 +725,15 @@ class UserAlertMonitorView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             end_time_str = request.query_params.get("end_date")
             start_time_str = request.query_params.get("start_date")
 
-            start_time = (
-                datetime.fromisoformat(start_time_str) if start_time_str else None
-            )
-            end_time = datetime.fromisoformat(end_time_str) if end_time_str else None
+            try:
+                start_time = (
+                    datetime.fromisoformat(start_time_str) if start_time_str else None
+                )
+                end_time = (
+                    datetime.fromisoformat(end_time_str) if end_time_str else None
+                )
+            except ValueError as e:
+                return self._gm.bad_request(f"Invalid date parameter: {e}")
 
             graph_data = get_graph_data(
                 monitor=monitor,
@@ -712,12 +743,16 @@ class UserAlertMonitorView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
 
             return self._gm.success_response(graph_data)
 
+        except MonitorConfigError as e:
+            # Invalid user-supplied config (e.g. bad filters) — a client error.
+            return self._gm.bad_request(f"Invalid monitor configuration: {e}")
         except Exception as e:
             logger.error(
                 f"Failed to get monitor preview graph data: {e}", exc_info=True
             )
-            return self._gm.bad_request(
-                get_error_message("FAILED_TO_GET_MONITOR_PREVIEW", str(e))
+            # Generic body: raw CH errors can leak hosts/SQL to the client.
+            return self._gm.internal_server_error_response(
+                "Failed to get monitor preview"
             )
 
     @action(detail=True, methods=["get"], url_path="graph")
@@ -735,10 +770,15 @@ class UserAlertMonitorView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             end_time_str = request.query_params.get("end_date")
             start_time_str = request.query_params.get("start_date")
 
-            start_time = (
-                datetime.fromisoformat(start_time_str) if start_time_str else None
-            )
-            end_time = datetime.fromisoformat(end_time_str) if end_time_str else None
+            try:
+                start_time = (
+                    datetime.fromisoformat(start_time_str) if start_time_str else None
+                )
+                end_time = (
+                    datetime.fromisoformat(end_time_str) if end_time_str else None
+                )
+            except ValueError as e:
+                return self._gm.bad_request(f"Invalid date parameter: {e}")
 
             # Call the graphing utility function to get the bucketed data.
             graph_data = get_graph_data(
@@ -749,11 +789,18 @@ class UserAlertMonitorView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
 
             return self._gm.success_response(graph_data)
 
-        except UserAlertMonitor.DoesNotExist:
-            return self._gm.not_found(get_error_message("MONITOR_NOT_FOUND"))
+        except (Http404, PermissionDenied):
+            # get_object()'s not-found / permission errors keep DRF semantics.
+            raise
+        except MonitorConfigError as e:
+            # Invalid stored config (e.g. bad filters) — a client-fixable error.
+            return self._gm.bad_request(f"Invalid monitor configuration: {e}")
         except Exception as e:
+            # CH/query failures are server-side; 400 would mask them as client bugs.
             logger.error(f"Failed to get monitor graph data: {e}", exc_info=True)
-            return self._gm.bad_request(get_error_message("FAILED_TO_GET_MONITOR"))
+            return self._gm.internal_server_error_response(
+                get_error_message("FAILED_TO_GET_MONITOR")
+            )
 
 
 class UserAlertMonitorLogView(BaseModelViewSetMixin, ModelViewSet):

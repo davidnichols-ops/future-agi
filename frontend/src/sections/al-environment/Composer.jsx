@@ -4,13 +4,22 @@ import { Box, Button, IconButton, Stack, Typography } from "@mui/material";
 import Iconify from "src/components/iconify";
 import { ALK_MONO } from "./alkTokens";
 import { quickChips } from "./quickChips";
+import { shortPath } from "./parts/shortPath";
 
 /**
  * The box the harness is talked to through. Send sits inside the border rather than beside
  * it, so the whole thing reads as one field; the chips above are the shortcuts for the
  * things you would otherwise type out every session.
  */
-const Composer = ({ onSay, onRun, onStop, streaming, status, sessionId }) => {
+const Composer = ({
+  onSay,
+  onRun,
+  onStop,
+  streaming,
+  status,
+  sessionId,
+  artifactsPath,
+}) => {
   const [text, setText] = useState("");
   const boxRef = useRef(null);
   const hasSession = Boolean(status?.session);
@@ -48,7 +57,8 @@ const Composer = ({ onSay, onRun, onStop, streaming, status, sessionId }) => {
   const chips = hasSession ? quickChips(status) : [];
 
   return (
-    <Box sx={{
+    <Box
+      sx={{
         px: 3,
         pt: 1.5,
         pb: 1.75,
@@ -63,16 +73,25 @@ const Composer = ({ onSay, onRun, onStop, streaming, status, sessionId }) => {
           borderTop: "1px solid",
           borderColor: "divider",
         },
-      }}>
+      }}
+    >
       {chips.length > 0 && (
-        <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap sx={{ mb: 1 }}>
+        <Stack
+          direction="row"
+          spacing={0.5}
+          flexWrap="wrap"
+          useFlexGap
+          sx={{ mb: 1 }}
+        >
           {chips.map((chip) => (
             <Box
               key={chip.label}
               component="button"
               type="button"
               disabled={streaming || busy}
-              onClick={() => (chip.run !== undefined ? onRun(chip.run) : onSay(chip.say))}
+              onClick={() =>
+                chip.run !== undefined ? onRun(chip.run) : onSay(chip.say)
+              }
               sx={{
                 px: 1.25,
                 py: 0.4,
@@ -84,7 +103,10 @@ const Composer = ({ onSay, onRun, onStop, streaming, status, sessionId }) => {
                 fontSize: 12,
                 fontFamily: "inherit",
                 cursor: "pointer",
-                "&:hover:not(:disabled)": { color: "text.primary", borderColor: "text.secondary" },
+                "&:hover:not(:disabled)": {
+                  color: "text.primary",
+                  borderColor: "text.secondary",
+                },
                 "&:disabled": { opacity: 0.5, cursor: "default" },
               }}
             >

@@ -176,7 +176,7 @@ const TranscriptPane = ({ messages, hasSession, thinking, spentUsd, onDismissErr
               spacing={1}
               sx={{
                 borderLeft: "2px solid",
-                borderColor: "error.main",
+                borderColor: "accent.fail",
                 pl: 1.25,
               }}
             >

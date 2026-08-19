@@ -297,7 +297,7 @@ const AlEnvironmentView = () => {
             my: 1,
             pl: 1.25,
             borderLeft: "2px solid",
-            borderColor: "error.main",
+            borderColor: "accent.fail",
           }}
         >
           <Typography
