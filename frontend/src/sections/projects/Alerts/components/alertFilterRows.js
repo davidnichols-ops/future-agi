@@ -40,6 +40,18 @@ export const toPanelType = (filterType) =>
 const toFilterType = (panelType) =>
   FILTER_TYPE_BY_PANEL_TYPE[panelType] || "text";
 
+// The panel's numeric input is a plain text field, so an edited row comes back
+// as a string. The old form coerced with parseFloat before storing, so keep
+// doing that or an edited row changes the type of filter_value on save.
+// Anything not a finite number — "", "-", a half-typed "1e" — is left alone.
+const toApiNumber = (value) => {
+  if (Array.isArray(value)) return value.map(toApiNumber);
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (trimmed === "" || !Number.isFinite(Number(trimmed))) return value;
+  return Number(trimmed);
+};
+
 // The panel's boolean control works in the strings "true"/"false"; the API
 // takes a native bool and drops the condition outright if given anything else.
 const toPanelBool = (value) =>
@@ -112,6 +124,11 @@ const toLegacyScalarOp = (operator, value) => {
   return { operator: LEGACY_SCALAR_OP[operator], value: values[0] ?? "" };
 };
 
+const API_VALUE_BY_TYPE = {
+  boolean: toApiBool,
+  number: toApiNumber,
+};
+
 /** Panel rows → form rows, matching what `transformFilterResponse` produces. */
 export const toFormRows = (panelRows = []) => {
   const out = [];
@@ -152,7 +169,7 @@ export const toFormRows = (panelRows = []) => {
       filterConfig: {
         filterType,
         filterOp: operator,
-        filterValue: filterType === "boolean" ? toApiBool(value) : value,
+        filterValue: API_VALUE_BY_TYPE[filterType]?.(value) ?? value,
       },
     });
   });

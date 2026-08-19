@@ -55,8 +55,8 @@ describe("alert filter bar round-trip", () => {
   });
 
   it("preserves a stored type that disagrees with the attribute's real type", () => {
-    // retry_count lives in attrs_number, but this alert was saved as text.
-    // Coercing it would change the payload and could invalidate the operator.
+    // Saved as text on an attribute that holds numbers. Coercing the stored
+    // type would change the payload and could invalidate the operator.
     const payload = {
       observation_type: [],
       span_attributes_filters: [
