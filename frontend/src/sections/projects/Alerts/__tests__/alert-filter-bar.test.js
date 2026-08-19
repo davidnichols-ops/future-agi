@@ -182,4 +182,21 @@ describe("alert filter bar round-trip", () => {
       [],
     );
   });
+
+  it("normalises stored type spellings through the contract's aliases", () => {
+    // `str`, `int`, `bool` are all live spellings in filter_contract.json.
+    const rowFor = (filterType) =>
+      toPanelRows([
+        {
+          property: "attributes",
+          propertyId: "attr",
+          filterConfig: { filterType, filterOp: "equals", filterValue: "x" },
+        },
+      ])[0];
+
+    expect(rowFor("str").fieldType).toBe("text");
+    expect(rowFor("int").fieldType).toBe("number");
+    expect(rowFor("bool").fieldType).toBe("boolean");
+    expect(rowFor("float").fieldType).toBe("number");
+  });
 });

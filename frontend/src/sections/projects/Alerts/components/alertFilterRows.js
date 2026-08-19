@@ -1,3 +1,4 @@
+import { FIELD_TYPE_ALIASES } from "src/api/contracts/filter-contract.generated";
 import { AllowedEvalSpanTypes } from "src/utils/constant";
 import { getRandomId } from "src/utils/utils";
 
@@ -29,16 +30,19 @@ export const CATEGORIES = [
   { key: "attribute", label: "Attributes" },
 ];
 
-const FILTER_TYPE_BY_PANEL_TYPE = {
-  number: "number",
-  boolean: "boolean",
-};
-
+// The contract is the authority on how a stored type spells itself — the
+// backend rejects anything outside it — so normalise through its aliases
+// rather than a local map that only knew number/boolean/text.
 export const toPanelType = (filterType) =>
-  FILTER_TYPE_BY_PANEL_TYPE[filterType] || "text";
+  FIELD_TYPE_ALIASES[filterType] ?? filterType ?? "text";
+
+// Span attributes only ever store text, number or boolean; anything the
+// contract normalises to something else is left alone so it round-trips
+// instead of being rewritten as text.
+const SPAN_ATTRIBUTE_TYPES = new Set(["text", "number", "boolean"]);
 
 const toFilterType = (panelType) =>
-  FILTER_TYPE_BY_PANEL_TYPE[panelType] || "text";
+  SPAN_ATTRIBUTE_TYPES.has(panelType) ? panelType : "text";
 
 // The panel's numeric input is a plain text field, so an edited row comes back
 // as a string. The old form coerced with parseFloat before storing, so keep
