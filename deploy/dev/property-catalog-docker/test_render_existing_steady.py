@@ -3,12 +3,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
-
 
 _DIRECTORY = Path(__file__).parent
 
@@ -96,6 +95,12 @@ class ExistingSteadyRendererTests(unittest.TestCase):
                 environment["PROPERTY_CATALOG_DEV_RECONCILE_ENABLED"], "true"
             )
             self.assertEqual(
+                environment[
+                    "PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS"
+                ],
+                "1200000",
+            )
+            self.assertEqual(
                 environment["PROPERTY_CATALOG_DEV_TASK_QUEUE"], task_queue
             )
             self.assertEqual(environment["TEMPORAL_TASK_QUEUE"], task_queue)
@@ -151,13 +156,14 @@ class ExistingSteadyProvisionerTests(unittest.TestCase):
                     return "1\n"
                 if "system.tables" in sql:
                     return "\n".join(
-                        '{"name":"%s","engine":"ReplacingMergeTree"}' % name
+                        f'{{"name":"{name}","engine":"ReplacingMergeTree"}}'
                         for name in provision.EXPECTED_TABLES
                     )
                 if "property_catalog_activations" in sql:
                     return (
-                        '{"activation_sha256":"%s","status":"active",'
-                        '"catalog_epoch":5,"catalog_revision":1}' % activation_sha256
+                        f'{{"activation_sha256":"{activation_sha256}",'
+                        '"status":"active","catalog_epoch":5,'
+                        '"catalog_revision":1}'
                     )
                 if "property_catalog_source_streams" in sql:
                     return "1\n"

@@ -49,6 +49,7 @@ from .coordinator import (
 )
 from .dev_rollout import (
     DEV_INITIAL_BACKFILL_MAX_WALL_MS,
+    DEV_SCHEDULED_RECONCILE_MAX_WALL_MS,
     DEV_STANDARD_MAX_WALL_MS,
     DevRolloutError,
     DevRolloutRequest,
@@ -777,6 +778,16 @@ class DevRuntimeConfig:
     rollout_wall_ms: int = DEV_STANDARD_MAX_WALL_MS
     catalog_control_database: str = "default"
     explicit_initial_backfill_wall: bool = False
+    explicit_scheduled_reconcile_wall: bool = False
+
+    @property
+    def extended_rollout_wall(self) -> bool:
+        """Whether the aggregate wall also needs a lease with headroom."""
+
+        return (
+            self.explicit_initial_backfill_wall
+            or self.explicit_scheduled_reconcile_wall
+        )
 
     @property
     def span_query_timeout_ms(self) -> int:
@@ -905,23 +916,38 @@ class DevRuntimeConfig:
             raise PropertyCatalogDevRuntimeError(
                 "explicit_initial_backfill_wall must be a bool"
             )
+        if type(self.explicit_scheduled_reconcile_wall) is not bool:
+            raise PropertyCatalogDevRuntimeError(
+                "explicit_scheduled_reconcile_wall must be a bool"
+            )
+        if (
+            self.explicit_initial_backfill_wall
+            and self.explicit_scheduled_reconcile_wall
+        ):
+            raise PropertyCatalogDevRuntimeError(
+                "initial backfill and scheduled reconcile walls are mutually "
+                "exclusive"
+            )
         if type(self.rollout_wall_ms) is not int:
             raise PropertyCatalogDevRuntimeError("rollout wall must be an integer")
-        if self.explicit_initial_backfill_wall:
+        if self.extended_rollout_wall:
             if not (
                 DEV_STANDARD_MAX_WALL_MS
                 < self.rollout_wall_ms
-                <= DEV_INITIAL_BACKFILL_MAX_WALL_MS
+                <= min(
+                    DEV_INITIAL_BACKFILL_MAX_WALL_MS,
+                    DEV_SCHEDULED_RECONCILE_MAX_WALL_MS,
+                )
             ):
                 raise PropertyCatalogDevRuntimeError(
-                    "explicit initial backfill wall must be in [100001, 1740000] ms"
+                    "explicit extended rollout wall must be in [100001, 1740000] ms"
                 )
             lease_headroom_ms = (
                 MAX_REVISION_LEASE_SECONDS * 1_000 - self.rollout_wall_ms
             )
             if lease_headroom_ms < _MIN_INITIAL_BACKFILL_LEASE_HEADROOM_MS:
                 raise PropertyCatalogDevRuntimeError(
-                    "explicit initial backfill wall must leave at least 60000 ms "
+                    "explicit extended rollout wall must leave at least 60000 ms "
                     "of revision lease headroom"
                 )
         elif not 1 <= self.rollout_wall_ms <= DEV_STANDARD_MAX_WALL_MS:
@@ -978,6 +1004,7 @@ class DevRuntimeConfig:
             "CH25_SERVER_ENFORCED_READONLY",
         )
         explicit_initial_wall_ms = request.initial_backfill_wall_ms
+        explicit_scheduled_wall_ms = request.scheduled_reconcile_wall_ms
         source = NativeConnectionConfig(
             host=source_value("CH25_HOST", "CH_HOST"),
             port=_strict_port(
@@ -1124,9 +1151,16 @@ class DevRuntimeConfig:
             rollout_wall_ms=(
                 explicit_initial_wall_ms
                 if explicit_initial_wall_ms is not None
-                else configured_wall_ms
+                else (
+                    explicit_scheduled_wall_ms
+                    if explicit_scheduled_wall_ms is not None
+                    else configured_wall_ms
+                )
             ),
             explicit_initial_backfill_wall=explicit_initial_wall_ms is not None,
+            explicit_scheduled_reconcile_wall=(
+                explicit_scheduled_wall_ms is not None
+            ),
         )
 
 
@@ -1474,6 +1508,9 @@ def _project_tenant_authorization_contract_sha256(
             "catalog_epoch": config.catalog_epoch,
             "drain_proof_file": config.drain_proof_file,
             "explicit_initial_backfill_wall": config.explicit_initial_backfill_wall,
+            "explicit_scheduled_reconcile_wall": (
+                config.explicit_scheduled_reconcile_wall
+            ),
             "hot_producer_stream_id": config.hot_producer_stream_id,
             "mutation_lock_directory": config.mutation_lock_directory,
             "producer_retirement_file": config.producer_retirement_file,
@@ -1515,6 +1552,7 @@ def _project_tenant_authorization_contract_sha256(
             "environment": request.environment,
             "execute": request.execute,
             "initial_backfill_wall_ms": request.initial_backfill_wall_ms,
+            "scheduled_reconcile_wall_ms": request.scheduled_reconcile_wall_ms,
             "organization_id": request.organization_id,
             "source_database": request.source_database,
             "status": request.status,
@@ -3566,7 +3604,7 @@ class PropertyCatalogDevRuntimeFactory:
             lease_seconds=(
                 (config.rollout_wall_ms + _MIN_INITIAL_BACKFILL_LEASE_HEADROOM_MS + 999)
                 // 1_000
-                if config.explicit_initial_backfill_wall
+                if config.extended_rollout_wall
                 else REVISION_LEASE_SECONDS
             ),
             now=self._now,

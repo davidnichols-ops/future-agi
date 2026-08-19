@@ -25,6 +25,7 @@ from tracer.services.clickhouse.v2.property_catalog.coordinator import (
 from tracer.services.clickhouse.v2.property_catalog.dev_rollout import (
     DEV_INITIAL_BACKFILL_MAX_WALL_MS,
     DEV_ROLLOUT_ACK,
+    DEV_SCHEDULED_RECONCILE_MAX_WALL_MS,
     DEV_STANDARD_MAX_WALL_MS,
     DevRolloutError,
     DevRolloutMode,
@@ -1284,7 +1285,10 @@ def test_workspace_tick_verifies_schema_without_running_ddl_or_initial_backfill(
     calls: list[str] = []
 
     evidence = run_workspace_reconcile(
-        request=_request(execute=True),
+        request=_request(
+            execute=True,
+            scheduled_reconcile_wall_ms=1_200_000,
+        ),
         runtime=_Runtime(calls),  # type: ignore[arg-type]
         mode=mode,
     )
@@ -1320,6 +1324,19 @@ def test_workspace_tick_rejects_initial_backfill_wall_before_runtime_io() -> Non
                 execute=True,
                 initial_backfill_wall_ms=DEV_STANDARD_MAX_WALL_MS + 1,
             ),
+            runtime=_Runtime(calls),  # type: ignore[arg-type]
+            mode=ReconcileMode.INCREMENTAL,
+        )
+
+    assert calls == []
+
+
+def test_workspace_tick_requires_explicit_scheduled_wall_before_runtime_io() -> None:
+    calls: list[str] = []
+
+    with pytest.raises(DevRolloutError, match="requires an explicit extended wall"):
+        run_workspace_reconcile(
+            request=_request(execute=True),
             runtime=_Runtime(calls),  # type: ignore[arg-type]
             mode=ReconcileMode.INCREMENTAL,
         )
@@ -1432,6 +1449,28 @@ def test_explicit_initial_backfill_wall_is_strictly_bounded(wall_ms: object) -> 
 def test_explicit_initial_backfill_wall_requires_execute() -> None:
     with pytest.raises(DevRolloutError, match="requires --execute"):
         _request(initial_backfill_wall_ms=DEV_STANDARD_MAX_WALL_MS + 1)
+
+
+@pytest.mark.parametrize(
+    "wall_ms",
+    (True, DEV_STANDARD_MAX_WALL_MS, DEV_SCHEDULED_RECONCILE_MAX_WALL_MS + 1),
+)
+def test_explicit_scheduled_reconcile_wall_is_strictly_bounded(
+    wall_ms: object,
+) -> None:
+    with pytest.raises(DevRolloutError, match="scheduled reconcile wall"):
+        _request(execute=True, scheduled_reconcile_wall_ms=wall_ms)
+
+
+def test_scheduled_reconcile_wall_requires_execute_and_excludes_initial() -> None:
+    with pytest.raises(DevRolloutError, match="requires execute mode"):
+        _request(scheduled_reconcile_wall_ms=1_200_000)
+    with pytest.raises(DevRolloutError, match="mutually exclusive"):
+        _request(
+            execute=True,
+            initial_backfill_wall_ms=1_200_000,
+            scheduled_reconcile_wall_ms=1_200_000,
+        )
 
 
 def test_expired_repair_is_explicit_in_execute_plan() -> None:
@@ -1555,6 +1594,18 @@ def test_dev_runtime_requires_v2_shared_proof_and_temporal_headroom(
             rollout_wall_ms=DEV_INITIAL_BACKFILL_MAX_WALL_MS + 1,
             explicit_initial_backfill_wall=True,
         )
+    scheduled = replace(
+        config,
+        rollout_wall_ms=1_200_000,
+        explicit_scheduled_reconcile_wall=True,
+    )
+    assert scheduled.extended_rollout_wall is True
+    assert scheduled.span_query_timeout_ms == CANONICAL_SPAN_QUERY_TIMEOUT_MS
+    with pytest.raises(PropertyCatalogDevRuntimeError, match="mutually exclusive"):
+        replace(
+            scheduled,
+            explicit_initial_backfill_wall=True,
+        )
 
 
 def test_runtime_settings_keep_standard_wall_capped_and_select_explicit_wall(
@@ -1597,6 +1648,26 @@ def test_runtime_settings_keep_standard_wall_capped_and_select_explicit_wall(
             ),
             now=ATTESTED_AT,
         )
+
+
+def test_runtime_settings_select_scheduled_aggregate_wall_without_widening_queries(
+    tmp_path: Any,
+) -> None:
+    config = DevRuntimeConfig.from_settings(
+        _request(
+            execute=True,
+            scheduled_reconcile_wall_ms=1_200_000,
+        ),
+        _runtime_settings(str(tmp_path)),
+        now=ATTESTED_AT,
+    )
+
+    assert config.rollout_wall_ms == 1_200_000
+    assert config.explicit_scheduled_reconcile_wall is True
+    assert config.explicit_initial_backfill_wall is False
+    assert config.extended_rollout_wall is True
+    assert config.span_query_timeout_ms == CANONICAL_SPAN_QUERY_TIMEOUT_MS
+    assert config.source.read_timeout_ceiling_ms == 9_500
 
 
 def test_factory_shares_one_extended_deadline_with_lease_headroom(

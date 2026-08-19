@@ -318,6 +318,10 @@ The renderer adds one worker polling only a workspace-isolated queue named
 activity/workflow slot and one registrar behind the `registrar` profile. This
 prevents a sidecar for one DEV workspace from consuming another workspace's
 reconciliation activity.
+The worker keeps ordinary per-query limits unchanged but admits a reviewed
+1,200,000 ms aggregate wall and matching immutable lease for a scheduled tick
+that is promoted to a 34-project full repair. Temporal overlap remains `SKIP`,
+so a long repair cannot race a later two-minute tick.
 It preserves loopback-only OTLP, `PROPERTY_CATALOG_READ_MODE=off`, the source
 database, the isolated target, credential split, runtime bind, and all
 container hardening.
@@ -342,6 +346,35 @@ revision and prove a new active activation, zero Kafka lag, no gap/poison
 ledger rows, and unchanged source-table fingerprints. Stop the worker and
 revoke the short-lived identities after the review window if the DEV rollout
 is not being kept.
+
+### Hand off hot writes to the live DEV collector
+
+The bootstrap producer is deliberately unrouted and therefore cannot observe
+normal application OTLP traffic. After activation, render a second fail-closed
+overlay for the existing `futureagi` Compose project. It copies only the
+reviewed unified-catalog mode, workspace, stream, fence/spool, Kafka topic, and
+exact local collector image from the bootstrap Compose. It does not copy the
+bootstrap source/PostgreSQL credentials or listener addresses, and adds no
+port. The live collector retains its existing canonical ClickHouse and API-key
+configuration from the base application Compose files.
+
+```bash
+python deploy/dev/property-catalog-docker/render_live_collector_handoff.py \
+  --bootstrap-compose "$ROOT/compose.yaml" \
+  --output "$ROOT/live-collector-handoff.compose.yaml"
+
+docker compose \
+  -f /home/ubuntu/future-agi/docker-compose.yml \
+  -f /home/ubuntu/future-agi/docker-compose.dev.yml \
+  -f "$ROOT/live-collector-handoff.compose.yaml" config --quiet
+```
+
+Before recreating the live collector, stop only the unrouted bootstrap
+`property-catalog-producer`; never run two producers with one stream ID and
+spool. Then recreate only `fi-collector` with the rendered overlay. Do not stop
+the consumer or control worker. Verify canonical trace acceptance, Kafka lag
+zero, a matching delivery-ledger row, and active-catalog visibility for one
+fresh unique marker before treating the handoff as complete.
 
 ## Stop and remove only the new project
 

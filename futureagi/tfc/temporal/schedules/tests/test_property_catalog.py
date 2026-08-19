@@ -41,6 +41,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         "PROPERTY_CATALOG_DEV_MAX_WALL_MS": 100_000,
         "PROPERTY_CATALOG_DEV_ORGANIZATION_ID": ORG,
         "PROPERTY_CATALOG_DEV_RECONCILE_ENABLED": True,
+        "PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS": 1_200_000,
         "PROPERTY_CATALOG_DEV_RUNTIME_FACTORY": (
             property_catalog.CHECKED_IN_DEV_RUNTIME_FACTORY_PATH
         ),
@@ -142,6 +143,10 @@ def test_enabled_schedule_is_bounded_and_skips_overlap() -> None:
         ),
         ({"PROPERTY_CATALOG_DEV_MAX_WALL_MS": 100_001}, "wall"),
         (
+            {"PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS": 100_000},
+            "scheduled reconcile wall",
+        ),
+        (
             {"PROPERTY_CATALOG_DEV_RUNTIME_FACTORY": "tests.catalog.runtime_factory"},
             "checked-in",
         ),
@@ -173,6 +178,7 @@ def test_activity_refuses_initial_backfill_wall_before_loading_runtime(
         return replace(
             configured_request(**kwargs),  # type: ignore[arg-type]
             initial_backfill_wall_ms=DEV_STANDARD_MAX_WALL_MS + 1,
+            scheduled_reconcile_wall_ms=None,
         )
 
     monkeypatch.setattr(
@@ -228,6 +234,7 @@ def test_activity_invokes_service_for_exact_allowlisted_workspace_and_mode(
     runtime_factory.assert_called_once()
     request = runtime_factory.call_args.args[0]
     assert request.workspace_id == WORKSPACE_A
+    assert request.scheduled_reconcile_wall_ms == 1_200_000
     scheduled.assert_called_once_with(
         request=request,
         runtime=runtime,
@@ -283,6 +290,10 @@ def test_activity_is_registered_without_temporal_retries() -> None:
         activity._activity_name == property_catalog.PROPERTY_CATALOG_RECONCILE_ACTIVITY
     )
     assert activity._metadata["max_retries"] == 0
+    assert (
+        activity._metadata["time_limit"]
+        == property_catalog.PROPERTY_CATALOG_RECONCILE_ACTIVITY_TIME_LIMIT_SECONDS
+    )
     assert activity._metadata["queue"] == property_catalog.PROPERTY_CATALOG_TASK_QUEUE
     assert property_catalog.PROPERTY_CATALOG_TASK_QUEUE != "default"
     assert "tfc.temporal.schedules.property_catalog" in TEMPORAL_ACTIVITY_MODULES

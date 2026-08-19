@@ -14,6 +14,7 @@ from tfc.temporal.drop_in import temporal_activity
 from tfc.temporal.property_catalog_queue import PROPERTY_CATALOG_TASK_QUEUE
 from tfc.temporal.schedules.config import ScheduleConfig
 from tracer.services.clickhouse.v2.property_catalog.dev_rollout import (
+    DEV_SCHEDULED_RECONCILE_MAX_WALL_MS,
     DEV_STANDARD_MAX_WALL_MS,
     DevRolloutError,
     DevRolloutRequest,
@@ -32,6 +33,11 @@ PROPERTY_CATALOG_RECONCILE_SCHEDULE_ID = "unified-property-catalog-dev"
 PROPERTY_CATALOG_RECONCILE_INTERVAL_SECONDS = 120
 PROPERTY_CATALOG_RECONCILE_MAX_WORKSPACES = 1
 PROPERTY_CATALOG_RECONCILE_MAX_WALL_MS = DEV_STANDARD_MAX_WALL_MS
+PROPERTY_CATALOG_RECONCILE_DEFAULT_EXTENDED_WALL_MS = 1_200_000
+PROPERTY_CATALOG_RECONCILE_MAX_EXTENDED_WALL_MS = (
+    DEV_SCHEDULED_RECONCILE_MAX_WALL_MS
+)
+PROPERTY_CATALOG_RECONCILE_ACTIVITY_TIME_LIMIT_SECONDS = 1_800
 
 
 class PropertyCatalogScheduleError(RuntimeError):
@@ -84,6 +90,21 @@ def property_catalog_schedule_configuration(
         raise PropertyCatalogScheduleError(
             "property catalog schedule wall must be in [1, 100000] ms"
         )
+    extended_wall_ms = getattr(
+        settings_object,
+        "PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS",
+        PROPERTY_CATALOG_RECONCILE_DEFAULT_EXTENDED_WALL_MS,
+    )
+    if (
+        type(extended_wall_ms) is not int
+        or not PROPERTY_CATALOG_RECONCILE_MAX_WALL_MS
+        < extended_wall_ms
+        <= PROPERTY_CATALOG_RECONCILE_MAX_EXTENDED_WALL_MS
+    ):
+        raise PropertyCatalogScheduleError(
+            "property catalog scheduled reconcile wall must be in "
+            "[100001, 1740000] ms"
+        )
 
     organization_id = str(
         getattr(settings_object, "PROPERTY_CATALOG_DEV_ORGANIZATION_ID", "")
@@ -114,6 +135,7 @@ def property_catalog_schedule_configuration(
                 workspace_id=workspace_id,
                 settings_object=settings_object,
                 execute=True,
+                scheduled_reconcile_wall_ms=extended_wall_ms,
             )
             for workspace_id in workspaces
         )
@@ -256,7 +278,7 @@ def run_property_catalog_dev_reconcile(
 
 @temporal_activity(
     name=PROPERTY_CATALOG_RECONCILE_ACTIVITY,
-    time_limit=110,
+    time_limit=PROPERTY_CATALOG_RECONCILE_ACTIVITY_TIME_LIMIT_SECONDS,
     queue=PROPERTY_CATALOG_TASK_QUEUE,
     max_retries=0,
 )
@@ -279,7 +301,10 @@ PROPERTY_CATALOG_SCHEDULES = list(configured_property_catalog_schedules(settings
 
 __all__ = [
     "PROPERTY_CATALOG_RECONCILE_ACTIVITY",
+    "PROPERTY_CATALOG_RECONCILE_ACTIVITY_TIME_LIMIT_SECONDS",
+    "PROPERTY_CATALOG_RECONCILE_DEFAULT_EXTENDED_WALL_MS",
     "PROPERTY_CATALOG_RECONCILE_INTERVAL_SECONDS",
+    "PROPERTY_CATALOG_RECONCILE_MAX_EXTENDED_WALL_MS",
     "PROPERTY_CATALOG_RECONCILE_MAX_WORKSPACES",
     "PROPERTY_CATALOG_RECONCILE_MAX_WALL_MS",
     "PROPERTY_CATALOG_RECONCILE_SCHEDULE_ID",

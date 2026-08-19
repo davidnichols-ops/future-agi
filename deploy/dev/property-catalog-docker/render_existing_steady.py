@@ -12,17 +12,17 @@ from __future__ import annotations
 import argparse
 import copy
 import os
-from pathlib import Path
 import re
-from collections.abc import Mapping, Sequence
 import sys
 import tempfile
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import yaml
 
-
 TASK_QUEUE_PREFIX = "property_catalog_dev_sidecar_"
+SCHEDULED_RECONCILE_WALL_MS = "1200000"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TARGET_RE = re.compile(r"th7247_catalog_dev_[a-z0-9][a-z0-9_]*")
 _UUID_RE = re.compile(
@@ -140,6 +140,9 @@ def _control_service(
     control["environment"].update(
         {
             "PROPERTY_CATALOG_DEV_RECONCILE_ENABLED": "true",
+            "PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS": (
+                SCHEDULED_RECONCILE_WALL_MS
+            ),
             "PROPERTY_CATALOG_DEV_TASK_QUEUE": task_queue,
             "PROPERTY_CATALOG_DEV_BOOTSTRAP_ACTIVATION_SHA256": (activation_sha256),
             "TEMPORAL_HOST": "temporal:7233",
@@ -238,6 +241,10 @@ def validate_overlay(
             or service.get("read_only") is not True
             or service.get("cap_drop") != ["ALL"]
             or environment.get("PROPERTY_CATALOG_DEV_RECONCILE_ENABLED") != "true"
+            or environment.get(
+                "PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS"
+            )
+            != SCHEDULED_RECONCILE_WALL_MS
             or environment.get("PROPERTY_CATALOG_DEV_TASK_QUEUE") != task_queue
             or environment.get("PROPERTY_CATALOG_READ_MODE") != "off"
             or environment.get("PROPERTY_CATALOG_DEV_OTLP_TRAFFIC_AUTHORIZED")

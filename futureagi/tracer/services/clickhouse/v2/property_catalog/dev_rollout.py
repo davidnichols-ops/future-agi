@@ -34,6 +34,7 @@ DEV_ENVIRONMENT = "development"
 DEV_CLOUD_DEPLOYMENT = "DEV"
 DEV_STANDARD_MAX_WALL_MS = 100_000
 DEV_INITIAL_BACKFILL_MAX_WALL_MS = 1_740_000
+DEV_SCHEDULED_RECONCILE_MAX_WALL_MS = 1_740_000
 _DEV_IDENTITY_RE = re.compile(r"^dev:[a-z0-9][a-z0-9._:/-]{2,127}$")
 _SOURCE_DATABASE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -69,6 +70,7 @@ class DevRolloutRequest:
     execute: bool = False
     status: bool = False
     initial_backfill_wall_ms: int | None = None
+    scheduled_reconcile_wall_ms: int | None = None
     repair_expired_incomplete: bool = False
 
     def __post_init__(self) -> None:
@@ -143,6 +145,26 @@ class DevRolloutRequest:
                 raise DevRolloutError(
                     "explicit initial backfill wall requires --execute"
                 )
+        if self.scheduled_reconcile_wall_ms is not None:
+            if (
+                type(self.scheduled_reconcile_wall_ms) is not int
+                or not DEV_STANDARD_MAX_WALL_MS
+                < self.scheduled_reconcile_wall_ms
+                <= DEV_SCHEDULED_RECONCILE_MAX_WALL_MS
+            ):
+                raise DevRolloutError(
+                    "explicit scheduled reconcile wall must be in "
+                    "[100001, 1740000] ms"
+                )
+            if not self.execute or self.status:
+                raise DevRolloutError(
+                    "explicit scheduled reconcile wall requires execute mode"
+                )
+            if self.initial_backfill_wall_ms is not None:
+                raise DevRolloutError(
+                    "initial backfill and scheduled reconcile walls are mutually "
+                    "exclusive"
+                )
 
     @property
     def mode(self) -> DevRolloutMode:
@@ -161,12 +183,14 @@ class DevRolloutPlan:
     legacy_source_access: str = "select_only"
     zero_io: bool = False
     initial_backfill_wall_ms: int | None = None
+    scheduled_reconcile_wall_ms: int | None = None
     repair_expired_incomplete: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "legacy_source_access": self.legacy_source_access,
             "initial_backfill_wall_ms": self.initial_backfill_wall_ms,
+            "scheduled_reconcile_wall_ms": self.scheduled_reconcile_wall_ms,
             "mode": self.mode,
             "repair_expired_incomplete": self.repair_expired_incomplete,
             "source_database": self.source_database,
@@ -266,6 +290,7 @@ class UnifiedDevRollout:
             write_allowlist=tuple(sorted(PROPERTY_CATALOG_TABLES)),
             zero_io=request.mode is DevRolloutMode.DRY_RUN,
             initial_backfill_wall_ms=request.initial_backfill_wall_ms,
+            scheduled_reconcile_wall_ms=request.scheduled_reconcile_wall_ms,
             repair_expired_incomplete=request.repair_expired_incomplete,
         )
 
@@ -345,6 +370,7 @@ def configured_dev_rollout_request(
     execute: bool,
     status: bool = False,
     initial_backfill_wall_ms: int | None = None,
+    scheduled_reconcile_wall_ms: int | None = None,
     repair_expired_incomplete: bool = False,
     overrides: Mapping[str, str | None] | None = None,
 ) -> DevRolloutRequest:
@@ -376,6 +402,7 @@ def configured_dev_rollout_request(
         execute=execute,
         status=status,
         initial_backfill_wall_ms=initial_backfill_wall_ms,
+        scheduled_reconcile_wall_ms=scheduled_reconcile_wall_ms,
         repair_expired_incomplete=repair_expired_incomplete,
     )
 
@@ -417,6 +444,10 @@ def run_workspace_reconcile(
         raise DevRolloutError(
             "scheduled workspace reconciliation refuses an initial backfill wall"
         )
+    if request.scheduled_reconcile_wall_ms is None:
+        raise DevRolloutError(
+            "scheduled workspace reconciliation requires an explicit extended wall"
+        )
     if request.repair_expired_incomplete and mode is not ReconcileMode.FULL_REPAIR:
         raise DevRolloutError(
             "expired incomplete scheduled repair requires full-repair mode"
@@ -449,6 +480,7 @@ __all__ = [
     "DEV_ENVIRONMENT",
     "DEV_ROLLOUT_ACK",
     "DEV_INITIAL_BACKFILL_MAX_WALL_MS",
+    "DEV_SCHEDULED_RECONCILE_MAX_WALL_MS",
     "DEV_STANDARD_MAX_WALL_MS",
     "DevRolloutError",
     "DevRolloutEvidence",

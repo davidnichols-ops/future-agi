@@ -1235,6 +1235,9 @@ PROPERTY_CATALOG_DEV_SIDECAR_ACK = os.getenv(
 _property_catalog_dev_max_wall_raw = os.getenv(
     "PROPERTY_CATALOG_DEV_MAX_WALL_MS", ""
 ).strip()
+_property_catalog_dev_scheduled_reconcile_wall_raw = os.getenv(
+    "PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS", ""
+).strip()
 PROPERTY_CATALOG_DEV_WORKSPACE_ALLOWLIST = tuple(
     sorted(
         {
@@ -1290,6 +1293,14 @@ try:
     )
 except ValueError:
     PROPERTY_CATALOG_DEV_MAX_WALL_MS = 0
+try:
+    PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS = (
+        int(_property_catalog_dev_scheduled_reconcile_wall_raw)
+        if _property_catalog_dev_scheduled_reconcile_wall_raw
+        else 1_200_000
+    )
+except ValueError:
+    PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_WALL_MS = 0
 if PROPERTY_CATALOG_READ_MODE not in {"off", "shadow", "read"}:
     raise ValueError("PROPERTY_CATALOG_READ_MODE must be off, shadow, or read")
 if PROPERTY_CATALOG_READ_MODE != "off":
