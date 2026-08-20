@@ -162,6 +162,7 @@ class CVConformScanner:
             if report_path:
                 report = verify_to_json(
                     model=str(model_path),
+                    path=str(report_path),
                     reference=self.reference,
                     targets=self.targets,
                     seed=self.seed,
@@ -169,9 +170,6 @@ class CVConformScanner:
                     output_names=None,
                     source_kind=source_format,
                 )
-                # verify_to_json already writes to file, but we can also write our own
-                with open(report_path, "w") as f:
-                    json.dump(report, f, indent=2)
             else:
                 report = verify(
                     model=str(model_path),

@@ -17,14 +17,17 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from tfc.ee_loader import has_ee
+try:
+    from ee.cloud.telemetry import schema as receiver_schema  # noqa: E402
+except ModuleNotFoundError:
+    receiver_schema = None  # type: ignore[assignment]
 
-# Skip on the OSS lane only; with ee present the import runs so divergence fails loud.
-if not has_ee("ee"):
-    pytest.skip("requires ee/ (OSS lane)", allow_module_level=True)
-
-from ee.cloud.telemetry import schema as receiver_schema  # noqa: E402
 from tfc.deployment_telemetry import schema as sender_schema  # noqa: E402
+
+pytestmark = pytest.mark.skipif(
+    receiver_schema is None,
+    reason="requires ee.cloud.telemetry (OSS lane)",
+)
 
 
 def _public_constants(module) -> dict:
