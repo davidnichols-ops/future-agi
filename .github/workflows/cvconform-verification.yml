@@ -1,0 +1,177 @@
+name: "cvconform Model Verification"
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_path:
+        description: "Path to model file (relative to repo root or absolute)"
+        required: true
+        type: string
+      reference:
+        description: "Reference runtime"
+        required: false
+        default: "pytorch"
+        type: choice
+        options:
+          - pytorch
+          - onnx
+          - coreml
+      targets:
+        description: "Comma-separated target runtimes"
+        required: false
+        default: "onnx,coreml,tensorrt"
+        type: string
+      require_conformant:
+        description: "Fail workflow if non-conformant"
+        required: false
+        default: "true"
+        type: boolean
+
+  pull_request:
+    paths:
+      - "models/**/*.pt"
+      - "models/**/*.onnx"
+      - "models/**/*.engine"
+      - "models/**/*.plan"
+      - "models/**/*.mlmodel"
+      - "models/**/*.mlpackage"
+
+jobs:
+  cvconform-verify:
+    name: "cvconform Verify"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-glx \
+            libglib2.0-0 \
+            libsm6 \
+            libxext6 \
+            libxrender-dev \
+            libgomp1
+
+      - name: Install cvconform
+        run: |
+          pip install cvconform[all] || pip install cvconform
+
+      - name: Run cvconform verify
+        id: cvconform
+        env:
+          MODEL_PATH: ${{ github.event.inputs.model_path || '' }}
+        run: |
+          set -e
+          
+          # Determine model path
+          if [ -n "${{ github.event.inputs.model_path }}" ]; then
+            MODEL="${{ github.event.inputs.model_path }}"
+          else
+            # Find model files in PR changes
+            MODEL=$(git diff --name-only ${{ github.base_ref }}..${{ github.head_ref }} | grep -E '\.(pt|onnx|engine|plan|mlmodel|mlpackage)$' | head -1)
+          fi
+          
+          if [ -z "$MODEL" ]; then
+            echo "No model file found to verify"
+            exit 0
+          fi
+          
+          echo "Verifying model: $MODEL"
+          
+          REFERENCE="${{ github.event.inputs.reference || 'pytorch' }}"
+          TARGETS="${{ github.event.inputs.targets || 'onnx,coreml,tensorrt' }}"
+          REQUIRE_CONFORMANT="${{ github.event.inputs.require_conformant || 'true' }}"
+          
+          CMD="cvconform verify $MODEL --reference $REFERENCE --targets $TARGETS"
+          
+          if [ "$REQUIRE_CONFORMANT" = "true" ]; then
+            CMD="$CMD --require-conformant"
+          fi
+          
+          echo "Running: $CMD"
+          eval $CMD
+          
+          echo "cvconform verification completed successfully"
+
+      - name: Upload cvconform report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvconform-report
+          path: |
+            *.json
+            cvconform-report.json
+          retention-days: 7
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            // Find cvconform report
+            let reportPath = null;
+            const files = fs.readdirSync('.');
+            for (const file of files) {
+              if (file.endsWith('_cvconform_report.json') || file === 'cvconform-report.json') {
+                reportPath = file;
+                break;
+              }
+            }
+            
+            if (!reportPath) {
+              console.log('No cvconform report found');
+              return;
+            }
+            
+            const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+            
+            // Build comment
+            let comment = '## 🔬 cvconform Model Verification Results\n\n';
+            comment += `**Model:** ${report.model}\n`;
+            comment += `**Source:** ${report.source}\n`;
+            comment += `**Reference:** ${report.reference}\n\n`;
+            
+            comment += '### Conformance Scores\n\n';
+            comment += '| Target | Score | Status |\n';
+            comment += '|--------|-------|--------|\n';
+            
+            for (const [target, data] of Object.entries(report.targets)) {
+              const status = data.is_conformant ? '✅ Conformant' : '❌ Non-conformant';
+              comment += `| ${target} | ${data.overall_score.toFixed(2)}% | ${status} |\n`;
+            }
+            
+            comment += '\n';
+            
+            if (report.findings && report.findings.length > 0) {
+              comment += '### Root Cause Findings\n\n';
+              for (const finding of report.findings) {
+                if (finding) {
+                  comment += `- **${finding.backend}**: ${finding.cause} (confidence: ${(finding.confidence * 100).toFixed(0)}%)\n`;
+                  if (finding.fixes && finding.fixes.length > 0) {
+                    comment += `  - Fixes: ${finding.fixes.join(', ')}\n`;
+                  }
+                }
+              }
+            }
+            
+            // Post comment
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
